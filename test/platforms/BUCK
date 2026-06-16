@@ -1,0 +1,12 @@
+# Copy this into your repo as platforms/BUCK.
+load("@prelude//platforms:defs.bzl", "host_configuration")
+load(":defs.bzl", "re_cache_execution_platform")
+
+# rebuck selects this by writing `[build] execution_platforms = root//platforms:re-cache`
+# into .buckconfig.local. Default (non-CI) builds keep the prelude platform.
+re_cache_execution_platform(
+    name = "re-cache",
+    cpu_configuration = host_configuration.cpu,
+    os_configuration = host_configuration.os,
+    visibility = ["PUBLIC"],
+)

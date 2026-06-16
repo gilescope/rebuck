@@ -29,9 +29,14 @@ inputs:
     default: "root//platforms:re-cache"
   write-buckconfig-local:
     description: >-
-      Write .buckconfig.local in the workspace with the RE client + execution_platforms config so your
+      Write .buckconfig.local with the RE client + execution_platforms config so your
       `buck build` needs no extra flags. Set false to manage buck config yourself.
     default: "true"
+  buck-root:
+    description: >-
+      Directory of your buck2 project root (where .buckconfig lives), relative to the workspace or
+      absolute. .buckconfig.local is written here. Defaults to the workspace root.
+    default: ""
   force-cache-upload:
     description: >-
       Export BUCK2_TEST_FORCE_CACHE_UPLOAD=1. The prelude marks rustc compile actions allow_cache_upload=False;

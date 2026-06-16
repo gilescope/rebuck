@@ -1,0 +1,68 @@
+name: selftest
+
+# Proves the action's full GHA lifecycle on a real runner: job `populate` builds
+# the tiny test/ buck2 project cold (compiles locally + uploads to the
+# bazel-remote sidecar, whose dir is saved to actions/cache in post). Job
+# `verify` (needs populate) restores that cache, starts its own sidecar, and the
+# build must be served from cache — proving cross-run reuse, the whole point.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  populate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write          # rebuck saves the cache
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: gilescope/install-buck2@latest
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+      - uses: ./
+        with:
+          buck-root: test
+          cache-key-prefix: rebuck-selftest
+      - name: cold build (populate)
+        working-directory: test
+        run: buck2 build //... 2>&1 | tee build.log
+      - name: assert cold run compiled locally
+        working-directory: test
+        run: |
+          grep -E 'local: [1-9]' build.log || { echo "expected local compiles on a cold run"; exit 1; }
+
+  verify:
+    needs: populate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: gilescope/install-buck2@latest
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+      - uses: ./
+        with:
+          buck-root: test
+          cache-key-prefix: rebuck-selftest
+      - name: warm build (from restored cache)
+        working-directory: test
+        run: buck2 build //... 2>&1 | tee build.log
+      - name: assert warm run hit the cache
+        working-directory: test
+        run: |
+          cat build.log
+          grep -E 'Cache hits: 100%|cached: [1-9]' build.log \
+            || { echo "FAIL: warm run did not hit the rebuck cache"; exit 1; }
+          if grep -qE 'local: [1-9]' build.log; then
+            echo "WARN: some actions still ran locally on the warm run"
+          fi

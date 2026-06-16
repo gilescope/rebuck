@@ -1,0 +1,8 @@
+rust_binary(
+    name = "hello",
+    srcs = ["src/main.rs"],
+    crate = "hello",
+    crate_root = "src/main.rs",
+    edition = "2021",
+    visibility = ["PUBLIC"],
+)

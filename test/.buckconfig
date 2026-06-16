@@ -1,0 +1,19 @@
+[cell_aliases]
+config = prelude
+fbsource = none
+fbcode = none
+
+[cells]
+root = .
+prelude = prelude
+toolchains = toolchains
+none = none
+
+[external_cells]
+prelude = bundled
+
+[parser]
+target_platform_detector_spec = target:root//...->prelude//platforms:default
+
+[rust]
+default_edition = 2021

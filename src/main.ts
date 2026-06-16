@@ -38,6 +38,7 @@ async function run(): Promise<void> {
   const execPlatform = core.getInput("execution-platform");
   const writeLocal = core.getBooleanInput("write-buckconfig-local");
   const forceUpload = core.getBooleanInput("force-cache-upload");
+  const buckRootInput = core.getInput("buck-root");
 
   const pa = platformArch();
   const runId = process.env.GITHUB_RUN_ID ?? "0";
@@ -97,7 +98,12 @@ async function run(): Promise<void> {
   core.setOutput("grpc-address", grpcAddr);
 
   if (writeLocal) {
-    const dest = writeBuckconfigLocal(workspace, grpcAddr, execPlatform);
+    const buckRoot = buckRootInput
+      ? path.isAbsolute(buckRootInput)
+        ? buckRootInput
+        : path.join(workspace, buckRootInput)
+      : workspace;
+    const dest = writeBuckconfigLocal(buckRoot, grpcAddr, execPlatform);
     core.info(`rebuck: wrote ${dest} (execution_platforms=${execPlatform})`);
   } else {
     core.info("rebuck: write-buckconfig-local=false — configure buck2 yourself with:");
