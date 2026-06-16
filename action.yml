@@ -1,0 +1,48 @@
+name: rebuck
+description: Persistent buck2 action cache on GitHub Actions via a bazel-remote sidecar (RE + buck).
+author: gilescope
+branding:
+  icon: database
+  color: purple
+
+inputs:
+  bazel-remote-version:
+    description: bazel-remote release version to install.
+    default: "2.6.1"
+  max-size-gb:
+    description: bazel-remote on-disk LRU cap, in GiB. Bound this so the cache fits the 10GB GHA budget.
+    default: "2"
+  grpc-port:
+    description: Localhost gRPC port bazel-remote serves the REAPI on.
+    default: "9092"
+  http-port:
+    description: Localhost HTTP port for the /status health + stats endpoint.
+    default: "8080"
+  cache-dir:
+    description: Directory bazel-remote stores blobs in (and the actions/cache path). Defaults to ~/.cache/rebuck.
+    default: ""
+  cache-key-prefix:
+    description: Prefix for the actions/cache key.
+    default: "rebuck"
+  execution-platform:
+    description: buck2 target providing the remote-cache execution platform (see examples/platforms).
+    default: "root//platforms:re-cache"
+  write-buckconfig-local:
+    description: >-
+      Write .buckconfig.local in the workspace with the RE client + execution_platforms config so your
+      `buck build` needs no extra flags. Set false to manage buck config yourself.
+    default: "true"
+  force-cache-upload:
+    description: >-
+      Export BUCK2_TEST_FORCE_CACHE_UPLOAD=1. The prelude marks rustc compile actions allow_cache_upload=False;
+      without this their outputs (the bulk of the build) are never uploaded.
+    default: "true"
+
+outputs:
+  grpc-address:
+    description: The grpc:// address buck2 should use for the RE cache (set via core.setOutput).
+
+runs:
+  using: node20
+  main: dist/main/index.js
+  post: dist/post/index.js

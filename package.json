@@ -1,0 +1,23 @@
+{
+  "name": "rebuck",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Persistent buck2 action cache on GitHub Actions via a bazel-remote sidecar (RE + buck).",
+  "main": "dist/main/index.js",
+  "scripts": {
+    "build": "ncc build src/main.ts -o dist/main --minify && ncc build src/post.ts -o dist/post --minify",
+    "typecheck": "tsc --noEmit",
+    "all": "npm run typecheck && npm run build"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@actions/cache": "^4.0.3",
+    "@actions/core": "^1.11.1",
+    "@actions/tool-cache": "^2.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@vercel/ncc": "^0.38.3",
+    "typescript": "^5.5.0"
+  }
+}

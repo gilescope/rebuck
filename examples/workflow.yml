@@ -1,0 +1,28 @@
+# Example consumer job. Drop rebuck before your buck steps; no buck-invocation
+# changes are needed (rebuck writes .buckconfig.local + sets the upload env).
+name: buck
+on: [push, pull_request]
+
+jobs:
+  buck-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write   # actions/cache save
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: gilescope/install-buck2@latest
+
+      # Pin rustc: buck2 resolves `rustc` from PATH and does NOT hash the binary
+      # into the action digest, so a runner-image rustc bump would otherwise
+      # cause silent stale cache hits.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: gilescope/rebuck@v1
+        # with:
+        #   max-size-gb: "2"
+        #   execution-platform: "root//platforms:re-cache"
+
+      - run: buck2 build //...
+      - run: buck2 test //...
