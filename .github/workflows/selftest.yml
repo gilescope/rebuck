@@ -22,7 +22,7 @@ jobs:
       actions: write          # rebuck saves the cache
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: gilescope/install-buck2@latest
+      - uses: gilescope/install-buck2@79ce03d0602320942c0a39bdf1c754fe19a85703 # latest
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: "1.92.0"
@@ -46,7 +46,7 @@ jobs:
       actions: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: gilescope/install-buck2@latest
+      - uses: gilescope/install-buck2@79ce03d0602320942c0a39bdf1c754fe19a85703 # latest
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: "1.92.0"
