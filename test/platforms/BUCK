@@ -10,3 +10,12 @@ re_cache_execution_platform(
     os_configuration = host_configuration.os,
     visibility = ["PUBLIC"],
 )
+
+# rebuck2: remote execution only — every action goes to the Execution service.
+re_cache_execution_platform(
+    name = "re-exec",
+    cpu_configuration = host_configuration.cpu,
+    local_enabled = False,
+    os_configuration = host_configuration.os,
+    visibility = ["PUBLIC"],
+)

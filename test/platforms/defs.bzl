@@ -21,7 +21,7 @@ def _re_cache_execution_platform_impl(ctx: AnalysisContext) -> list[Provider]:
         label = name,
         configuration = cfg,
         executor_config = CommandExecutorConfig(
-            local_enabled = True,
+            local_enabled = ctx.attrs.local_enabled,
             remote_enabled = True,
             remote_cache_enabled = True,
             remote_execution_use_case = "buck2-default",
@@ -42,6 +42,9 @@ re_cache_execution_platform = rule(
     attrs = {
         "cpu_configuration": attrs.dep(providers = [ConfigurationInfo]),
         "os_configuration": attrs.dep(providers = [ConfigurationInfo]),
+        # False forces every action through the RE Execution service (rebuck2
+        # workers) — no local fallback inside buck2 itself.
+        "local_enabled": attrs.bool(default = True),
         "use_windows_path_separators": attrs.bool(default = False),
     },
 )

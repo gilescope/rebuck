@@ -1,0 +1,191 @@
+//! rebuck2 — ad-hoc distributed Remote Execution for buck2, over iroh.
+//!
+//! One binary, two roles:
+//!   rebuck2 driver  — beside buck2: serves REAPI on localhost, coordinates
+//!                     workers over the iroh mesh.
+//!   rebuck2 worker  — anywhere: joins the mesh, executes actions.
+//!
+//! Rendezvous needs no service: both sides derive the driver's iroh key from
+//! `--session` (default $GITHUB_RUN_ID), see mesh.rs.
+
+mod driver;
+mod exec;
+mod mesh;
+mod rpc;
+mod store;
+mod worker;
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+use bazel_remote_apis::build::bazel::remote::execution::v2 as re;
+use bazel_remote_apis::google::bytestream as bs;
+
+fn usage() -> ! {
+    eprintln!(
+        "usage: rebuck2 driver [--grpc-port N] [--store DIR] [--session S] \
+         [--min-workers N] [--no-local-exec]\n       \
+         rebuck2 worker [--store DIR] [--session S] [--slots N] [--connect-wait-secs N]"
+    );
+    std::process::exit(2)
+}
+
+struct Args(Vec<String>);
+
+impl Args {
+    fn opt(&mut self, name: &str) -> Option<String> {
+        let i = self.0.iter().position(|a| a == name)?;
+        if i + 1 >= self.0.len() {
+            usage()
+        }
+        self.0.remove(i);
+        Some(self.0.remove(i))
+    }
+    fn flag(&mut self, name: &str) -> bool {
+        let i = self.0.iter().position(|a| a == name);
+        if let Some(i) = i {
+            self.0.remove(i);
+            true
+        } else {
+            false
+        }
+    }
+    fn done(self) {
+        if let Some(a) = self.0.first() {
+            eprintln!("unknown argument: {a}");
+            usage()
+        }
+    }
+}
+
+fn default_store(role: &str) -> std::path::PathBuf {
+    dirs_home().join(".cache").join("rebuck2").join(role)
+}
+
+fn dirs_home() -> std::path::PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(Into::into)
+        .unwrap_or_else(|| ".".into())
+}
+
+fn default_session() -> String {
+    std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "local".into())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.is_empty() {
+        usage()
+    }
+    let role = argv.remove(0);
+    let mut args = Args(argv);
+    match role.as_str() {
+        "driver" => run_driver(args).await,
+        "worker" => {
+            let store = Arc::new(store::Store::new(
+                args.opt("--store")
+                    .map(Into::into)
+                    .unwrap_or_else(|| default_store("worker")),
+            )?);
+            let cfg = worker::WorkerCfg {
+                session: args.opt("--session").unwrap_or_else(default_session),
+                slots: args
+                    .opt("--slots")
+                    .map(|s| s.parse().expect("--slots: number"))
+                    .unwrap_or_else(|| {
+                        std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(2)
+                    }),
+                scratch: std::env::temp_dir().join("rebuck2-exec"),
+                connect_wait: Duration::from_secs(
+                    args.opt("--connect-wait-secs")
+                        .map(|s| s.parse().expect("--connect-wait-secs: number"))
+                        .unwrap_or(600),
+                ),
+            };
+            args.done();
+            std::fs::create_dir_all(&cfg.scratch)?;
+            worker::run(store, cfg).await
+        }
+        _ => usage(),
+    }
+}
+
+async fn run_driver(mut args: Args) -> Result<()> {
+    let grpc_port: u16 = args
+        .opt("--grpc-port")
+        .map(|s| s.parse().expect("--grpc-port: port"))
+        .unwrap_or(9092);
+    let store = Arc::new(store::Store::new(
+        args.opt("--store")
+            .map(Into::into)
+            .unwrap_or_else(|| default_store("driver")),
+    )?);
+    let scratch = std::env::temp_dir().join("rebuck2-exec");
+    std::fs::create_dir_all(&scratch)?;
+    let cfg = driver::DriverCfg {
+        session: args.opt("--session").unwrap_or_else(default_session),
+        min_workers: args
+            .opt("--min-workers")
+            .map(|s| s.parse().expect("--min-workers: number"))
+            .unwrap_or(0),
+        local_exec: !args.flag("--no-local-exec"),
+        scratch,
+    };
+    args.done();
+
+    let d = driver::Driver::new(store.clone(), cfg);
+
+    let mesh = {
+        let d = d.clone();
+        tokio::spawn(async move {
+            if let Err(e) = d.serve_mesh().await {
+                eprintln!("[driver] mesh died: {e:#}");
+            }
+        })
+    };
+
+    let addr = format!("127.0.0.1:{grpc_port}").parse()?;
+    println!("[driver] REAPI listening on grpc://{addr}");
+    let max = 256 * 1024 * 1024; // rustc rlibs can be chunky
+    tonic::transport::Server::builder()
+        .add_service(
+            re::capabilities_server::CapabilitiesServer::new(rpc::Caps)
+                .max_decoding_message_size(max),
+        )
+        .add_service(
+            re::content_addressable_storage_server::ContentAddressableStorageServer::new(
+                rpc::Cas {
+                    store: store.clone(),
+                },
+            )
+            .max_decoding_message_size(max),
+        )
+        .add_service(
+            bs::byte_stream_server::ByteStreamServer::new(rpc::ByteStreamSvc {
+                store: store.clone(),
+            })
+            .max_decoding_message_size(max),
+        )
+        .add_service(
+            re::action_cache_server::ActionCacheServer::new(rpc::Ac {
+                store: store.clone(),
+            })
+            .max_decoding_message_size(max),
+        )
+        .add_service(
+            re::execution_server::ExecutionServer::new(rpc::Exec { driver: d.clone() })
+                .max_decoding_message_size(max),
+        )
+        .serve(addr)
+        .await
+        .context("gRPC server")?;
+
+    mesh.abort();
+    bail!("gRPC server exited")
+}

@@ -1,0 +1,288 @@
+//! Action execution: materialize the input tree, run the command, collect
+//! outputs. Used by workers and by the driver's local fallback — the only
+//! difference is where blobs come from (`Blobs` impl).
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use bazel_remote_apis::build::bazel::remote::execution::v2 as re;
+use prost::Message;
+
+use crate::mesh::Dig;
+
+#[async_trait::async_trait]
+pub trait Blobs: Send + Sync {
+    async fn get(&self, d: &Dig) -> Result<Vec<u8>>;
+    /// Store bytes, returning their digest.
+    async fn put(&self, bytes: Vec<u8>) -> Result<Dig>;
+}
+
+pub struct Outcome {
+    pub action_result: re::ActionResult,
+    pub do_not_cache: bool,
+}
+
+pub async fn run_action(blobs: &dyn Blobs, action_digest: &Dig, scratch: &Path) -> Result<Outcome> {
+    let action =
+        re::Action::decode(blobs.get(action_digest).await?.as_slice()).context("decode Action")?;
+    let cmd_dig: Dig = (&action
+        .command_digest
+        .clone()
+        .context("Action.command_digest")?)
+        .into();
+    let command =
+        re::Command::decode(blobs.get(&cmd_dig).await?.as_slice()).context("decode Command")?;
+    let root_dig: Dig = (&action
+        .input_root_digest
+        .clone()
+        .context("Action.input_root_digest")?)
+        .into();
+
+    let exec_dir = tempfile::tempdir_in(scratch).context("mk exec dir")?;
+    let root = exec_dir.path();
+    materialize(blobs, &root_dig, root).await?;
+
+    let cwd = if command.working_directory.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(&command.working_directory)
+    };
+    tokio::fs::create_dir_all(&cwd).await?;
+
+    // REAPI: the worker creates parent dirs of every declared output path.
+    #[allow(deprecated)] // pre-v2.1 clients send output_files/output_directories
+    let out_paths: Vec<String> = if !command.output_paths.is_empty() {
+        command.output_paths.clone()
+    } else {
+        command
+            .output_files
+            .iter()
+            .chain(command.output_directories.iter())
+            .cloned()
+            .collect()
+    };
+    for p in &out_paths {
+        if let Some(parent) = cwd.join(p).parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+    }
+
+    let (argv0, args) = command
+        .arguments
+        .split_first()
+        .context("Command.arguments empty")?;
+    let mut proc = tokio::process::Command::new(argv0);
+    proc.args(args).current_dir(&cwd).env_clear();
+    let mut saw_path = false;
+    for ev in &command.environment_variables {
+        saw_path |= ev.name == "PATH";
+        proc.env(&ev.name, &ev.value);
+    }
+    // System toolchains (rustc, cl.exe) are PATH-resolved and buck2 doesn't
+    // ship a PATH in the action env. Runner images are uniform per-OS, so
+    // inheriting the worker's PATH is the pragmatic v0 hermeticity trade.
+    if !saw_path {
+        if let Ok(path) = std::env::var("PATH") {
+            proc.env("PATH", path);
+        }
+    }
+    let started = std::time::SystemTime::now();
+    let output = proc
+        .output()
+        .await
+        .with_context(|| format!("spawn {argv0}"))?;
+    let finished = std::time::SystemTime::now();
+
+    let stdout_digest = blobs.put(output.stdout).await?;
+    let stderr_digest = blobs.put(output.stderr).await?;
+
+    let mut result = re::ActionResult {
+        exit_code: output.status.code().unwrap_or(-1),
+        stdout_digest: Some(stdout_digest.to_proto()),
+        stderr_digest: Some(stderr_digest.to_proto()),
+        execution_metadata: Some(re::ExecutedActionMetadata {
+            worker: hostname(),
+            execution_start_timestamp: Some(ts(started)),
+            execution_completed_timestamp: Some(ts(finished)),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    for p in &out_paths {
+        let abs = cwd.join(p);
+        let Ok(meta) = tokio::fs::symlink_metadata(&abs).await else {
+            continue; // action declared but didn't produce it; buck2 will complain if it matters
+        };
+        if meta.file_type().is_symlink() {
+            let target = tokio::fs::read_link(&abs).await?;
+            result.output_symlinks.push(re::OutputSymlink {
+                path: p.clone(),
+                target: target.to_string_lossy().into_owned(),
+                node_properties: None,
+            });
+        } else if meta.is_dir() {
+            let tree_digest = upload_tree(blobs, &abs).await?;
+            result.output_directories.push(re::OutputDirectory {
+                path: p.clone(),
+                tree_digest: Some(tree_digest.to_proto()),
+                is_topologically_sorted: false,
+                root_directory_digest: None,
+            });
+        } else {
+            let bytes = tokio::fs::read(&abs).await?;
+            let is_executable = is_exec(&meta);
+            let digest = blobs.put(bytes).await?;
+            result.output_files.push(re::OutputFile {
+                path: p.clone(),
+                digest: Some(digest.to_proto()),
+                is_executable,
+                contents: Vec::new(),
+                node_properties: None,
+            });
+        }
+    }
+
+    Ok(Outcome {
+        action_result: result,
+        do_not_cache: action.do_not_cache,
+    })
+}
+
+async fn materialize(blobs: &dyn Blobs, dir_digest: &Dig, dest: &Path) -> Result<()> {
+    // Iterative BFS; recursion in async fns needs boxing and trees are shallow-ish.
+    let mut queue: Vec<(Dig, PathBuf)> = vec![(dir_digest.clone(), dest.to_path_buf())];
+    let mut seen: HashMap<Dig, re::Directory> = HashMap::new();
+    while let Some((dig, path)) = queue.pop() {
+        tokio::fs::create_dir_all(&path).await?;
+        let dir = match seen.get(&dig) {
+            Some(d) => d.clone(),
+            None => {
+                let d = re::Directory::decode(blobs.get(&dig).await?.as_slice())
+                    .context("decode Directory")?;
+                seen.insert(dig.clone(), d.clone());
+                d
+            }
+        };
+        for f in &dir.files {
+            let fdig: Dig = (&f.digest.clone().context("FileNode.digest")?).into();
+            let bytes = blobs.get(&fdig).await?;
+            let fp = path.join(&f.name);
+            tokio::fs::write(&fp, &bytes).await?;
+            if f.is_executable {
+                set_exec(&fp).await?;
+            }
+        }
+        for s in &dir.symlinks {
+            let sp = path.join(&s.name);
+            #[cfg(unix)]
+            tokio::fs::symlink(&s.target, &sp).await?;
+            #[cfg(windows)]
+            {
+                // Windows symlinks need elevation; a file copy of the target
+                // is wrong in general, so surface loudly if we ever hit one.
+                anyhow::bail!(
+                    "symlink {} in input tree unsupported on windows",
+                    sp.display()
+                );
+            }
+        }
+        for d in &dir.directories {
+            let ddig: Dig = (&d.digest.clone().context("DirectoryNode.digest")?).into();
+            queue.push((ddig, path.join(&d.name)));
+        }
+    }
+    Ok(())
+}
+
+/// Build + upload a Tree proto for an output directory; returns the Tree digest.
+async fn upload_tree(blobs: &dyn Blobs, dir: &Path) -> Result<Dig> {
+    let mut children: Vec<re::Directory> = Vec::new();
+    let root = build_dir(blobs, dir, &mut children).await?;
+    let tree = re::Tree {
+        root: Some(root),
+        children,
+    };
+    blobs.put(tree.encode_to_vec()).await
+}
+
+/// Post-order directory build. Entries sorted by name — REAPI canonical form,
+/// and tree digests must be deterministic.
+async fn build_dir(
+    blobs: &dyn Blobs,
+    dir: &Path,
+    children: &mut Vec<re::Directory>,
+) -> Result<re::Directory> {
+    let mut out = re::Directory::default();
+    let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+    entries.sort_by_key(|e| e.file_name());
+    for e in entries {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let meta = e.metadata()?;
+        let p = e.path();
+        if meta.file_type().is_symlink() {
+            out.symlinks.push(re::SymlinkNode {
+                name,
+                target: std::fs::read_link(&p)?.to_string_lossy().into_owned(),
+                node_properties: None,
+            });
+        } else if meta.is_dir() {
+            let sub = Box::pin(build_dir(blobs, &p, children)).await?;
+            let digest = blobs.put(sub.encode_to_vec()).await?;
+            children.push(sub);
+            out.directories.push(re::DirectoryNode {
+                name,
+                digest: Some(digest.to_proto()),
+            });
+        } else {
+            let bytes = tokio::fs::read(&p).await?;
+            let is_executable = is_exec(&meta);
+            let digest = blobs.put(bytes).await?;
+            out.files.push(re::FileNode {
+                name,
+                digest: Some(digest.to_proto()),
+                is_executable,
+                node_properties: None,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn ts(t: std::time::SystemTime) -> bazel_remote_apis::google::protobuf::Timestamp {
+    let d = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    bazel_remote_apis::google::protobuf::Timestamp {
+        seconds: d.as_secs() as i64,
+        nanos: d.subsec_nanos() as i32,
+    }
+}
+
+fn hostname() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "rebuck2-worker".into())
+}
+
+#[cfg(unix)]
+fn is_exec(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_exec(_meta: &std::fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+async fn set_exec(p: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn set_exec(_p: &Path) -> Result<()> {
+    Ok(())
+}
