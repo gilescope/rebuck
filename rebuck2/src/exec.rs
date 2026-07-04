@@ -75,7 +75,20 @@ pub async fn run_action(blobs: &dyn Blobs, action_digest: &Dig, scratch: &Path) 
         .arguments
         .split_first()
         .context("Command.arguments empty")?;
-    let mut proc = tokio::process::Command::new(argv0);
+    // Windows resolves a relative argv0 against the PARENT process's cwd,
+    // not `current_dir` (documented std::process behaviour) — project-relative
+    // scripts (buck-out\...\foo.bat) then miss. Absolutize against the action
+    // cwd when the file exists there; bare tool names keep PATH resolution.
+    let argv0_abs = {
+        let p = std::path::Path::new(argv0);
+        let joined = cwd.join(p);
+        if p.is_relative() && joined.is_file() {
+            joined
+        } else {
+            p.to_path_buf()
+        }
+    };
+    let mut proc = tokio::process::Command::new(&argv0_abs);
     proc.args(args).current_dir(&cwd).env_clear();
     let mut saw: std::collections::HashSet<String> = std::collections::HashSet::new();
     for ev in &command.environment_variables {
