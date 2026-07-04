@@ -149,8 +149,14 @@ restored cold, and the AC hits.
    the whole input tree, then one connection per provider; (3) provider
    hints attached to the Run dispatch itself — zero marginal lookups;
    (4) bloom gossip (#8). Rung 1 until the stats heartbeat says otherwise.
-8. **Discovery scaling** — gossip/bloom provider index, only if the
-   scheduler-implicit index proves insufficient at pool scale.
+8. **Discovery scaling** — ✅ v1 built: workers gossip blooms of their
+   stores (30s cadence, probe indices sliced from the uniform sha256 hex,
+   ~0.6% FP at 12 bits/entry); driver rebroadcasts. Consumers fetch from
+   bloom-claiming peer caches before the driver — hot blobs spread across
+   holders (deterministic pick from the hash), centralized mode gets egress
+   offload, decentralized mode gets provider-death tolerance via surviving
+   copies. Layering: bloom (many holders, approximate) → provider index
+   (exact, producer) → driver store → re-derive. Unproven at sweep scale.
 
 ## Open questions / risks
 
