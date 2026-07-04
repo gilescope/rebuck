@@ -139,6 +139,15 @@ pub async fn run_action(blobs: &dyn Blobs, action_digest: &Dig, scratch: &Path) 
             }
         }
     }
+    // One start/finish line per action, always — makes a worker's CI log a
+    // live view of what it's building. The first output path is the most
+    // human-readable handle we have for an action.
+    let label = out_paths
+        .first()
+        .map(String::as_str)
+        .unwrap_or(argv0)
+        .to_owned();
+    println!("[action] start {label}");
     if keep_scratch {
         eprintln!(
             "[exec] action {} argv={:?} cwd={} outs={:?}",
@@ -154,6 +163,28 @@ pub async fn run_action(blobs: &dyn Blobs, action_digest: &Dig, scratch: &Path) 
         .await
         .with_context(|| format!("spawn {argv0}"))?;
     let finished = std::time::SystemTime::now();
+    let secs = finished
+        .duration_since(started)
+        .unwrap_or_default()
+        .as_secs_f64();
+    if output.status.success() {
+        println!("[action] ok    {label} ({secs:.1}s)");
+    } else {
+        println!(
+            "[action] FAIL  {label} exit={:?} ({secs:.1}s)",
+            output.status.code()
+        );
+        // Raw compiler output, where the failure actually explains itself.
+        // (It also travels back to buck2 as a blob; this is the live copy.)
+        let excerpt =
+            |bytes: &[u8]| String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).into_owned();
+        if !output.stderr.is_empty() {
+            eprintln!("--- stderr {label}\n{}", excerpt(&output.stderr));
+        }
+        if !output.stdout.is_empty() {
+            eprintln!("--- stdout {label}\n{}", excerpt(&output.stdout));
+        }
+    }
     if keep_scratch {
         eprintln!(
             "[exec] action {} exit={:?} scratch kept at {}",
