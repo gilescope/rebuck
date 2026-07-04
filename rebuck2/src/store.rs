@@ -23,6 +23,9 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     s
 }
 
+/// Process-wide tmp-file sequence — see the uniqueness note in [`Store::put`].
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct Store {
     root: PathBuf,
 }
@@ -77,13 +80,23 @@ impl Store {
         let dest = self.cas_path(&hash);
         if tokio::fs::metadata(&dest).await.is_err() {
             tokio::fs::create_dir_all(dest.parent().context("cas path has parent")?).await?;
-            let tmp = self
-                .root
-                .join("tmp")
-                .join(format!("{hash}.{}", std::process::id()));
+            // Tmp name must be unique per CALL: concurrent puts of the same
+            // blob in one process otherwise share a path and race each
+            // other's rename (ENOENT storms under sweep-scale upload load).
+            let tmp = self.root.join("tmp").join(format!(
+                "{hash}.{}.{}",
+                std::process::id(),
+                TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
             tokio::fs::write(&tmp, bytes).await?;
-            // rename is atomic; a concurrent identical write wins harmlessly
-            tokio::fs::rename(&tmp, &dest).await?;
+            if let Err(e) = tokio::fs::rename(&tmp, &dest).await {
+                // A concurrent identical put may have won the rename; content
+                // is identical by construction, so losing is fine.
+                let _ = tokio::fs::remove_file(&tmp).await;
+                if tokio::fs::metadata(&dest).await.is_err() {
+                    return Err(e).context("persist blob");
+                }
+            }
         }
         Ok(Dig {
             hash,
@@ -105,5 +118,32 @@ impl Store {
         tokio::fs::write(&tmp, bytes).await?;
         tokio::fs::rename(&tmp, self.root.join("ac").join(action_hash)).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: concurrent puts of the SAME content must all succeed.
+    /// The sweep hit "os error 2" storms when thousands of uploads of a
+    /// common blob shared one tmp path and raced each other's rename.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_same_blob_puts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(Store::new(dir.path().to_path_buf()).unwrap());
+        for round in 0u32..20 {
+            let bytes = vec![round as u8; 256 * 1024];
+            let tasks: Vec<_> = (0..50)
+                .map(|_| {
+                    let store = store.clone();
+                    let bytes = bytes.clone();
+                    tokio::spawn(async move { store.put(None, &bytes).await })
+                })
+                .collect();
+            for t in tasks {
+                t.await.unwrap().expect("concurrent put must not race");
+            }
+        }
     }
 }
