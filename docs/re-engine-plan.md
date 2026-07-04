@@ -91,7 +91,19 @@ restored cold, and the AC hits.
 4. **Multi-worker + rendezvous barrier** — driver waits for ≥K workers; workers
    outlive the build; distribute a real build slice.
 5. **GH-cache persistence** — seed/snapshot the iroh-blobs store + AC; a cold
-   build warms from the previous run.
+   build warms from the previous run. The 10 GB budget forces a *selection
+   policy* for what persists:
+   - **Cost-aware**: the driver already times every action
+     (`ExecutedActionMetadata` timestamps flow back with each result), so it
+     gets a `digest → rebuild-cost` index for free. Snapshot greedily by
+     rebuild-cost-per-byte — the slowest-to-rebuild artifacts are the most
+     valuable cache residents.
+   - **First-party vs third-party split**: third-party outputs (reindeer /
+     `third-party//...` targets) are identical across branches and PRs —
+     high hit rate, long-lived. First-party outputs churn per-branch. Persist
+     third-party by default; spend any remaining budget on the costliest
+     first-party actions. Target provenance is visible to the driver via the
+     action's target label in the buck2 metadata.
 6. **Windows worker pool** — re-point the windows sweep at it. **Kills the OOM.**
    The concrete deliverable.
 7. **Discovery scaling** — gossip/bloom provider index, only if the
@@ -103,7 +115,9 @@ restored cold, and the AC hits.
   (run 28702838934). Residual: rate under sustained many-stream CAS load.
 - Worker **rendezvous + liveness** — jobs start independently, must overlap in
   time and survive the whole build; a dropped worker must reschedule gracefully.
-- CAS footprint vs the 10 GB budget under a full sweep.
+- CAS footprint vs the 10 GB budget under a full sweep — mitigated by the
+  roadmap-#5 selection policy (cost-aware + third-party-first), but the
+  numbers need measuring on a real sweep.
 - The **minimal REAPI surface** buck2 actually requires (`Execute`/
   `WaitExecution`, CAS `FindMissingBlobs`/`ByteStream`/`BatchUpdate`,
   `ActionCache`) — scope it before building.
