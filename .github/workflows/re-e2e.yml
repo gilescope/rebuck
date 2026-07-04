@@ -1,0 +1,91 @@
+# rebuck2 distributed e2e: two runners, one build. The worker job joins the
+# iroh mesh; the driver job runs buck2 against the local rebuck2 REAPI with
+# local execution disabled — so 'remote: N' in buck2's summary means the
+# compile genuinely happened on the other runner, blobs over P2P.
+# Rendezvous is keyless: both derive the driver's iroh key from GITHUB_RUN_ID.
+name: rebuck2-e2e
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [giles-iroh-re-punch]
+    paths:
+      - rebuck2/**
+      - .github/workflows/re-e2e.yml
+
+permissions:
+  contents: read
+
+jobs:
+  driver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: gilescope/install-buck2@79ce03d0602320942c0a39bdf1c754fe19a85703 # latest
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+      - run: cargo build --release --manifest-path rebuck2/Cargo.toml
+      - name: start driver (remote exec only)
+        run: |
+          ./rebuck2/target/release/rebuck2 driver \
+            --grpc-port 9092 --min-workers 1 --no-local-exec \
+            --store "$HOME/.cache/rebuck2/driver" > driver.log 2>&1 &
+          echo $! > driver.pid
+      - name: wait for worker to join the mesh
+        run: |
+          for _ in $(seq 1 120); do
+            grep -q "worker 1 joined" driver.log && exit 0
+            kill -0 "$(cat driver.pid)" || { cat driver.log; echo "driver died"; exit 1; }
+            sleep 5
+          done
+          cat driver.log; echo "worker never joined"; exit 1
+      - name: point buck2 at rebuck2
+        run: |
+          cat > test/.buckconfig.local <<'EOF'
+          [build]
+          execution_platforms = root//platforms:re-exec
+
+          [buck2_re_client]
+          action_cache_address = grpc://127.0.0.1:9092
+          cas_address = grpc://127.0.0.1:9092
+          engine_address = grpc://127.0.0.1:9092
+          tls = false
+          EOF
+      - name: buck2 build (all actions remote)
+        working-directory: test
+        run: buck2 build //... 2>&1 | tee build.log
+      - name: assert actions executed on the other runner
+        run: |
+          cat driver.log
+          grep -E 'remote: [1-9]' test/build.log \
+            || { echo "FAIL: buck2 reports no remote commands"; exit 1; }
+          grep -q -- "-> worker 1" driver.log \
+            || { echo "FAIL: driver never dispatched to the worker"; exit 1; }
+          if grep -qE 'local: [1-9]' test/build.log; then
+            echo "FAIL: some actions ran locally with local_enabled=False"; exit 1
+          fi
+          echo "PASS: $(grep -c -- '-> worker 1' driver.log) action(s) executed cross-runner"
+      - name: stop driver
+        if: always()
+        run: kill "$(cat driver.pid)" 2>/dev/null || true
+
+  worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+      - run: cargo build --release --manifest-path rebuck2/Cargo.toml
+      - name: serve until the driver disconnects
+        # Exits 0 when the driver job's process closes the control stream.
+        # The 25m timeout via `timeout` guards a driver that never shows up.
+        run: |
+          timeout 1500 ./rebuck2/target/release/rebuck2 worker \
+            --store "$HOME/.cache/rebuck2/worker" | tee worker.log
