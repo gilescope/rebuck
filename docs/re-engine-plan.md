@@ -141,6 +141,11 @@ restored cold, and the AC hits.
    this — identical sources share blobs (content addressing) and identical
    actions don't re-execute at all (AC hit inside one graph), so the
    mono-sweep's store should come in well under the sum of its legs.
+   Index-lookup amortisation ladder: (1) worker-local cache — ask once per
+   blob per worker (v1); (2) batched per-action manifest — one GetMany for
+   the whole input tree, then one connection per provider; (3) provider
+   hints attached to the Run dispatch itself — zero marginal lookups;
+   (4) bloom gossip (#8). Rung 1 until the stats heartbeat says otherwise.
 8. **Discovery scaling** — gossip/bloom provider index, only if the
    scheduler-implicit index proves insufficient at pool scale.
 
