@@ -25,6 +25,10 @@ pub struct DriverCfg {
     pub session: String,
     pub min_workers: usize,
     pub local_exec: bool,
+    /// Outputs stay on producing workers; the driver keeps digest -> worker
+    /// index and redirects fetches. Trades worker-loss resilience for
+    /// driver disk/egress. See docs/re-engine-plan.md roadmap #7.
+    pub decentralized: bool,
     pub scratch: std::path::PathBuf,
 }
 
@@ -56,6 +60,10 @@ pub struct Driver {
     next_job: AtomicU64,
     next_worker: AtomicU64,
     local_slots: Semaphore,
+    /// Decentralized mode: blob hash -> producing worker's endpoint id.
+    providers: Mutex<HashMap<String, String>>,
+    /// Mesh endpoint, for read-through fetches from providers.
+    mesh_ep: tokio::sync::OnceCell<Endpoint>,
 }
 
 impl Driver {
@@ -72,6 +80,8 @@ impl Driver {
             next_job: AtomicU64::new(1),
             next_worker: AtomicU64::new(1),
             local_slots: Semaphore::new(cores),
+            providers: Mutex::new(HashMap::new()),
+            mesh_ep: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -82,10 +92,12 @@ impl Driver {
             .alpns(vec![mesh::ALPN.to_vec()])
             .bind()
             .await?;
+        let _ = self.mesh_ep.set(ep.clone());
         println!(
-            "[driver] mesh endpoint_id={} session={}",
+            "[driver] mesh endpoint_id={} session={} decentralized={}",
             ep.id(),
-            self.cfg.session
+            self.cfg.session,
+            self.cfg.decentralized
         );
         loop {
             let Some(incoming) = ep.accept().await else {
@@ -115,7 +127,18 @@ impl Driver {
             bail!("expected Hello, got {hello:?}");
         };
         let worker_id = self.next_worker.fetch_add(1, Ordering::Relaxed);
-        println!("[driver] worker {worker_id} joined: {os}/{arch} slots={slots}");
+        let endpoint = conn.remote_id().to_string();
+        println!("[driver] worker {worker_id} joined: {os}/{arch} slots={slots} ep={endpoint}");
+
+        // Mode handshake before anything else flows.
+        let mut ctrl_send = ctrl_send;
+        mesh::send_frame(
+            &mut ctrl_send,
+            &D2W::Welcome {
+                decentralized: self.cfg.decentralized,
+            },
+        )
+        .await?;
 
         let (tx, mut rx) = mpsc::unbounded_channel::<D2W>();
         let inflight = Arc::new(AtomicU32::new(0));
@@ -128,7 +151,6 @@ impl Driver {
         self.worker_arrived.notify_waiters();
 
         // writer: job dispatches -> control stream
-        let mut ctrl_send = ctrl_send;
         let writer = tokio::spawn(async move {
             while let Some(msg) = rx.recv().await {
                 if mesh::send_frame(&mut ctrl_send, &msg).await.is_err() {
@@ -139,12 +161,12 @@ impl Driver {
 
         // blob streams: each request on its own bi-stream
         let blob_conn = conn.clone();
-        let blob_store = self.store.clone();
+        let blob_driver = self.clone();
         let blobs = tokio::spawn(async move {
             while let Ok((send, recv)) = blob_conn.accept_bi().await {
-                let store = blob_store.clone();
+                let driver = blob_driver.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_blob_stream(store, send, recv).await {
+                    if let Err(e) = serve_blob_stream(driver, send, recv).await {
                         eprintln!("[driver] blob stream error: {e:#}");
                     }
                 });
@@ -158,8 +180,18 @@ impl Driver {
                     return Ok(()); // clean disconnect
                 };
                 match msg {
-                    W2D::Done { job, action_result } => {
+                    W2D::Done {
+                        job,
+                        action_result,
+                        stored,
+                    } => {
                         inflight.fetch_sub(1, Ordering::Relaxed);
+                        if self.cfg.decentralized && !stored.is_empty() {
+                            let mut providers = self.providers.lock().await;
+                            for hash in stored {
+                                providers.insert(hash, endpoint.clone());
+                            }
+                        }
                         let result = re::ActionResult::decode(action_result.as_slice())
                             .map_err(|e| format!("bad ActionResult from worker: {e}"));
                         self.complete(job, result).await;
@@ -202,6 +234,47 @@ impl Driver {
 
     pub async fn pending_jobs(&self) -> usize {
         self.jobs.lock().await.len()
+    }
+
+    /// Blob presence, counting provider-indexed blobs as present.
+    pub async fn has_blob(&self, d: &Dig) -> bool {
+        if self.store.has(d).await {
+            return true;
+        }
+        self.providers.lock().await.contains_key(&d.hash)
+    }
+
+    /// Read-through get: local store first, then fetch from the producing
+    /// worker and cache. Used by the gRPC surface (buck2's reads).
+    pub async fn get_blob(&self, d: &Dig) -> Result<Option<Vec<u8>>> {
+        if let Some(bytes) = self.store.get(d).await? {
+            return Ok(Some(bytes));
+        }
+        let Some(endpoint) = self.providers.lock().await.get(&d.hash).cloned() else {
+            return Ok(None);
+        };
+        let Some(ep) = self.mesh_ep.get() else {
+            return Ok(None);
+        };
+        let id: iroh::EndpointId = endpoint
+            .parse()
+            .map_err(|_| anyhow::anyhow!("bad provider endpoint {endpoint:?}"))?;
+        let conn = ep.connect(id, mesh::ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        mesh::send_frame(&mut send, &BlobReq::Get(d.clone())).await?;
+        send.finish()?;
+        match mesh::recv_frame::<BlobResp>(&mut recv)
+            .await?
+            .context("provider closed blob stream")?
+        {
+            BlobResp::Found { size } => {
+                let bytes = mesh::recv_raw(&mut recv, size).await?;
+                self.store.put(Some(d), &bytes).await?;
+                Ok(Some(bytes))
+            }
+            BlobResp::Missing => Ok(None),
+            other => bail!("provider {endpoint} for {}: {other:?}", d.hash),
+        }
     }
 
     pub async fn worker_count(&self) -> usize {
@@ -338,7 +411,7 @@ impl exec::Blobs for StoreBlobs {
 }
 
 async fn serve_blob_stream(
-    store: Arc<Store>,
+    driver: Arc<Driver>,
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
 ) -> Result<()> {
@@ -346,7 +419,7 @@ async fn serve_blob_stream(
         return Ok(());
     };
     match req {
-        BlobReq::Get(d) => match store.get(&d).await {
+        BlobReq::Get(d) => match driver.store.get(&d).await {
             Ok(Some(bytes)) => {
                 mesh::send_frame(
                     &mut send,
@@ -357,12 +430,22 @@ async fn serve_blob_stream(
                 .await?;
                 send.write_all(&bytes).await?;
             }
-            Ok(None) => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
+            Ok(None) => {
+                // Decentralized: point the asker at the producer instead of
+                // relaying bytes through the driver's NIC.
+                let provider = driver.providers.lock().await.get(&d.hash).cloned();
+                match provider {
+                    Some(endpoint) => {
+                        mesh::send_frame(&mut send, &BlobResp::Provider { endpoint }).await?
+                    }
+                    None => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
+                }
+            }
             Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
         },
         BlobReq::Put(d) => {
             let bytes = mesh::recv_raw(&mut recv, d.size as u64).await?;
-            match store.put(Some(&d), &bytes).await {
+            match driver.store.put(Some(&d), &bytes).await {
                 Ok(_) => mesh::send_frame(&mut send, &BlobResp::PutOk).await?,
                 Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
             }

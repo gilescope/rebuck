@@ -65,10 +65,13 @@ pub enum W2D {
         arch: String,
         slots: u32,
     },
-    /// prost-encoded ActionResult.
+    /// prost-encoded ActionResult. `stored` lists blob hashes this action
+    /// persisted on the worker — the driver's provider index in
+    /// decentralized mode (empty when outputs were uploaded).
     Done {
         job: u64,
         action_result: Vec<u8>,
+        stored: Vec<String>,
     },
     Failed {
         job: u64,
@@ -79,7 +82,14 @@ pub enum W2D {
 /// Driver → worker, on the control stream.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum D2W {
-    Run { job: u64, action: Dig },
+    /// First frame after Hello: session-wide mode flags.
+    Welcome {
+        decentralized: bool,
+    },
+    Run {
+        job: u64,
+        action: Dig,
+    },
 }
 
 /// Worker → driver, each on a fresh bi-stream (header, then raw bytes for Put).
@@ -96,6 +106,10 @@ pub enum BlobResp {
         size: u64,
     },
     Missing,
+    /// Decentralized mode: the bytes live on this peer — fetch direct.
+    Provider {
+        endpoint: String,
+    },
     PutOk,
     Err(String),
 }

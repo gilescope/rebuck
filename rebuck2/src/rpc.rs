@@ -108,7 +108,7 @@ impl re::capabilities_server::Capabilities for Caps {
 // ------------------------------------------------------------------------ cas
 
 pub struct Cas {
-    pub store: Arc<Store>,
+    pub driver: Arc<Driver>,
 }
 
 #[tonic::async_trait]
@@ -119,7 +119,8 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Cas {
     ) -> Result<Response<re::FindMissingBlobsResponse>, Status> {
         let mut missing = Vec::new();
         for d in &req.get_ref().blob_digests {
-            if !self.store.has(&dig(d)?).await {
+            // Provider-indexed blobs count as present (decentralized mode).
+            if !self.driver.has_blob(&dig(d)?).await {
                 missing.push(d.clone());
             }
         }
@@ -135,7 +136,7 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Cas {
         let mut responses = Vec::new();
         for r in &req.get_ref().requests {
             let Some(d) = &r.digest else { continue };
-            let status = match self.store.put(Some(&dig(d)?), &r.data).await {
+            let status = match self.driver.store.put(Some(&dig(d)?), &r.data).await {
                 Ok(_) => ok_status(),
                 Err(e) => rpc_status(tonic::Code::InvalidArgument, &format!("{e:#}")),
             };
@@ -153,7 +154,7 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Cas {
     ) -> Result<Response<re::BatchReadBlobsResponse>, Status> {
         let mut responses = Vec::new();
         for d in &req.get_ref().digests {
-            let (data, status) = match self.store.get(&dig(d)?).await {
+            let (data, status) = match self.driver.get_blob(&dig(d)?).await {
                 Ok(Some(bytes)) => (bytes, ok_status()),
                 Ok(None) => (
                     Vec::new(),
@@ -202,7 +203,7 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Cas {
 // ------------------------------------------------------------------ bytestream
 
 pub struct ByteStreamSvc {
-    pub store: Arc<Store>,
+    pub driver: Arc<Driver>,
 }
 
 #[tonic::async_trait]
@@ -217,8 +218,8 @@ impl bs::byte_stream_server::ByteStream for ByteStreamSvc {
         let r = req.get_ref();
         let d = parse_resource(&r.resource_name)?;
         let bytes = self
-            .store
-            .get(&d)
+            .driver
+            .get_blob(&d)
             .await
             .map_err(|e| Status::internal(format!("{e:#}")))?
             .ok_or_else(|| Status::not_found(format!("blob {} not found", d.hash)))?;
@@ -257,7 +258,8 @@ impl bs::byte_stream_server::ByteStream for ByteStreamSvc {
         }
         let expected = expected.ok_or_else(|| Status::invalid_argument("no resource_name"))?;
         let committed = data.len() as i64;
-        self.store
+        self.driver
+            .store
             .put(Some(&expected), &data)
             .await
             .map_err(|e| Status::invalid_argument(format!("{e:#}")))?;

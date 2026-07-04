@@ -25,7 +25,7 @@ use bazel_remote_apis::google::bytestream as bs;
 fn usage() -> ! {
     eprintln!(
         "usage: rebuck2 driver [--grpc-port N] [--store DIR] [--session S] \
-         [--min-workers N] [--no-local-exec]\n       \
+         [--min-workers N] [--no-local-exec] [--decentralized-cas]\n       \
          rebuck2 worker [--store DIR] [--session S] [--slots N] [--connect-wait-secs N]"
     );
     std::process::exit(2)
@@ -135,6 +135,7 @@ async fn run_driver(mut args: Args) -> Result<()> {
             .map(|s| s.parse().expect("--min-workers: number"))
             .unwrap_or(0),
         local_exec: !args.flag("--no-local-exec"),
+        decentralized: args.flag("--decentralized-cas"),
         scratch,
     };
     args.done();
@@ -185,17 +186,13 @@ async fn run_driver(mut args: Args) -> Result<()> {
         )
         .add_service(
             re::content_addressable_storage_server::ContentAddressableStorageServer::new(
-                rpc::Cas {
-                    store: store.clone(),
-                },
+                rpc::Cas { driver: d.clone() },
             )
             .max_decoding_message_size(max),
         )
         .add_service(
-            bs::byte_stream_server::ByteStreamServer::new(rpc::ByteStreamSvc {
-                store: store.clone(),
-            })
-            .max_decoding_message_size(max),
+            bs::byte_stream_server::ByteStreamServer::new(rpc::ByteStreamSvc { driver: d.clone() })
+                .max_decoding_message_size(max),
         )
         .add_service(
             re::action_cache_server::ActionCacheServer::new(rpc::Ac {

@@ -1,6 +1,11 @@
 //! Worker: join the mesh, pull jobs off the control stream, execute, push
 //! outputs back. Blob reads check the local store first — inputs shared
 //! across actions (toolchains, common deps) transfer once per worker.
+//!
+//! Decentralized mode (driver's Welcome says so): outputs stay in the local
+//! store instead of uploading; every worker serves `Get`s from its store to
+//! any peer, and misses can be redirected to the producing worker
+//! (`BlobResp::Provider`). Trade-off: a dead worker takes its blobs with it.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,6 +29,7 @@ pub struct WorkerCfg {
 
 pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
     let ep = Endpoint::builder(iroh::endpoint::presets::N0)
+        .alpns(vec![mesh::ALPN.to_vec()])
         .bind()
         .await?;
     let target = mesh::driver_id(&cfg.session);
@@ -32,6 +38,28 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
         ep.id(),
         cfg.session
     );
+
+    // Serve blobs to any peer (driver read-through, sibling workers).
+    {
+        let ep = ep.clone();
+        let store = store.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = ep.accept().await {
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let Ok(conn) = incoming.await else { return };
+                    while let Ok((send, recv)) = conn.accept_bi().await {
+                        let store = store.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = serve_get(store, send, recv).await {
+                                eprintln!("[worker] blob serve error: {e:#}");
+                            }
+                        });
+                    }
+                });
+            }
+        });
+    }
 
     let conn = {
         let deadline = Instant::now() + cfg.connect_wait;
@@ -59,11 +87,22 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
     )
     .await?;
 
+    // First frame back is the mode handshake.
+    let decentralized = match mesh::recv_frame::<D2W>(&mut ctrl_recv).await? {
+        Some(D2W::Welcome { decentralized }) => decentralized,
+        other => bail!("expected Welcome after Hello, got {other:?}"),
+    };
+    if decentralized {
+        println!("[worker] decentralized CAS: outputs stay local, serving peers");
+    }
+
     let ctrl_send = Arc::new(Mutex::new(ctrl_send));
     let slots = Arc::new(Semaphore::new(cfg.slots));
     let blobs = Arc::new(RemoteBlobs {
         conn: conn.clone(),
+        ep: ep.clone(),
         store: store.clone(),
+        upload: !decentralized,
     });
 
     loop {
@@ -71,17 +110,24 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
             println!("[worker] driver closed control stream — done");
             return Ok(());
         };
-        let D2W::Run { job, action } = msg;
+        let D2W::Run { job, action } = msg else {
+            continue; // stray Welcome — ignore
+        };
         let blobs = blobs.clone();
         let ctrl = ctrl_send.clone();
         let scratch = cfg.scratch.clone();
         let slots = slots.clone();
         tokio::spawn(async move {
             let _permit = slots.acquire_owned().await.expect("semaphore open");
-            let reply = match exec::run_action(blobs.as_ref(), &action, &scratch).await {
+            let tracking = TrackingBlobs {
+                inner: blobs,
+                stored: Mutex::new(Vec::new()),
+            };
+            let reply = match exec::run_action(&tracking, &action, &scratch).await {
                 Ok(outcome) => W2D::Done {
                     job,
                     action_result: outcome.action_result.encode_to_vec(),
+                    stored: tracking.stored.into_inner(),
                 },
                 Err(e) => W2D::Failed {
                     job,
@@ -95,10 +141,86 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
     }
 }
 
-/// Blobs fetched from / pushed to the driver, with local store as cache.
+async fn serve_get(
+    store: Arc<Store>,
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+) -> Result<()> {
+    let Some(req) = mesh::recv_frame::<BlobReq>(&mut recv).await? else {
+        return Ok(());
+    };
+    match req {
+        BlobReq::Get(d) => match store.get(&d).await {
+            Ok(Some(bytes)) => {
+                mesh::send_frame(
+                    &mut send,
+                    &BlobResp::Found {
+                        size: bytes.len() as u64,
+                    },
+                )
+                .await?;
+                send.write_all(&bytes).await?;
+            }
+            Ok(None) => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
+            Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
+        },
+        other => {
+            mesh::send_frame(
+                &mut send,
+                &BlobResp::Err(format!("unsupported here: {other:?}")),
+            )
+            .await?
+        }
+    }
+    send.finish()?;
+    Ok(())
+}
+
+/// Records which blobs an action persisted — the driver's provider index.
+struct TrackingBlobs {
+    inner: Arc<RemoteBlobs>,
+    stored: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl exec::Blobs for TrackingBlobs {
+    async fn get(&self, d: &Dig) -> Result<Vec<u8>> {
+        self.inner.get(d).await
+    }
+    async fn put(&self, bytes: Vec<u8>) -> Result<Dig> {
+        let d = self.inner.put(bytes).await?;
+        self.stored.lock().await.push(d.hash.clone());
+        Ok(d)
+    }
+}
+
+/// Blobs fetched from the driver (or, on redirect, straight from the
+/// producing worker), with the local store as cache.
 struct RemoteBlobs {
     conn: Connection,
+    ep: Endpoint,
     store: Arc<Store>,
+    /// false in decentralized mode: outputs stay local, driver gets an index.
+    upload: bool,
+}
+
+impl RemoteBlobs {
+    async fn fetch_from(&self, endpoint: &str, d: &Dig) -> Result<Vec<u8>> {
+        let id: iroh::EndpointId = endpoint.parse().map_err(|_| {
+            anyhow::anyhow!("bad provider endpoint {endpoint:?} for blob {}", d.hash)
+        })?;
+        let conn = self.ep.connect(id, mesh::ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        mesh::send_frame(&mut send, &BlobReq::Get(d.clone())).await?;
+        send.finish()?;
+        match mesh::recv_frame::<BlobResp>(&mut recv)
+            .await?
+            .context("provider closed blob stream")?
+        {
+            BlobResp::Found { size } => Ok(mesh::recv_raw(&mut recv, size).await?),
+            other => bail!("provider {endpoint} for {}: {other:?}", d.hash),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -119,6 +241,11 @@ impl exec::Blobs for RemoteBlobs {
                 self.store.put(Some(d), &bytes).await?;
                 Ok(bytes)
             }
+            BlobResp::Provider { endpoint } => {
+                let bytes = self.fetch_from(&endpoint, d).await?;
+                self.store.put(Some(d), &bytes).await?;
+                Ok(bytes)
+            }
             BlobResp::Missing => bail!("driver CAS missing blob {}/{}", d.hash, d.size),
             other => bail!("unexpected blob response: {other:?}"),
         }
@@ -126,6 +253,9 @@ impl exec::Blobs for RemoteBlobs {
 
     async fn put(&self, bytes: Vec<u8>) -> Result<Dig> {
         let d = self.store.put(None, &bytes).await?;
+        if !self.upload {
+            return Ok(d);
+        }
         let (mut send, mut recv) = self.conn.open_bi().await?;
         mesh::send_frame(&mut send, &BlobReq::Put(d.clone())).await?;
         send.write_all(&bytes).await?;

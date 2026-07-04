@@ -10,9 +10,16 @@ any machines) form a throwaway RE cluster for one build, over
 
 ```text
 rebuck2 driver [--grpc-port 9092] [--session S] [--store DIR]
-               [--min-workers N] [--no-local-exec]
+               [--min-workers N] [--no-local-exec] [--decentralized-cas]
 rebuck2 worker [--session S] [--store DIR] [--slots N] [--connect-wait-secs N]
 ```
+
+`--decentralized-cas`: outputs stay on the worker that built them; the driver
+keeps a digest→producer index and redirects fetches (peers pull direct over
+the mesh; the driver read-through-caches only what buck2 itself asks for).
+Slashes driver disk/egress at sweep scale. Trade-off: a dead worker takes its
+blobs with it — requeue re-runs an action but cannot resurrect a lost input,
+so keep it off for small builds where the driver's disk is a non-issue.
 
 - **driver** runs beside buck2: serves the REAPI buck2 dials on localhost
   (Capabilities + CAS + ByteStream + ActionCache + Execution) from a

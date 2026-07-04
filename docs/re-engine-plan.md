@@ -131,8 +131,11 @@ restored cold, and the AC hits.
    Six windows bugs were shaken out en route: 32K argv cap (→ argfile),
    local_only vswhere (→ limited hybrid), tmp-name race, missing system
    env, relative-argv0-vs-parent-cwd, symlink materialization.
-7. **Decentralised CAS** — when the stats heartbeat shows driver disk or
-   egress saturating: `Get` returns the producing worker's endpoint instead
+7. **Decentralised CAS** — ✅ v1 built (opt-in `--decentralized-cas`;
+   `e2e-decentralized.sh` green: outputs stay on workers, driver keeps the
+   index + read-through cache). Not yet sweep-proven; known gap: a dead
+   provider's blobs are unrecoverable (requeue re-runs actions, not their
+   inputs' producers). Design: `Get` returns the producing worker's endpoint instead
    of bytes (the scheduler-implicit index made real), outputs stay on the
    worker that built them, consumers fetch direct over the mesh. The driver
    keeps only the index + AC + buck2's own uploads, and pulls the
