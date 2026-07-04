@@ -10,47 +10,58 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use iroh::{
-    endpoint::presets,
-    Endpoint, EndpointId, SecretKey,
-};
+use iroh::{endpoint::presets, Endpoint, EndpointId, SecretKey};
 
 const ALPN: &[u8] = b"iroh-re/punch/0";
 const BYTES: usize = 256 * 1024 * 1024;
 const CHUNK: usize = 1024 * 1024;
 
-fn key(run_id: &str, role: &str) -> SecretKey {
+/// PUNCH_PAIR partitions key derivation so N pairs can soak concurrently
+/// in one run without cross-connecting.
+fn key(run_id: &str, pair: &str, role: &str) -> SecretKey {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
-    h.update(b"iroh-re-punch-v1\0");
+    h.update(b"iroh-re-punch-v2\0");
     h.update(run_id.as_bytes());
+    h.update(b"\0");
+    h.update(pair.as_bytes());
     h.update(b"\0");
     h.update(role.as_bytes());
     let seed: [u8; 32] = h.finalize().into();
     SecretKey::from_bytes(&seed)
 }
 
+fn env_or(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let role = std::env::args().nth(1).context("usage: punch <serve|fetch>")?;
+    let role = std::env::args()
+        .nth(1)
+        .context("usage: punch <serve|fetch>")?;
     let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "local".into());
+    let pair = std::env::var("PUNCH_PAIR").unwrap_or_else(|_| "0".into());
     match role.as_str() {
-        "serve" => serve(&run_id).await,
-        "fetch" => fetch(&run_id).await,
+        "serve" => serve(&run_id, &pair).await,
+        "fetch" => fetch(&run_id, &pair).await,
         other => anyhow::bail!("role must be serve|fetch, got {other}"),
     }
 }
 
-async fn serve(run_id: &str) -> Result<()> {
+async fn serve(run_id: &str, pair: &str) -> Result<()> {
     let ep = Endpoint::builder(presets::N0)
-        .secret_key(key(run_id, "A"))
+        .secret_key(key(run_id, pair, "A"))
         .alpns(vec![ALPN.to_vec()])
         .bind()
         .await?;
-    println!("[serve] endpoint_id={}", ep.id());
+    println!("[serve] pair={pair} endpoint_id={}", ep.id());
 
-    let deadline = Instant::now() + Duration::from_secs(240);
+    let deadline = Instant::now() + Duration::from_secs(env_or("PUNCH_WAIT_SECS", 240));
     while Instant::now() < deadline {
         let accept = tokio::time::timeout(Duration::from_secs(10), ep.accept()).await;
         let Ok(Some(incoming)) = accept else { continue };
@@ -73,17 +84,21 @@ async fn serve(run_id: &str) -> Result<()> {
     Ok(())
 }
 
-async fn fetch(run_id: &str) -> Result<()> {
+async fn fetch(run_id: &str, pair: &str) -> Result<()> {
     let ep = Endpoint::builder(presets::N0)
-        .secret_key(key(run_id, "B"))
+        .secret_key(key(run_id, pair, "B"))
         .bind()
         .await?;
-    let target: EndpointId = key(run_id, "A").public();
-    println!("[fetch] endpoint_id={} target={}", ep.id(), target);
+    let target: EndpointId = key(run_id, pair, "A").public();
+    println!(
+        "[fetch] pair={pair} endpoint_id={} target={}",
+        ep.id(),
+        target
+    );
 
     // retry until the serve endpoint is discoverable
     let conn = {
-        let deadline = Instant::now() + Duration::from_secs(180);
+        let deadline = Instant::now() + Duration::from_secs(env_or("PUNCH_WAIT_SECS", 180));
         loop {
             match ep.connect(target, ALPN).await {
                 Ok(c) => break c,
@@ -118,7 +133,7 @@ async fn fetch(run_id: &str) -> Result<()> {
             "relay-only"
         };
     }
-    println!("RESULT bytes={total} secs={secs:.2} MBps={mbps:.1} path={kind}");
+    println!("RESULT pair={pair} bytes={total} secs={secs:.2} MBps={mbps:.1} path={kind}");
     ep.close().await;
     Ok(())
 }

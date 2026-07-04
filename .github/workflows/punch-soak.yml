@@ -1,0 +1,71 @@
+# Roadmap #1: punch reliability. 20 independent runner pairs hole-punch in one
+# run; the report job aggregates direct-vs-relay rate + throughput. n=1 → n=20.
+# max-parallel 20 = 10 whole pairs at a time (matrix order keeps pairs adjacent);
+# PUNCH_WAIT_SECS absorbs queue skew if a pair's jobs start far apart.
+name: iroh-punch-soak
+on:
+  workflow_dispatch: {}
+
+jobs:
+  punch:
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        pair: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        role: [serve, fetch]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      PUNCH_PAIR: ${{ matrix.pair }}
+      PUNCH_WAIT_SECS: "900"
+    steps:
+      - uses: actions/checkout@v4          # TODO pin to SHA before graduating
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --manifest-path experiments/punch/Cargo.toml
+      - name: run ${{ matrix.role }} (pair ${{ matrix.pair }})
+        run: |
+          set -o pipefail
+          ./experiments/punch/target/release/punch ${{ matrix.role }} | tee punch.log
+      - name: extract result
+        if: matrix.role == 'fetch'
+        run: grep '^RESULT' punch.log > "result-${{ matrix.pair }}.txt"
+      - uses: actions/upload-artifact@v4
+        if: matrix.role == 'fetch'
+        with:
+          name: result-${{ matrix.pair }}
+          path: result-${{ matrix.pair }}.txt
+
+  report:
+    needs: punch
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          merge-multiple: true
+          path: results
+      - name: aggregate
+        run: |
+          cat results/*.txt | sort -t= -k2 -n > all.txt || true
+          total=20
+          done=$(grep -c '^RESULT' all.txt || true)
+          direct=$(grep -c 'path=has-direct' all.txt || true)
+          relay=$(grep -c 'path=relay-only' all.txt || true)
+          failed=$((total - done))
+          mean=$(awk -F'MBps=' 'NF>1 {split($2,a," "); s+=a[1]; n++} END {if (n) printf "%.1f", s/n; else print "n/a"}' all.txt)
+          {
+            echo "## punch soak: $direct/$total direct, $relay relay-only, $failed no-result"
+            echo ""
+            echo "mean throughput: **$mean MB/s**"
+            echo ""
+            echo '```'
+            cat all.txt
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
