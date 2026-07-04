@@ -94,12 +94,14 @@ restored cold, and the AC hits.
    runner, both compile actions executed on a second runner over iroh —
    `Commands: 2 (remote: 2, local: 0)`. AC round-trip also proven
    (restart driver, `Cache hits: 100%`).
-4. **Multi-worker + rendezvous barrier** — partial: `--min-workers K` barrier
-   and least-loaded dispatch exist; dropped-worker rescheduling and a real
-   multi-worker build slice still open.
-5. **GH-cache persistence** — seed/snapshot the iroh-blobs store + AC; a cold
-   build warms from the previous run. The 10 GB budget forces a *selection
-   policy* for what persists:
+4. **Multi-worker + rendezvous barrier** — ✅ `--min-workers K` barrier,
+   least-loaded dispatch (CI: 3 actions spread 1/2 across two workers), and
+   requeue-on-drop (`e2e-requeue.sh`: `kill -9` the executing worker → job
+   re-lands on the survivor, build green; ≤3 attempts then fail).
+5. **GH-cache persistence** — ✅ mechanism proven (`re-e2e.yml` `warm` job:
+   driver store saved via `actions/cache`, restored on a fresh runner →
+   `Cache hits: 100%, cached: 3`, zero execution). The 10 GB budget still
+   forces a *selection policy* for what persists at sweep scale:
    - **Cost-aware**: the driver already times every action
      (`ExecutedActionMetadata` timestamps flow back with each result), so it
      gets a `digest → rebuild-cost` index for free. Snapshot greedily by
@@ -120,8 +122,9 @@ restored cold, and the AC hits.
 
 - ~~Punch success **rate** across runner placements~~ — answered: 20/20 direct
   (run 28702838934). Residual: rate under sustained many-stream CAS load.
-- Worker **rendezvous + liveness** — jobs start independently, must overlap in
-  time and survive the whole build; a dropped worker must reschedule gracefully.
+- Worker **rendezvous + liveness** — barrier + requeue now proven at n=2;
+  unproven at pool scale (20+ workers) and for long builds (runner 6 h cap,
+  workers outliving buck2's patience on a thin pool).
 - CAS footprint vs the 10 GB budget under a full sweep — mitigated by the
   roadmap-#5 selection policy (cost-aware + third-party-first), but the
   numbers need measuring on a real sweep.
