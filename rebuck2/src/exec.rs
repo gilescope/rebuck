@@ -39,6 +39,9 @@ pub async fn run_action(blobs: &dyn Blobs, action_digest: &Dig, scratch: &Path) 
         .context("Action.input_root_digest")?)
         .into();
 
+    // REBUCK2_KEEP_SCRATCH=1 keeps exec dirs and logs each action's argv/cwd
+    // — the debug lever for "worked locally, failed on the worker".
+    let keep_scratch = std::env::var_os("REBUCK2_KEEP_SCRATCH").is_some();
     let exec_dir = tempfile::tempdir_in(scratch).context("mk exec dir")?;
     let root = exec_dir.path();
     materialize(blobs, &root_dig, root).await?;
@@ -123,12 +126,29 @@ pub async fn run_action(blobs: &dyn Blobs, action_digest: &Dig, scratch: &Path) 
             }
         }
     }
+    if keep_scratch {
+        eprintln!(
+            "[exec] action {} argv={:?} cwd={} outs={:?}",
+            action_digest.hash,
+            command.arguments,
+            cwd.display(),
+            out_paths
+        );
+    }
     let started = std::time::SystemTime::now();
     let output = proc
         .output()
         .await
         .with_context(|| format!("spawn {argv0}"))?;
     let finished = std::time::SystemTime::now();
+    if keep_scratch {
+        eprintln!(
+            "[exec] action {} exit={:?} scratch kept at {}",
+            action_digest.hash,
+            output.status.code(),
+            root.display()
+        );
+    }
 
     let stdout_digest = blobs.put(output.stdout).await?;
     let stderr_digest = blobs.put(output.stderr).await?;
@@ -180,6 +200,10 @@ pub async fn run_action(blobs: &dyn Blobs, action_digest: &Dig, scratch: &Path) 
         }
     }
 
+    if keep_scratch {
+        // Leak the tempdir so the workflow can inspect scripts post-mortem.
+        std::mem::forget(exec_dir);
+    }
     Ok(Outcome {
         action_result: result,
         do_not_cache: action.do_not_cache,
