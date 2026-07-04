@@ -42,7 +42,7 @@ buck2 is RE-native — remote execution *is* its scaling axis. Two motivations:
 
 ## Architecture
 
-One `rebuck2` binary, `--role`:
+One `rebuck2` binary, role as subcommand (`rebuck2 driver` / `rebuck2 worker`):
 
 - **driver** — runs beside buck2; serves the localhost REAPI gRPC that buck2
   dials (Execution + CAS + ActionCache); translates `Execute` into iroh dispatch
@@ -54,7 +54,9 @@ Data planes:
 
 - **mesh** — iroh net. Rendezvous by keys derived from `GITHUB_RUN_ID` (+ a
   cache-published ticket if discovery needs a nudge). No hub.
-- **CAS** — iroh-blobs, fetched P2P on demand.
+- **CAS** — digest-keyed disk store on the driver, blobs fetched P2P on
+  demand over the mesh (workers cache locally). iroh-blobs (BLAKE3, provider
+  discovery) is the intended replacement — roadmap #2 residue.
 - **persistence** — the actions cache seeds CAS + AC at job start and snapshots
   at job end (rebuck's dance, ported from bazel-remote's dir to iroh-blobs' store).
 
@@ -123,9 +125,10 @@ restored cold, and the AC hits.
 - CAS footprint vs the 10 GB budget under a full sweep — mitigated by the
   roadmap-#5 selection policy (cost-aware + third-party-first), but the
   numbers need measuring on a real sweep.
-- The **minimal REAPI surface** buck2 actually requires (`Execute`/
-  `WaitExecution`, CAS `FindMissingBlobs`/`ByteStream`/`BatchUpdate`,
-  `ActionCache`) — scope it before building.
+- ~~The **minimal REAPI surface** buck2 actually requires~~ — answered by
+  building it: Capabilities, `Execute` (single done-Operation stream),
+  CAS `FindMissingBlobs`/`BatchUpdate`/`BatchRead`, ByteStream `Read`/`Write`,
+  ActionCache get/update. `GetTree`/`SplitBlob`/compression: unneeded.
 - iroh + worker execution parity **on windows**.
 - Relay bandwidth if hole-punch fails for a pair.
 

@@ -36,10 +36,21 @@ struct WorkerConn {
     os: String,
 }
 
+/// An action in flight: who to answer, what to run, where it's running.
+struct Job {
+    tx: oneshot::Sender<Result<re::ActionResult, String>>,
+    action: Dig,
+    /// Current assignee (worker id; 0 = driver-local).
+    worker: u64,
+    attempts: u32,
+}
+
+const MAX_ATTEMPTS: u32 = 3;
+
 pub struct Driver {
     pub store: Arc<Store>,
     cfg: DriverCfg,
-    jobs: Mutex<HashMap<u64, oneshot::Sender<Result<re::ActionResult, String>>>>,
+    jobs: Mutex<HashMap<u64, Job>>,
     workers: Mutex<Vec<WorkerConn>>,
     worker_arrived: tokio::sync::Notify,
     next_job: AtomicU64,
@@ -151,15 +162,11 @@ impl Driver {
                         inflight.fetch_sub(1, Ordering::Relaxed);
                         let result = re::ActionResult::decode(action_result.as_slice())
                             .map_err(|e| format!("bad ActionResult from worker: {e}"));
-                        if let Some(tx) = self.jobs.lock().await.remove(&job) {
-                            let _ = tx.send(result.map_err(|e| e.to_string()));
-                        }
+                        self.complete(job, result).await;
                     }
                     W2D::Failed { job, msg } => {
                         inflight.fetch_sub(1, Ordering::Relaxed);
-                        if let Some(tx) = self.jobs.lock().await.remove(&job) {
-                            let _ = tx.send(Err(msg));
-                        }
+                        self.complete(job, Err(msg)).await;
                     }
                     W2D::Hello { .. } => bail!("unexpected second Hello"),
                 }
@@ -167,61 +174,128 @@ impl Driver {
         }
         .await;
 
-        // v0: jobs in flight on a dropped worker fail; rescheduling is roadmap #4.
         self.workers.lock().await.retain(|w| w.id != worker_id);
         println!("[driver] worker {worker_id} left");
         writer.abort();
         blobs.abort();
+
+        // Requeue whatever the departed worker still owed us.
+        let orphans: Vec<u64> = self
+            .jobs
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, j)| j.worker == worker_id)
+            .map(|(id, _)| *id)
+            .collect();
+        if !orphans.is_empty() {
+            println!(
+                "[driver] requeueing {} job(s) from worker {worker_id}",
+                orphans.len()
+            );
+            for id in orphans {
+                self.dispatch(id).await;
+            }
+        }
         read_result
     }
 
-    /// Execute an action: dispatch to a worker, or run locally as fallback.
+    /// Resolve a job's oneshot and drop it from the table.
+    async fn complete(&self, job_id: u64, result: Result<re::ActionResult, String>) {
+        if let Some(job) = self.jobs.lock().await.remove(&job_id) {
+            let _ = job.tx.send(result);
+        }
+    }
+
+    /// Assign a queued job to the least-loaded worker, or the driver-local
+    /// executor when there are no workers, or fail it out of attempts/options.
+    async fn dispatch(self: &Arc<Self>, job_id: u64) {
+        let workers = self.workers.lock().await;
+        let mut jobs = self.jobs.lock().await;
+        let Some(job) = jobs.get_mut(&job_id) else {
+            return; // completed while we raced
+        };
+        if job.attempts >= MAX_ATTEMPTS {
+            let job = jobs.remove(&job_id).expect("just found it");
+            let _ = job
+                .tx
+                .send(Err(format!("gave up after {MAX_ATTEMPTS} attempts")));
+            return;
+        }
+        job.attempts += 1;
+        if let Some(w) = workers
+            .iter()
+            .min_by_key(|w| w.inflight.load(Ordering::Relaxed))
+        {
+            job.worker = w.id;
+            w.inflight.fetch_add(1, Ordering::Relaxed);
+            println!(
+                "[driver] job {job_id} -> worker {} ({})",
+                w.id, job.action.hash
+            );
+            if w.tx
+                .send(D2W::Run {
+                    job: job_id,
+                    action: job.action.clone(),
+                })
+                .is_ok()
+            {
+                return;
+            }
+            // Channel already closed — the disconnect path will requeue us.
+            w.inflight.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+        if self.cfg.local_exec {
+            job.worker = 0;
+            let action = job.action.clone();
+            drop(jobs);
+            drop(workers);
+            println!("[driver] job {job_id} -> local ({})", action.hash);
+            let this = self.clone();
+            tokio::spawn(async move {
+                let _permit = this.local_slots.acquire().await.expect("semaphore open");
+                let blobs = StoreBlobs {
+                    store: this.store.clone(),
+                };
+                let result = exec::run_action(&blobs, &action, &this.cfg.scratch)
+                    .await
+                    .map(|o| o.action_result)
+                    .map_err(|e| format!("{e:#}"));
+                this.complete(job_id, result).await;
+            });
+            return;
+        }
+        let job = jobs.remove(&job_id).expect("just found it");
+        let _ = job.tx.send(Err(
+            "no workers connected and local execution disabled".into()
+        ));
+    }
+
+    /// Execute an action: queue it, dispatch (worker or local), await the result.
     pub async fn execute(self: &Arc<Self>, action_digest: &Dig) -> Result<exec::Outcome> {
         // Barrier: don't start work until the agreed pool has formed.
         while self.workers.lock().await.len() < self.cfg.min_workers {
             self.worker_arrived.notified().await;
         }
 
-        let dispatched = {
-            let workers = self.workers.lock().await;
-            match workers
-                .iter()
-                .min_by_key(|w| w.inflight.load(Ordering::Relaxed))
-            {
-                Some(w) => {
-                    let job = self.next_job.fetch_add(1, Ordering::Relaxed);
-                    let (tx, rx) = oneshot::channel();
-                    self.jobs.lock().await.insert(job, tx);
-                    w.inflight.fetch_add(1, Ordering::Relaxed);
-                    println!(
-                        "[driver] job {job} -> worker {} ({})",
-                        w.id, action_digest.hash
-                    );
-                    w.tx.send(D2W::Run {
-                        job,
-                        action: action_digest.clone(),
-                    })
-                    .map_err(|_| anyhow::anyhow!("worker channel closed"))?;
-                    Some(rx)
-                }
-                None => None,
-            }
-        };
+        let job_id = self.next_job.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.jobs.lock().await.insert(
+            job_id,
+            Job {
+                tx,
+                action: action_digest.clone(),
+                worker: 0,
+                attempts: 0,
+            },
+        );
+        self.dispatch(job_id).await;
 
-        let action_result = match dispatched {
-            Some(rx) => rx
-                .await
-                .context("worker dropped mid-job")?
-                .map_err(|e| anyhow::anyhow!("remote execution failed: {e}"))?,
-            None if self.cfg.local_exec => {
-                let _permit = self.local_slots.acquire().await?;
-                let blobs = StoreBlobs {
-                    store: self.store.clone(),
-                };
-                return exec::run_action(&blobs, action_digest, &self.cfg.scratch).await;
-            }
-            None => bail!("no workers connected and local execution disabled"),
-        };
+        let action_result = rx
+            .await
+            .context("job dropped without completion")?
+            .map_err(|e| anyhow::anyhow!("execution failed: {e}"))?;
 
         // Recover do_not_cache from the Action we already hold in CAS.
         let do_not_cache = match self.store.get(action_digest).await? {

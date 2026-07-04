@@ -1,9 +1,10 @@
 # Copy this into your repo as platforms/defs.bzl (alongside platforms/BUCK).
 #
-# Execution platform that keeps LOCAL execution but turns on the remote ACTION
-# CACHE (read+write). buck2 then queries the cache by action digest; on a miss
-# it runs the action locally and uploads the result. The rebuck action points
-# [buck2_re_client] at a cache-only bazel-remote sidecar.
+# Execution platform with the remote ACTION CACHE on (read+write). By default
+# (local_enabled=True) execution stays local: buck2 queries the cache by
+# action digest, runs misses locally, uploads results — rebuck's cache-only
+# mode against a bazel-remote sidecar. With local_enabled=False every action
+# must go through the RE Execution service — rebuck2's remote-exec mode.
 #
 # The prelude's own execution_platform hardcodes remote_enabled=False (-> no
 # cache). We need remote_enabled=True to activate the ActionCacheChecker path,
