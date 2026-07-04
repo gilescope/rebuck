@@ -131,8 +131,18 @@ restored cold, and the AC hits.
    Six windows bugs were shaken out en route: 32K argv cap (→ argfile),
    local_only vswhere (→ limited hybrid), tmp-name race, missing system
    env, relative-argv0-vs-parent-cwd, symlink materialization.
-7. **Discovery scaling** — gossip/bloom provider index, only if the
-   scheduler-implicit index proves insufficient.
+7. **Decentralised CAS** — when the stats heartbeat shows driver disk or
+   egress saturating: `Get` returns the producing worker's endpoint instead
+   of bytes (the scheduler-implicit index made real), outputs stay on the
+   worker that built them, consumers fetch direct over the mesh. The driver
+   keeps only the index + AC + buck2's own uploads, and pulls the
+   *persistence set* (roadmap #5's selection) from workers before releasing
+   them at build-end. Note: cross-rig overlap already dedups twice without
+   this — identical sources share blobs (content addressing) and identical
+   actions don't re-execute at all (AC hit inside one graph), so the
+   mono-sweep's store should come in well under the sum of its legs.
+8. **Discovery scaling** — gossip/bloom provider index, only if the
+   scheduler-implicit index proves insufficient at pool scale.
 
 ## Open questions / risks
 
