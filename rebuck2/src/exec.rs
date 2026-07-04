@@ -74,17 +74,53 @@ pub async fn run_action(blobs: &dyn Blobs, action_digest: &Dig, scratch: &Path) 
         .context("Command.arguments empty")?;
     let mut proc = tokio::process::Command::new(argv0);
     proc.args(args).current_dir(&cwd).env_clear();
-    let mut saw_path = false;
+    let mut saw: std::collections::HashSet<String> = std::collections::HashSet::new();
     for ev in &command.environment_variables {
-        saw_path |= ev.name == "PATH";
+        saw.insert(ev.name.to_ascii_uppercase());
         proc.env(&ev.name, &ev.value);
     }
     // System toolchains (rustc, cl.exe) are PATH-resolved and buck2 doesn't
     // ship a PATH in the action env. Runner images are uniform per-OS, so
     // inheriting the worker's PATH is the pragmatic v0 hermeticity trade.
-    if !saw_path {
+    if !saw.contains("PATH") {
         if let Ok(path) = std::env::var("PATH") {
             proc.env("PATH", path);
+        }
+    }
+    // Windows actions shell out via cmd.exe, whose scripts fail with "The
+    // system cannot find the path specified." without the core system env
+    // (SystemRoot, ComSpec, TEMP, ...). buck2 doesn't put these in the
+    // action env; inherit any the action didn't set itself.
+    #[cfg(windows)]
+    for name in [
+        "SYSTEMROOT",
+        "SYSTEMDRIVE",
+        "COMSPEC",
+        "PATHEXT",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "PROGRAMDATA",
+        "ALLUSERSPROFILE",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "COMMONPROGRAMFILES",
+        "COMMONPROGRAMFILES(X86)",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+        "OS",
+    ] {
+        if !saw.contains(name) {
+            // Lookup is case-insensitive on windows, so the canonical-case
+            // names above find e.g. `ProgramFiles(x86)` too.
+            if let Ok(v) = std::env::var(name) {
+                proc.env(name, v);
+            }
         }
     }
     let started = std::time::SystemTime::now();
