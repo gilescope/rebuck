@@ -258,6 +258,9 @@ async fn materialize(blobs: &dyn Blobs, dir_digest: &Dig, dest: &Path) -> Result
     // Iterative BFS; recursion in async fns needs boxing and trees are shallow-ish.
     let mut queue: Vec<(Dig, PathBuf)> = vec![(dir_digest.clone(), dest.to_path_buf())];
     let mut seen: HashMap<Dig, re::Directory> = HashMap::new();
+    // Symlinks last: windows needs to know file-vs-dir at creation time, so
+    // the targets must exist first (buck2's __srcs trees link to sibling dirs).
+    let mut symlinks: Vec<(PathBuf, String)> = Vec::new();
     while let Some((dig, path)) = queue.pop() {
         tokio::fs::create_dir_all(&path).await?;
         let dir = match seen.get(&dig) {
@@ -279,23 +282,37 @@ async fn materialize(blobs: &dyn Blobs, dir_digest: &Dig, dest: &Path) -> Result
             }
         }
         for s in &dir.symlinks {
-            let sp = path.join(&s.name);
-            #[cfg(unix)]
-            tokio::fs::symlink(&s.target, &sp).await?;
-            #[cfg(windows)]
-            {
-                // Windows symlinks need elevation; a file copy of the target
-                // is wrong in general, so surface loudly if we ever hit one.
-                anyhow::bail!(
-                    "symlink {} in input tree unsupported on windows",
-                    sp.display()
-                );
-            }
+            symlinks.push((path.join(&s.name), s.target.clone()));
         }
         for d in &dir.directories {
             let ddig: Dig = (&d.digest.clone().context("DirectoryNode.digest")?).into();
             queue.push((ddig, path.join(&d.name)));
         }
+    }
+    for (link, target) in symlinks {
+        make_symlink(&link, &target)
+            .with_context(|| format!("symlink {} -> {}", link.display(), target))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_symlink(link: &Path, target: &str) -> Result<()> {
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn make_symlink(link: &Path, target: &str) -> Result<()> {
+    // Forward slashes don't resolve in NT symlink targets.
+    let target = target.replace('/', "\\");
+    let resolved = link.parent().context("link has parent")?.join(&target);
+    // Windows distinguishes file and directory symlinks; stat the (already
+    // materialized) target to pick. Dangling targets default to file links.
+    if resolved.is_dir() {
+        std::os::windows::fs::symlink_dir(&target, link)?;
+    } else {
+        std::os::windows::fs::symlink_file(&target, link)?;
     }
     Ok(())
 }
