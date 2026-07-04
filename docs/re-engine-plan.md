@@ -10,11 +10,14 @@ service, no persistent host, no account.
 
 buck2 is RE-native — remote execution *is* its scaling axis. Two motivations:
 
-- **Concrete trigger — the windows crate sweep.** [facebook/buck2#1359](https://github.com/facebook/buck2/pull/1359)
-  (our fix) made windows `cc-rs` build scripts actually compile. So the full-rig
-  sweep (~2185 crates) now genuinely compiles C on a single 16 GB runner and gets
-  OOM-killed. Throttling concurrency is a dead end — the answer is to spread the
-  build across N runners. This engine is the sweep fix.
+- **Concrete trigger — the windows crate sweep.** The
+  [buck2-fixups](https://github.com/gilescope/buck2-fixups) sweep builds ~2185
+  crates per OS. [facebook/buck2#1359](https://github.com/facebook/buck2/pull/1359)
+  (our fix) made windows `cc-rs` build scripts actually compile, so the windows
+  sweep now genuinely compiles C on a single 16 GB runner and gets OOM-killed.
+  Throttling concurrency is a dead end, and splitting into N independent jobs
+  forfeits the shared build graph — the answer is N runners behind one buck2.
+  This engine is the sweep fix.
 - **General.** Any buck2 build distributes + caches across free GH runners.
 
 ## Non-goals
