@@ -84,12 +84,17 @@ restored cold, and the AC hits.
 1. **Punch reliability** — ✅ 20-pair soak (`punch-soak.yml`): **20/20 direct,
    0 relay-only**, mean 70.6 MB/s (spread 16–254 MB/s with 20 concurrent
    pairs sharing runner egress). Hole-punch between GH runners is dependable.
-2. **CAS over iroh-blobs** — a REAPI CAS/AC facade buck2 can hit; prove a buck2
-   build pulling CAS P2P (local execution still).
-3. **Execution v0** — minimal REAPI `Execute` on the driver; one worker runs one
-   action remotely, end to end.
-4. **Multi-worker + rendezvous barrier** — driver waits for ≥K workers; workers
-   outlive the build; distribute a real build slice.
+2. **CAS facade** — ✅ REAPI CAS/AC/ByteStream/Capabilities served by
+   `rebuck2 driver` from a digest-keyed disk store; blobs travel P2P via a
+   framed protocol on the mesh. (Swapping the store for iroh-blobs proper —
+   BLAKE3 digests, provider discovery — stays open.)
+3. **Execution v0** — ✅ `rebuck2` driver+worker, `re-e2e.yml`: buck2 on one
+   runner, both compile actions executed on a second runner over iroh —
+   `Commands: 2 (remote: 2, local: 0)`. AC round-trip also proven
+   (restart driver, `Cache hits: 100%`).
+4. **Multi-worker + rendezvous barrier** — partial: `--min-workers K` barrier
+   and least-loaded dispatch exist; dropped-worker rescheduling and a real
+   multi-worker build slice still open.
 5. **GH-cache persistence** — seed/snapshot the iroh-blobs store + AC; a cold
    build warms from the previous run. The 10 GB budget forces a *selection
    policy* for what persists:
@@ -127,5 +132,6 @@ restored cold, and the AC hits.
 ## Repo layout (working)
 
 - `experiments/punch/` — the direct-vs-relay spike (done).
-- `rebuck2/` — the engine (next).
+- `rebuck2/` — the engine (v0 shipped: driver/worker, REAPI surface, iroh
+  dispatch — see its [README](../rebuck2/README.md)).
 - reuses rebuck's cache/platform plumbing; cache-only rebuck untouched.
