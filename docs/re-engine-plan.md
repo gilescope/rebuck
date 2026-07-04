@@ -120,8 +120,17 @@ restored cold, and the AC hits.
      third-party by default; spend any remaining budget on the costliest
      first-party actions. Target provenance is visible to the driver via the
      action's target label in the buck2 metadata.
-6. **Windows worker pool** — re-point the windows sweep at it. **Kills the OOM.**
-   The concrete deliverable.
+6. **Windows worker pool** — ✅ **the OOM is dead.** Full base leg
+   (buck2-fixups PR #66): 17,296 actions executed across 4 windows workers,
+   driver compile-free, no OOM, no disk death, sweep reached its
+   failure-diff stage for the first time. Heavyweights that used to fail
+   (`sqlx`, `arrow`, `aws-config`) now pass — they were OOM victims all
+   along. Residual triage: ~25 new-vs-expected failures, largely
+   platform-gated crates plus an `OUT_DIR`/buildscript-output cluster
+   (gl_generator/khronos_api/built) that looks like one real RE bug.
+   Six windows bugs were shaken out en route: 32K argv cap (→ argfile),
+   local_only vswhere (→ limited hybrid), tmp-name race, missing system
+   env, relative-argv0-vs-parent-cwd, symlink materialization.
 7. **Discovery scaling** — gossip/bloom provider index, only if the
    scheduler-implicit index proves insufficient.
 
