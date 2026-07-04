@@ -62,6 +62,8 @@ pub struct Driver {
     local_slots: Semaphore,
     /// Decentralized mode: blob hash -> producing worker's endpoint id.
     providers: Mutex<HashMap<String, String>>,
+    /// Bloom gossip: worker endpoint id -> summary of its store.
+    blooms: Mutex<HashMap<String, mesh::Bloom>>,
     /// Mesh endpoint, for read-through fetches from providers.
     mesh_ep: tokio::sync::OnceCell<Endpoint>,
 }
@@ -81,6 +83,7 @@ impl Driver {
             next_worker: AtomicU64::new(1),
             local_slots: Semaphore::new(cores),
             providers: Mutex::new(HashMap::new()),
+            blooms: Mutex::new(HashMap::new()),
             mesh_ep: tokio::sync::OnceCell::new(),
         })
     }
@@ -200,6 +203,22 @@ impl Driver {
                         inflight.fetch_sub(1, Ordering::Relaxed);
                         self.complete(job, Err(msg)).await;
                     }
+                    W2D::Holdings { bloom } => {
+                        self.blooms.lock().await.insert(endpoint.clone(), bloom);
+                        // Rebroadcast the full picture to everyone.
+                        let peers: Vec<(String, mesh::Bloom)> = self
+                            .blooms
+                            .lock()
+                            .await
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        for w in self.workers.lock().await.iter() {
+                            let _ = w.tx.send(D2W::Blooms {
+                                peers: peers.clone(),
+                            });
+                        }
+                    }
                     W2D::Hello { .. } => bail!("unexpected second Hello"),
                 }
             }
@@ -207,6 +226,7 @@ impl Driver {
         .await;
 
         self.workers.lock().await.retain(|w| w.id != worker_id);
+        self.blooms.lock().await.remove(&endpoint);
         println!("[driver] worker {worker_id} left");
         writer.abort();
         blobs.abort();
@@ -250,8 +270,20 @@ impl Driver {
         if let Some(bytes) = self.store.get(d).await? {
             return Ok(Some(bytes));
         }
-        let Some(endpoint) = self.providers.lock().await.get(&d.hash).cloned() else {
-            return Ok(None);
+        let endpoint = match self.providers.lock().await.get(&d.hash).cloned() {
+            Some(e) => e,
+            // Index miss: any peer whose bloom claims the blob (FP -> None).
+            None => {
+                let blooms = self.blooms.lock().await;
+                match blooms
+                    .iter()
+                    .find(|(_, b)| b.contains(&d.hash))
+                    .map(|(e, _)| e.clone())
+                {
+                    Some(e) => e,
+                    None => return Ok(None),
+                }
+            }
         };
         let Some(ep) = self.mesh_ep.get() else {
             return Ok(None);

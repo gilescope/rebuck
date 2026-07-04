@@ -57,6 +57,48 @@ impl Dig {
     }
 }
 
+/// Space-efficient "what my store holds" summary, gossiped between peers.
+/// Blob hashes are uniform (sha256), so probe positions are sliced straight
+/// from the hex — no hash functions needed. k=4 at ~12 bits/entry ≈ 0.6% FP;
+/// a false positive costs one refused Get, never correctness.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Bloom {
+    pub k: u8,
+    pub bits: Vec<u8>,
+}
+
+impl Bloom {
+    pub fn with_capacity(n: usize) -> Self {
+        let mbits = (n.max(64) * 12).next_power_of_two();
+        Bloom {
+            k: 4,
+            bits: vec![0; mbits / 8],
+        }
+    }
+
+    fn idx(&self, hash: &str, i: u8) -> Option<usize> {
+        let start = (i as usize) * 8;
+        let h = u64::from_str_radix(hash.get(start..start + 8)?, 16).ok()?;
+        Some((h as usize) & (self.bits.len() * 8 - 1))
+    }
+
+    pub fn insert(&mut self, hash: &str) {
+        for i in 0..self.k {
+            if let Some(b) = self.idx(hash, i) {
+                self.bits[b / 8] |= 1 << (b % 8);
+            }
+        }
+    }
+
+    pub fn contains(&self, hash: &str) -> bool {
+        (0..self.k).all(|i| {
+            self.idx(hash, i)
+                .map(|b| self.bits[b / 8] & (1 << (b % 8)) != 0)
+                .unwrap_or(false)
+        })
+    }
+}
+
 /// Worker → driver, on the control stream.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum W2D {
@@ -77,6 +119,10 @@ pub enum W2D {
         job: u64,
         msg: String,
     },
+    /// Periodic summary of the worker's store (bloom gossip).
+    Holdings {
+        bloom: Bloom,
+    },
 }
 
 /// Driver → worker, on the control stream.
@@ -89,6 +135,10 @@ pub enum D2W {
     Run {
         job: u64,
         action: Dig,
+    },
+    /// Rebroadcast of every peer's holdings: (endpoint id, bloom).
+    Blooms {
+        peers: Vec<(String, Bloom)>,
     },
 }
 
@@ -150,4 +200,28 @@ pub async fn recv_raw(r: &mut RecvStream, size: u64) -> Result<Vec<u8>> {
         .await
         .context("blob body truncated")?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bloom_no_false_negatives_and_sane_fp() {
+        // Production hashes are sha256 — uniform across all hex positions.
+        let fake = |i: u32| crate::store::sha256_hex(&i.to_le_bytes());
+        let n = 5000;
+        let mut b = Bloom::with_capacity(n);
+        for i in 0..n as u32 {
+            b.insert(&fake(i));
+        }
+        for i in 0..n as u32 {
+            assert!(b.contains(&fake(i)), "false negative at {i}");
+        }
+        let fps = (n as u32..3 * n as u32)
+            .filter(|i| b.contains(&fake(*i)))
+            .count();
+        let rate = fps as f64 / (2.0 * n as f64);
+        assert!(rate < 0.05, "false-positive rate too high: {rate}");
+    }
 }

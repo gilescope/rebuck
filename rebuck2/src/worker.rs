@@ -7,6 +7,7 @@
 //! any peer, and misses can be redirected to the producing worker
 //! (`BlobResp::Provider`). Trade-off: a dead worker takes its blobs with it.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -98,20 +99,59 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
 
     let ctrl_send = Arc::new(Mutex::new(ctrl_send));
     let slots = Arc::new(Semaphore::new(cfg.slots));
+    let peer_blooms: Arc<Mutex<HashMap<String, mesh::Bloom>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let blobs = Arc::new(RemoteBlobs {
         conn: conn.clone(),
         ep: ep.clone(),
         store: store.clone(),
         upload: !decentralized,
+        peers: peer_blooms.clone(),
+        my_id: ep.id().to_string(),
     });
+
+    // Bloom gossip: advertise what this store holds, every 30s when changed.
+    // Peers use it to fetch hot blobs from caches instead of one producer.
+    {
+        let store = store.clone();
+        let ctrl = ctrl_send.clone();
+        tokio::spawn(async move {
+            let mut last_n = usize::MAX;
+            loop {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                let hashes = store.list_hashes();
+                if hashes.len() == last_n {
+                    continue;
+                }
+                last_n = hashes.len();
+                let mut bloom = mesh::Bloom::with_capacity(hashes.len());
+                for h in &hashes {
+                    bloom.insert(h);
+                }
+                if mesh::send_frame(&mut *ctrl.lock().await, &W2D::Holdings { bloom })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+    }
 
     loop {
         let Some(msg) = mesh::recv_frame::<D2W>(&mut ctrl_recv).await? else {
             println!("[worker] driver closed control stream — done");
             return Ok(());
         };
-        let D2W::Run { job, action } = msg else {
-            continue; // stray Welcome — ignore
+        let (job, action) = match msg {
+            D2W::Run { job, action } => (job, action),
+            D2W::Blooms { peers } => {
+                let mut map = peer_blooms.lock().await;
+                map.clear();
+                map.extend(peers);
+                continue;
+            }
+            D2W::Welcome { .. } => continue,
         };
         let blobs = blobs.clone();
         let ctrl = ctrl_send.clone();
@@ -202,6 +242,9 @@ struct RemoteBlobs {
     store: Arc<Store>,
     /// false in decentralized mode: outputs stay local, driver gets an index.
     upload: bool,
+    /// Gossiped peer holdings; consulted before asking the driver.
+    peers: Arc<Mutex<HashMap<String, mesh::Bloom>>>,
+    my_id: String,
 }
 
 impl RemoteBlobs {
@@ -228,6 +271,24 @@ impl exec::Blobs for RemoteBlobs {
     async fn get(&self, d: &Dig) -> Result<Vec<u8>> {
         if let Some(bytes) = self.store.get(d).await? {
             return Ok(bytes);
+        }
+        // Bloom-first: any peer cache claiming the blob beats a driver hop.
+        // Deterministic pick from the hash spreads hot blobs across holders;
+        // a false positive costs one refused Get and we fall through.
+        let candidates: Vec<String> = {
+            let peers = self.peers.lock().await;
+            peers
+                .iter()
+                .filter(|(id, b)| **id != self.my_id && b.contains(&d.hash))
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        if !candidates.is_empty() {
+            let pick = usize::from_str_radix(&d.hash[..4], 16).unwrap_or(0) % candidates.len();
+            if let Ok(bytes) = self.fetch_from(&candidates[pick], d).await {
+                self.store.put(Some(d), &bytes).await?;
+                return Ok(bytes);
+            }
         }
         let (mut send, mut recv) = self.conn.open_bi().await?;
         mesh::send_frame(&mut send, &BlobReq::Get(d.clone())).await?;

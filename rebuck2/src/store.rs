@@ -120,6 +120,25 @@ impl Store {
         })
     }
 
+    /// All CAS blob hashes currently on disk (for bloom gossip). Walks the
+    /// two-level fan-out; ~10k entries costs single-digit ms.
+    pub fn list_hashes(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let Ok(subs) = std::fs::read_dir(self.root.join("cas")) else {
+            return out;
+        };
+        for sub in subs.flatten() {
+            if let Ok(files) = std::fs::read_dir(sub.path()) {
+                for f in files.flatten() {
+                    if let Some(name) = f.file_name().to_str() {
+                        out.push(name.to_owned());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub async fn ac_get(&self, action_hash: &str) -> Option<Vec<u8>> {
         tokio::fs::read(self.root.join("ac").join(action_hash))
             .await
