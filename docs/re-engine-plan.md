@@ -1,10 +1,13 @@
-# rebuck-re — ad-hoc distributed Remote Execution for buck2 on GitHub Actions
+# rebuck2 — ad-hoc distributed Remote Execution for buck2 on GitHub Actions
 
-Working name. Extends [rebuck](../README.md) (persistent action *cache*) with
+Extends [rebuck](../README.md) (persistent action *cache*) with
 distributed *execution*: N ephemeral GitHub-Actions jobs form a throwaway
 Remote Execution cluster for one buck2 build, over [iroh](https://iroh.computer)
 P2P, with the free 10 GB actions cache as cross-run persistence. No external
 service, no persistent host, no account.
+
+rebuck (cache-only) stays a supported mode: if you don't need distribution,
+the original action keeps working unchanged — rebuck2 is opt-in on top.
 
 ## Why
 
@@ -39,7 +42,7 @@ buck2 is RE-native — remote execution *is* its scaling axis. Two motivations:
 
 ## Architecture
 
-One `re-node` binary, `--role`:
+One `rebuck2` binary, `--role`:
 
 - **driver** — runs beside buck2; serves the localhost REAPI gRPC that buck2
   dials (Execution + CAS + ActionCache); translates `Execute` into iroh dispatch
@@ -108,5 +111,5 @@ restored cold, and the AC hits.
 ## Repo layout (working)
 
 - `experiments/punch/` — the direct-vs-relay spike (done).
-- `re-node/` — the engine (next).
-- reuses rebuck's cache/platform plumbing.
+- `rebuck2/` — the engine (next).
+- reuses rebuck's cache/platform plumbing; cache-only rebuck untouched.
