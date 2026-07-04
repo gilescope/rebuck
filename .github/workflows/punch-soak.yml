@@ -3,8 +3,13 @@
 # max-parallel 20 = 10 whole pairs at a time (matrix order keeps pairs adjacent);
 # PUNCH_WAIT_SECS absorbs queue skew if a pair's jobs start far apart.
 name: iroh-punch-soak
+# workflow_dispatch only registers once the file reaches the default branch, so
+# on this spike branch the trigger is a push touching this file.
 on:
   workflow_dispatch: {}
+  push:
+    branches: [giles-iroh-re-punch]
+    paths: [.github/workflows/punch-soak.yml]
 
 jobs:
   punch:
