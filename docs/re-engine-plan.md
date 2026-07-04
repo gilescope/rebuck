@@ -79,6 +79,13 @@ restored cold, and the AC hits.
   would break the graph. Live CAS lives on the mesh.
 - **Relay is standby.** Punch works, so P2P is primary; relay only if a pair
   fails to hole-punch.
+- **Driver disk is the CAS's ceiling** — every output lands in the driver's
+  store (~14 GB free on a stock runner). Mitigation idea: once dispatch goes
+  quiet the driver is network-bound, so it can spend the idle CPU deleting
+  unused runner ballast (Android SDK, .NET, GHC, CodeQL, preloaded docker
+  images — ~50 GB reclaimable) ahead of the rlib flood. Do it lazily/async,
+  not upfront: cold-start time matters more than disk until the build is
+  actually running.
 
 ## Roadmap
 
