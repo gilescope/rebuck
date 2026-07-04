@@ -27,10 +27,10 @@ buck2 is RE-native — remote execution *is* its scaling axis. Two motivations:
 
 - **NativeLink / BuildBarn** — general-purpose, too much config. This is
   purpose-built for GH runners + the actions cache.
-- **Persistent hub / external scheduler** (e.g. a NixOS box). Everything
+- **No Persistent hub / external scheduler** (e.g. a NixOS box). Everything
   ephemeral, on GH runners.
-- **Tailscale** — account + control plane. iroh instead (P2P, keyless rendezvous).
-- **Cross-compiling MSVC from linux** — keep native `cl.exe`.
+- **Tailscale** — requires account + control plane - use iroh instead (P2P, keyless rendezvous).
+- **Dont Cross-compiling MSVC from linux** — keep native `cl.exe`.
 
 ## Building blocks (proven)
 
@@ -81,8 +81,9 @@ restored cold, and the AC hits.
 ## Roadmap
 
 0. **Punch spike** — ✅ direct P2P proven, 261 MB/s (`experiments/punch/`).
-1. **Punch reliability** — loop the matrix ~20×; record direct-vs-relay rate,
-   cross-region behaviour. Don't bet the architecture on n=1.
+1. **Punch reliability** — ✅ 20-pair soak (`punch-soak.yml`): **20/20 direct,
+   0 relay-only**, mean 70.6 MB/s (spread 16–254 MB/s with 20 concurrent
+   pairs sharing runner egress). Hole-punch between GH runners is dependable.
 2. **CAS over iroh-blobs** — a REAPI CAS/AC facade buck2 can hit; prove a buck2
    build pulling CAS P2P (local execution still).
 3. **Execution v0** — minimal REAPI `Execute` on the driver; one worker runs one
@@ -98,7 +99,8 @@ restored cold, and the AC hits.
 
 ## Open questions / risks
 
-- Punch success **rate** across runner placements (n=1 so far).
+- ~~Punch success **rate** across runner placements~~ — answered: 20/20 direct
+  (run 28702838934). Residual: rate under sustained many-stream CAS load.
 - Worker **rendezvous + liveness** — jobs start independently, must overlap in
   time and survive the whole build; a dropped worker must reschedule gracefully.
 - CAS footprint vs the 10 GB budget under a full sweep.
