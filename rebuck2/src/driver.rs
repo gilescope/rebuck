@@ -200,6 +200,14 @@ impl Driver {
         read_result
     }
 
+    pub async fn pending_jobs(&self) -> usize {
+        self.jobs.lock().await.len()
+    }
+
+    pub async fn worker_count(&self) -> usize {
+        self.workers.lock().await.len()
+    }
+
     /// Resolve a job's oneshot and drop it from the table.
     async fn complete(&self, job_id: u64, result: Result<re::ActionResult, String>) {
         if let Some(job) = self.jobs.lock().await.remove(&job_id) {

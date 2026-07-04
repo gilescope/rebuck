@@ -150,6 +150,31 @@ async fn run_driver(mut args: Args) -> Result<()> {
         })
     };
 
+    // Once-a-minute heartbeat: egress saturation and disk pressure are the
+    // driver's two failure horizons — make both visible in the job log.
+    {
+        let store = store.clone();
+        let d = d.clone();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+            let mut last_read = 0u64;
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let read = store.read_bytes.load(Relaxed);
+                println!(
+                    "[stats] store={:.2} GiB served_total={:.2} GiB serve_rate={:.1} MiB/s pending_jobs={} workers={}",
+                    gib(store.stored_bytes.load(Relaxed)),
+                    gib(read),
+                    (read - last_read) as f64 / (60.0 * 1024.0 * 1024.0),
+                    d.pending_jobs().await,
+                    d.worker_count().await,
+                );
+                last_read = read;
+            }
+        });
+    }
+
     let addr = format!("127.0.0.1:{grpc_port}").parse()?;
     println!("[driver] REAPI listening on grpc://{addr}");
     let max = 256 * 1024 * 1024; // rustc rlibs can be chunky

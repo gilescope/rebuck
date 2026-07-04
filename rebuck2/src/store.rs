@@ -28,6 +28,11 @@ static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 
 pub struct Store {
     root: PathBuf,
+    /// Bytes newly persisted to the CAS (disk-pressure signal).
+    pub stored_bytes: std::sync::atomic::AtomicU64,
+    /// Bytes read out of the CAS (egress-saturation proxy — mesh Gets and
+    /// gRPC reads all funnel through here).
+    pub read_bytes: std::sync::atomic::AtomicU64,
 }
 
 impl Store {
@@ -35,7 +40,11 @@ impl Store {
         for sub in ["cas", "ac", "tmp"] {
             std::fs::create_dir_all(root.join(sub))?;
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            stored_bytes: std::sync::atomic::AtomicU64::new(0),
+            read_bytes: std::sync::atomic::AtomicU64::new(0),
+        })
     }
 
     fn cas_path(&self, hash: &str) -> PathBuf {
@@ -57,7 +66,11 @@ impl Store {
             return Ok(Some(Vec::new()));
         }
         match tokio::fs::read(self.cas_path(&d.hash)).await {
-            Ok(b) => Ok(Some(b)),
+            Ok(b) => {
+                self.read_bytes
+                    .fetch_add(b.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                Ok(Some(b))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
@@ -96,6 +109,9 @@ impl Store {
                 if tokio::fs::metadata(&dest).await.is_err() {
                     return Err(e).context("persist blob");
                 }
+            } else {
+                self.stored_bytes
+                    .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
             }
         }
         Ok(Dig {
