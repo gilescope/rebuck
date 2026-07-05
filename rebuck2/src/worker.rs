@@ -26,6 +26,9 @@ pub struct WorkerCfg {
     pub slots: usize,
     pub scratch: std::path::PathBuf,
     pub connect_wait: Duration,
+    /// Hardlink inputs from the store into exec dirs (default). Off for
+    /// filesystems/tools where shared inodes are problematic.
+    pub hardlinks: bool,
 }
 
 pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
@@ -106,6 +109,7 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
         ep: ep.clone(),
         store: store.clone(),
         upload: !decentralized,
+        hardlinks: cfg.hardlinks,
         peers: peer_blooms.clone(),
         my_id: ep.id().to_string(),
         hits_local: std::sync::atomic::AtomicU64::new(0),
@@ -260,6 +264,9 @@ impl exec::Blobs for TrackingBlobs {
         self.stored.lock().await.push(d.hash.clone());
         Ok(d)
     }
+    async fn materialize_file(&self, d: &Dig, dest: &std::path::Path) -> Result<()> {
+        self.inner.materialize_file(d, dest).await
+    }
 }
 
 /// Blobs fetched from the driver (or, on redirect, straight from the
@@ -270,6 +277,7 @@ struct RemoteBlobs {
     store: Arc<Store>,
     /// false in decentralized mode: outputs stay local, driver gets an index.
     upload: bool,
+    hardlinks: bool,
     /// Gossiped peer holdings; consulted before asking the driver.
     peers: Arc<Mutex<HashMap<String, mesh::Bloom>>>,
     my_id: String,
@@ -347,6 +355,24 @@ impl exec::Blobs for RemoteBlobs {
             BlobResp::Missing => bail!("driver CAS missing blob {}/{}", d.hash, d.size),
             other => bail!("unexpected blob response: {other:?}"),
         }
+    }
+
+    async fn materialize_file(&self, d: &Dig, dest: &std::path::Path) -> Result<()> {
+        if !self.hardlinks {
+            let bytes = self.get(d).await?;
+            tokio::fs::write(dest, &bytes).await?;
+            return Ok(());
+        }
+        if !self.store.has(d).await {
+            // Pulls into the local store as a side effect.
+            let _ = self.get(d).await?;
+        }
+        if d.size == 0 {
+            tokio::fs::write(dest, b"").await?;
+            return Ok(());
+        }
+        self.store.link_out(d, dest).await?;
+        Ok(())
     }
 
     async fn put(&self, bytes: Vec<u8>) -> Result<Dig> {

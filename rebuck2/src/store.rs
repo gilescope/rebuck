@@ -120,6 +120,23 @@ impl Store {
         })
     }
 
+    /// Materialize a blob at `dest` by hardlink, falling back to copy when
+    /// the filesystem refuses (cross-volume, NTFS's per-file link ceiling).
+    /// Links share the inode: callers must treat materialized inputs as
+    /// immutable (REAPI semantics) — that's the whole trade.
+    pub async fn link_out(&self, d: &Dig, dest: &std::path::Path) -> Result<bool> {
+        let src = self.cas_path(&d.hash);
+        match tokio::fs::hard_link(&src, dest).await {
+            Ok(()) => Ok(true),
+            Err(_) => {
+                tokio::fs::copy(&src, dest)
+                    .await
+                    .with_context(|| format!("materialize {} -> {}", d.hash, dest.display()))?;
+                Ok(false)
+            }
+        }
+    }
+
     /// All CAS blob hashes currently on disk (for bloom gossip). Walks the
     /// two-level fan-out; ~10k entries costs single-digit ms.
     pub fn list_hashes(&self) -> Vec<String> {

@@ -29,6 +29,8 @@ pub struct DriverCfg {
     /// index and redirects fetches. Trades worker-loss resilience for
     /// driver disk/egress. See docs/re-engine-plan.md roadmap #7.
     pub decentralized: bool,
+    /// Hardlink inputs from the store in local-fallback execution.
+    pub hardlinks: bool,
     pub scratch: std::path::PathBuf,
 }
 
@@ -384,6 +386,7 @@ impl Driver {
                     let _permit = this.local_slots.acquire().await.expect("semaphore open");
                     let blobs = StoreBlobs {
                         store: this.store.clone(),
+                        hardlinks: this.cfg.hardlinks,
                     };
                     let result = exec::run_action(&blobs, &action, &this.cfg.scratch)
                         .await
@@ -516,6 +519,7 @@ impl Driver {
 /// Blobs backed directly by the driver's store (local fallback execution).
 pub struct StoreBlobs {
     pub store: Arc<Store>,
+    pub hardlinks: bool,
 }
 
 #[async_trait::async_trait]
@@ -528,6 +532,15 @@ impl exec::Blobs for StoreBlobs {
     }
     async fn put(&self, bytes: Vec<u8>) -> Result<Dig> {
         self.store.put(None, &bytes).await
+    }
+    async fn materialize_file(&self, d: &Dig, dest: &std::path::Path) -> Result<()> {
+        if !self.hardlinks || d.size == 0 {
+            let bytes = self.get(d).await?;
+            tokio::fs::write(dest, &bytes).await?;
+            return Ok(());
+        }
+        self.store.link_out(d, dest).await?;
+        Ok(())
     }
 }
 
@@ -589,6 +602,7 @@ mod tests {
                 min_workers: 0,
                 local_exec,
                 decentralized: false,
+                hardlinks: true,
                 scratch: std::env::temp_dir(),
             },
         )

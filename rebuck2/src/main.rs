@@ -25,8 +25,8 @@ use bazel_remote_apis::google::bytestream as bs;
 fn usage() -> ! {
     eprintln!(
         "usage: rebuck2 driver [--grpc-port N] [--store DIR] [--session S] \
-         [--min-workers N] [--no-local-exec] [--decentralized-cas]\n       \
-         rebuck2 worker [--store DIR] [--session S] [--slots N] [--connect-wait-secs N]"
+         [--min-workers N] [--no-local-exec] [--decentralized-cas] [--no-hardlinks]\n       \
+         rebuck2 worker [--store DIR] [--session S] [--slots N] [--connect-wait-secs N] [--no-hardlinks]"
     );
     std::process::exit(2)
 }
@@ -107,6 +107,7 @@ async fn main() -> Result<()> {
                         .map(|s| s.parse().expect("--connect-wait-secs: number"))
                         .unwrap_or(600),
                 ),
+                hardlinks: !args.flag("--no-hardlinks"),
             };
             args.done();
             std::fs::create_dir_all(&cfg.scratch)?;
@@ -136,6 +137,7 @@ async fn run_driver(mut args: Args) -> Result<()> {
             .unwrap_or(0),
         local_exec: !args.flag("--no-local-exec"),
         decentralized: args.flag("--decentralized-cas"),
+        hardlinks: !args.flag("--no-hardlinks"),
         scratch,
     };
     args.done();

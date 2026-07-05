@@ -16,6 +16,14 @@ pub trait Blobs: Send + Sync {
     async fn get(&self, d: &Dig) -> Result<Vec<u8>>;
     /// Store bytes, returning their digest.
     async fn put(&self, bytes: Vec<u8>) -> Result<Dig>;
+    /// Write blob `d` to `dest`. Default: fetch + write. Store-backed impls
+    /// override with hardlink-from-store (copy fallback) — the
+    /// write-amplification fix.
+    async fn materialize_file(&self, d: &Dig, dest: &std::path::Path) -> Result<()> {
+        let bytes = self.get(d).await?;
+        tokio::fs::write(dest, &bytes).await?;
+        Ok(())
+    }
 }
 
 pub struct Outcome {
@@ -274,9 +282,8 @@ async fn materialize(blobs: &dyn Blobs, dir_digest: &Dig, dest: &Path) -> Result
         };
         for f in &dir.files {
             let fdig: Dig = (&f.digest.clone().context("FileNode.digest")?).into();
-            let bytes = blobs.get(&fdig).await?;
             let fp = path.join(&f.name);
-            tokio::fs::write(&fp, &bytes).await?;
+            blobs.materialize_file(&fdig, &fp).await?;
             if f.is_executable {
                 set_exec(&fp).await?;
             }
