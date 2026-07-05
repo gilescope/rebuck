@@ -352,7 +352,9 @@ impl re::execution_server::Execution for Exec {
             .await
             .map_err(|e| Status::internal(format!("{e:#}")))?;
 
-        if outcome.action_result.exit_code == 0 && !outcome.do_not_cache {
+        let cacheable = !outcome.do_not_cache
+            && (outcome.action_result.exit_code == 0 || self.driver.cache_failures());
+        if cacheable {
             let _ = self
                 .driver
                 .store

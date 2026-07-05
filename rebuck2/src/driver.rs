@@ -31,6 +31,12 @@ pub struct DriverCfg {
     pub decentralized: bool,
     /// Hardlink inputs from the store in local-fallback execution.
     pub hardlinks: bool,
+    /// Cache non-zero exit codes in the AC too. A compile failure is as
+    /// deterministic as a success for a given action digest — any toolchain
+    /// or source change makes a new digest and retries for real. Kills the
+    /// re-run-every-known-failure tax on warm sweeps. Infra failures are
+    /// never cached regardless.
+    pub cache_failures: bool,
     pub scratch: std::path::PathBuf,
 }
 
@@ -287,6 +293,10 @@ impl Driver {
             self.pump().await;
         }
         read_result
+    }
+
+    pub fn cache_failures(&self) -> bool {
+        self.cfg.cache_failures
     }
 
     pub async fn pending_jobs(&self) -> usize {
@@ -628,6 +638,7 @@ mod tests {
                 local_exec,
                 decentralized: false,
                 hardlinks: true,
+                cache_failures: false,
                 scratch: std::env::temp_dir(),
             },
         )
