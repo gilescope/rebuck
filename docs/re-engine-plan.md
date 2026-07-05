@@ -120,7 +120,11 @@ restored cold, and the AC hits.
      third-party by default; spend any remaining budget on the costliest
      first-party actions. Target provenance is visible to the driver via the
      action's target label in the buck2 metadata.
-6. **Windows worker pool** — ✅ **the OOM is dead.** Full base leg
+6. **Windows worker pool** — ✅✅ **whole-tree GREEN** (run 28719654654):
+   base + conflict rigs + all four snapshots in ONE buck2 invocation,
+   8 workers, 2 h 35 m, failure diff clean. Ballast reclaim kept the
+   driver's 17.4 GiB store inside disk. Earlier milestone — **the OOM is
+   dead:** Full base leg
    (buck2-fixups PR #66): 17,296 actions executed across 4 windows workers,
    driver compile-free, no OOM, no disk death, sweep reached its
    failure-diff stage for the first time. Heavyweights that used to fail
