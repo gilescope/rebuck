@@ -162,6 +162,21 @@ restored cold, and the AC hits.
    copies. Layering: bloom (many holders, approximate) → provider index
    (exact, producer) → driver store → re-derive. Unproven at sweep scale.
 
+### Snapshot v2: sharded, content-addressed (designed, not yet built)
+
+One-big-tar snapshots (v1, shipped) update monolithically and share poorly
+across branches. v2: partition the store by digest prefix into ~32 shard
+bundles; each saved under a key derived from its own content
+(`rebuck2-shard-<nn>-<sha of member list>`), plus a tiny per-run manifest
+listing the exact shard keys. Unchanged shard => key exists => save is a
+no-op (incremental upload for free). GH cache branch scoping does the
+sharing: main's scheduled sweep is the canonical donor (branches restore
+default-branch entries), feature branches save only their dirty shards.
+The always-dirty AC rides in its own small bundle, separate from the fat
+stable CAS shards — the selection policy falling out of addressing.
+Request count is constant in store size (~32 restores), dodging both
+too-coarse (monolith) and too-fine (per-blob API storm).
+
 ### Scheduler v2 (designed, not yet built)
 
 Pull-based dispatch replaces push-and-pin: driver holds the queue; a worker
