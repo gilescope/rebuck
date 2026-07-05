@@ -25,8 +25,8 @@ use bazel_remote_apis::google::bytestream as bs;
 fn usage() -> ! {
     eprintln!(
         "usage: rebuck2 driver [--grpc-port N] [--store DIR] [--session S] \
-         [--min-workers N] [--no-local-exec] [--decentralized-cas] [--no-hardlinks]\n       \
-         rebuck2 worker [--store DIR] [--session S] [--slots N] [--connect-wait-secs N] [--no-hardlinks]"
+         [--min-workers N] [--no-local-exec] [--decentralized-cas] [--no-hardlinks] [--no-reflink]\n       \
+         rebuck2 worker [--store DIR] [--session S] [--slots N] [--connect-wait-secs N] [--no-hardlinks] [--no-reflink]"
     );
     std::process::exit(2)
 }
@@ -91,6 +91,9 @@ async fn main() -> Result<()> {
                 .map(Into::into)
                 .unwrap_or_else(|| default_store("worker"));
             let store = Arc::new(store::Store::new(store_root.clone())?);
+            if args.flag("--no-reflink") {
+                store.disable_clone();
+            }
             let cfg = worker::WorkerCfg {
                 session: args.opt("--session").unwrap_or_else(default_session),
                 slots: args
@@ -129,6 +132,9 @@ async fn run_driver(mut args: Args) -> Result<()> {
         .map(Into::into)
         .unwrap_or_else(|| default_store("driver"));
     let store = Arc::new(store::Store::new(store_root.clone())?);
+    if args.flag("--no-reflink") {
+        store.disable_clone();
+    }
     let scratch = store_root.join("exec");
     std::fs::create_dir_all(&scratch)?;
     let cfg = driver::DriverCfg {

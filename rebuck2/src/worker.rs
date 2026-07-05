@@ -399,8 +399,13 @@ impl exec::Blobs for RemoteBlobs {
             // Pulls into the local store as a side effect.
             let _ = self.get(d).await?;
         }
-        // Store perms (0o555) already carry read-only + exec.
-        self.store.link_out(d, dest).await
+        // Linked = shared 0o555 inode, exec included; Private = ours to chmod.
+        if self.store.link_out(d, dest).await? == crate::store::Materialized::Private
+            && is_executable
+        {
+            exec::set_exec(dest).await?;
+        }
+        Ok(())
     }
 
     async fn put(&self, bytes: Vec<u8>) -> Result<Dig> {

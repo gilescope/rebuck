@@ -26,8 +26,21 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// Process-wide tmp-file sequence — see the uniqueness note in [`Store::put`].
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// How a blob reached its destination — decides who owns exec-bit duty.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(target_os = "macos", allow(dead_code))] // Linked is a non-mac path
+pub enum Materialized {
+    /// Shared inode (hardlink): perms already correct, never chmod.
+    Linked,
+    /// Private inode (clone or copy): caller may chmod freely.
+    Private,
+}
+
 pub struct Store {
     root: PathBuf,
+    /// Block-clone probe: 0 unknown, 1 works, 2 refused (NTFS/ext4) or
+    /// disabled via --no-reflink. One failed ioctl per process, not per file.
+    clone_state: std::sync::atomic::AtomicU8,
     /// Bytes newly persisted to the CAS (disk-pressure signal).
     pub stored_bytes: std::sync::atomic::AtomicU64,
     /// Bytes read out of the CAS (egress-saturation proxy — mesh Gets and
@@ -42,9 +55,40 @@ impl Store {
         }
         Ok(Self {
             root,
+            clone_state: std::sync::atomic::AtomicU8::new(0),
             stored_bytes: std::sync::atomic::AtomicU64::new(0),
             read_bytes: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Force the old pre-clone behaviour (--no-reflink).
+    pub fn disable_clone(&self) {
+        self.clone_state
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// ReFS block clone / FICLONE via reflink-copy: CoW, private inode, no
+    /// link ceiling. Returns false when unsupported here (probe-once).
+    async fn try_clone(&self, src: &std::path::Path, dest: &std::path::Path) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        if cfg!(target_os = "macos") {
+            return false; // fs::copy already clones on APFS
+        }
+        let state = self.clone_state.load(Relaxed);
+        if state == 2 {
+            return false;
+        }
+        let (s, d) = (src.to_path_buf(), dest.to_path_buf());
+        let ok = tokio::task::spawn_blocking(move || reflink_copy::reflink(&s, &d).is_ok())
+            .await
+            .unwrap_or(false);
+        if ok {
+            self.clone_state.store(1, Relaxed);
+        } else if state == 0 {
+            self.clone_state.store(2, Relaxed);
+            println!("[store] block clone unsupported here — hardlink/copy chain in use");
+        }
+        ok
     }
 
     fn cas_path(&self, hash: &str) -> PathBuf {
@@ -130,23 +174,24 @@ impl Store {
         })
     }
 
-    /// Materialize a blob at `dest` for near-zero cost. macOS: CoW clone via
-    /// fs::copy (private inode). Elsewhere: hardlink — shared inode, defended
-    /// by the store's 0o555 mode on unix, convention on windows.
-    pub async fn link_out(&self, d: &Dig, dest: &std::path::Path) -> Result<()> {
+    /// Materialize a blob at `dest` for near-zero cost. Chain: block clone
+    /// (ReFS/btrfs — private inode) -> hardlink (shared inode, 0o555-defended)
+    /// -> copy on the two honest link refusals. macOS: fs::copy = APFS clone.
+    pub async fn link_out(&self, d: &Dig, dest: &std::path::Path) -> Result<Materialized> {
         let src = self.cas_path(&d.hash);
+        if self.try_clone(&src, dest).await {
+            return Ok(Materialized::Private);
+        }
         #[cfg(target_os = "macos")]
         {
-            // fs::copy is an APFS CoW clone under the hood: private inode,
-            // mutation-safe, O(1) — strictly better than a hardlink here.
             tokio::fs::copy(&src, dest)
                 .await
                 .with_context(|| format!("clone {} -> {}", d.hash, dest.display()))?;
-            Ok(())
+            Ok(Materialized::Private)
         }
         #[cfg(not(target_os = "macos"))]
         match tokio::fs::hard_link(&src, dest).await {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(Materialized::Linked),
             // The two honest refusals fall back to copy; anything else
             // surfaces rather than hiding filesystem trouble.
             Err(e)
@@ -158,22 +203,40 @@ impl Store {
                 tokio::fs::copy(&src, dest)
                     .await
                     .with_context(|| format!("materialize {} -> {}", d.hash, dest.display()))?;
-                Ok(())
+                Ok(Materialized::Private)
             }
             Err(e) => Err(e).with_context(|| format!("hardlink {} -> {}", d.hash, dest.display())),
         }
     }
 
-    /// Adopt an existing file (an action output) into the CAS by link/clone
+    /// Adopt an existing file (an action output) into the CAS by clone/link
     /// instead of rewriting its bytes — the outbound twin of `link_out`.
-    /// Unix: the source inode goes 0o555 first, so the store name is
-    /// read-only from the moment it exists.
+    /// Clone path: store gets private CoW extents, source stays writable.
+    /// Hardlink path: source inode goes 0o555 first on unix, so the store
+    /// name is read-only from the moment it exists.
     pub async fn adopt(&self, expected: &Dig, src: &std::path::Path) -> Result<()> {
         let dest = self.cas_path(&expected.hash);
         if tokio::fs::metadata(&dest).await.is_ok() {
             return Ok(());
         }
         tokio::fs::create_dir_all(dest.parent().context("cas path has parent")?).await?;
+        let tmp = self.root.join("tmp").join(format!(
+            "{}.{}.{}",
+            expected.hash,
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        if self.try_clone(src, &tmp).await {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)).await?;
+            }
+            tokio::fs::rename(&tmp, &dest).await?;
+            self.stored_bytes
+                .fetch_add(expected.size as u64, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -186,12 +249,6 @@ impl Store {
             tokio::fs::rename(&tmp, &dest).await?;
             Ok::<(), std::io::Error>(())
         };
-        let tmp = self.root.join("tmp").join(format!(
-            "{}.{}.{}",
-            expected.hash,
-            std::process::id(),
-            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
         #[cfg(target_os = "macos")]
         {
             copy_via_tmp(src.to_path_buf(), dest.clone(), tmp)

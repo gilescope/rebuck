@@ -13,6 +13,7 @@ futures = "0.3"
 iroh = "1"
 postcard = { version = "1", features = ["use-std"] }
 prost = "0.14"
+reflink-copy = "0.1.30"
 rustls = { version = "0.23", features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"

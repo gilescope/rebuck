@@ -560,7 +560,12 @@ impl exec::Blobs for StoreBlobs {
             }
             return Ok(());
         }
-        self.store.link_out(d, dest).await
+        if self.store.link_out(d, dest).await? == crate::store::Materialized::Private
+            && is_executable
+        {
+            exec::set_exec(dest).await?;
+        }
+        Ok(())
     }
 }
 
