@@ -35,7 +35,9 @@ pub struct DriverCfg {
 struct WorkerConn {
     id: u64,
     tx: mpsc::UnboundedSender<D2W>,
+    /// Jobs sent and not yet answered (running + prefetched).
     inflight: Arc<AtomicU32>,
+    slots: u32,
     #[allow(dead_code)]
     os: String,
 }
@@ -44,9 +46,12 @@ struct WorkerConn {
 struct Job {
     tx: oneshot::Sender<Result<re::ActionResult, String>>,
     action: Dig,
-    /// Current assignee (worker id; 0 = driver-local).
+    /// Current assignee (worker id; 0 = driver-local/queued).
     worker: u64,
     attempts: u32,
+    started: Option<std::time::Instant>,
+    /// Tail speculation: raced on a second worker, first result wins.
+    speculated: bool,
 }
 
 const MAX_ATTEMPTS: u32 = 3;
@@ -60,6 +65,9 @@ pub struct Driver {
     next_job: AtomicU64,
     next_worker: AtomicU64,
     local_slots: Semaphore,
+    /// Jobs awaiting assignment — workers pull via bounded outstanding
+    /// counts rather than having work pinned to them at arrival.
+    queue: Mutex<std::collections::VecDeque<u64>>,
     /// Decentralized mode: blob hash -> producing worker's endpoint id.
     providers: Mutex<HashMap<String, String>>,
     /// Bloom gossip: worker endpoint id -> summary of its store.
@@ -82,6 +90,7 @@ impl Driver {
             next_job: AtomicU64::new(1),
             next_worker: AtomicU64::new(1),
             local_slots: Semaphore::new(cores),
+            queue: Mutex::new(std::collections::VecDeque::new()),
             providers: Mutex::new(HashMap::new()),
             blooms: Mutex::new(HashMap::new()),
             mesh_ep: tokio::sync::OnceCell::new(),
@@ -149,9 +158,11 @@ impl Driver {
             id: worker_id,
             tx,
             inflight: inflight.clone(),
+            slots,
             os,
         });
         self.worker_arrived.notify_waiters();
+        self.pump().await;
 
         // writer: job dispatches -> control stream
         let writer = tokio::spawn(async move {
@@ -198,10 +209,12 @@ impl Driver {
                         let result = re::ActionResult::decode(action_result.as_slice())
                             .map_err(|e| format!("bad ActionResult from worker: {e}"));
                         self.complete(job, result).await;
+                        self.pump().await;
                     }
                     W2D::Failed { job, msg } => {
                         inflight.fetch_sub(1, Ordering::Relaxed);
                         self.complete(job, Err(msg)).await;
+                        self.pump().await;
                     }
                     W2D::Holdings { bloom } => {
                         self.blooms.lock().await.insert(endpoint.clone(), bloom);
@@ -245,9 +258,18 @@ impl Driver {
                 "[driver] requeueing {} job(s) from worker {worker_id}",
                 orphans.len()
             );
-            for id in orphans {
-                self.dispatch(id).await;
+            {
+                let mut jobs = self.jobs.lock().await;
+                let mut queue = self.queue.lock().await;
+                for id in orphans.iter().rev() {
+                    if let Some(job) = jobs.get_mut(id) {
+                        job.worker = 0;
+                        job.started = None;
+                        queue.push_front(*id);
+                    }
+                }
             }
+            self.pump().await;
         }
         read_result
     }
@@ -320,27 +342,69 @@ impl Driver {
         }
     }
 
-    /// Assign a queued job to the least-loaded worker, or the driver-local
-    /// executor when there are no workers, or fail it out of attempts/options.
-    async fn dispatch(self: &Arc<Self>, job_id: u64) {
+    /// Drain the queue into workers, pull-style: each worker holds at most
+    /// `slots + n` jobs, where n adapts to queue depth — deep queue means big
+    /// pipelines (round-trip amortisation), a draining queue tightens n to 1
+    /// so the last placements are precise. With no workers, fall back to
+    /// driver-local execution (when allowed). Idle tail capacity speculates:
+    /// the oldest running job is raced on a free worker, first result wins.
+    async fn pump(self: &Arc<Self>) {
         let workers = self.workers.lock().await;
         let mut jobs = self.jobs.lock().await;
-        let Some(job) = jobs.get_mut(&job_id) else {
-            return; // completed while we raced
-        };
-        if job.attempts >= MAX_ATTEMPTS {
-            let job = jobs.remove(&job_id).expect("just found it");
-            let _ = job
-                .tx
-                .send(Err(format!("gave up after {MAX_ATTEMPTS} attempts")));
+        let mut queue = self.queue.lock().await;
+
+        if workers.is_empty() {
+            if !self.cfg.local_exec {
+                return; // hold everything queued until a worker joins
+            }
+            while let Some(job_id) = queue.pop_front() {
+                let Some(job) = jobs.get_mut(&job_id) else {
+                    continue;
+                };
+                job.attempts += 1;
+                job.worker = 0;
+                job.started = Some(std::time::Instant::now());
+                let action = job.action.clone();
+                println!("[driver] job {job_id} -> local ({})", action.hash);
+                let this = self.clone();
+                tokio::spawn(async move {
+                    let _permit = this.local_slots.acquire().await.expect("semaphore open");
+                    let blobs = StoreBlobs {
+                        store: this.store.clone(),
+                    };
+                    let result = exec::run_action(&blobs, &action, &this.cfg.scratch)
+                        .await
+                        .map(|o| o.action_result)
+                        .map_err(|e| format!("{e:#}"));
+                    this.complete(job_id, result).await;
+                });
+            }
             return;
         }
-        job.attempts += 1;
-        if let Some(w) = workers
-            .iter()
-            .min_by_key(|w| w.inflight.load(Ordering::Relaxed))
-        {
+
+        while !queue.is_empty() {
+            let n = (queue.len() / (workers.len() * 4)).clamp(1, 16) as u32;
+            let Some(w) = workers
+                .iter()
+                .filter(|w| w.inflight.load(Ordering::Relaxed) < w.slots + n)
+                .min_by_key(|w| w.inflight.load(Ordering::Relaxed))
+            else {
+                break; // every pipeline full — completions re-pump
+            };
+            let job_id = queue.pop_front().expect("checked non-empty");
+            let Some(job) = jobs.get_mut(&job_id) else {
+                continue; // completed while queued
+            };
+            if job.attempts >= MAX_ATTEMPTS {
+                let job = jobs.remove(&job_id).expect("just found it");
+                let _ = job
+                    .tx
+                    .send(Err(format!("gave up after {MAX_ATTEMPTS} attempts")));
+                continue;
+            }
+            job.attempts += 1;
             job.worker = w.id;
+            job.started = Some(std::time::Instant::now());
             w.inflight.fetch_add(1, Ordering::Relaxed);
             println!(
                 "[driver] job {job_id} -> worker {} ({})",
@@ -351,38 +415,44 @@ impl Driver {
                     job: job_id,
                     action: job.action.clone(),
                 })
-                .is_ok()
+                .is_err()
             {
-                return;
+                // Dying worker: put the job back; its disconnect path re-pumps.
+                w.inflight.fetch_sub(1, Ordering::Relaxed);
+                job.worker = 0;
+                job.started = None;
+                queue.push_front(job_id);
+                break;
             }
-            // Channel already closed — the disconnect path will requeue us.
-            w.inflight.fetch_sub(1, Ordering::Relaxed);
-            return;
         }
-        if self.cfg.local_exec {
-            job.worker = 0;
-            let action = job.action.clone();
-            drop(jobs);
-            drop(workers);
-            println!("[driver] job {job_id} -> local ({})", action.hash);
-            let this = self.clone();
-            tokio::spawn(async move {
-                let _permit = this.local_slots.acquire().await.expect("semaphore open");
-                let blobs = StoreBlobs {
-                    store: this.store.clone(),
+
+        // Tail speculation: nothing queued, RUN capacity idle -> race stragglers.
+        if queue.is_empty() {
+            for w in workers
+                .iter()
+                .filter(|w| w.inflight.load(Ordering::Relaxed) < w.slots)
+            {
+                let Some((&job_id, job)) = jobs
+                    .iter_mut()
+                    .filter(|(_, j)| {
+                        j.started.is_some() && !j.speculated && j.worker != 0 && j.worker != w.id
+                    })
+                    .min_by_key(|(_, j)| j.started)
+                else {
+                    break;
                 };
-                let result = exec::run_action(&blobs, &action, &this.cfg.scratch)
-                    .await
-                    .map(|o| o.action_result)
-                    .map_err(|e| format!("{e:#}"));
-                this.complete(job_id, result).await;
-            });
-            return;
+                job.speculated = true;
+                w.inflight.fetch_add(1, Ordering::Relaxed);
+                println!(
+                    "[driver] job {job_id} speculated -> worker {} ({})",
+                    w.id, job.action.hash
+                );
+                let _ = w.tx.send(D2W::Run {
+                    job: job_id,
+                    action: job.action.clone(),
+                });
+            }
         }
-        let job = jobs.remove(&job_id).expect("just found it");
-        let _ = job.tx.send(Err(
-            "no workers connected and local execution disabled".into()
-        ));
     }
 
     /// Execute an action: queue it, dispatch (worker or local), await the result.
@@ -401,9 +471,12 @@ impl Driver {
                 action: action_digest.clone(),
                 worker: 0,
                 attempts: 0,
+                started: None,
+                speculated: false,
             },
         );
-        self.dispatch(job_id).await;
+        self.queue.lock().await.push_back(job_id);
+        self.pump().await;
 
         let action_result = rx
             .await
