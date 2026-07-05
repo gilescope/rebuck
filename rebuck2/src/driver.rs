@@ -55,6 +55,9 @@ struct Job {
 }
 
 const MAX_ATTEMPTS: u32 = 3;
+/// A running job must be at least this old before the tail races it on a
+/// second worker — otherwise every action in a small build runs twice.
+const SPECULATE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct Driver {
     pub store: Arc<Store>,
@@ -105,6 +108,16 @@ impl Driver {
             .bind()
             .await?;
         let _ = self.mesh_ep.set(ep.clone());
+        {
+            // Speculation needs a clock, not just completion events.
+            let this = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    this.pump().await;
+                }
+            });
+        }
         println!(
             "[driver] mesh endpoint_id={} session={} decentralized={}",
             ep.id(),
@@ -435,7 +448,10 @@ impl Driver {
                 let Some((&job_id, job)) = jobs
                     .iter_mut()
                     .filter(|(_, j)| {
-                        j.started.is_some() && !j.speculated && j.worker != 0 && j.worker != w.id
+                        j.started.is_some_and(|t| t.elapsed() >= SPECULATE_AFTER)
+                            && !j.speculated
+                            && j.worker != 0
+                            && j.worker != w.id
                     })
                     .min_by_key(|(_, j)| j.started)
                 else {
@@ -558,4 +574,103 @@ async fn serve_blob_stream(
     }
     send.finish()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_driver(local_exec: bool) -> Arc<Driver> {
+        let dir = tempfile::tempdir().unwrap().keep();
+        Driver::new(
+            Arc::new(Store::new(dir).unwrap()),
+            DriverCfg {
+                session: "test".into(),
+                min_workers: 0,
+                local_exec,
+                decentralized: false,
+                scratch: std::env::temp_dir(),
+            },
+        )
+    }
+
+    /// Fake worker: drains Runs from its channel, completes them after a
+    /// beat, and re-pumps — exactly what handle_worker's reader does.
+    async fn fake_worker(d: &Arc<Driver>, id: u64, slots: u32) -> Arc<AtomicU32> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<D2W>();
+        let inflight = Arc::new(AtomicU32::new(0));
+        let d2 = d.clone();
+        let inf = inflight.clone();
+        tokio::spawn(async move {
+            while let Some(D2W::Run { job, .. }) = rx.recv().await {
+                let d3 = d2.clone();
+                let inf = inf.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    inf.fetch_sub(1, Ordering::Relaxed);
+                    d3.complete(job, Ok(re::ActionResult::default())).await;
+                    d3.pump().await;
+                });
+            }
+        });
+        let handle = inflight.clone();
+        d.workers.lock().await.push(WorkerConn {
+            id,
+            tx,
+            inflight,
+            slots,
+            os: "test".into(),
+        });
+        handle
+    }
+
+    /// Pull-model invariant: a worker's outstanding count never exceeds
+    /// slots + max prefetch, and every job completes exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pump_bounds_outstanding_and_completes_all() {
+        let d = test_driver(false);
+        let inf1 = fake_worker(&d, 1, 2).await;
+        let inf2 = fake_worker(&d, 2, 2).await;
+
+        let watchdog = {
+            let (inf1, inf2) = (inf1.clone(), inf2.clone());
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let s2 = stop.clone();
+            let h = tokio::spawn(async move {
+                let mut max = 0;
+                while !s2.load(Ordering::Relaxed) {
+                    max = max
+                        .max(inf1.load(Ordering::Relaxed))
+                        .max(inf2.load(Ordering::Relaxed));
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                max
+            });
+            (stop, h)
+        };
+
+        let runs: Vec<_> = (0..100)
+            .map(|i| {
+                let d = d.clone();
+                tokio::spawn(async move {
+                    d.execute(&Dig {
+                        hash: format!("{i:064}"),
+                        size: 1,
+                    })
+                    .await
+                })
+            })
+            .collect();
+        for r in runs {
+            // Actions "succeed" with an empty result; do_not_cache lookup
+            // tolerates the digest being absent from the store.
+            r.await.unwrap().expect("job must complete");
+        }
+        watchdog.0.store(true, Ordering::Relaxed);
+        let max_seen = watchdog.1.await.unwrap();
+        assert!(
+            max_seen <= 2 + 16,
+            "outstanding exceeded slots+max_prefetch: {max_seen}"
+        );
+    }
 }
