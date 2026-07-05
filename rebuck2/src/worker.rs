@@ -108,7 +108,35 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
         upload: !decentralized,
         peers: peer_blooms.clone(),
         my_id: ep.id().to_string(),
+        hits_local: std::sync::atomic::AtomicU64::new(0),
+        hits_peer: std::sync::atomic::AtomicU64::new(0),
+        hits_driver: std::sync::atomic::AtomicU64::new(0),
     });
+
+    // Fetch-source stats: one line a minute (when changed) makes peer-serving
+    // measurable rather than a matter of faith.
+    {
+        let blobs = blobs.clone();
+        tokio::spawn(async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            let mut last = (0, 0, 0);
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let now = (
+                    blobs.hits_local.load(Relaxed),
+                    blobs.hits_peer.load(Relaxed),
+                    blobs.hits_driver.load(Relaxed),
+                );
+                if now != last {
+                    println!(
+                        "[cas] fetches: local={} peer={} driver={}",
+                        now.0, now.1, now.2
+                    );
+                    last = now;
+                }
+            }
+        });
+    }
 
     // Bloom gossip: advertise what this store holds, every 30s when changed.
     // Peers use it to fetch hot blobs from caches instead of one producer.
@@ -245,6 +273,10 @@ struct RemoteBlobs {
     /// Gossiped peer holdings; consulted before asking the driver.
     peers: Arc<Mutex<HashMap<String, mesh::Bloom>>>,
     my_id: String,
+    /// Where fetches were satisfied — settles "did peers actually serve?".
+    hits_local: std::sync::atomic::AtomicU64,
+    hits_peer: std::sync::atomic::AtomicU64,
+    hits_driver: std::sync::atomic::AtomicU64,
 }
 
 impl RemoteBlobs {
@@ -269,7 +301,9 @@ impl RemoteBlobs {
 #[async_trait::async_trait]
 impl exec::Blobs for RemoteBlobs {
     async fn get(&self, d: &Dig) -> Result<Vec<u8>> {
+        use std::sync::atomic::Ordering::Relaxed;
         if let Some(bytes) = self.store.get(d).await? {
+            self.hits_local.fetch_add(1, Relaxed);
             return Ok(bytes);
         }
         // Bloom-first: any peer cache claiming the blob beats a driver hop.
@@ -286,6 +320,7 @@ impl exec::Blobs for RemoteBlobs {
         if !candidates.is_empty() {
             let pick = usize::from_str_radix(&d.hash[..4], 16).unwrap_or(0) % candidates.len();
             if let Ok(bytes) = self.fetch_from(&candidates[pick], d).await {
+                self.hits_peer.fetch_add(1, Relaxed);
                 self.store.put(Some(d), &bytes).await?;
                 return Ok(bytes);
             }
@@ -299,11 +334,13 @@ impl exec::Blobs for RemoteBlobs {
         match resp {
             BlobResp::Found { size } => {
                 let bytes = mesh::recv_raw(&mut recv, size).await?;
+                self.hits_driver.fetch_add(1, Relaxed);
                 self.store.put(Some(d), &bytes).await?;
                 Ok(bytes)
             }
             BlobResp::Provider { endpoint } => {
                 let bytes = self.fetch_from(&endpoint, d).await?;
+                self.hits_peer.fetch_add(1, Relaxed);
                 self.store.put(Some(d), &bytes).await?;
                 Ok(bytes)
             }
