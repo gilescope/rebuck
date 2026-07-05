@@ -162,6 +162,21 @@ restored cold, and the AC hits.
    copies. Layering: bloom (many holders, approximate) → provider index
    (exact, producer) → driver store → re-derive. Unproven at sweep scale.
 
+### Scheduler v2 (designed, not yet built)
+
+Pull-based dispatch replaces push-and-pin: driver holds the queue; a worker
+runs `slots` actions and prefetches `n` more, where the DRIVER sets `n`
+adaptively — large while the queue is deep (round-trip amortisation, any
+imbalance self-corrects), decaying to 1 as it drains (placement precision
+exactly when it matters). ~`n = clamp(queue / (workers*4), 1, 16)`,
+recomputed per reply; later weighted by measured per-worker drain rate.
+Garnishes: tail speculation (duplicate the last `< workers` stragglers,
+first result wins) and longest-processing-time-first ordering from the
+per-action duration history. Also: efficiency ledger from the 2h35m
+whole-tree run — (1) wire GH-cache warm seed into sweep-re (weekly sweeps
+should rebuild only what changed), (2) hardlink materialisation instead of
+copying input trees per action, (3) driver runs a --slots 2 worker.
+
 ## Open questions / risks
 
 - ~~Punch success **rate** across runner placements~~ — answered: 20/20 direct
