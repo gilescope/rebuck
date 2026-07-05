@@ -83,6 +83,12 @@ pub struct Driver {
     providers: Mutex<HashMap<String, String>>,
     /// Bloom gossip: worker endpoint id -> summary of its store.
     blooms: Mutex<HashMap<String, mesh::Bloom>>,
+    /// Cache outcome accounting for the stats heartbeat: AC hits that were
+    /// successes, AC hits that were cached failures, and executions forced
+    /// by do_not_cache actions (the prelude's diag wrappers).
+    pub ac_hit_ok: AtomicU64,
+    pub ac_hit_fail: AtomicU64,
+    pub dnc_exec: AtomicU64,
     /// Mesh endpoint, for read-through fetches from providers.
     mesh_ep: tokio::sync::OnceCell<Endpoint>,
 }
@@ -104,6 +110,9 @@ impl Driver {
             queue: Mutex::new(std::collections::VecDeque::new()),
             providers: Mutex::new(HashMap::new()),
             blooms: Mutex::new(HashMap::new()),
+            ac_hit_ok: AtomicU64::new(0),
+            ac_hit_fail: AtomicU64::new(0),
+            dnc_exec: AtomicU64::new(0),
             mesh_ep: tokio::sync::OnceCell::new(),
         })
     }

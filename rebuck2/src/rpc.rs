@@ -341,6 +341,12 @@ impl re::execution_server::Execution for Exec {
         if !r.skip_cache_lookup {
             if let Some(bytes) = self.driver.store.ac_get(&d.hash).await {
                 if let Ok(result) = re::ActionResult::decode(bytes.as_slice()) {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    if result.exit_code == 0 {
+                        self.driver.ac_hit_ok.fetch_add(1, Relaxed);
+                    } else {
+                        self.driver.ac_hit_fail.fetch_add(1, Relaxed);
+                    }
                     return Ok(op_stream(&d, result, true));
                 }
             }
@@ -352,6 +358,11 @@ impl re::execution_server::Execution for Exec {
             .await
             .map_err(|e| Status::internal(format!("{e:#}")))?;
 
+        if outcome.do_not_cache {
+            self.driver
+                .dnc_exec
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let cacheable = !outcome.do_not_cache
             && (outcome.action_result.exit_code == 0 || self.driver.cache_failures());
         if cacheable {

@@ -175,12 +175,15 @@ async fn run_driver(mut args: Args) -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 let read = store.read_bytes.load(Relaxed);
                 println!(
-                    "[stats] store={:.2} GiB served_total={:.2} GiB serve_rate={:.1} MiB/s pending_jobs={} workers={}",
+                    "[stats] store={:.2} GiB served_total={:.2} GiB serve_rate={:.1} MiB/s pending_jobs={} workers={} ac_ok={} ac_fail={} dnc_exec={}",
                     gib(store.stored_bytes.load(Relaxed)),
                     gib(read),
                     (read - last_read) as f64 / (60.0 * 1024.0 * 1024.0),
                     d.pending_jobs().await,
                     d.worker_count().await,
+                    d.ac_hit_ok.load(Relaxed),
+                    d.ac_hit_fail.load(Relaxed),
+                    d.dnc_exec.load(Relaxed),
                 );
                 last_read = read;
             }
