@@ -16,12 +16,21 @@ pub trait Blobs: Send + Sync {
     async fn get(&self, d: &Dig) -> Result<Vec<u8>>;
     /// Store bytes, returning their digest.
     async fn put(&self, bytes: Vec<u8>) -> Result<Dig>;
-    /// Write blob `d` to `dest`. Default: fetch + write. Store-backed impls
-    /// override with hardlink-from-store (copy fallback) — the
-    /// write-amplification fix.
-    async fn materialize_file(&self, d: &Dig, dest: &std::path::Path) -> Result<()> {
+    /// Write blob `d` to `dest`. Default: fetch + write (+exec bit). Store-
+    /// backed impls override with link/clone-from-store — the write-
+    /// amplification fix — where store perms (0o555) already cover exec, and
+    /// chmod on a shared inode would be a cross-action mutation.
+    async fn materialize_file(
+        &self,
+        d: &Dig,
+        dest: &std::path::Path,
+        is_executable: bool,
+    ) -> Result<()> {
         let bytes = self.get(d).await?;
         tokio::fs::write(dest, &bytes).await?;
+        if is_executable {
+            set_exec(dest).await?;
+        }
         Ok(())
     }
 }
@@ -283,10 +292,7 @@ async fn materialize(blobs: &dyn Blobs, dir_digest: &Dig, dest: &Path) -> Result
         for f in &dir.files {
             let fdig: Dig = (&f.digest.clone().context("FileNode.digest")?).into();
             let fp = path.join(&f.name);
-            blobs.materialize_file(&fdig, &fp).await?;
-            if f.is_executable {
-                set_exec(&fp).await?;
-            }
+            blobs.materialize_file(&fdig, &fp, f.is_executable).await?;
         }
         for s in &dir.symlinks {
             symlinks.push((path.join(&s.name), s.target.clone()));
@@ -404,13 +410,13 @@ fn is_exec(_meta: &std::fs::Metadata) -> bool {
 }
 
 #[cfg(unix)]
-async fn set_exec(p: &Path) -> Result<()> {
+pub(crate) async fn set_exec(p: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     tokio::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).await?;
     Ok(())
 }
 
 #[cfg(not(unix))]
-async fn set_exec(_p: &Path) -> Result<()> {
+pub(crate) async fn set_exec(_p: &Path) -> Result<()> {
     Ok(())
 }

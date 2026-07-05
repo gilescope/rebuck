@@ -533,14 +533,21 @@ impl exec::Blobs for StoreBlobs {
     async fn put(&self, bytes: Vec<u8>) -> Result<Dig> {
         self.store.put(None, &bytes).await
     }
-    async fn materialize_file(&self, d: &Dig, dest: &std::path::Path) -> Result<()> {
+    async fn materialize_file(
+        &self,
+        d: &Dig,
+        dest: &std::path::Path,
+        is_executable: bool,
+    ) -> Result<()> {
         if !self.hardlinks || d.size == 0 {
             let bytes = self.get(d).await?;
             tokio::fs::write(dest, &bytes).await?;
+            if is_executable {
+                exec::set_exec(dest).await?;
+            }
             return Ok(());
         }
-        self.store.link_out(d, dest).await?;
-        Ok(())
+        self.store.link_out(d, dest).await
     }
 }
 

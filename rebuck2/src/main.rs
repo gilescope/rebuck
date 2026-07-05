@@ -86,11 +86,11 @@ async fn main() -> Result<()> {
     match role.as_str() {
         "driver" => run_driver(args).await,
         "worker" => {
-            let store = Arc::new(store::Store::new(
-                args.opt("--store")
-                    .map(Into::into)
-                    .unwrap_or_else(|| default_store("worker")),
-            )?);
+            let store_root: std::path::PathBuf = args
+                .opt("--store")
+                .map(Into::into)
+                .unwrap_or_else(|| default_store("worker"));
+            let store = Arc::new(store::Store::new(store_root.clone())?);
             let cfg = worker::WorkerCfg {
                 session: args.opt("--session").unwrap_or_else(default_session),
                 slots: args
@@ -101,7 +101,9 @@ async fn main() -> Result<()> {
                             .map(|n| n.get())
                             .unwrap_or(2)
                     }),
-                scratch: std::env::temp_dir().join("rebuck2-exec"),
+                // Same volume as the store — hardlinks die of EXDEV when
+                // /tmp is tmpfs (ubuntu >= 24.10).
+                scratch: store_root.join("exec"),
                 connect_wait: Duration::from_secs(
                     args.opt("--connect-wait-secs")
                         .map(|s| s.parse().expect("--connect-wait-secs: number"))
@@ -122,12 +124,12 @@ async fn run_driver(mut args: Args) -> Result<()> {
         .opt("--grpc-port")
         .map(|s| s.parse().expect("--grpc-port: port"))
         .unwrap_or(9092);
-    let store = Arc::new(store::Store::new(
-        args.opt("--store")
-            .map(Into::into)
-            .unwrap_or_else(|| default_store("driver")),
-    )?);
-    let scratch = std::env::temp_dir().join("rebuck2-exec");
+    let store_root: std::path::PathBuf = args
+        .opt("--store")
+        .map(Into::into)
+        .unwrap_or_else(|| default_store("driver"));
+    let store = Arc::new(store::Store::new(store_root.clone())?);
+    let scratch = store_root.join("exec");
     std::fs::create_dir_all(&scratch)?;
     let cfg = driver::DriverCfg {
         session: args.opt("--session").unwrap_or_else(default_session),

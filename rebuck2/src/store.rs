@@ -102,6 +102,16 @@ impl Store {
                 TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             tokio::fs::write(&tmp, bytes).await?;
+            // Unix blobs are 0o555 from first visibility: no write bit means a
+            // careless action writing through a hardlinked input gets EACCES
+            // instead of silently poisoning the CAS; the exec bit is global
+            // because REAPI exec-ness is per-reference, and a spurious +x on
+            // an input is benign where a chmod on a shared inode is not.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)).await?;
+            }
             if let Err(e) = tokio::fs::rename(&tmp, &dest).await {
                 // A concurrent identical put may have won the rename; content
                 // is identical by construction, so losing is fine.
@@ -120,20 +130,37 @@ impl Store {
         })
     }
 
-    /// Materialize a blob at `dest` by hardlink, falling back to copy when
-    /// the filesystem refuses (cross-volume, NTFS's per-file link ceiling).
-    /// Links share the inode: callers must treat materialized inputs as
-    /// immutable (REAPI semantics) — that's the whole trade.
-    pub async fn link_out(&self, d: &Dig, dest: &std::path::Path) -> Result<bool> {
+    /// Materialize a blob at `dest` for near-zero cost. macOS: CoW clone via
+    /// fs::copy (private inode). Elsewhere: hardlink — shared inode, defended
+    /// by the store's 0o555 mode on unix, convention on windows.
+    pub async fn link_out(&self, d: &Dig, dest: &std::path::Path) -> Result<()> {
         let src = self.cas_path(&d.hash);
+        #[cfg(target_os = "macos")]
+        {
+            // fs::copy is an APFS CoW clone under the hood: private inode,
+            // mutation-safe, O(1) — strictly better than a hardlink here.
+            tokio::fs::copy(&src, dest)
+                .await
+                .with_context(|| format!("clone {} -> {}", d.hash, dest.display()))?;
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
         match tokio::fs::hard_link(&src, dest).await {
-            Ok(()) => Ok(true),
-            Err(_) => {
+            Ok(()) => Ok(()),
+            // The two honest refusals fall back to copy; anything else
+            // surfaces rather than hiding filesystem trouble.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TooManyLinks | std::io::ErrorKind::CrossesDevices
+                ) =>
+            {
                 tokio::fs::copy(&src, dest)
                     .await
                     .with_context(|| format!("materialize {} -> {}", d.hash, dest.display()))?;
-                Ok(false)
+                Ok(())
             }
+            Err(e) => Err(e).with_context(|| format!("hardlink {} -> {}", d.hash, dest.display())),
         }
     }
 

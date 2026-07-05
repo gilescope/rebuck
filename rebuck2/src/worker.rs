@@ -264,8 +264,13 @@ impl exec::Blobs for TrackingBlobs {
         self.stored.lock().await.push(d.hash.clone());
         Ok(d)
     }
-    async fn materialize_file(&self, d: &Dig, dest: &std::path::Path) -> Result<()> {
-        self.inner.materialize_file(d, dest).await
+    async fn materialize_file(
+        &self,
+        d: &Dig,
+        dest: &std::path::Path,
+        is_executable: bool,
+    ) -> Result<()> {
+        self.inner.materialize_file(d, dest, is_executable).await
     }
 }
 
@@ -357,22 +362,26 @@ impl exec::Blobs for RemoteBlobs {
         }
     }
 
-    async fn materialize_file(&self, d: &Dig, dest: &std::path::Path) -> Result<()> {
-        if !self.hardlinks {
+    async fn materialize_file(
+        &self,
+        d: &Dig,
+        dest: &std::path::Path,
+        is_executable: bool,
+    ) -> Result<()> {
+        if !self.hardlinks || d.size == 0 {
             let bytes = self.get(d).await?;
             tokio::fs::write(dest, &bytes).await?;
+            if is_executable {
+                exec::set_exec(dest).await?;
+            }
             return Ok(());
         }
         if !self.store.has(d).await {
             // Pulls into the local store as a side effect.
             let _ = self.get(d).await?;
         }
-        if d.size == 0 {
-            tokio::fs::write(dest, b"").await?;
-            return Ok(());
-        }
-        self.store.link_out(d, dest).await?;
-        Ok(())
+        // Store perms (0o555) already carry read-only + exec.
+        self.store.link_out(d, dest).await
     }
 
     async fn put(&self, bytes: Vec<u8>) -> Result<Dig> {
