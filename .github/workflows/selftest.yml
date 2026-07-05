@@ -29,7 +29,7 @@ jobs:
       - uses: ./
         with:
           buck-root: test
-          cache-key-prefix: rebuck-selftest
+          cache-key-prefix: rebuck-selftest-${{ github.run_id }}
       - name: cold build (populate)
         working-directory: test
         run: buck2 build //... 2>&1 | tee build.log
@@ -53,7 +53,7 @@ jobs:
       - uses: ./
         with:
           buck-root: test
-          cache-key-prefix: rebuck-selftest
+          cache-key-prefix: rebuck-selftest-${{ github.run_id }}
       - name: warm build (from restored cache)
         working-directory: test
         run: buck2 build //... 2>&1 | tee build.log
