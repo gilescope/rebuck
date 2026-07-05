@@ -272,6 +272,11 @@ impl exec::Blobs for TrackingBlobs {
     ) -> Result<()> {
         self.inner.materialize_file(d, dest, is_executable).await
     }
+    async fn put_file(&self, path: &std::path::Path) -> Result<Dig> {
+        let d = self.inner.put_file(path).await?;
+        self.stored.lock().await.push(d.hash.clone());
+        Ok(d)
+    }
 }
 
 /// Blobs fetched from the driver (or, on redirect, straight from the
@@ -293,6 +298,20 @@ struct RemoteBlobs {
 }
 
 impl RemoteBlobs {
+    async fn upload_bytes(&self, d: &Dig, bytes: &[u8]) -> Result<()> {
+        let (mut send, mut recv) = self.conn.open_bi().await?;
+        mesh::send_frame(&mut send, &BlobReq::Put(d.clone())).await?;
+        send.write_all(bytes).await?;
+        send.finish()?;
+        let resp: BlobResp = mesh::recv_frame(&mut recv)
+            .await?
+            .context("driver closed blob stream")?;
+        match resp {
+            BlobResp::PutOk => Ok(()),
+            other => bail!("blob put rejected: {other:?}"),
+        }
+    }
+
     async fn fetch_from(&self, endpoint: &str, d: &Dig) -> Result<Vec<u8>> {
         let id: iroh::EndpointId = endpoint.parse().map_err(|_| {
             anyhow::anyhow!("bad provider endpoint {endpoint:?} for blob {}", d.hash)
@@ -386,19 +405,26 @@ impl exec::Blobs for RemoteBlobs {
 
     async fn put(&self, bytes: Vec<u8>) -> Result<Dig> {
         let d = self.store.put(None, &bytes).await?;
-        if !self.upload {
-            return Ok(d);
+        if self.upload {
+            self.upload_bytes(&d, &bytes).await?;
         }
-        let (mut send, mut recv) = self.conn.open_bi().await?;
-        mesh::send_frame(&mut send, &BlobReq::Put(d.clone())).await?;
-        send.write_all(&bytes).await?;
-        send.finish()?;
-        let resp: BlobResp = mesh::recv_frame(&mut recv)
-            .await?
-            .context("driver closed blob stream")?;
-        match resp {
-            BlobResp::PutOk => Ok(d),
-            other => bail!("blob put rejected: {other:?}"),
+        Ok(d)
+    }
+
+    async fn put_file(&self, path: &std::path::Path) -> Result<Dig> {
+        let bytes = tokio::fs::read(path).await?;
+        let d = Dig {
+            hash: crate::store::sha256_hex(&bytes),
+            size: bytes.len() as i64,
+        };
+        if self.hardlinks {
+            self.store.adopt(&d, path).await?;
+        } else {
+            self.store.put(Some(&d), &bytes).await?;
         }
+        if self.upload {
+            self.upload_bytes(&d, &bytes).await?;
+        }
+        Ok(d)
     }
 }

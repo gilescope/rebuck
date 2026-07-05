@@ -164,6 +164,63 @@ impl Store {
         }
     }
 
+    /// Adopt an existing file (an action output) into the CAS by link/clone
+    /// instead of rewriting its bytes — the outbound twin of `link_out`.
+    /// Unix: the source inode goes 0o555 first, so the store name is
+    /// read-only from the moment it exists.
+    pub async fn adopt(&self, expected: &Dig, src: &std::path::Path) -> Result<()> {
+        let dest = self.cas_path(&expected.hash);
+        if tokio::fs::metadata(&dest).await.is_ok() {
+            return Ok(());
+        }
+        tokio::fs::create_dir_all(dest.parent().context("cas path has parent")?).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(src, std::fs::Permissions::from_mode(0o555)).await?;
+        }
+        let copy_via_tmp = |src: std::path::PathBuf,
+                            dest: std::path::PathBuf,
+                            tmp: std::path::PathBuf| async move {
+            tokio::fs::copy(&src, &tmp).await?;
+            tokio::fs::rename(&tmp, &dest).await?;
+            Ok::<(), std::io::Error>(())
+        };
+        let tmp = self.root.join("tmp").join(format!(
+            "{}.{}.{}",
+            expected.hash,
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        #[cfg(target_os = "macos")]
+        {
+            copy_via_tmp(src.to_path_buf(), dest.clone(), tmp)
+                .await
+                .with_context(|| format!("adopt-clone {}", expected.hash))?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        match tokio::fs::hard_link(src, &dest).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TooManyLinks | std::io::ErrorKind::CrossesDevices
+                ) =>
+            {
+                copy_via_tmp(src.to_path_buf(), dest.clone(), tmp)
+                    .await
+                    .with_context(|| format!("adopt-copy {}", expected.hash))?;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("adopt-link {}", expected.hash));
+            }
+        }
+        self.stored_bytes
+            .fetch_add(expected.size as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     /// All CAS blob hashes currently on disk (for bloom gossip). Walks the
     /// two-level fan-out; ~10k entries costs single-digit ms.
     pub fn list_hashes(&self) -> Vec<String> {

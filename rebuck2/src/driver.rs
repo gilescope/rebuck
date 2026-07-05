@@ -533,6 +533,19 @@ impl exec::Blobs for StoreBlobs {
     async fn put(&self, bytes: Vec<u8>) -> Result<Dig> {
         self.store.put(None, &bytes).await
     }
+    async fn put_file(&self, path: &std::path::Path) -> Result<Dig> {
+        let bytes = tokio::fs::read(path).await?;
+        let d = Dig {
+            hash: crate::store::sha256_hex(&bytes),
+            size: bytes.len() as i64,
+        };
+        if self.hardlinks {
+            self.store.adopt(&d, path).await?;
+        } else {
+            self.store.put(Some(&d), &bytes).await?;
+        }
+        Ok(d)
+    }
     async fn materialize_file(
         &self,
         d: &Dig,

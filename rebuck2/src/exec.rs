@@ -16,6 +16,14 @@ pub trait Blobs: Send + Sync {
     async fn get(&self, d: &Dig) -> Result<Vec<u8>>;
     /// Store bytes, returning their digest.
     async fn put(&self, bytes: Vec<u8>) -> Result<Dig>;
+    /// Ingest an output file, returning its digest. Default: read + put.
+    /// Store-backed impls adopt the file into the CAS by link/clone instead
+    /// of rewriting it (same --no-hardlinks opt-out as materialization).
+    async fn put_file(&self, path: &std::path::Path) -> Result<Dig> {
+        let bytes = tokio::fs::read(path).await?;
+        self.put(bytes).await
+    }
+
     /// Write blob `d` to `dest`. Default: fetch + write (+exec bit). Store-
     /// backed impls override with link/clone-from-store — the write-
     /// amplification fix — where store perms (0o555) already cover exec, and
@@ -248,9 +256,9 @@ pub async fn run_action(blobs: &dyn Blobs, action_digest: &Dig, scratch: &Path) 
                 root_directory_digest: None,
             });
         } else {
-            let bytes = tokio::fs::read(&abs).await?;
+            // Exec bit read BEFORE adoption chmods the inode to 0o555.
             let is_executable = is_exec(&meta);
-            let digest = blobs.put(bytes).await?;
+            let digest = blobs.put_file(&abs).await?;
             result.output_files.push(re::OutputFile {
                 path: p.clone(),
                 digest: Some(digest.to_proto()),
