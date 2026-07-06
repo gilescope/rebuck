@@ -367,6 +367,27 @@ impl Driver {
         self.jobs.lock().await.len()
     }
 
+    /// Per-platform queued-work summary for the stats heartbeat, e.g.
+    /// "windows/x86_64:12 macos/aarch64:340" ("-" when nothing queued).
+    pub async fn queue_summary(&self) -> String {
+        let queue = self.queue.lock().await;
+        let mut parts: Vec<String> = queue
+            .iter()
+            .filter(|(_, q)| !q.is_empty())
+            .map(|(k, q)| {
+                let os = if k.os.is_empty() { "*" } else { &k.os };
+                let arch = if k.arch.is_empty() { "*" } else { &k.arch };
+                format!("{os}/{arch}:{}", q.len())
+            })
+            .collect();
+        parts.sort();
+        if parts.is_empty() {
+            "-".to_owned()
+        } else {
+            parts.join(" ")
+        }
+    }
+
     /// Blob presence, counting provider-indexed blobs as present.
     pub async fn has_blob(&self, d: &Dig) -> bool {
         if self.store.has(d).await {
