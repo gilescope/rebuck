@@ -46,14 +46,68 @@ struct WorkerConn {
     /// Jobs sent and not yet answered (running + prefetched).
     inflight: Arc<AtomicU32>,
     slots: u32,
-    #[allow(dead_code)]
     os: String,
+    arch: String,
+}
+
+/// What platform an action demands, from its REAPI platform properties.
+/// Empty string = no constraint on that axis (matches any worker).
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
+pub struct PlatKey {
+    pub os: String,
+    pub arch: String,
+}
+
+impl PlatKey {
+    fn admits(&self, os: &str, arch: &str) -> bool {
+        (self.os.is_empty() || self.os == os) && (self.arch.is_empty() || self.arch == arch)
+    }
+
+    /// Queue keys a worker may pull from, most specific first.
+    fn pull_order(os: &str, arch: &str) -> [PlatKey; 4] {
+        [
+            PlatKey {
+                os: os.into(),
+                arch: arch.into(),
+            },
+            PlatKey {
+                os: os.into(),
+                arch: String::new(),
+            },
+            PlatKey {
+                os: String::new(),
+                arch: arch.into(),
+            },
+            PlatKey::default(),
+        ]
+    }
+
+    /// Parse from REAPI platform properties (Command.platform /
+    /// Action.platform). Recognised keys (case-insensitive): OSFamily/os,
+    /// Arch/arch. Values are matched verbatim against the worker's
+    /// std::env::consts OS/ARCH strings ("windows"/"linux"/"macos",
+    /// "x86_64"/"aarch64").
+    fn from_properties(platform: Option<&re::Platform>) -> PlatKey {
+        let mut key = PlatKey::default();
+        if let Some(p) = platform {
+            for prop in &p.properties {
+                match prop.name.to_ascii_lowercase().as_str() {
+                    "osfamily" | "os" => key.os = prop.value.to_ascii_lowercase(),
+                    "arch" | "architecture" => key.arch = prop.value.to_ascii_lowercase(),
+                    _ => {}
+                }
+            }
+        }
+        key
+    }
 }
 
 /// An action in flight: who to answer, what to run, where it's running.
 struct Job {
     tx: oneshot::Sender<Result<re::ActionResult, String>>,
     action: Dig,
+    /// Platform this action demands (empty axes = any).
+    plat: PlatKey,
     /// Current assignee (worker id; 0 = driver-local/queued).
     worker: u64,
     attempts: u32,
@@ -76,9 +130,9 @@ pub struct Driver {
     next_job: AtomicU64,
     next_worker: AtomicU64,
     local_slots: Semaphore,
-    /// Jobs awaiting assignment — workers pull via bounded outstanding
-    /// counts rather than having work pinned to them at arrival.
-    queue: Mutex<std::collections::VecDeque<u64>>,
+    /// Jobs awaiting assignment, bucketed by demanded platform — workers
+    /// pull from their matching buckets via bounded outstanding counts.
+    queue: Mutex<HashMap<PlatKey, std::collections::VecDeque<u64>>>,
     /// Decentralized mode: blob hash -> producing worker's endpoint id.
     providers: Mutex<HashMap<String, String>>,
     /// Bloom gossip: worker endpoint id -> summary of its store.
@@ -107,7 +161,7 @@ impl Driver {
             next_job: AtomicU64::new(1),
             next_worker: AtomicU64::new(1),
             local_slots: Semaphore::new(cores),
-            queue: Mutex::new(std::collections::VecDeque::new()),
+            queue: Mutex::new(HashMap::new()),
             providers: Mutex::new(HashMap::new()),
             blooms: Mutex::new(HashMap::new()),
             ac_hit_ok: AtomicU64::new(0),
@@ -190,6 +244,7 @@ impl Driver {
             inflight: inflight.clone(),
             slots,
             os,
+            arch,
         });
         self.worker_arrived.notify_waiters();
         self.pump().await;
@@ -295,7 +350,7 @@ impl Driver {
                     if let Some(job) = jobs.get_mut(id) {
                         job.worker = 0;
                         job.started = None;
-                        queue.push_front(*id);
+                        queue.entry(job.plat.clone()).or_default().push_front(*id);
                     }
                 }
             }
@@ -386,12 +441,20 @@ impl Driver {
         let workers = self.workers.lock().await;
         let mut jobs = self.jobs.lock().await;
         let mut queue = self.queue.lock().await;
+        let host_os = std::env::consts::OS;
+        let host_arch = std::env::consts::ARCH;
 
         if workers.is_empty() {
             if !self.cfg.local_exec {
                 return; // hold everything queued until a worker joins
             }
-            while let Some(job_id) = queue.pop_front() {
+            // Local fallback can only run host-compatible actions.
+            let local_ids: Vec<u64> = PlatKey::pull_order(host_os, host_arch)
+                .into_iter()
+                .filter_map(|k| queue.remove(&k))
+                .flatten()
+                .collect();
+            for job_id in local_ids {
                 let Some(job) = jobs.get_mut(&job_id) else {
                     continue;
                 };
@@ -417,52 +480,67 @@ impl Driver {
             return;
         }
 
-        while !queue.is_empty() {
-            let n = (queue.len() / (workers.len() * 4)).clamp(1, 16) as u32;
-            let Some(w) = workers
-                .iter()
-                .filter(|w| w.inflight.load(Ordering::Relaxed) < w.slots + n)
-                .min_by_key(|w| w.inflight.load(Ordering::Relaxed))
-            else {
-                break; // every pipeline full — completions re-pump
-            };
-            let job_id = queue.pop_front().expect("checked non-empty");
-            let Some(job) = jobs.get_mut(&job_id) else {
-                continue; // completed while queued
-            };
-            if job.attempts >= MAX_ATTEMPTS {
-                let job = jobs.remove(&job_id).expect("just found it");
-                let _ = job
-                    .tx
-                    .send(Err(format!("gave up after {MAX_ATTEMPTS} attempts")));
-                continue;
+        let total_pending: usize = queue.values().map(|q| q.len()).sum();
+        let n = (total_pending / (workers.len().max(1) * 4)).clamp(1, 16) as u32;
+        // Each worker drains its matching buckets (most specific first)
+        // while it has pipeline headroom. Per-platform buckets mean a full
+        // windows pool never blocks an idle mac pool.
+        loop {
+            let mut assigned_any = false;
+            for w in workers.iter() {
+                while w.inflight.load(Ordering::Relaxed) < w.slots + n {
+                    let Some(job_id) = PlatKey::pull_order(&w.os, &w.arch)
+                        .into_iter()
+                        .find_map(|k| queue.get_mut(&k).and_then(|q| q.pop_front()))
+                    else {
+                        break; // nothing this worker can run
+                    };
+                    let Some(job) = jobs.get_mut(&job_id) else {
+                        continue; // completed while queued
+                    };
+                    if job.attempts >= MAX_ATTEMPTS {
+                        let job = jobs.remove(&job_id).expect("just found it");
+                        let _ = job
+                            .tx
+                            .send(Err(format!("gave up after {MAX_ATTEMPTS} attempts")));
+                        continue;
+                    }
+                    job.attempts += 1;
+                    job.worker = w.id;
+                    job.started = Some(std::time::Instant::now());
+                    w.inflight.fetch_add(1, Ordering::Relaxed);
+                    println!(
+                        "[driver] job {job_id} -> worker {} ({})",
+                        w.id, job.action.hash
+                    );
+                    if w.tx
+                        .send(D2W::Run {
+                            job: job_id,
+                            action: job.action.clone(),
+                        })
+                        .is_err()
+                    {
+                        // Dying worker: put the job back; its disconnect
+                        // path re-pumps.
+                        w.inflight.fetch_sub(1, Ordering::Relaxed);
+                        job.worker = 0;
+                        job.started = None;
+                        queue
+                            .entry(job.plat.clone())
+                            .or_default()
+                            .push_front(job_id);
+                        break;
+                    }
+                    assigned_any = true;
+                }
             }
-            job.attempts += 1;
-            job.worker = w.id;
-            job.started = Some(std::time::Instant::now());
-            w.inflight.fetch_add(1, Ordering::Relaxed);
-            println!(
-                "[driver] job {job_id} -> worker {} ({})",
-                w.id, job.action.hash
-            );
-            if w.tx
-                .send(D2W::Run {
-                    job: job_id,
-                    action: job.action.clone(),
-                })
-                .is_err()
-            {
-                // Dying worker: put the job back; its disconnect path re-pumps.
-                w.inflight.fetch_sub(1, Ordering::Relaxed);
-                job.worker = 0;
-                job.started = None;
-                queue.push_front(job_id);
+            if !assigned_any {
                 break;
             }
         }
 
         // Tail speculation: nothing queued, RUN capacity idle -> race stragglers.
-        if queue.is_empty() {
+        if queue.values().all(|q| q.is_empty()) {
             for w in workers
                 .iter()
                 .filter(|w| w.inflight.load(Ordering::Relaxed) < w.slots)
@@ -474,6 +552,7 @@ impl Driver {
                             && !j.speculated
                             && j.worker != 0
                             && j.worker != w.id
+                            && j.plat.admits(&w.os, &w.arch)
                     })
                     .min_by_key(|(_, j)| j.started)
                 else {
@@ -500,6 +579,36 @@ impl Driver {
             self.worker_arrived.notified().await;
         }
 
+        // Route by the action's demanded platform (REAPI platform
+        // properties live on the Command; Action.platform is the newer
+        // spot — honour both, Command winning only if Action has none).
+        let (plat, do_not_cache) = match self.store.get(action_digest).await? {
+            Some(bytes) => match re::Action::decode(bytes.as_slice()) {
+                Ok(action) => {
+                    let mut plat = PlatKey::from_properties(action.platform.as_ref());
+                    if plat == PlatKey::default() {
+                        if let Some(cd) = &action.command_digest {
+                            if let Ok(Some(cmd_bytes)) = self
+                                .store
+                                .get(&Dig {
+                                    hash: cd.hash.clone(),
+                                    size: cd.size_bytes,
+                                })
+                                .await
+                            {
+                                if let Ok(cmd) = re::Command::decode(cmd_bytes.as_slice()) {
+                                    plat = PlatKey::from_properties(cmd.platform.as_ref());
+                                }
+                            }
+                        }
+                    }
+                    (plat, action.do_not_cache)
+                }
+                Err(_) => (PlatKey::default(), false),
+            },
+            None => (PlatKey::default(), false),
+        };
+
         let job_id = self.next_job.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.jobs.lock().await.insert(
@@ -507,13 +616,19 @@ impl Driver {
             Job {
                 tx,
                 action: action_digest.clone(),
+                plat: plat.clone(),
                 worker: 0,
                 attempts: 0,
                 started: None,
                 speculated: false,
             },
         );
-        self.queue.lock().await.push_back(job_id);
+        self.queue
+            .lock()
+            .await
+            .entry(plat)
+            .or_default()
+            .push_back(job_id);
         self.pump().await;
 
         let action_result = rx
@@ -521,13 +636,6 @@ impl Driver {
             .context("job dropped without completion")?
             .map_err(|e| anyhow::anyhow!("execution failed: {e}"))?;
 
-        // Recover do_not_cache from the Action we already hold in CAS.
-        let do_not_cache = match self.store.get(action_digest).await? {
-            Some(bytes) => re::Action::decode(bytes.as_slice())
-                .map(|a| a.do_not_cache)
-                .unwrap_or(false),
-            None => false,
-        };
         Ok(exec::Outcome {
             action_result,
             do_not_cache,
@@ -655,7 +763,7 @@ mod tests {
 
     /// Fake worker: drains Runs from its channel, completes them after a
     /// beat, and re-pumps — exactly what handle_worker's reader does.
-    async fn fake_worker(d: &Arc<Driver>, id: u64, slots: u32) -> Arc<AtomicU32> {
+    async fn fake_worker(d: &Arc<Driver>, id: u64, slots: u32, os: &str) -> Arc<AtomicU32> {
         let (tx, mut rx) = mpsc::unbounded_channel::<D2W>();
         let inflight = Arc::new(AtomicU32::new(0));
         let d2 = d.clone();
@@ -678,7 +786,8 @@ mod tests {
             tx,
             inflight,
             slots,
-            os: "test".into(),
+            os: os.into(),
+            arch: "test_arch".into(),
         });
         handle
     }
@@ -688,8 +797,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn pump_bounds_outstanding_and_completes_all() {
         let d = test_driver(false);
-        let inf1 = fake_worker(&d, 1, 2).await;
-        let inf2 = fake_worker(&d, 2, 2).await;
+        let inf1 = fake_worker(&d, 1, 2, "test").await;
+        let inf2 = fake_worker(&d, 2, 2, "test").await;
 
         let watchdog = {
             let (inf1, inf2) = (inf1.clone(), inf2.clone());
@@ -731,5 +840,94 @@ mod tests {
             max_seen <= 2 + 16,
             "outstanding exceeded slots+max_prefetch: {max_seen}"
         );
+    }
+
+    /// Like fake_worker, but records every action hash it runs.
+    async fn fake_worker_logged(
+        d: &Arc<Driver>,
+        id: u64,
+        slots: u32,
+        os: &str,
+        log: Arc<Mutex<Vec<(u64, String)>>>,
+    ) {
+        let (tx, mut rx) = mpsc::unbounded_channel::<D2W>();
+        let inflight = Arc::new(AtomicU32::new(0));
+        let d2 = d.clone();
+        let inf = inflight.clone();
+        tokio::spawn(async move {
+            while let Some(D2W::Run { job, action }) = rx.recv().await {
+                log.lock().await.push((id, action.hash.clone()));
+                let d3 = d2.clone();
+                let inf = inf.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    inf.fetch_sub(1, Ordering::Relaxed);
+                    d3.complete(job, Ok(re::ActionResult::default())).await;
+                    d3.pump().await;
+                });
+            }
+        });
+        d.workers.lock().await.push(WorkerConn {
+            id,
+            tx,
+            inflight,
+            slots,
+            os: os.into(),
+            arch: "test_arch".into(),
+        });
+    }
+
+    /// Store an Action demanding `os` and return its digest.
+    async fn platformed_action(d: &Arc<Driver>, os: &str) -> Dig {
+        use prost::Message;
+        let action = re::Action {
+            platform: Some(re::Platform {
+                properties: vec![re::platform::Property {
+                    name: "OSFamily".into(),
+                    value: os.into(),
+                }],
+            }),
+            ..Default::default()
+        };
+        let mut bytes = Vec::new();
+        action.encode(&mut bytes).unwrap();
+        d.store.put(None, &bytes).await.unwrap()
+    }
+
+    /// Platform routing: os-tagged jobs only land on matching workers;
+    /// untagged jobs land anywhere.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn jobs_route_to_matching_platform_workers() {
+        let d = test_driver(false);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        fake_worker_logged(&d, 1, 4, "windows", log.clone()).await;
+        fake_worker_logged(&d, 2, 4, "macos", log.clone()).await;
+
+        let mut runs = Vec::new();
+        let mut want: HashMap<String, &str> = HashMap::new();
+        for i in 0..20u32 {
+            let os = if i % 2 == 0 { "windows" } else { "macos" };
+            let dig = platformed_action(&d, os).await;
+            want.insert(dig.hash.clone(), os);
+            let d2 = d.clone();
+            runs.push(tokio::spawn(async move { d2.execute(&dig).await }));
+        }
+        for r in runs {
+            r.await.unwrap().expect("job must complete");
+        }
+
+        let log = log.lock().await;
+        assert_eq!(log.len(), 20, "every job dispatched exactly once");
+        for (worker, hash) in log.iter() {
+            let expect = match want[hash] {
+                "windows" => 1,
+                _ => 2,
+            };
+            assert_eq!(
+                *worker, expect,
+                "action for {} landed on worker {worker}",
+                want[hash]
+            );
+        }
     }
 }
