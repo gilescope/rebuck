@@ -26,6 +26,10 @@ pub struct WorkerCfg {
     pub slots: usize,
     pub scratch: std::path::PathBuf,
     pub connect_wait: Duration,
+    /// Path to a JSON EndpointAddr for the driver (CI run artifact).
+    /// Dialing by explicit addr sidesteps n0 discovery; the session-derived
+    /// id remains the fallback when the file is absent or stale.
+    pub driver_addr_file: Option<std::path::PathBuf>,
     /// Hardlink inputs from the store into exec dirs (default). Off for
     /// filesystems/tools where shared inodes are problematic.
     pub hardlinks: bool,
@@ -68,7 +72,22 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
     let conn = {
         let deadline = Instant::now() + cfg.connect_wait;
         loop {
-            match ep.connect(target, mesh::ALPN).await {
+            // Prefer the published addr (no discovery dependency); fall
+            // back to the session-derived id via n0 discovery.
+            let attempt = match &cfg.driver_addr_file {
+                Some(path) => match tokio::fs::read_to_string(path).await {
+                    Ok(json) => match serde_json::from_str::<iroh::EndpointAddr>(&json) {
+                        Ok(addr) => ep.connect(addr, mesh::ALPN).await,
+                        Err(e) => {
+                            println!("[worker] bad driver addr file ({e}); using discovery");
+                            ep.connect(target, mesh::ALPN).await
+                        }
+                    },
+                    Err(_) => ep.connect(target, mesh::ALPN).await,
+                },
+                None => ep.connect(target, mesh::ALPN).await,
+            };
+            match attempt {
                 Ok(c) => break c,
                 Err(e) if Instant::now() < deadline => {
                     println!("[worker] connect retry: {e}");

@@ -107,6 +107,7 @@ async fn main() -> Result<()> {
                 // Same volume as the store — hardlinks die of EXDEV when
                 // /tmp is tmpfs (ubuntu >= 24.10).
                 scratch: store_root.join("exec"),
+                driver_addr_file: args.opt("--driver-addr-file").map(Into::into),
                 connect_wait: Duration::from_secs(
                     args.opt("--connect-wait-secs")
                         .map(|s| s.parse().expect("--connect-wait-secs: number"))
@@ -147,6 +148,7 @@ async fn run_driver(mut args: Args) -> Result<()> {
         decentralized: args.flag("--decentralized-cas"),
         hardlinks: !args.flag("--no-hardlinks"),
         cache_failures: args.flag("--cache-failures"),
+        addr_file: args.opt("--addr-file").map(Into::into),
         scratch,
     };
     args.done();

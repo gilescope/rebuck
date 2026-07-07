@@ -37,6 +37,12 @@ pub struct DriverCfg {
     /// re-run-every-known-failure tax on warm sweeps. Infra failures are
     /// never cached regardless.
     pub cache_failures: bool,
+    /// Write the driver's full EndpointAddr (id + relay) here once bound.
+    /// CI publishes it as a run artifact so workers can dial directly -
+    /// n0 discovery becomes a fallback instead of a single point of
+    /// failure (observed: regional discovery outages stranding workers
+    /// for their whole 30-minute window).
+    pub addr_file: Option<std::path::PathBuf>,
     pub scratch: std::path::PathBuf,
 }
 
@@ -178,6 +184,22 @@ impl Driver {
             .alpns(vec![mesh::ALPN.to_vec()])
             .bind()
             .await?;
+        if let Some(path) = &self.cfg.addr_file {
+            // Give the relay handshake a beat so the addr carries a relay
+            // URL; workers can dial it without any discovery lookup.
+            let mut addr = ep.addr();
+            for _ in 0..50 {
+                if addr.relay_urls().next().is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                addr = ep.addr();
+            }
+            let json = serde_json::to_string(&addr)?;
+            tokio::fs::write(path, &json).await?;
+            println!("[driver] addr written to {}", path.display());
+        }
+
         let _ = self.mesh_ep.set(ep.clone());
         {
             // Speculation needs a clock, not just completion events.
@@ -776,6 +798,7 @@ mod tests {
                 local_exec,
                 decentralized: false,
                 hardlinks: true,
+                addr_file: None,
                 cache_failures: false,
                 scratch: std::env::temp_dir(),
             },
