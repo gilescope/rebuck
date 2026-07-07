@@ -205,7 +205,35 @@ impl Store {
                     .with_context(|| format!("materialize {} -> {}", d.hash, dest.display()))?;
                 Ok(Materialized::Private)
             }
-            Err(e) => Err(e).with_context(|| format!("hardlink {} -> {}", d.hash, dest.display())),
+            Err(e) => {
+                // Field forensics: which leg of the link vanished? A stat
+                // burst is cheap next to a failed action, and one retry
+                // distinguishes a transient race from a real absence.
+                let src_exists = tokio::fs::metadata(&src).await.is_ok();
+                let parent_exists = match dest.parent() {
+                    Some(p) => tokio::fs::metadata(p).await.is_ok(),
+                    None => false,
+                };
+                let dest_exists = tokio::fs::symlink_metadata(dest).await.is_ok();
+                if src_exists && parent_exists && !dest_exists {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    if tokio::fs::hard_link(&src, dest).await.is_ok() {
+                        eprintln!(
+                            "[store] hardlink transient race healed by retry: {} -> {}",
+                            d.hash,
+                            dest.display()
+                        );
+                        return Ok(Materialized::Linked);
+                    }
+                }
+                Err(e).with_context(|| {
+                    format!(
+                        "hardlink {} -> {} (src_exists={src_exists} dest_parent_exists={parent_exists} dest_exists={dest_exists})",
+                        d.hash,
+                        dest.display()
+                    )
+                })
+            }
         }
     }
 
