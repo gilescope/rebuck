@@ -165,11 +165,14 @@ async fn run_driver(mut args: Args) -> Result<()> {
         })
     };
 
+    let rpc_stats = Arc::new(rpc::RpcStats::default());
+
     // Once-a-minute heartbeat: egress saturation and disk pressure are the
     // driver's two failure horizons — make both visible in the job log.
     {
         let store = store.clone();
         let d = d.clone();
+        let rs = rpc_stats.clone();
         tokio::spawn(async move {
             use std::sync::atomic::Ordering::Relaxed;
             let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
@@ -178,7 +181,7 @@ async fn run_driver(mut args: Args) -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 let read = store.read_bytes.load(Relaxed);
                 println!(
-                    "[stats] store={:.2} GiB served_total={:.2} GiB serve_rate={:.1} MiB/s pending_jobs={} workers={} ac_ok={} ac_fail={} dnc_exec={} queued[{}]",
+                    "[stats] store={:.2} GiB served_total={:.2} GiB serve_rate={:.1} MiB/s pending_jobs={} workers={} ac_ok={} ac_fail={} dnc_exec={} queued[{}] grpc[ac {}/{} {:.2} GiB | casR {} {:.2} GiB | casW {:.2} GiB]",
                     gib(store.stored_bytes.load(Relaxed)),
                     gib(read),
                     (read - last_read) as f64 / (60.0 * 1024.0 * 1024.0),
@@ -188,6 +191,12 @@ async fn run_driver(mut args: Args) -> Result<()> {
                     d.ac_hit_fail.load(Relaxed),
                     d.dnc_exec.load(Relaxed),
                     d.queue_summary().await,
+                    rs.ac_hits.load(Relaxed),
+                    rs.ac_misses.load(Relaxed),
+                    gib(rs.ac_bytes.load(Relaxed)),
+                    rs.blobs_read.load(Relaxed),
+                    gib(rs.blob_read_bytes.load(Relaxed)),
+                    gib(rs.blob_write_bytes.load(Relaxed)),
                 );
                 last_read = read;
             }
@@ -204,17 +213,24 @@ async fn run_driver(mut args: Args) -> Result<()> {
         )
         .add_service(
             re::content_addressable_storage_server::ContentAddressableStorageServer::new(
-                rpc::Cas { driver: d.clone() },
+                rpc::Cas {
+                    driver: d.clone(),
+                    stats: rpc_stats.clone(),
+                },
             )
             .max_decoding_message_size(max),
         )
         .add_service(
-            bs::byte_stream_server::ByteStreamServer::new(rpc::ByteStreamSvc { driver: d.clone() })
-                .max_decoding_message_size(max),
+            bs::byte_stream_server::ByteStreamServer::new(rpc::ByteStreamSvc {
+                driver: d.clone(),
+                stats: rpc_stats.clone(),
+            })
+            .max_decoding_message_size(max),
         )
         .add_service(
             re::action_cache_server::ActionCacheServer::new(rpc::Ac {
                 store: store.clone(),
+                stats: rpc_stats.clone(),
             })
             .max_decoding_message_size(max),
         )

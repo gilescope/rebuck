@@ -7,6 +7,7 @@
 //! client is fine with that; WaitExecution only matters if the stream drops).
 
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 
 use bazel_remote_apis::build::bazel::remote::execution::v2 as re;
@@ -23,6 +24,20 @@ use crate::mesh::Dig;
 use crate::store::Store;
 
 const MAX_BATCH: i64 = 4 * 1024 * 1024;
+
+/// Per-request-type accounting for the localhost gRPC surface. `served_total`
+/// alone can't attribute the client's download volume (e.g. 1.1 GiB pulled on
+/// a warm `materializations=none` build) — these split it by AC result
+/// payloads vs CAS blob reads vs uploads, surfaced in the stats heartbeat.
+#[derive(Default)]
+pub struct RpcStats {
+    pub ac_hits: AtomicU64,
+    pub ac_misses: AtomicU64,
+    pub ac_bytes: AtomicU64,
+    pub blobs_read: AtomicU64,
+    pub blob_read_bytes: AtomicU64,
+    pub blob_write_bytes: AtomicU64,
+}
 
 type OpStream = Pin<Box<dyn Stream<Item = Result<Operation, Status>> + Send + 'static>>;
 
@@ -109,6 +124,7 @@ impl re::capabilities_server::Capabilities for Caps {
 
 pub struct Cas {
     pub driver: Arc<Driver>,
+    pub stats: Arc<RpcStats>,
 }
 
 #[tonic::async_trait]
@@ -146,6 +162,9 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Cas {
         let mut responses = Vec::new();
         for r in &req.get_ref().requests {
             let Some(d) = &r.digest else { continue };
+            self.stats
+                .blob_write_bytes
+                .fetch_add(r.data.len() as u64, Relaxed);
             let status = match self.driver.store.put(Some(&dig(d)?), &r.data).await {
                 Ok(_) => ok_status(),
                 Err(e) => rpc_status(tonic::Code::InvalidArgument, &format!("{e:#}")),
@@ -165,7 +184,13 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Cas {
         let mut responses = Vec::new();
         for d in &req.get_ref().digests {
             let (data, status) = match self.driver.get_blob(&dig(d)?).await {
-                Ok(Some(bytes)) => (bytes, ok_status()),
+                Ok(Some(bytes)) => {
+                    self.stats.blobs_read.fetch_add(1, Relaxed);
+                    self.stats
+                        .blob_read_bytes
+                        .fetch_add(bytes.len() as u64, Relaxed);
+                    (bytes, ok_status())
+                }
                 Ok(None) => (
                     Vec::new(),
                     rpc_status(tonic::Code::NotFound, "blob not found"),
@@ -214,6 +239,7 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Cas {
 
 pub struct ByteStreamSvc {
     pub driver: Arc<Driver>,
+    pub stats: Arc<RpcStats>,
 }
 
 #[tonic::async_trait]
@@ -241,6 +267,10 @@ impl bs::byte_stream_server::ByteStream for ByteStreamSvc {
         } else {
             bytes.len()
         };
+        self.stats.blobs_read.fetch_add(1, Relaxed);
+        self.stats
+            .blob_read_bytes
+            .fetch_add((end - start) as u64, Relaxed);
         let chunks: Vec<Result<bs::ReadResponse, Status>> = bytes[start..end]
             .chunks(1024 * 1024)
             .map(|c| Ok(bs::ReadResponse { data: c.to_vec() }))
@@ -268,6 +298,9 @@ impl bs::byte_stream_server::ByteStream for ByteStreamSvc {
         }
         let expected = expected.ok_or_else(|| Status::invalid_argument("no resource_name"))?;
         let committed = data.len() as i64;
+        self.stats
+            .blob_write_bytes
+            .fetch_add(data.len() as u64, Relaxed);
         self.driver
             .store
             .put(Some(&expected), &data)
@@ -294,6 +327,7 @@ impl bs::byte_stream_server::ByteStream for ByteStreamSvc {
 
 pub struct Ac {
     pub store: Arc<Store>,
+    pub stats: Arc<RpcStats>,
 }
 
 #[tonic::async_trait]
@@ -304,10 +338,17 @@ impl re::action_cache_server::ActionCache for Ac {
     ) -> Result<Response<re::ActionResult>, Status> {
         let d = req.get_ref().action_digest.as_ref().ok_or_else(no_digest)?;
         match self.store.ac_get(&dig(d)?.hash).await {
-            Some(bytes) => re::ActionResult::decode(bytes.as_slice())
-                .map(Response::new)
-                .map_err(|e| Status::internal(format!("corrupt AC entry: {e}"))),
-            None => Err(Status::not_found("action not cached")),
+            Some(bytes) => {
+                self.stats.ac_hits.fetch_add(1, Relaxed);
+                self.stats.ac_bytes.fetch_add(bytes.len() as u64, Relaxed);
+                re::ActionResult::decode(bytes.as_slice())
+                    .map(Response::new)
+                    .map_err(|e| Status::internal(format!("corrupt AC entry: {e}")))
+            }
+            None => {
+                self.stats.ac_misses.fetch_add(1, Relaxed);
+                Err(Status::not_found("action not cached"))
+            }
         }
     }
 
