@@ -731,12 +731,17 @@ impl Driver {
     /// Returns how many workers were told (each shard covered when the
     /// fleet is >= `of`; extras double up for redundancy).
     pub async fn finalize_shards(&self, of: u8) -> usize {
+        // One shard, one worker: duplicate assignments produced duplicate
+        // shard artifacts whose contents depended on each packer's sync
+        // progress — the fetch-side "newest first" then picked one
+        // arbitrarily (reader 28957851178 hit the holes). Extra workers
+        // get no assignment and just exit clean.
         let workers = self.workers.lock().await;
-        for (i, w) in workers.iter().enumerate() {
-            let shard = (i as u8) % of;
-            let _ = w.tx.send(D2W::Finalize { shard, of });
+        let n = usize::from(of).min(workers.len());
+        for (i, w) in workers.iter().take(n).enumerate() {
+            let _ = w.tx.send(D2W::Finalize { shard: i as u8, of });
         }
-        workers.len()
+        n
     }
 
     pub fn finalized_count(&self) -> u64 {
@@ -912,15 +917,18 @@ impl Driver {
         // Route by the action's demanded platform (REAPI platform
         // properties live on the Command; Action.platform is the newer
         // spot — honour both, Command winning only if Action has none).
-        let (plat, do_not_cache) = match self.store.get(action_digest).await? {
+        // get_blob, not store.get: with an AC-only-seeded driver the
+        // action/command blobs live on worker shards; a local-only read
+        // silently degraded routing to PlatKey::default() and put /bin/sh
+        // actions on windows workers (reader 28957851178).
+        let (plat, do_not_cache) = match self.get_blob(action_digest).await? {
             Some(bytes) => match re::Action::decode(bytes.as_slice()) {
                 Ok(action) => {
                     let mut plat = PlatKey::from_properties(action.platform.as_ref());
                     if plat == PlatKey::default() {
                         if let Some(cd) = &action.command_digest {
                             if let Ok(Some(cmd_bytes)) = self
-                                .store
-                                .get(&Dig {
+                                .get_blob(&Dig {
                                     hash: cd.hash.clone(),
                                     size: cd.size_bytes,
                                 })

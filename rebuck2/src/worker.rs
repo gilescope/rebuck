@@ -216,7 +216,10 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                     .parent()
                     .unwrap_or(&cfg.scratch)
                     .join("shard.id");
-                let _ = tokio::fs::write(&id_path, format!("{shard} {of}")).await;
+                // Trailing newline matters: `read` in the CI teardown returns
+                // rc=1 at EOF-without-newline, and bash -e killed the pack
+                // step on every worker (shards were never saved).
+                let _ = tokio::fs::write(&id_path, format!("{shard} {of}\n")).await;
                 let _ =
                     mesh::send_frame(&mut *ctrl_send.lock().await, &W2D::Finalized { shard }).await;
                 println!("[worker] finalized shard {shard} — exiting");
