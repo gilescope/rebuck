@@ -137,6 +137,10 @@ pub struct Driver {
     jobs: Mutex<HashMap<u64, Job>>,
     workers: Mutex<Vec<WorkerConn>>,
     worker_arrived: tokio::sync::Notify,
+    /// Latched once the pool first reaches `min_workers` — the barrier must
+    /// not re-arm when workers are lost mid-run (a CI fleet cannot refill;
+    /// re-blocking would hang the build until the job timeout).
+    pool_formed: std::sync::atomic::AtomicBool,
     next_job: AtomicU64,
     next_worker: AtomicU64,
     local_slots: Semaphore,
@@ -170,6 +174,7 @@ impl Driver {
             jobs: Mutex::new(HashMap::new()),
             workers: Mutex::new(Vec::new()),
             worker_arrived: tokio::sync::Notify::new(),
+            pool_formed: std::sync::atomic::AtomicBool::new(false),
             next_job: AtomicU64::new(1),
             next_worker: AtomicU64::new(1),
             local_slots: Semaphore::new(cores),
@@ -733,12 +738,23 @@ impl Driver {
         }
     }
 
-    /// Execute an action: queue it, dispatch (worker or local), await the result.
-    pub async fn execute(self: &Arc<Self>, action_digest: &Dig) -> Result<exec::Outcome> {
-        // Barrier: don't start work until the agreed pool has formed.
+    /// Barrier: block until the agreed pool has formed once. A latch, not a
+    /// level check — late joiners always add capacity, and a shrinking pool
+    /// never re-blocks dispatch.
+    async fn await_pool_formed(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.pool_formed.load(Relaxed) {
+            return;
+        }
         while self.workers.lock().await.len() < self.cfg.min_workers {
             self.worker_arrived.notified().await;
         }
+        self.pool_formed.store(true, Relaxed);
+    }
+
+    /// Execute an action: queue it, dispatch (worker or local), await the result.
+    pub async fn execute(self: &Arc<Self>, action_digest: &Dig) -> Result<exec::Outcome> {
+        self.await_pool_formed().await;
 
         // Route by the action's demanded platform (REAPI platform
         // properties live on the Command; Action.platform is the newer
@@ -929,12 +945,16 @@ mod tests {
     use super::*;
 
     fn test_driver(local_exec: bool) -> Arc<Driver> {
+        test_driver_min(local_exec, 0)
+    }
+
+    fn test_driver_min(local_exec: bool, min_workers: usize) -> Arc<Driver> {
         let dir = tempfile::tempdir().unwrap().keep();
         Driver::new(
             Arc::new(Store::new(dir).unwrap()),
             DriverCfg {
                 session: "test".into(),
-                min_workers: 0,
+                min_workers,
                 local_exec,
                 decentralized: false,
                 hardlinks: true,
@@ -975,6 +995,21 @@ mod tests {
             arch: "test_arch".into(),
         });
         handle
+    }
+
+    /// The join barrier is a latch: once the pool has formed, losing a
+    /// worker mid-run must NOT re-arm it (a CI fleet cannot refill — every
+    /// new execute() would block until the job timeout).
+    #[tokio::test]
+    async fn pool_barrier_latches_once_formed() {
+        let d = test_driver_min(false, 2);
+        fake_worker(&d, 1, 2, "test").await;
+        fake_worker(&d, 2, 2, "test").await;
+        d.await_pool_formed().await; // forms at 2/2
+        d.workers.lock().await.retain(|w| w.id != 1); // straggler dies
+        tokio::time::timeout(std::time::Duration::from_millis(200), d.await_pool_formed())
+            .await
+            .expect("barrier re-armed after worker loss - latch regressed");
     }
 
     /// Pull-model invariant: a worker's outstanding count never exceeds
