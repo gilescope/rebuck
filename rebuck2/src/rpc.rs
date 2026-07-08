@@ -27,15 +27,21 @@ const MAX_BATCH: i64 = 4 * 1024 * 1024;
 
 /// Per-request-type accounting for the localhost gRPC surface. `served_total`
 /// alone can't attribute the client's download volume (e.g. 1.1 GiB pulled on
-/// a warm `materializations=none` build) — these split it by AC result
+/// a warm `materializations=none` build) - these split it by AC result
 /// payloads vs CAS blob reads vs uploads, surfaced in the stats heartbeat.
 #[derive(Default)]
 pub struct RpcStats {
+    /// `GetActionResult` served from the AC.
     pub ac_hits: AtomicU64,
+    /// `GetActionResult` that returned NOT_FOUND.
     pub ac_misses: AtomicU64,
+    /// Encoded `ActionResult` payload bytes - hits only, misses add nothing.
     pub ac_bytes: AtomicU64,
+    /// Blobs served via `BatchReadBlobs` + `ByteStream::Read` combined.
     pub blobs_read: AtomicU64,
+    /// Bytes for [`Self::blobs_read`] (post-range-slice for stream reads).
     pub blob_read_bytes: AtomicU64,
+    /// Bytes accepted via `BatchUpdateBlobs` + `ByteStream::Write` combined.
     pub blob_write_bytes: AtomicU64,
 }
 
