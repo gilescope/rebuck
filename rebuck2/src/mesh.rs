@@ -147,6 +147,10 @@ pub enum D2W {
 pub enum BlobReq {
     Get(Dig),
     Put(Dig),
+    /// Exact presence check for a batch — the honesty layer over bloom
+    /// gossip (blooms route, HasMany confirms; FindMissingBlobs must never
+    /// lie to buck2).
+    HasMany(Vec<Dig>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -161,6 +165,8 @@ pub enum BlobResp {
         endpoint: String,
     },
     PutOk,
+    /// Reply to HasMany, same order as the request.
+    HaveMany(Vec<bool>),
     Err(String),
 }
 

@@ -117,13 +117,23 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Cas {
         &self,
         req: Request<re::FindMissingBlobsRequest>,
     ) -> Result<Response<re::FindMissingBlobsResponse>, Status> {
-        let mut missing = Vec::new();
-        for d in &req.get_ref().blob_digests {
-            // Provider-indexed blobs count as present (decentralized mode).
-            if !self.driver.has_blob(&dig(d)?).await {
-                missing.push(d.clone());
-            }
-        }
+        let digs: Vec<crate::mesh::Dig> = req
+            .get_ref()
+            .blob_digests
+            .iter()
+            .map(dig)
+            .collect::<Result<_, _>>()?;
+        // Mesh-wide presence: local + provider index + bloom-routed exact
+        // verification against workers (shard-seeded stores count).
+        let have = self.driver.has_blobs(&digs).await;
+        let missing = req
+            .get_ref()
+            .blob_digests
+            .iter()
+            .zip(&have)
+            .filter(|(_, h)| !**h)
+            .map(|(d, _)| d.clone())
+            .collect();
         Ok(Response::new(re::FindMissingBlobsResponse {
             missing_blob_digests: missing,
         }))

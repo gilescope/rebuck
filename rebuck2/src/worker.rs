@@ -255,6 +255,13 @@ async fn serve_get(
             Ok(None) => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
             Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
         },
+        BlobReq::HasMany(digs) => {
+            let mut have = Vec::with_capacity(digs.len());
+            for d in &digs {
+                have.push(store.has(d).await);
+            }
+            mesh::send_frame(&mut send, &BlobResp::HaveMany(have)).await?;
+        }
         other => {
             mesh::send_frame(
                 &mut send,

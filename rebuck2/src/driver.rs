@@ -418,6 +418,70 @@ impl Driver {
         self.providers.lock().await.contains_key(&d.hash)
     }
 
+    /// Batch presence over the whole mesh: local store + provider index
+    /// first, then bloom-routed exact `HasMany` verification against
+    /// workers (blooms route, never testify). Confirmed holders land in
+    /// the providers map so later fetches redirect straight to them.
+    /// This is what lets shard-seeded worker stores count as "present"
+    /// in buck2's FindMissingBlobs without the driver holding the bytes.
+    pub async fn has_blobs(self: &Arc<Self>, digs: &[Dig]) -> Vec<bool> {
+        let mut have = vec![false; digs.len()];
+        let mut unknown: Vec<usize> = Vec::new();
+        {
+            let providers = self.providers.lock().await;
+            for (i, d) in digs.iter().enumerate() {
+                if self.store.has(d).await || providers.contains_key(&d.hash) {
+                    have[i] = true;
+                } else {
+                    unknown.push(i);
+                }
+            }
+        }
+        if unknown.is_empty() {
+            return have;
+        }
+        // Group the unknowns by the first bloom that claims them.
+        let mut by_peer: HashMap<String, Vec<usize>> = HashMap::new();
+        {
+            let blooms = self.blooms.lock().await;
+            for &i in &unknown {
+                if let Some((ep, _)) = blooms.iter().find(|(_, b)| b.contains(&digs[i].hash)) {
+                    by_peer.entry(ep.clone()).or_default().push(i);
+                }
+            }
+        }
+        let Some(ep) = self.mesh_ep.get() else {
+            return have;
+        };
+        for (peer, idxs) in by_peer {
+            let batch: Vec<Dig> = idxs.iter().map(|&i| digs[i].clone()).collect();
+            let confirmed = async {
+                let id: iroh::EndpointId = peer.parse().ok()?;
+                let conn = ep.connect(id, mesh::ALPN).await.ok()?;
+                let (mut send, mut recv) = conn.open_bi().await.ok()?;
+                mesh::send_frame(&mut send, &BlobReq::HasMany(batch))
+                    .await
+                    .ok()?;
+                send.finish().ok()?;
+                match mesh::recv_frame::<BlobResp>(&mut recv).await.ok()?? {
+                    BlobResp::HaveMany(v) => Some(v),
+                    _ => None,
+                }
+            }
+            .await;
+            if let Some(v) = confirmed {
+                let mut providers = self.providers.lock().await;
+                for (k, &i) in idxs.iter().enumerate() {
+                    if v.get(k).copied().unwrap_or(false) {
+                        have[i] = true;
+                        providers.insert(digs[i].hash.clone(), peer.clone());
+                    }
+                }
+            }
+        }
+        have
+    }
+
     /// Read-through get: local store first, then fetch from the producing
     /// worker and cache. Used by the gRPC surface (buck2's reads).
     pub async fn get_blob(&self, d: &Dig) -> Result<Option<Vec<u8>>> {
@@ -778,6 +842,13 @@ async fn serve_blob_stream(
                 Ok(_) => mesh::send_frame(&mut send, &BlobResp::PutOk).await?,
                 Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
             }
+        }
+        BlobReq::HasMany(digs) => {
+            let mut have = Vec::with_capacity(digs.len());
+            for d in &digs {
+                have.push(driver.store.has(d).await);
+            }
+            mesh::send_frame(&mut send, &BlobResp::HaveMany(have)).await?;
         }
     }
     send.finish()?;
