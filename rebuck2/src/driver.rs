@@ -151,6 +151,15 @@ pub struct Driver {
     providers: Mutex<HashMap<String, String>>,
     /// Bloom gossip: worker endpoint id -> summary of its store.
     blooms: Mutex<HashMap<String, mesh::Bloom>>,
+    /// One QUIC connection per peer, multiplexed bi-streams. Per-call dials
+    /// melt the endpoint under FindMissing storms (reader 28929862924: three
+    /// warm daemons probing ~50k digests against an AC-only store spawned
+    /// thousands of concurrent handshakes; the tonic h2 streams starved and
+    /// every leg died with BrokenPipe).
+    peer_conns: Mutex<HashMap<String, Connection>>,
+    /// Bounds concurrent mesh fetches/probes so a warm-start burst cannot
+    /// exhaust sockets even with pooled connections.
+    mesh_fetches: Semaphore,
     /// Cache outcome accounting for the stats heartbeat: AC hits that were
     /// successes, AC hits that were cached failures, and executions forced
     /// by do_not_cache actions (the prelude's diag wrappers).
@@ -181,6 +190,8 @@ impl Driver {
             queue: Mutex::new(HashMap::new()),
             providers: Mutex::new(HashMap::new()),
             blooms: Mutex::new(HashMap::new()),
+            peer_conns: Mutex::new(HashMap::new()),
+            mesh_fetches: Semaphore::new(64),
             finalized: AtomicU64::new(0),
             ac_hit_ok: AtomicU64::new(0),
             ac_hit_fail: AtomicU64::new(0),
@@ -466,6 +477,58 @@ impl Driver {
     /// the providers map so later fetches redirect straight to them.
     /// This is what lets shard-seeded worker stores count as "present"
     /// in buck2's FindMissingBlobs without the driver holding the bytes.
+    /// Pooled peer connection: reuse the live one, dial on first use or
+    /// after the old one died. Callers that hit a stream-open error should
+    /// `drop_peer_conn` and retry once — a stale handle looks healthy until
+    /// the first stream touches it.
+    async fn peer_conn(&self, peer: &str) -> Result<Connection> {
+        if let Some(c) = self.peer_conns.lock().await.get(peer) {
+            if c.close_reason().is_none() {
+                return Ok(c.clone());
+            }
+        }
+        let ep = self.mesh_ep.get().context("mesh endpoint not up")?;
+        let id: iroh::EndpointId = peer
+            .parse()
+            .map_err(|_| anyhow::anyhow!("bad peer endpoint {peer:?}"))?;
+        let conn = ep.connect(id, mesh::ALPN).await?;
+        self.peer_conns
+            .lock()
+            .await
+            .insert(peer.to_string(), conn.clone());
+        Ok(conn)
+    }
+
+    async fn drop_peer_conn(&self, peer: &str) {
+        self.peer_conns.lock().await.remove(peer);
+    }
+
+    /// One BlobReq round-trip on a pooled connection, one retry on a fresh
+    /// connection if the pooled one turned out stale.
+    async fn peer_request(&self, peer: &str, req: &BlobReq) -> Result<BlobResp> {
+        for attempt in 0..2 {
+            let conn = self.peer_conn(peer).await?;
+            let res = async {
+                let (mut send, mut recv) = conn.open_bi().await?;
+                mesh::send_frame(&mut send, req).await?;
+                send.finish()?;
+                mesh::recv_frame::<BlobResp>(&mut recv)
+                    .await?
+                    .context("peer closed blob stream")
+            }
+            .await;
+            match res {
+                Ok(resp) => return Ok(resp),
+                Err(e) if attempt == 0 => {
+                    self.drop_peer_conn(peer).await;
+                    let _ = e;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!("loop returns on second attempt")
+    }
+
     pub async fn has_blobs(self: &Arc<Self>, digs: &[Dig]) -> Vec<bool> {
         let mut have = vec![false; digs.len()];
         let mut unknown: Vec<usize> = Vec::new();
@@ -492,25 +555,13 @@ impl Driver {
                 }
             }
         }
-        let Some(ep) = self.mesh_ep.get() else {
-            return have;
-        };
         for (peer, idxs) in by_peer {
             let batch: Vec<Dig> = idxs.iter().map(|&i| digs[i].clone()).collect();
-            let confirmed = async {
-                let id: iroh::EndpointId = peer.parse().ok()?;
-                let conn = ep.connect(id, mesh::ALPN).await.ok()?;
-                let (mut send, mut recv) = conn.open_bi().await.ok()?;
-                mesh::send_frame(&mut send, &BlobReq::HasMany(batch))
-                    .await
-                    .ok()?;
-                send.finish().ok()?;
-                match mesh::recv_frame::<BlobResp>(&mut recv).await.ok()?? {
-                    BlobResp::HaveMany(v) => Some(v),
-                    _ => None,
-                }
-            }
-            .await;
+            let _permit = self.mesh_fetches.acquire().await;
+            let confirmed = match self.peer_request(&peer, &BlobReq::HasMany(batch)).await {
+                Ok(BlobResp::HaveMany(v)) => Some(v),
+                _ => None,
+            };
             if let Some(v) = confirmed {
                 let mut providers = self.providers.lock().await;
                 for (k, &i) in idxs.iter().enumerate() {
@@ -545,28 +596,37 @@ impl Driver {
                 }
             }
         };
-        let Some(ep) = self.mesh_ep.get() else {
-            return Ok(None);
-        };
-        let id: iroh::EndpointId = endpoint
-            .parse()
-            .map_err(|_| anyhow::anyhow!("bad provider endpoint {endpoint:?}"))?;
-        let conn = ep.connect(id, mesh::ALPN).await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        mesh::send_frame(&mut send, &BlobReq::Get(d.clone())).await?;
-        send.finish()?;
-        match mesh::recv_frame::<BlobResp>(&mut recv)
-            .await?
-            .context("provider closed blob stream")?
-        {
-            BlobResp::Found { size } => {
-                let bytes = mesh::recv_raw(&mut recv, size).await?;
-                self.store.put(Some(d), &bytes).await?;
-                Ok(Some(bytes))
+        let _permit = self.mesh_fetches.acquire().await;
+        for attempt in 0..2 {
+            let conn = self.peer_conn(&endpoint).await?;
+            let res: Result<Option<Vec<u8>>> = async {
+                let (mut send, mut recv) = conn.open_bi().await?;
+                mesh::send_frame(&mut send, &BlobReq::Get(d.clone())).await?;
+                send.finish()?;
+                match mesh::recv_frame::<BlobResp>(&mut recv)
+                    .await?
+                    .context("provider closed blob stream")?
+                {
+                    BlobResp::Found { size } => {
+                        let bytes = mesh::recv_raw(&mut recv, size).await?;
+                        Ok(Some(bytes))
+                    }
+                    BlobResp::Missing => Ok(None),
+                    other => bail!("provider {endpoint} for {}: {other:?}", d.hash),
+                }
             }
-            BlobResp::Missing => Ok(None),
-            other => bail!("provider {endpoint} for {}: {other:?}", d.hash),
+            .await;
+            match res {
+                Ok(Some(bytes)) => {
+                    self.store.put(Some(d), &bytes).await?;
+                    return Ok(Some(bytes));
+                }
+                Ok(None) => return Ok(None),
+                Err(_) if attempt == 0 => self.drop_peer_conn(&endpoint).await,
+                Err(e) => return Err(e),
+            }
         }
+        unreachable!("loop returns on second attempt")
     }
 
     pub async fn worker_count(&self) -> usize {
