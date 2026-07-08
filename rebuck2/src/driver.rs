@@ -161,6 +161,13 @@ struct Job {
     started: Option<std::time::Instant>,
     /// Tail speculation: raced on a second worker, first result wins.
     speculated: bool,
+    /// Input-root affinity: actions sharing an input root run on the SAME
+    /// worker. A crate's pipelined metadata compile and its rlib compile
+    /// share an input root, and rustc's crate hash is only provably stable
+    /// within one machine — split across machines the pair diverged and
+    /// every downstream link died with E0460 (gooseberry PR#23 takes 5-8).
+    /// Locality is the free side benefit.
+    affinity: Option<u64>,
 }
 
 const MAX_ATTEMPTS: u32 = 3;
@@ -194,6 +201,9 @@ pub struct Driver {
     /// thousands of concurrent handshakes; the tonic h2 streams starved and
     /// every leg died with BrokenPipe).
     peer_conns: Mutex<HashMap<String, Connection>>,
+    /// Input-root hash -> owning worker id ([`Job::affinity`]). Locked
+    /// after `queue` everywhere.
+    affinity_owner: Mutex<HashMap<u64, u64>>,
     /// Bounds concurrent mesh fetches/probes so a warm-start burst cannot
     /// exhaust sockets even with pooled connections.
     mesh_fetches: Semaphore,
@@ -228,6 +238,7 @@ impl Driver {
             providers: Mutex::new(HashMap::new()),
             blooms: Mutex::new(HashMap::new()),
             peer_conns: Mutex::new(HashMap::new()),
+            affinity_owner: Mutex::new(HashMap::new()),
             mesh_fetches: Semaphore::new(64),
             finalized: AtomicU64::new(0),
             ac_hit_ok: AtomicU64::new(0),
@@ -815,17 +826,32 @@ impl Driver {
 
         let total_pending: usize = queue.values().map(|q| q.len()).sum();
         let n = (total_pending / (workers.len().max(1) * 4)).clamp(1, 16) as u32;
+        let live_ids: std::collections::HashSet<u64> = workers.iter().map(|w| w.id).collect();
+        let mut owners = self.affinity_owner.lock().await;
         // Each worker drains its matching buckets (most specific first)
         // while it has pipeline headroom. Per-platform buckets mean a full
-        // windows pool never blocks an idle mac pool.
+        // windows pool never blocks an idle mac pool. Affinity jobs owned
+        // by another LIVE worker are skipped (dead owners are usurped).
         loop {
             let mut assigned_any = false;
             for w in workers.iter() {
                 while w.inflight.load(Ordering::Relaxed) < w.slots + n {
-                    let Some(job_id) = PlatKey::pull_order(&w.os, &w.arch)
+                    let job_id = PlatKey::pull_order(&w.os, &w.arch)
                         .into_iter()
-                        .find_map(|k| queue.get_mut(&k).and_then(|q| q.pop_front()))
-                    else {
+                        .find_map(|k| {
+                            let q = queue.get_mut(&k)?;
+                            let pos = q.iter().position(|id| {
+                                match jobs.get(id).and_then(|j| j.affinity) {
+                                    None => true,
+                                    Some(a) => match owners.get(&a) {
+                                        Some(owner) => *owner == w.id || !live_ids.contains(owner),
+                                        None => true,
+                                    },
+                                }
+                            })?;
+                            q.remove(pos)
+                        });
+                    let Some(job_id) = job_id else {
                         break; // nothing this worker can run
                     };
                     let Some(job) = jobs.get_mut(&job_id) else {
@@ -841,6 +867,9 @@ impl Driver {
                     job.attempts += 1;
                     job.worker = w.id;
                     job.started = Some(std::time::Instant::now());
+                    if let Some(a) = job.affinity {
+                        owners.insert(a, w.id);
+                    }
                     w.inflight.fetch_add(1, Ordering::Relaxed);
                     println!(
                         "[driver] job {job_id} -> worker {} ({})",
@@ -885,6 +914,10 @@ impl Driver {
                             && !j.speculated
                             && j.worker != 0
                             && j.worker != w.id
+                            // Affinity jobs never race on a second machine —
+                            // a byte-different twin is exactly what affinity
+                            // exists to prevent.
+                            && j.affinity.is_none()
                             && j.plat.admits(&w.os, &w.arch)
                     })
                     .min_by_key(|(_, j)| j.started)
@@ -930,7 +963,7 @@ impl Driver {
         // action/command blobs live on worker shards; a local-only read
         // silently degraded routing to PlatKey::default() and put /bin/sh
         // actions on windows workers (reader 28957851178).
-        let (plat, do_not_cache) = match self.get_blob(action_digest).await? {
+        let (plat, do_not_cache, affinity) = match self.get_blob(action_digest).await? {
             Some(bytes) => match re::Action::decode(bytes.as_slice()) {
                 Ok(action) => {
                     let mut plat = PlatKey::from_properties(action.platform.as_ref());
@@ -949,11 +982,17 @@ impl Driver {
                             }
                         }
                     }
-                    (plat, action.do_not_cache)
+                    let affinity = action.input_root_digest.as_ref().map(|d| {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        d.hash.hash(&mut h);
+                        h.finish()
+                    });
+                    (plat, action.do_not_cache, affinity)
                 }
-                Err(_) => (PlatKey::default(), false),
+                Err(_) => (PlatKey::default(), false, None),
             },
-            None => (PlatKey::default(), false),
+            None => (PlatKey::default(), false, None),
         };
 
         let job_id = self.next_job.fetch_add(1, Ordering::Relaxed);
@@ -968,6 +1007,7 @@ impl Driver {
                 attempts: 0,
                 started: None,
                 speculated: false,
+                affinity,
             },
         );
         self.queue
@@ -1189,6 +1229,81 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(200), d.await_pool_formed())
             .await
             .expect("barrier re-armed after worker loss - latch regressed");
+    }
+
+    /// Actions sharing an input root must execute on the SAME worker: a
+    /// crate's pipelined metadata compile and its rlib compile share one
+    /// input root, and splitting the pair across machines diverged their
+    /// crate hashes (E0460 at every downstream link).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn affinity_pins_same_input_root_to_one_worker() {
+        let d = test_driver(false);
+        let log: Arc<std::sync::Mutex<Vec<(u64, String)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        for wid in [1u64, 2] {
+            let (tx, mut rx) = mpsc::unbounded_channel::<D2W>();
+            let inflight = Arc::new(AtomicU32::new(0));
+            let d2 = d.clone();
+            let log2 = log.clone();
+            let inf = inflight.clone();
+            tokio::spawn(async move {
+                while let Some(D2W::Run { job, action }) = rx.recv().await {
+                    log2.lock().unwrap().push((wid, action.hash.clone()));
+                    let d3 = d2.clone();
+                    let inf = inf.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        inf.fetch_sub(1, Ordering::Relaxed);
+                        d3.complete(job, Ok(re::ActionResult::default())).await;
+                        d3.pump().await;
+                    });
+                }
+            });
+            d.workers.lock().await.push(WorkerConn {
+                id: wid,
+                tx,
+                inflight,
+                slots: 1,
+                os: "test".into(),
+                arch: "test_arch".into(),
+                endpoint: String::new(),
+            });
+        }
+
+        // Two distinct actions (different salts) sharing one input root.
+        let root = re::Digest {
+            hash: "c".repeat(64),
+            size_bytes: 1,
+        };
+        let mut digs = Vec::new();
+        for salt in 0u8..12 {
+            let action = re::Action {
+                input_root_digest: Some(root.clone()),
+                salt: vec![salt],
+                ..Default::default()
+            };
+            let dig = d.store.put(None, &action.encode_to_vec()).await.unwrap();
+            digs.push(dig);
+        }
+        let runs: Vec<_> = digs
+            .iter()
+            .map(|dig| {
+                let d = d.clone();
+                let dig = dig.clone();
+                tokio::spawn(async move { d.execute(&dig).await })
+            })
+            .collect();
+        for r in runs {
+            r.await.unwrap().expect("job must complete");
+        }
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 12, "all actions executed: {log:?}");
+        let owners: std::collections::HashSet<u64> = log.iter().map(|(w, _)| *w).collect();
+        assert_eq!(
+            owners.len(),
+            1,
+            "same input root must pin to one worker: {log:?}"
+        );
     }
 
     /// Pull-model invariant: a worker's outstanding count never exceeds
