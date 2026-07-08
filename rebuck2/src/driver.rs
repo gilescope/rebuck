@@ -1043,30 +1043,38 @@ async fn serve_blob_stream(
         return Ok(());
     };
     match req {
-        BlobReq::Get(d) => match driver.store.get(&d).await {
-            Ok(Some(bytes)) => {
-                mesh::send_frame(
-                    &mut send,
-                    &BlobResp::Found {
-                        size: bytes.len() as u64,
-                    },
-                )
-                .await?;
-                send.write_all(&bytes).await?;
-            }
-            Ok(None) => {
-                // Decentralized: point the asker at the producer instead of
-                // relaying bytes through the driver's NIC.
-                let provider = driver.providers.lock().await.get(&d.hash).cloned();
-                match provider {
-                    Some(endpoint) => {
-                        mesh::send_frame(&mut send, &BlobResp::Provider { endpoint }).await?
+        BlobReq::Get(d) => {
+            // Decentralized: point the asker at the producer instead of
+            // relaying bytes through the driver's NIC.
+            let redirect = if driver.cfg.decentralized {
+                driver.providers.lock().await.get(&d.hash).cloned()
+            } else {
+                None
+            };
+            if let Some(endpoint) = redirect {
+                mesh::send_frame(&mut send, &BlobResp::Provider { endpoint }).await?;
+            } else {
+                // get_blob, not store.get: with an AC-only-seeded driver a
+                // worker's exec inputs often live on ANOTHER worker's shard;
+                // a store-only serve returned Missing for 2,756 input
+                // fetches (run 28959911677). Read-through relays and caches
+                // locally, reconstituting the driver's hot set.
+                match driver.get_blob(&d).await {
+                    Ok(Some(bytes)) => {
+                        mesh::send_frame(
+                            &mut send,
+                            &BlobResp::Found {
+                                size: bytes.len() as u64,
+                            },
+                        )
+                        .await?;
+                        send.write_all(&bytes).await?;
                     }
-                    None => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
+                    Ok(None) => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
+                    Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
                 }
             }
-            Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
-        },
+        }
         BlobReq::Put(d) => {
             let bytes = mesh::recv_raw(&mut recv, d.size as u64).await?;
             match driver.store.put(Some(&d), &bytes).await {
