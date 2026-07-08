@@ -60,6 +60,22 @@ pub enum AcLookup {
     Miss,
 }
 
+/// Affinity key for a command: the crate output prefix (buck2 rust rules
+/// place every emit flavour of one crate under `.../__<crate>__/`). A
+/// crate's pipelined metadata compile and its rlib compile MUST run on one
+/// machine — split across CI machines their crate hashes diverged and every
+/// downstream link died with E0460 (gooseberry PR#23). The input root can't
+/// pair them (output skeletons differ); the output prefix can.
+fn crate_affinity_key(cmd: &re::Command) -> Option<String> {
+    let first = cmd
+        .output_paths
+        .first()
+        .or_else(|| cmd.output_files.first())
+        .or_else(|| cmd.output_directories.first())?;
+    let end = first.find("__/")? + 3;
+    Some(first[..end].to_string())
+}
+
 /// Every CAS digest a cached result commits the server to delivering.
 /// Zero-size blobs are implicit in RE and skipped.
 pub fn result_digests(r: &re::ActionResult) -> Vec<Dig> {
@@ -967,27 +983,33 @@ impl Driver {
             Some(bytes) => match re::Action::decode(bytes.as_slice()) {
                 Ok(action) => {
                     let mut plat = PlatKey::from_properties(action.platform.as_ref());
-                    if plat == PlatKey::default() {
-                        if let Some(cd) = &action.command_digest {
-                            if let Ok(Some(cmd_bytes)) = self
-                                .get_blob(&Dig {
-                                    hash: cd.hash.clone(),
-                                    size: cd.size_bytes,
-                                })
-                                .await
-                            {
-                                if let Ok(cmd) = re::Command::decode(cmd_bytes.as_slice()) {
+                    let mut affinity_key: Option<String> = None;
+                    if let Some(cd) = &action.command_digest {
+                        if let Ok(Some(cmd_bytes)) = self
+                            .get_blob(&Dig {
+                                hash: cd.hash.clone(),
+                                size: cd.size_bytes,
+                            })
+                            .await
+                        {
+                            if let Ok(cmd) = re::Command::decode(cmd_bytes.as_slice()) {
+                                if plat == PlatKey::default() {
                                     plat = PlatKey::from_properties(cmd.platform.as_ref());
                                 }
+                                affinity_key = crate_affinity_key(&cmd);
                             }
                         }
                     }
-                    let affinity = action.input_root_digest.as_ref().map(|d| {
-                        use std::hash::{Hash, Hasher};
-                        let mut h = std::collections::hash_map::DefaultHasher::new();
-                        d.hash.hash(&mut h);
-                        h.finish()
-                    });
+                    // Fall back to the input root when no crate prefix is
+                    // recognisable — same-input actions still colocate.
+                    let affinity = affinity_key
+                        .or_else(|| action.input_root_digest.as_ref().map(|d| d.hash.clone()))
+                        .map(|key| {
+                            use std::hash::{Hash, Hasher};
+                            let mut h = std::collections::hash_map::DefaultHasher::new();
+                            key.hash(&mut h);
+                            h.finish()
+                        });
                     (plat, action.do_not_cache, affinity)
                 }
                 Err(_) => (PlatKey::default(), false, None),
