@@ -161,30 +161,32 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
         });
     }
 
-    // Bloom gossip: advertise what this store holds, every 30s when changed.
-    // Peers use it to fetch hot blobs from caches instead of one producer.
+    // Bloom gossip: advertise what this store holds — immediately on
+    // connect (a dice-warm client starts fetching within seconds; shard
+    // seeds must be visible before the first FindMissing), then every 30s
+    // when changed. Peers use it to fetch hot blobs from caches instead of
+    // one producer.
     {
         let store = store.clone();
         let ctrl = ctrl_send.clone();
         tokio::spawn(async move {
             let mut last_n = usize::MAX;
             loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
                 let hashes = store.list_hashes();
-                if hashes.len() == last_n {
-                    continue;
+                if hashes.len() != last_n {
+                    last_n = hashes.len();
+                    let mut bloom = mesh::Bloom::with_capacity(hashes.len());
+                    for h in &hashes {
+                        bloom.insert(h);
+                    }
+                    if mesh::send_frame(&mut *ctrl.lock().await, &W2D::Holdings { bloom })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
-                last_n = hashes.len();
-                let mut bloom = mesh::Bloom::with_capacity(hashes.len());
-                for h in &hashes {
-                    bloom.insert(h);
-                }
-                if mesh::send_frame(&mut *ctrl.lock().await, &W2D::Holdings { bloom })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
+                tokio::time::sleep(Duration::from_secs(30)).await;
             }
         });
     }

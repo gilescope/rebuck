@@ -181,7 +181,7 @@ async fn run_driver(mut args: Args) -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 let read = store.read_bytes.load(Relaxed);
                 println!(
-                    "[stats] store={:.2} GiB served_total={:.2} GiB serve_rate={:.1} MiB/s pending_jobs={} workers={} ac_ok={} ac_fail={} dnc_exec={} queued[{}] grpc[ac {}/{} {:.2} GiB | casR {} {:.2} GiB | casW {:.2} GiB]",
+                    "[stats] store={:.2} GiB served_total={:.2} GiB serve_rate={:.1} MiB/s pending_jobs={} workers={} ac_ok={} ac_fail={} dnc_exec={} queued[{}] grpc[ac {}/{}/{}u {:.2} GiB | casR {} {:.2} GiB | casW {:.2} GiB]",
                     gib(store.stored_bytes.load(Relaxed)),
                     gib(read),
                     (read - last_read) as f64 / (60.0 * 1024.0 * 1024.0),
@@ -193,6 +193,7 @@ async fn run_driver(mut args: Args) -> Result<()> {
                     d.queue_summary().await,
                     rs.ac_hits.load(Relaxed),
                     rs.ac_misses.load(Relaxed),
+                    rs.ac_unservable.load(Relaxed),
                     gib(rs.ac_bytes.load(Relaxed)),
                     rs.blobs_read.load(Relaxed),
                     gib(rs.blob_read_bytes.load(Relaxed)),
@@ -231,6 +232,7 @@ async fn run_driver(mut args: Args) -> Result<()> {
             re::action_cache_server::ActionCacheServer::new(rpc::Ac {
                 store: store.clone(),
                 stats: rpc_stats.clone(),
+                driver: d.clone(),
             })
             .max_decoding_message_size(max),
         )

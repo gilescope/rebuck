@@ -35,6 +35,9 @@ pub struct RpcStats {
     pub ac_hits: AtomicU64,
     /// `GetActionResult` that returned NOT_FOUND.
     pub ac_misses: AtomicU64,
+    /// Hits withheld because a referenced blob is unfetchable (evicted CAS):
+    /// reported to the client as a miss so it re-executes and re-uploads.
+    pub ac_unservable: AtomicU64,
     /// Encoded `ActionResult` payload bytes - hits only, misses add nothing.
     pub ac_bytes: AtomicU64,
     /// Blobs served via `BatchReadBlobs` + `ByteStream::Read` combined.
@@ -334,6 +337,32 @@ impl bs::byte_stream_server::ByteStream for ByteStreamSvc {
 pub struct Ac {
     pub store: Arc<Store>,
     pub stats: Arc<RpcStats>,
+    pub driver: Arc<Driver>,
+}
+
+/// Every CAS digest a cached result commits us to serving. Zero-size blobs
+/// are implicit in RE (every CAS "has" the empty blob) and are skipped.
+fn result_digests(r: &re::ActionResult) -> Vec<Dig> {
+    let mut digs = Vec::new();
+    let mut push = |d: &Option<re::Digest>| {
+        if let Some(d) = d {
+            if d.size_bytes > 0 {
+                digs.push(Dig {
+                    hash: d.hash.clone(),
+                    size: d.size_bytes,
+                });
+            }
+        }
+    };
+    for f in &r.output_files {
+        push(&f.digest);
+    }
+    for t in &r.output_directories {
+        push(&t.tree_digest);
+    }
+    push(&r.stdout_digest);
+    push(&r.stderr_digest);
+    digs
 }
 
 #[tonic::async_trait]
@@ -345,11 +374,30 @@ impl re::action_cache_server::ActionCache for Ac {
         let d = req.get_ref().action_digest.as_ref().ok_or_else(no_digest)?;
         match self.store.ac_get(&dig(d)?.hash).await {
             Some(bytes) => {
+                let result = re::ActionResult::decode(bytes.as_slice())
+                    .map_err(|e| Status::internal(format!("corrupt AC entry: {e}")))?;
+                // A hit is a promise the CAS can deliver every referenced
+                // blob. Cache eviction breaks that silently (reader
+                // 28932994472: 17k hits, zero fetchable blobs, all legs
+                // dead) - validate here and report a miss instead, so the
+                // client re-executes and the fleet re-uploads: self-healing.
+                let digs = result_digests(&result);
+                if !digs.is_empty()
+                    && self
+                        .driver
+                        .has_blobs(&digs)
+                        .await
+                        .iter()
+                        .any(|present| !present)
+                {
+                    self.stats.ac_unservable.fetch_add(1, Relaxed);
+                    return Err(Status::not_found(
+                        "cached result references unfetchable blobs",
+                    ));
+                }
                 self.stats.ac_hits.fetch_add(1, Relaxed);
                 self.stats.ac_bytes.fetch_add(bytes.len() as u64, Relaxed);
-                re::ActionResult::decode(bytes.as_slice())
-                    .map(Response::new)
-                    .map_err(|e| Status::internal(format!("corrupt AC entry: {e}")))
+                Ok(Response::new(result))
             }
             None => {
                 self.stats.ac_misses.fetch_add(1, Relaxed);
@@ -474,5 +522,87 @@ fn rpc_status(code: tonic::Code, msg: &str) -> bazel_remote_apis::google::rpc::S
         code: code as i32,
         message: msg.into(),
         details: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::{Driver, DriverCfg};
+    use tonic::Request;
+
+    /// sha256("abc") - the store verifies content digests on put.
+    const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    fn rig() -> Ac {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let store = Arc::new(Store::new(dir).unwrap());
+        let driver = Driver::new(
+            store.clone(),
+            DriverCfg {
+                session: "test".into(),
+                min_workers: 0,
+                local_exec: false,
+                decentralized: false,
+                hardlinks: true,
+                cache_failures: false,
+                addr_file: None,
+                finalize_file: None,
+                scratch: std::env::temp_dir(),
+            },
+        );
+        Ac {
+            store,
+            stats: Arc::new(RpcStats::default()),
+            driver,
+        }
+    }
+
+    fn req(hash: &str) -> Request<re::GetActionResultRequest> {
+        Request::new(re::GetActionResultRequest {
+            action_digest: Some(re::Digest {
+                hash: hash.into(),
+                size_bytes: 1,
+            }),
+            ..Default::default()
+        })
+    }
+
+    /// An AC hit whose output blob is unfetchable must report NOT_FOUND -
+    /// serving it strands the client on blobs nobody can deliver (the
+    /// evicted-shards outage, run 28932994472). Present blobs serve normally.
+    #[tokio::test]
+    async fn ac_hit_validates_blob_presence() {
+        use re::action_cache_server::ActionCache;
+        let ac = rig();
+        let key = "a".repeat(64);
+        let result = re::ActionResult {
+            output_files: vec![re::OutputFile {
+                path: "out".into(),
+                digest: Some(re::Digest {
+                    hash: ABC.into(),
+                    size_bytes: 3,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        ac.store
+            .ac_put(&key, &result.encode_to_vec())
+            .await
+            .unwrap();
+
+        let err = ac.get_action_result(req(&key)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert_eq!(ac.stats.ac_unservable.load(Relaxed), 1);
+
+        // Store the referenced blob -> the same entry becomes servable.
+        let d = crate::mesh::Dig {
+            hash: ABC.into(),
+            size: 3,
+        };
+        ac.store.put(Some(&d), b"abc").await.unwrap();
+        ac.get_action_result(req(&key)).await.expect("now servable");
+        assert_eq!(ac.stats.ac_hits.load(Relaxed), 1);
     }
 }

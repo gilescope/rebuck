@@ -58,6 +58,8 @@ struct WorkerConn {
     slots: u32,
     os: String,
     arch: String,
+    /// Mesh endpoint id, for direct blob probes (gossip-independent).
+    endpoint: String,
 }
 
 /// What platform an action demands, from its REAPI platform properties.
@@ -316,6 +318,7 @@ impl Driver {
             slots,
             os,
             arch,
+            endpoint: endpoint.clone(),
         });
         self.worker_arrived.notify_waiters();
         self.pump().await;
@@ -575,6 +578,34 @@ impl Driver {
         have
     }
 
+    /// Direct HasMany probe of every connected worker for one digest.
+    /// Returns the first endpoint that testifies, seeding the provider
+    /// index so the next lookup is O(1).
+    async fn probe_workers(&self, d: &Dig) -> Option<String> {
+        let endpoints: Vec<String> = self
+            .workers
+            .lock()
+            .await
+            .iter()
+            .map(|w| w.endpoint.clone())
+            .filter(|e| !e.is_empty())
+            .collect();
+        for ep in endpoints {
+            let hit = matches!(
+                self.peer_request(&ep, &BlobReq::HasMany(vec![d.clone()])).await,
+                Ok(BlobResp::HaveMany(v)) if v.first().copied().unwrap_or(false)
+            );
+            if hit {
+                self.providers
+                    .lock()
+                    .await
+                    .insert(d.hash.clone(), ep.clone());
+                return Some(ep);
+            }
+        }
+        None
+    }
+
     /// Read-through get: local store first, then fetch from the producing
     /// worker and cache. Used by the gRPC surface (buck2's reads).
     pub async fn get_blob(&self, d: &Dig) -> Result<Option<Vec<u8>>> {
@@ -583,16 +614,23 @@ impl Driver {
         }
         let endpoint = match self.providers.lock().await.get(&d.hash).cloned() {
             Some(e) => e,
-            // Index miss: any peer whose bloom claims the blob (FP -> None).
+            // Index miss: any peer whose bloom claims the blob, else a direct
+            // probe of every connected worker — gossip is 30s-periodic and a
+            // dice-warm client outruns it (reader 28932994472 died on this).
             None => {
-                let blooms = self.blooms.lock().await;
-                match blooms
-                    .iter()
-                    .find(|(_, b)| b.contains(&d.hash))
-                    .map(|(e, _)| e.clone())
-                {
+                let claimed = {
+                    let blooms = self.blooms.lock().await;
+                    blooms
+                        .iter()
+                        .find(|(_, b)| b.contains(&d.hash))
+                        .map(|(e, _)| e.clone())
+                };
+                match claimed {
                     Some(e) => e,
-                    None => return Ok(None),
+                    None => match self.probe_workers(d).await {
+                        Some(e) => e,
+                        None => return Ok(None),
+                    },
                 }
             }
         };
@@ -1053,6 +1091,7 @@ mod tests {
             slots,
             os: os.into(),
             arch: "test_arch".into(),
+            endpoint: String::new(),
         });
         handle
     }
@@ -1154,6 +1193,7 @@ mod tests {
             slots,
             os: os.into(),
             arch: "test_arch".into(),
+            endpoint: String::new(),
         });
     }
 
