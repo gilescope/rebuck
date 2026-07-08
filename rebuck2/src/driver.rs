@@ -645,20 +645,29 @@ impl Driver {
             .map(|w| w.endpoint.clone())
             .filter(|e| !e.is_empty())
             .collect();
-        for ep in endpoints {
+        // All peers concurrently: a healing run probes for thousands of
+        // genuinely-new blobs, and 11 sequential round-trips per miss
+        // multiplied out to hours (run 28962751323). One fan-out, first
+        // yes wins; unanimous no answers in one RTT.
+        let probes = endpoints.into_iter().map(|ep| async move {
             let hit = matches!(
                 self.peer_request(&ep, &BlobReq::HasMany(vec![d.clone()])).await,
                 Ok(BlobResp::HaveMany(v)) if v.first().copied().unwrap_or(false)
             );
-            if hit {
-                self.providers
-                    .lock()
-                    .await
-                    .insert(d.hash.clone(), ep.clone());
-                return Some(ep);
-            }
+            hit.then_some(ep)
+        });
+        let found = futures::future::join_all(probes)
+            .await
+            .into_iter()
+            .flatten()
+            .next();
+        if let Some(ep) = &found {
+            self.providers
+                .lock()
+                .await
+                .insert(d.hash.clone(), ep.clone());
         }
-        None
+        found
     }
 
     /// Read-through get: local store first, then fetch from the producing
