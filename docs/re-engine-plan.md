@@ -238,15 +238,31 @@ shards trivially by cas/<2hex> prefix. Make the fleet do it:
   driver must count worker-held blobs as present, else buck2 re-uploads
   (or worse, fails on blobs it never had under materializations=none).
   Bloom hit -> Has verify -> present.
-- **Save**: after the driver disconnects, each worker tars ITS shard from
-  its own store (zstd -T0 -8) and saves it - 11-way parallel, in job
-  teardown, off the critical path. The driver saves ac + dice only.
+- **Save (as built - fully distributed)**: after the build, the workflow
+  touches the driver's `--finalize-file`; the driver assigns shards
+  round-robin (`D2W::Finalize{shard, of}`) across the connected fleet.
+  Each worker SYNCS its shard to completeness first
+  (`BlobReq::ListShard` -> diff -> fetch missing over the mesh, in the
+  otherwise-idle post-build window - this closes the coverage hole where
+  a blob is held only by a non-assigned worker), writes `shard.id`
+  beside its store, replies `W2D::Finalized`, and exits its serve loop.
+  The worker JOB then tars `cas/<prefixes of its shard>` and saves the
+  cache entry - 8+-way parallel, in job teardown, off the critical path.
+  The driver waits for `<finalize-file>.done` and saves ac + dice only.
 
 Expected effect: seed+save drop from ~8-10min of driver critical path to
 ~1min (AC only); the 10GB cap holds disjoint shards instead of one
 monolith, so eviction hits one shard (self-heals: that shard rebuilds
 cold) instead of the whole store.
 
+Protocol additions (as built): `BlobReq::{HasMany, ListShard}`,
+`BlobResp::{HaveMany, HashList}`, `D2W::Finalize`, `W2D::Finalized`;
+driver flags `--addr-file` (published-addr dialing) and
+`--finalize-file` (shard handoff signal); worker flag
+`--driver-addr-file`.
+
 Risks: shard entry eviction skew (popular shard rebuilt often - acceptable,
 self-healing); worker count < shard count (a worker restores 2 shards);
-first run per shard-scheme migration is cold.
+first run migrates via the driver's monolith-restore fallback (gone once
+shard entries exist); a worker lost before Finalized leaves its shard
+stale for one run (next run's finalize re-syncs it).

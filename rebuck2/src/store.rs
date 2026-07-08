@@ -325,6 +325,25 @@ impl Store {
         out
     }
 
+    /// Like `list_hashes` but with sizes (for shard listings, where the
+    /// fetcher needs full digests).
+    pub fn list_entries(&self) -> Vec<(String, i64)> {
+        let mut out = Vec::new();
+        let Ok(subs) = std::fs::read_dir(self.root.join("cas")) else {
+            return out;
+        };
+        for sub in subs.flatten() {
+            if let Ok(files) = std::fs::read_dir(sub.path()) {
+                for f in files.flatten() {
+                    if let (Some(name), Ok(meta)) = (f.file_name().to_str(), f.metadata()) {
+                        out.push((name.to_owned(), meta.len() as i64));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     pub async fn ac_get(&self, action_hash: &str) -> Option<Vec<u8>> {
         tokio::fs::read(self.root.join("ac").join(action_hash))
             .await

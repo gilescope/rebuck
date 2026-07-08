@@ -123,6 +123,10 @@ pub enum W2D {
     Holdings {
         bloom: Bloom,
     },
+    /// Shard sync complete; this worker's job will save the shard entry.
+    Finalized {
+        shard: u8,
+    },
 }
 
 /// Driver → worker, on the control stream.
@@ -140,6 +144,11 @@ pub enum D2W {
     Blooms {
         peers: Vec<(String, Bloom)>,
     },
+    /// Post-build: sync + own snapshot shard `shard` (of `of`), then exit.
+    Finalize {
+        shard: u8,
+        of: u8,
+    },
 }
 
 /// Worker → driver, each on a fresh bi-stream (header, then raw bytes for Put).
@@ -151,6 +160,12 @@ pub enum BlobReq {
     /// gossip (blooms route, HasMany confirms; FindMissingBlobs must never
     /// lie to buck2).
     HasMany(Vec<Dig>),
+    /// All store hashes whose shard (first hex nibble / 2 when of=8) is
+    /// `shard`. Used by workers syncing their assigned snapshot shard.
+    ListShard {
+        shard: u8,
+        of: u8,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -167,6 +182,8 @@ pub enum BlobResp {
     PutOk,
     /// Reply to HasMany, same order as the request.
     HaveMany(Vec<bool>),
+    /// Reply to ListShard.
+    HashList(Vec<Dig>),
     Err(String),
 }
 

@@ -37,6 +37,10 @@ pub struct DriverCfg {
     /// re-run-every-known-failure tax on warm sweeps. Infra failures are
     /// never cached regardless.
     pub cache_failures: bool,
+    /// When this file appears, assign snapshot shards to the fleet
+    /// (Finalize), await their Finalized replies, then write
+    /// `<file>.done` for the workflow to proceed on.
+    pub finalize_file: Option<std::path::PathBuf>,
     /// Write the driver's full EndpointAddr (id + relay) here once bound.
     /// CI publishes it as a run artifact so workers can dial directly -
     /// n0 discovery becomes a fallback instead of a single point of
@@ -146,6 +150,8 @@ pub struct Driver {
     /// Cache outcome accounting for the stats heartbeat: AC hits that were
     /// successes, AC hits that were cached failures, and executions forced
     /// by do_not_cache actions (the prelude's diag wrappers).
+    /// Workers that completed their post-build shard sync.
+    pub finalized: AtomicU64,
     pub ac_hit_ok: AtomicU64,
     pub ac_hit_fail: AtomicU64,
     pub dnc_exec: AtomicU64,
@@ -170,6 +176,7 @@ impl Driver {
             queue: Mutex::new(HashMap::new()),
             providers: Mutex::new(HashMap::new()),
             blooms: Mutex::new(HashMap::new()),
+            finalized: AtomicU64::new(0),
             ac_hit_ok: AtomicU64::new(0),
             ac_hit_fail: AtomicU64::new(0),
             dnc_exec: AtomicU64::new(0),
@@ -198,6 +205,32 @@ impl Driver {
             let json = serde_json::to_string(&addr)?;
             tokio::fs::write(path, &json).await?;
             println!("[driver] addr written to {}", path.display());
+        }
+        if let Some(sig) = self.cfg.finalize_file.clone() {
+            let this = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    if tokio::fs::metadata(&sig).await.is_ok() {
+                        let told = this.finalize_shards(8).await as u64;
+                        println!("[driver] finalize signalled: told {told} workers");
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(900);
+                        while this.finalized_count() < told && std::time::Instant::now() < deadline
+                        {
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        }
+                        let done = sig.with_extension("done");
+                        let _ =
+                            tokio::fs::write(&done, format!("{}", this.finalized_count())).await;
+                        println!(
+                            "[driver] finalize complete: {}/{told} workers",
+                            this.finalized_count()
+                        );
+                        return;
+                    }
+                }
+            });
         }
 
         let _ = self.mesh_ep.set(ep.clone());
@@ -322,6 +355,10 @@ impl Driver {
                         inflight.fetch_sub(1, Ordering::Relaxed);
                         self.complete(job, Err(msg)).await;
                         self.pump().await;
+                    }
+                    W2D::Finalized { shard } => {
+                        println!("[driver] worker {worker_id} finalized shard {shard}");
+                        self.finalized.fetch_add(1, Ordering::Relaxed);
                     }
                     W2D::Holdings { bloom } => {
                         self.blooms.lock().await.insert(endpoint.clone(), bloom);
@@ -529,6 +566,23 @@ impl Driver {
 
     pub async fn worker_count(&self) -> usize {
         self.workers.lock().await.len()
+    }
+
+    /// Post-build: assign snapshot shards 0..of round-robin across the
+    /// connected fleet and tell each worker to sync + save its shard.
+    /// Returns how many workers were told (each shard covered when the
+    /// fleet is >= `of`; extras double up for redundancy).
+    pub async fn finalize_shards(&self, of: u8) -> usize {
+        let workers = self.workers.lock().await;
+        for (i, w) in workers.iter().enumerate() {
+            let shard = (i as u8) % of;
+            let _ = w.tx.send(D2W::Finalize { shard, of });
+        }
+        workers.len()
+    }
+
+    pub fn finalized_count(&self) -> u64 {
+        self.finalized.load(Ordering::Relaxed)
     }
 
     /// Resolve a job's oneshot and drop it from the table.
@@ -850,6 +904,21 @@ async fn serve_blob_stream(
             }
             mesh::send_frame(&mut send, &BlobResp::HaveMany(have)).await?;
         }
+        BlobReq::ListShard { shard, of } => {
+            let of = of.max(1);
+            let digs: Vec<Dig> = driver
+                .store
+                .list_entries()
+                .into_iter()
+                .filter(|(hash, _)| {
+                    u8::from_str_radix(&hash[..1], 16)
+                        .map(|n| n / (16 / of.min(16)) == shard)
+                        .unwrap_or(false)
+                })
+                .map(|(hash, size)| Dig { hash, size })
+                .collect();
+            mesh::send_frame(&mut send, &BlobResp::HashList(digs)).await?;
+        }
     }
     send.finish()?;
     Ok(())
@@ -870,6 +939,7 @@ mod tests {
                 decentralized: false,
                 hardlinks: true,
                 addr_file: None,
+                finalize_file: None,
                 cache_failures: false,
                 scratch: std::env::temp_dir(),
             },

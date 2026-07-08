@@ -149,6 +149,7 @@ async fn run_driver(mut args: Args) -> Result<()> {
         hardlinks: !args.flag("--no-hardlinks"),
         cache_failures: args.flag("--cache-failures"),
         addr_file: args.opt("--addr-file").map(Into::into),
+        finalize_file: args.opt("--finalize-file").map(Into::into),
         scratch,
     };
     args.done();

@@ -203,6 +203,23 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                 continue;
             }
             D2W::Welcome { .. } => continue,
+            D2W::Finalize { shard, of } => {
+                println!("[worker] finalize: syncing snapshot shard {shard}/{of}");
+                if let Err(e) = sync_shard(&store, &conn, shard, of, &cfg.scratch).await {
+                    eprintln!("[worker] shard sync failed (partial save): {e:#}");
+                }
+                // The workflow's save step reads this to key the cache entry.
+                let id_path = cfg
+                    .scratch
+                    .parent()
+                    .unwrap_or(&cfg.scratch)
+                    .join("shard.id");
+                let _ = tokio::fs::write(&id_path, format!("{shard} {of}")).await;
+                let _ =
+                    mesh::send_frame(&mut *ctrl_send.lock().await, &W2D::Finalized { shard }).await;
+                println!("[worker] finalized shard {shard} — exiting");
+                return Ok(());
+            }
         };
         let blobs = blobs.clone();
         let ctrl = ctrl_send.clone();
@@ -458,4 +475,64 @@ impl exec::Blobs for RemoteBlobs {
         }
         Ok(d)
     }
+}
+
+/// Make this worker's store a complete replica of snapshot shard
+/// `shard`/`of`: list the driver's shard hashes, fetch what's missing.
+/// Bounded concurrency; the post-build window is otherwise idle.
+async fn sync_shard(
+    store: &Arc<Store>,
+    conn: &Connection,
+    shard: u8,
+    of: u8,
+    _scratch: &std::path::Path,
+) -> Result<()> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    mesh::send_frame(&mut send, &BlobReq::ListShard { shard, of }).await?;
+    send.finish()?;
+    let digs = match mesh::recv_frame::<BlobResp>(&mut recv)
+        .await?
+        .context("driver closed shard list stream")?
+    {
+        BlobResp::HashList(v) => v,
+        other => bail!("unexpected shard list response: {other:?}"),
+    };
+    let mut missing = Vec::new();
+    for d in digs {
+        if !store.has(&d).await {
+            missing.push(d);
+        }
+    }
+    println!(
+        "[worker] shard {shard}: fetching {} missing blobs",
+        missing.len()
+    );
+    let sem = Arc::new(tokio::sync::Semaphore::new(8));
+    let mut tasks = Vec::new();
+    for d in missing {
+        let sem = sem.clone();
+        let store = store.clone();
+        let conn = conn.clone();
+        tasks.push(tokio::spawn(async move {
+            let _p = sem.acquire().await.expect("semaphore open");
+            let (mut send, mut recv) = conn.open_bi().await?;
+            mesh::send_frame(&mut send, &BlobReq::Get(d.clone())).await?;
+            send.finish()?;
+            match mesh::recv_frame::<BlobResp>(&mut recv)
+                .await?
+                .context("driver closed blob stream")?
+            {
+                BlobResp::Found { size } => {
+                    let bytes = mesh::recv_raw(&mut recv, size).await?;
+                    store.put(Some(&d), &bytes).await?;
+                    Ok::<(), anyhow::Error>(())
+                }
+                _ => Ok(()), // missing/err: shard save is best-effort
+            }
+        }));
+    }
+    for t in tasks {
+        let _ = t.await;
+    }
+    Ok(())
 }
