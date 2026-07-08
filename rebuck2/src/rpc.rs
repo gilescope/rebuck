@@ -19,7 +19,7 @@ use futures::Stream;
 use prost::Message;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::driver::Driver;
+use crate::driver::{AcLookup, Driver};
 use crate::mesh::Dig;
 use crate::store::Store;
 
@@ -340,31 +340,6 @@ pub struct Ac {
     pub driver: Arc<Driver>,
 }
 
-/// Every CAS digest a cached result commits us to serving. Zero-size blobs
-/// are implicit in RE (every CAS "has" the empty blob) and are skipped.
-fn result_digests(r: &re::ActionResult) -> Vec<Dig> {
-    let mut digs = Vec::new();
-    let mut push = |d: &Option<re::Digest>| {
-        if let Some(d) = d {
-            if d.size_bytes > 0 {
-                digs.push(Dig {
-                    hash: d.hash.clone(),
-                    size: d.size_bytes,
-                });
-            }
-        }
-    };
-    for f in &r.output_files {
-        push(&f.digest);
-    }
-    for t in &r.output_directories {
-        push(&t.tree_digest);
-    }
-    push(&r.stdout_digest);
-    push(&r.stderr_digest);
-    digs
-}
-
 #[tonic::async_trait]
 impl re::action_cache_server::ActionCache for Ac {
     async fn get_action_result(
@@ -372,34 +347,25 @@ impl re::action_cache_server::ActionCache for Ac {
         req: Request<re::GetActionResultRequest>,
     ) -> Result<Response<re::ActionResult>, Status> {
         let d = req.get_ref().action_digest.as_ref().ok_or_else(no_digest)?;
-        match self.store.ac_get(&dig(d)?.hash).await {
-            Some(bytes) => {
-                let result = re::ActionResult::decode(bytes.as_slice())
-                    .map_err(|e| Status::internal(format!("corrupt AC entry: {e}")))?;
-                // A hit is a promise the CAS can deliver every referenced
-                // blob. Cache eviction breaks that silently (reader
-                // 28932994472: 17k hits, zero fetchable blobs, all legs
-                // dead) - validate here and report a miss instead, so the
-                // client re-executes and the fleet re-uploads: self-healing.
-                let digs = result_digests(&result);
-                if !digs.is_empty()
-                    && self
-                        .driver
-                        .has_blobs(&digs)
-                        .await
-                        .iter()
-                        .any(|present| !present)
-                {
-                    self.stats.ac_unservable.fetch_add(1, Relaxed);
-                    return Err(Status::not_found(
-                        "cached result references unfetchable blobs",
-                    ));
-                }
+        // A hit is a promise the CAS can deliver every referenced blob.
+        // Cache eviction breaks that silently (reader 28932994472) - the
+        // validated gate reports a miss instead, so the client re-executes
+        // and the fleet re-uploads: self-healing.
+        match self.driver.validated_ac_get(&dig(d)?.hash).await {
+            AcLookup::Hit(result) => {
                 self.stats.ac_hits.fetch_add(1, Relaxed);
-                self.stats.ac_bytes.fetch_add(bytes.len() as u64, Relaxed);
+                self.stats
+                    .ac_bytes
+                    .fetch_add(result.encoded_len() as u64, Relaxed);
                 Ok(Response::new(result))
             }
-            None => {
+            AcLookup::Unservable => {
+                self.stats.ac_unservable.fetch_add(1, Relaxed);
+                Err(Status::not_found(
+                    "cached result references unfetchable blobs",
+                ))
+            }
+            AcLookup::Miss => {
                 self.stats.ac_misses.fetch_add(1, Relaxed);
                 Err(Status::not_found("action not cached"))
             }
@@ -428,6 +394,7 @@ impl re::action_cache_server::ActionCache for Ac {
 
 pub struct Exec {
     pub driver: Arc<Driver>,
+    pub stats: Arc<RpcStats>,
 }
 
 #[tonic::async_trait]
@@ -442,11 +409,12 @@ impl re::execution_server::Execution for Exec {
         let r = req.get_ref();
         let d = dig(r.action_digest.as_ref().ok_or_else(no_digest)?)?;
 
-        // AC short-circuit — the dedup layer.
+        // AC short-circuit — the dedup layer. Same validated gate as the
+        // GetActionResult endpoint: an unvalidated door here served 17k
+        // blob-less results after cache eviction (writer 28935304124).
         if !r.skip_cache_lookup {
-            if let Some(bytes) = self.driver.store.ac_get(&d.hash).await {
-                if let Ok(result) = re::ActionResult::decode(bytes.as_slice()) {
-                    use std::sync::atomic::Ordering::Relaxed;
+            match self.driver.validated_ac_get(&d.hash).await {
+                AcLookup::Hit(result) => {
                     if result.exit_code == 0 {
                         self.driver.ac_hit_ok.fetch_add(1, Relaxed);
                     } else {
@@ -454,6 +422,10 @@ impl re::execution_server::Execution for Exec {
                     }
                     return Ok(op_stream(&d, result, true));
                 }
+                AcLookup::Unservable => {
+                    self.stats.ac_unservable.fetch_add(1, Relaxed);
+                }
+                AcLookup::Miss => {}
             }
         }
 

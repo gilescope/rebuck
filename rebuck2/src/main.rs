@@ -237,8 +237,11 @@ async fn run_driver(mut args: Args) -> Result<()> {
             .max_decoding_message_size(max),
         )
         .add_service(
-            re::execution_server::ExecutionServer::new(rpc::Exec { driver: d.clone() })
-                .max_decoding_message_size(max),
+            re::execution_server::ExecutionServer::new(rpc::Exec {
+                driver: d.clone(),
+                stats: rpc_stats.clone(),
+            })
+            .max_decoding_message_size(max),
         )
         .serve(addr)
         .await

@@ -50,6 +50,41 @@ pub struct DriverCfg {
     pub scratch: std::path::PathBuf,
 }
 
+/// Outcome of a validated AC lookup ([`Driver::validated_ac_get`]).
+pub enum AcLookup {
+    /// Cached result whose referenced blobs are all fetchable.
+    Hit(re::ActionResult),
+    /// Entry exists but at least one referenced blob is gone (evicted CAS):
+    /// callers must report a miss so the client re-executes and re-uploads.
+    Unservable,
+    Miss,
+}
+
+/// Every CAS digest a cached result commits the server to delivering.
+/// Zero-size blobs are implicit in RE and skipped.
+pub fn result_digests(r: &re::ActionResult) -> Vec<Dig> {
+    let mut digs = Vec::new();
+    let mut push = |d: &Option<re::Digest>| {
+        if let Some(d) = d {
+            if d.size_bytes > 0 {
+                digs.push(Dig {
+                    hash: d.hash.clone(),
+                    size: d.size_bytes,
+                });
+            }
+        }
+    };
+    for f in &r.output_files {
+        push(&f.digest);
+    }
+    for t in &r.output_directories {
+        push(&t.tree_digest);
+    }
+    push(&r.stdout_digest);
+    push(&r.stderr_digest);
+    digs
+}
+
 struct WorkerConn {
     id: u64,
     tx: mpsc::UnboundedSender<D2W>,
@@ -576,6 +611,26 @@ impl Driver {
             }
         }
         have
+    }
+
+    /// AC lookup that only returns results the CAS can actually deliver.
+    /// BOTH doors — the GetActionResult endpoint and Execute's short-circuit
+    /// — must go through here: an unvalidated Execute door served 17k
+    /// blob-less results after cache eviction (writer 28935304124, 34,208
+    /// extract_artifacts failures).
+    pub async fn validated_ac_get(self: &Arc<Self>, hash: &str) -> AcLookup {
+        let Some(bytes) = self.store.ac_get(hash).await else {
+            return AcLookup::Miss;
+        };
+        let Ok(result) = re::ActionResult::decode(bytes.as_slice()) else {
+            // Corrupt entry: re-execution overwrites it. Safer than serving.
+            return AcLookup::Miss;
+        };
+        let digs = result_digests(&result);
+        if !digs.is_empty() && self.has_blobs(&digs).await.iter().any(|p| !p) {
+            return AcLookup::Unservable;
+        }
+        AcLookup::Hit(result)
     }
 
     /// Direct HasMany probe of every connected worker for one digest.
