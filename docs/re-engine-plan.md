@@ -215,3 +215,38 @@ copying input trees per action, (3) driver runs a --slots 2 worker.
 - `rebuck2/` — the engine (v0 shipped: driver/worker, REAPI surface, iroh
   dispatch — see its [README](../rebuck2/README.md)).
 - reuses rebuck's cache/platform plumbing; cache-only rebuck untouched.
+
+## Roadmap #9: sharded snapshots via the fleet (kill the seed/save bookkeeping)
+
+Today the driver alone tars/untars the whole store (~3-6GB) against the GH
+actions cache: ~3-5min each way, serialized on one box, inside the run's
+critical path. But we have 11 machines and a content-addressed store that
+shards trivially by cas/<2hex> prefix. Make the fleet do it:
+
+- **Shard function**: prefix byte % 8 -> shard id (disjoint, no duplication).
+- **Restore**: each worker restores cache entry `rebuck2-cas-shard-<i>-*`
+  into its own store BEFORE serving - overlapped with the join window, so
+  restore costs ~zero wall time. The driver restores only the AC (tiny,
+  ~50-100MB) plus dice snapshots.
+- **Serving**: workers already gossip blooms of their holdings. The driver,
+  on a local miss, consults blooms and VERIFIES with a new exact
+  `BlobReq::Has` round-trip (blooms have ~0.1% false positives - fine for
+  routing, not for FindMissingBlobs honesty). Confirmed holders land in the
+  providers map; fetches redirect via the existing Provider plumbing
+  (built for decentralized mode, enabled for seeded shards too).
+- **FindMissing honesty**: buck2's input-upload FindMissing against the
+  driver must count worker-held blobs as present, else buck2 re-uploads
+  (or worse, fails on blobs it never had under materializations=none).
+  Bloom hit -> Has verify -> present.
+- **Save**: after the driver disconnects, each worker tars ITS shard from
+  its own store (zstd -T0 -8) and saves it - 11-way parallel, in job
+  teardown, off the critical path. The driver saves ac + dice only.
+
+Expected effect: seed+save drop from ~8-10min of driver critical path to
+~1min (AC only); the 10GB cap holds disjoint shards instead of one
+monolith, so eviction hits one shard (self-heals: that shard rebuilds
+cold) instead of the whole store.
+
+Risks: shard entry eviction skew (popular shard rebuilt often - acceptable,
+self-healing); worker count < shard count (a worker restores 2 shards);
+first run per shard-scheme migration is cold.
