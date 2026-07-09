@@ -646,7 +646,43 @@ impl Driver {
             // Corrupt entry: re-execution overwrites it. Safer than serving.
             return AcLookup::Miss;
         };
-        let digs = result_digests(&result);
+        let mut digs = result_digests(&result);
+        // Top-level digests prove a directory output's Tree PROTO exists,
+        // not its contents: reader 29010597531 lost 5,390 actions to
+        // interior files of validated directory outputs that existed
+        // nowhere. Expand each tree (small, cached after first fetch) and
+        // demand its files and child Directory protos too.
+        for od in &result.output_directories {
+            let Some(td) = &od.tree_digest else { continue };
+            let tdig: Dig = td.into();
+            let Ok(Some(tree_bytes)) = self.get_blob(&tdig).await else {
+                return AcLookup::Unservable;
+            };
+            let Ok(tree) = re::Tree::decode(tree_bytes.as_slice()) else {
+                return AcLookup::Unservable;
+            };
+            for dir in tree.root.iter().chain(tree.children.iter()) {
+                for f in &dir.files {
+                    if let Some(d) = &f.digest {
+                        if d.size_bytes > 0 {
+                            digs.push(d.into());
+                        }
+                    }
+                }
+            }
+            // Child Directory protos are separate CAS blobs referenced by
+            // digest during materialization; their digests are computable
+            // locally from the embedded copies.
+            for child in &tree.children {
+                let enc = child.encode_to_vec();
+                if !enc.is_empty() {
+                    digs.push(Dig {
+                        hash: crate::store::sha256_hex(&enc),
+                        size: enc.len() as i64,
+                    });
+                }
+            }
+        }
         if !digs.is_empty() && self.has_blobs(&digs).await.iter().any(|p| !p) {
             return AcLookup::Unservable;
         }
@@ -1418,6 +1454,53 @@ mod tests {
             .insert(dig.hash.clone(), "unreachable-peer".into());
         assert!(d.get_blob(&dig).await.is_err());
         assert!(d.providers.lock().await.contains_key(&dig.hash));
+    }
+
+    /// Shallow validation proved the Tree PROTO exists, not its contents:
+    /// reader 29010597531 lost 5,390 actions to interior files of
+    /// validated directory outputs that no longer existed anywhere.
+    #[tokio::test]
+    async fn ac_validation_expands_directory_trees() {
+        let d = test_driver(false);
+        // A tree whose root directory references one file we never store.
+        let file_hash = crate::store::sha256_hex(b"1234567");
+        let tree = re::Tree {
+            root: Some(re::Directory {
+                files: vec![re::FileNode {
+                    name: "gone.rlib".into(),
+                    digest: Some(re::Digest {
+                        hash: file_hash.clone(),
+                        size_bytes: 7,
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            children: vec![],
+        };
+        let tree_dig = d.store.put(None, &tree.encode_to_vec()).await.unwrap();
+        let result = re::ActionResult {
+            output_directories: vec![re::OutputDirectory {
+                path: "outdir".into(),
+                tree_digest: Some(tree_dig.to_proto()),
+                is_topologically_sorted: false,
+                root_directory_digest: None,
+            }],
+            ..Default::default()
+        };
+        let key = "b".repeat(64);
+        d.store.ac_put(&key, &result.encode_to_vec()).await.unwrap();
+        assert!(
+            matches!(d.validated_ac_get(&key).await, AcLookup::Unservable),
+            "tree proto present but interior file absent must be Unservable"
+        );
+        // Store the interior file -> the same entry becomes servable.
+        let f = Dig {
+            hash: file_hash,
+            size: 7,
+        };
+        d.store.put(Some(&f), b"1234567").await.unwrap();
+        assert!(matches!(d.validated_ac_get(&key).await, AcLookup::Hit(_)));
     }
 
     /// Pull-model invariant: a worker's outstanding count never exceeds
