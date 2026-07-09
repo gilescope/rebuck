@@ -44,16 +44,18 @@ inputs:
     default: "driver-addr"
   addr-poll-secs:
     description: >-
-      How long to poll for the address artifact. n0 discovery remains the
-      fallback. Long-sweep fleets should raise this - driver runner
-      allocation can tail past 30 min.
-    default: "450"
+      How long to poll for the address artifact (driver runner allocation
+      can tail past 30 min). n0 discovery remains the fallback. The job's
+      timeout-minutes clips this on short-lap fleets.
+    default: "2400"
   serve-timeout-secs:
-    description: Hard cap on the serve step (guards a driver that never shows).
-    default: "1500"
+    description: >-
+      Hard cap on the serve step (guards a driver that never shows).
+      Keep it below the job's timeout-minutes on long sweep jobs.
+    default: "20400"
   connect-wait-secs:
     description: --connect-wait-secs passed to the worker.
-    default: "600"
+    default: "1800"
   extra-args:
     description: Extra raw flags appended to `rebuck2 worker`.
     default: ""

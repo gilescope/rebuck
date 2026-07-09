@@ -80,15 +80,12 @@ evicted whole shard sets within an hour):
           snapshot-subdirs: ac
 
       # worker <n> preloads shard <n-1> and publishes whichever shard the
-      # driver assigns it at finalize. Long sweeps raise the smallish
-      # defaults - driver runner allocation can tail past 30 min.
+      # driver assigns it at finalize. Timing defaults suit long sweeps;
+      # short-lap fleets are clipped by the job's timeout-minutes anyway.
       - uses: gilescope/rebuck/rebuck2/actions/worker@<sha>
         with:
           session: mesh-${{ github.run_id }}
           shard: ${{ matrix.shard }}
-          addr-poll-secs: "2400"
-          serve-timeout-secs: "20400"
-          connect-wait-secs: "1800"
 ```
 
 Shard artifact names (`cas-shard-N`) are content-addressed slices, so
