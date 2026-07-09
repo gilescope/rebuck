@@ -63,14 +63,22 @@ runs:
       id: shards
       if: always()
       shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
       run: |
         [ "${REBUCK2_CAS_SHARDS:-false}" = "true" ] || { echo "cas shards disabled"; exit 0; }
         mkdir -p "$REBUCK2_WORK/shard-out"
         for i in 0 1 2 3; do
           p=$(printf 'cas/%x* cas/%x* cas/%x* cas/%x*' $((i*4)) $((i*4+1)) $((i*4+2)) $((i*4+3)))
-          if bash "$GITHUB_ACTION_PATH/../store-snapshot.sh" unchanged \
+          # Skip only when BOTH unchanged since seed AND already published -
+          # a warm first lap is unchanged by definition and the pool would
+          # never bootstrap on unchanged-alone.
+          published=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$REBUCK2_SHARD_PREFIX$i&per_page=1" \
+            --jq '[.artifacts[] | select(.expired==false)] | length' 2>/dev/null || echo 0)
+          if [ "${published:-0}" -gt 0 ] \
+             && bash "$GITHUB_ACTION_PATH/../store-snapshot.sh" unchanged \
                "$REBUCK2_STORE/driver" "$REBUCK2_SEEDED_MANIFEST.shard$i" "$p"; then
-            echo "[shard] $i unchanged since seed - skipping"
+            echo "[shard] $i unchanged since seed and published - skipping"
             continue
           fi
           mkdir -p "$REBUCK2_WORK/shard-out/$i"
