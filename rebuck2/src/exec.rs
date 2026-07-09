@@ -311,10 +311,75 @@ async fn materialize(blobs: &dyn Blobs, dir_digest: &Dig, dest: &Path) -> Result
         }
     }
     for (link, target) in symlinks {
-        make_symlink(&link, &target)
-            .with_context(|| format!("symlink {} -> {}", link.display(), target))?;
+        // Canonical topology: buck2 ships the SAME logical tree sometimes as
+        // SymlinkNodes and sometimes dereferenced FileNodes (observed on the
+        // rust dep forests: one compile of a pipelined pair got each form,
+        // rustc's crate hash is topology-sensitive, and every downstream
+        // link died with E0460). Dereference in-tree relative symlinks into
+        // hardlinks so every materialization is file-topology; external or
+        // dangling targets keep the symlink.
+        let resolved = link
+            .parent()
+            .map(|p| p.join(&target))
+            .filter(|r| r.starts_with(dest) || target_within(dest, r));
+        let deref_ok = match &resolved {
+            Some(r) => dereference_into(r, &link).await.unwrap_or(false),
+            None => false,
+        };
+        if !deref_ok {
+            make_symlink(&link, &target)
+                .with_context(|| format!("symlink {} -> {}", link.display(), target))?;
+        }
     }
     Ok(())
+}
+
+/// Lexically normalize `r` (resolving `..`) and check it stays inside `root`.
+fn target_within(root: &Path, r: &Path) -> bool {
+    let mut norm = PathBuf::new();
+    for c in r.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                if !norm.pop() {
+                    return false;
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => norm.push(other),
+        }
+    }
+    norm.starts_with(root)
+}
+
+/// Hardlink (or copy) `target` to `link`; directories link file-by-file.
+/// Ok(false) = target missing/unsupported, caller falls back to a symlink.
+async fn dereference_into(target: &Path, link: &Path) -> Result<bool> {
+    let Ok(meta) = tokio::fs::metadata(target).await else {
+        return Ok(false); // dangling — keep the symlink
+    };
+    if meta.is_file() {
+        if tokio::fs::hard_link(target, link).await.is_err() {
+            tokio::fs::copy(target, link).await?;
+        }
+        return Ok(true);
+    }
+    if meta.is_dir() {
+        let mut stack = vec![(target.to_path_buf(), link.to_path_buf())];
+        while let Some((src, dst)) = stack.pop() {
+            tokio::fs::create_dir_all(&dst).await?;
+            let mut rd = tokio::fs::read_dir(&src).await?;
+            while let Some(e) = rd.next_entry().await? {
+                let (s, d) = (e.path(), dst.join(e.file_name()));
+                if e.file_type().await?.is_dir() {
+                    stack.push((s, d));
+                } else if tokio::fs::hard_link(&s, &d).await.is_err() {
+                    tokio::fs::copy(&s, &d).await?;
+                }
+            }
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 #[cfg(unix)]
