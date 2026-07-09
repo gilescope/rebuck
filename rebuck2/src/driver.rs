@@ -580,27 +580,29 @@ impl Driver {
 
     pub async fn has_blobs(self: &Arc<Self>, digs: &[Dig]) -> Vec<bool> {
         let mut have = vec![false; digs.len()];
-        let mut unknown: Vec<usize> = Vec::new();
-        {
-            let providers = self.providers.lock().await;
-            for (i, d) in digs.iter().enumerate() {
-                if self.store.has(d).await || providers.contains_key(&d.hash) {
-                    have[i] = true;
-                } else {
-                    unknown.push(i);
-                }
-            }
-        }
-        if unknown.is_empty() {
-            return have;
-        }
-        // Group the unknowns by the first bloom that claims them.
+        // Peer to ask per unknown digest: the provider-index entry first,
+        // else the first bloom claimant. The index is a routing HINT, not
+        // a presence oracle - a worker's LRU can evict a blob minutes
+        // after announcing it, and testifying on the bare entry turned
+        // 3,650 stale hints into hard exec failures per lap (healing4/5).
+        // Both sources get the same exact HasMany verification.
         let mut by_peer: HashMap<String, Vec<usize>> = HashMap::new();
         {
+            let providers = self.providers.lock().await;
             let blooms = self.blooms.lock().await;
-            for &i in &unknown {
-                if let Some((ep, _)) = blooms.iter().find(|(_, b)| b.contains(&digs[i].hash)) {
-                    by_peer.entry(ep.clone()).or_default().push(i);
+            for (i, d) in digs.iter().enumerate() {
+                if self.store.has(d).await {
+                    have[i] = true;
+                    continue;
+                }
+                let peer = providers.get(&d.hash).cloned().or_else(|| {
+                    blooms
+                        .iter()
+                        .find(|(_, b)| b.contains(&d.hash))
+                        .map(|(e, _)| e.clone())
+                });
+                if let Some(p) = peer {
+                    by_peer.entry(p).or_default().push(i);
                 }
             }
         }
@@ -611,13 +613,20 @@ impl Driver {
                 Ok(BlobResp::HaveMany(v)) => Some(v),
                 _ => None,
             };
-            if let Some(v) = confirmed {
-                let mut providers = self.providers.lock().await;
-                for (k, &i) in idxs.iter().enumerate() {
-                    if v.get(k).copied().unwrap_or(false) {
-                        have[i] = true;
-                        providers.insert(digs[i].hash.clone(), peer.clone());
-                    }
+            let mut providers = self.providers.lock().await;
+            for (k, &i) in idxs.iter().enumerate() {
+                let ok = confirmed
+                    .as_ref()
+                    .and_then(|v| v.get(k))
+                    .copied()
+                    .unwrap_or(false);
+                if ok {
+                    have[i] = true;
+                    providers.insert(digs[i].hash.clone(), peer.clone());
+                } else if providers.get(&digs[i].hash) == Some(&peer) {
+                    // Unproven: evict so the next lookup rediscovers
+                    // honestly instead of re-trusting the stale entry.
+                    providers.remove(&digs[i].hash);
                 }
             }
         }
@@ -681,37 +690,74 @@ impl Driver {
         found
     }
 
-    /// Read-through get: local store first, then fetch from the producing
-    /// worker and cache. Used by the gRPC surface (buck2's reads).
+    /// Read-through get: local store first, then fetch from the fleet and
+    /// cache. Used by the gRPC surface (buck2's reads) and the mesh serve
+    /// arm (workers' exec inputs).
+    ///
+    /// Candidate order: provider-index hint, then every bloom claimant,
+    /// then one exact fan-out probe. A single peer's "Missing" is a
+    /// routing miss (stale index, bloom false positive, LRU eviction) -
+    /// NOT an answer: trusting it turned 3,650 fetches per lap into hard
+    /// action failures (healing4/5). Failed hints are evicted so
+    /// rediscovery stays honest.
     pub async fn get_blob(&self, d: &Dig) -> Result<Option<Vec<u8>>> {
         if let Some(bytes) = self.store.get(d).await? {
             return Ok(Some(bytes));
         }
-        let endpoint = match self.providers.lock().await.get(&d.hash).cloned() {
-            Some(e) => e,
-            // Index miss: any peer whose bloom claims the blob, else a direct
-            // probe of every connected worker — gossip is 30s-periodic and a
-            // dice-warm client outruns it (reader 28932994472 died on this).
-            None => {
-                let claimed = {
-                    let blooms = self.blooms.lock().await;
-                    blooms
-                        .iter()
-                        .find(|(_, b)| b.contains(&d.hash))
-                        .map(|(e, _)| e.clone())
-                };
-                match claimed {
-                    Some(e) => e,
-                    None => match self.probe_workers(d).await {
-                        Some(e) => e,
-                        None => return Ok(None),
-                    },
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(e) = self.providers.lock().await.get(&d.hash).cloned() {
+            candidates.push(e);
+        }
+        {
+            let blooms = self.blooms.lock().await;
+            candidates.extend(
+                blooms
+                    .iter()
+                    .filter(|(_, b)| b.contains(&d.hash))
+                    .map(|(e, _)| e.clone()),
+            );
+        }
+        let _permit = self.mesh_fetches.acquire().await;
+        let mut tried: std::collections::BTreeSet<String> = Default::default();
+        for round in 0..2 {
+            for endpoint in std::mem::take(&mut candidates) {
+                if !tried.insert(endpoint.clone()) {
+                    continue;
+                }
+                match self.fetch_blob_from(&endpoint, d).await {
+                    Ok(Some(bytes)) => {
+                        self.store.put(Some(d), &bytes).await?;
+                        self.providers.lock().await.insert(d.hash.clone(), endpoint);
+                        return Ok(Some(bytes));
+                    }
+                    Ok(None) | Err(_) => {
+                        let mut providers = self.providers.lock().await;
+                        if providers.get(&d.hash) == Some(&endpoint) {
+                            providers.remove(&d.hash);
+                        }
+                    }
                 }
             }
-        };
-        let _permit = self.mesh_fetches.acquire().await;
+            // Last resort, once: exact fan-out probe of every worker
+            // (gossip is 30s-periodic and a dice-warm client outruns it;
+            // the probe also reseeds the index).
+            if round == 0 {
+                match self.probe_workers(d).await {
+                    Some(e) if !tried.contains(&e) => candidates.push(e),
+                    _ => break,
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// One blob fetch from one peer: two attempts (retry once on a fresh
+    /// connection if the pooled one went stale). Ok(None) = peer answered
+    /// Missing; Err = peer unreachable/protocol error. Callers treat both
+    /// as "not from this peer", never as a global verdict.
+    async fn fetch_blob_from(&self, endpoint: &str, d: &Dig) -> Result<Option<Vec<u8>>> {
         for attempt in 0..2 {
-            let conn = self.peer_conn(&endpoint).await?;
+            let conn = self.peer_conn(endpoint).await?;
             let res: Result<Option<Vec<u8>>> = async {
                 let (mut send, mut recv) = conn.open_bi().await?;
                 mesh::send_frame(&mut send, &BlobReq::Get(d.clone())).await?;
@@ -730,12 +776,8 @@ impl Driver {
             }
             .await;
             match res {
-                Ok(Some(bytes)) => {
-                    self.store.put(Some(d), &bytes).await?;
-                    return Ok(Some(bytes));
-                }
-                Ok(None) => return Ok(None),
-                Err(_) if attempt == 0 => self.drop_peer_conn(&endpoint).await,
+                Ok(x) => return Ok(x),
+                Err(_) if attempt == 0 => self.drop_peer_conn(endpoint).await,
                 Err(e) => return Err(e),
             }
         }
@@ -1310,6 +1352,31 @@ mod tests {
             1,
             "same input root must pin to one worker: {log:?}"
         );
+    }
+
+    /// The provider index is a routing HINT, not a presence oracle: a
+    /// worker's 10GB LRU can evict a blob minutes after announcing it.
+    /// healing4/5: has_blobs testified on the bare index entry, exec-time
+    /// get_blob then trusted the same stale entry and turned one peer's
+    /// "Missing" into a hard action failure - 3,650 times per lap.
+    #[tokio::test]
+    async fn stale_provider_entry_is_a_hint_not_truth() {
+        let d = test_driver(false);
+        let dig = Dig {
+            hash: "ab".repeat(32),
+            size: 3,
+        };
+        d.providers
+            .lock()
+            .await
+            .insert(dig.hash.clone(), "unreachable-peer".into());
+        // Validation must verify the entry (unreachable peer = unproven).
+        assert_eq!(d.has_blobs(&[dig.clone()]).await, vec![false]);
+        // The serve path must degrade to discovery (nothing else holds it
+        // here) and evict the stale entry - not error, not trust it.
+        let got = d.get_blob(&dig).await.unwrap();
+        assert!(got.is_none());
+        assert!(!d.providers.lock().await.contains_key(&dig.hash));
     }
 
     /// Pull-model invariant: a worker's outstanding count never exceeds
