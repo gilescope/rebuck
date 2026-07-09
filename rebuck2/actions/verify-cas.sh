@@ -27,7 +27,7 @@ while IFS= read -r f; do
     rm -f "$f"
     bad=$((bad + 1))
   fi
-done < <(find "$store/cas" -maxdepth 1 -type f)
+done < <(find "$store/cas" -type f)
 
 echo "verify-cas: $ok verified, $bad rejected"
 [ "$bad" -eq 0 ] || echo "verify-cas: WARNING - rejected blobs suggest a poisoned or corrupt shard artifact" >&2
