@@ -1404,12 +1404,18 @@ mod tests {
             .lock()
             .await
             .insert(dig.hash.clone(), "unreachable-peer".into());
-        // Validation must verify the entry (unreachable peer = unproven).
+        // Validation must verify the entry (unreachable peer = unproven)
+        // and evict the failed hint so rediscovery stays honest.
         assert_eq!(d.has_blobs(&[dig.clone()]).await, vec![false]);
+        assert!(!d.providers.lock().await.contains_key(&dig.hash));
         // The serve path must classify a claimed-but-unfetchable blob as an
         // INFRA error (retryable at the job layer), never Ok(None): reader
         // 29007342337 lost 3,212 actions to transient fetch failures being
         // reported as Missing. The hint is kept - it may recover.
+        d.providers
+            .lock()
+            .await
+            .insert(dig.hash.clone(), "unreachable-peer".into());
         assert!(d.get_blob(&dig).await.is_err());
         assert!(d.providers.lock().await.contains_key(&dig.hash));
     }
