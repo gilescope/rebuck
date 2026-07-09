@@ -215,7 +215,16 @@ runs:
           # only accept shards uploaded by runs of THIS repo's own branches.
           AID=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$REBUCK2_SHARD_PREFIX$i&per_page=10" --jq '[.artifacts[] | select(.expired==false and .workflow_run.head_repository_id == .workflow_run.repository_id)][0].id // empty' 2>/dev/null || true)
           if [ -n "$AID" ]; then
-            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$AID/zip" > "$REBUCK2_WORK/shard.zip"               && unzip -o -q "$REBUCK2_WORK/shard.zip" -d "$REBUCK2_SNAPSHOT_DIR"               && rm -f "$REBUCK2_WORK/shard.zip"               && mv "$REBUCK2_SNAPSHOT_DIR/bulk.tar.zst" "$REBUCK2_SNAPSHOT_DIR/shard-$i.tar.zst" 2>/dev/null               || echo "shard $i fetch failed - partial warmth is fine"
+            # Extract in isolation: the shard zip's inner tar is ALSO named
+            # bulk.tar.zst - unzipping straight into SNAPSHOT_DIR overwrote
+            # the cache-restored AC tar of the same name (every lap then ran
+            # ac-cold, re-executing hundreds of actions).
+            rm -rf "$REBUCK2_WORK/shard-tmp" && mkdir -p "$REBUCK2_WORK/shard-tmp"
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$AID/zip" > "$REBUCK2_WORK/shard.zip" \
+              && unzip -o -q "$REBUCK2_WORK/shard.zip" -d "$REBUCK2_WORK/shard-tmp" \
+              && rm -f "$REBUCK2_WORK/shard.zip" \
+              && mv "$REBUCK2_WORK/shard-tmp/bulk.tar.zst" "$REBUCK2_SNAPSHOT_DIR/shard-$i.tar.zst" \
+              || echo "shard $i fetch failed - partial warmth is fine"
           else
             echo "no $REBUCK2_SHARD_PREFIX$i artifact yet"
           fi
