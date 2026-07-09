@@ -42,6 +42,12 @@ inputs:
   addr-artifact:
     description: Run-artifact name the driver address is published under.
     default: "driver-addr"
+  addr-run-id:
+    description: >-
+      Run id that published the addr artifact. Defaults to this run - set
+      it when workers are summoned by an autoscaler into their own run
+      (workflow_dispatch) while the driver lives in the triggering one.
+    default: ${{ github.run_id }}
   addr-poll-secs:
     description: >-
       How long to poll for the address artifact (driver runner allocation
@@ -151,11 +157,12 @@ runs:
       env:
         GH_TOKEN: ${{ inputs.github-token }}
         IN_ADDR_NAME: ${{ inputs.addr-artifact }}
+        IN_ADDR_RUN: ${{ inputs.addr-run-id }}
         IN_POLL: ${{ inputs.addr-poll-secs }}
       run: |
         cd "$REBUCK2_WORK"
         for _ in $(seq 1 $((IN_POLL / 10))); do
-          if gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts" \
+          if gh api "repos/$GITHUB_REPOSITORY/actions/runs/$IN_ADDR_RUN/artifacts" \
                --jq ".artifacts[] | select(.name==\"$IN_ADDR_NAME\") | .id" 2>/dev/null | head -1 > aid.txt \
              && [ -s aid.txt ]; then
             gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$(cat aid.txt)/zip" > addr.zip 2>/dev/null \

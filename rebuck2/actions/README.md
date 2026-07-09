@@ -93,6 +93,18 @@ separate fleets sharing a repo (e.g. a single-OS one and a mixed-OS one)
 cross-pollinate through them, while their ACs stay per-fleet via
 `snapshot-key-prefix`.
 
+## Autoscaled workers (optional)
+
+Static worker jobs idle on warm laps (everything is an AC hit). Instead
+of a fixed matrix, drop the worker jobs and let the driver summon them:
+the driver's heartbeat logs `pending_jobs=N`; a background loop next to
+the build greps it and `gh workflow run`s a workers workflow with a
+count sized to the queue. Warm laps never spawn a worker (give the
+driver `co-worker-slots` for the trickle); cold laps summon the fleet
+within a heartbeat. Summoned workers run in their own workflow run, so
+they pass `addr-run-id: <the driver's run id>` to find the addr
+artifact. The dispatching job needs `actions: write`.
+
 ## Notes
 
 - **Rendezvous** is keyless: pass the same `session` to driver and
