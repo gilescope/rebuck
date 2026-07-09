@@ -4,6 +4,8 @@ description: >-
   commit. Defaults to the same commit this action is pinned at, so one
   `@sha` pins engine and choreography together. Requires a rust toolchain
   on PATH for the cache-miss cargo install (pair with dtolnay/rust-toolchain).
+  The `driver` and `worker` actions embed this install themselves - reach
+  for this standalone form only when you manage the mesh by hand.
 
 inputs:
   rebuck2-git:
@@ -32,22 +34,13 @@ runs:
       id: resolve
       shell: bash
       env:
+        IN_GIT: ${{ inputs.rebuck2-git }}
         IN_REV: ${{ inputs.rev }}
         IN_BRANCH: ${{ inputs.branch }}
         ACTION_REF: ${{ github.action_ref }}
-        REBUCK2_GIT: ${{ inputs.rebuck2-git }}
       run: |
-        REV="$IN_REV"
-        if [ -z "$REV" ] && [ -n "$IN_BRANCH" ]; then
-          REV=$(git ls-remote "$REBUCK2_GIT" "refs/heads/$IN_BRANCH" | cut -f1)
-          [ -n "$REV" ] || { echo "branch $IN_BRANCH not found on $REBUCK2_GIT"; exit 1; }
-        fi
-        REV="${REV:-$ACTION_REF}"
-        case "$REV" in
-          [0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
-          *) echo "rev '$REV' is not a sha - pin the action by full sha or pass rev/branch"; exit 1 ;;
-        esac
-        echo "rev=$REV" >> "$GITHUB_OUTPUT"
+        echo "rev=$(bash "$GITHUB_ACTION_PATH/../resolve-rev.sh" "$IN_GIT" "$IN_REV" "$IN_BRANCH" "$ACTION_REF")" \
+          >> "$GITHUB_OUTPUT"
 
     - name: Cache rebuck2 binary (keyed by rebuck commit)
       id: bin
@@ -62,6 +55,6 @@ runs:
       if: steps.bin.outputs.cache-hit != 'true'
       shell: bash
       env:
-        REBUCK2_GIT: ${{ inputs.rebuck2-git }}
-        REBUCK2_REV: ${{ steps.resolve.outputs.rev }}
-      run: cargo install --locked --git "$REBUCK2_GIT" --rev "$REBUCK2_REV" rebuck2
+        IN_GIT: ${{ inputs.rebuck2-git }}
+        REV: ${{ steps.resolve.outputs.rev }}
+      run: cargo install --locked --git "$IN_GIT" --rev "$REV" rebuck2

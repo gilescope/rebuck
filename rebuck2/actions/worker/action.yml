@@ -1,17 +1,26 @@
 name: rebuck2 worker
 description: >-
-  Run a rebuck2 worker for the whole job: optionally preload a CAS shard
-  from the newest run artifact, poll for the driver address artifact,
-  serve until the driver disconnects, then pack + publish the shard the
-  driver assigned at finalize (skipped when unchanged since seed).
-  Requires rebuck2 on PATH (see the sibling `setup` action). Put
-  `continue-on-error: true` on the job - a lost worker must not redden
-  the run; the driver job is the verdict.
+  Run a rebuck2 worker for the whole job: install the engine, optionally
+  preload a CAS shard from the newest run artifact, poll for the driver
+  address artifact, serve until the driver disconnects, then pack +
+  publish the shard the driver assigned at finalize (skipped when
+  unchanged since seed). Needs a rust toolchain on PATH for the engine's
+  cache-miss cargo install. Put `continue-on-error: true` on the job -
+  a lost worker must not redden the run; the driver job is the verdict.
 
 inputs:
   session:
     description: Mesh session id - must match the driver's.
     required: true
+  rebuck2-git:
+    description: Git URL of the rebuck repo to install the engine from.
+    default: https://github.com/gilescope/rebuck
+  rebuck2-rev:
+    description: >-
+      Engine commit to install. Empty = the ref this action was pinned at
+      (github.action_ref) - pin the action by full sha for that to work.
+      Set to "skip" if rebuck2 is already on PATH.
+    default: ""
   store:
     description: >-
       Store root (worker store = <root>/worker). Empty = $DEV_DRIVE/rebuck2
@@ -35,15 +44,16 @@ inputs:
     default: "driver-addr"
   addr-poll-secs:
     description: >-
-      How long to poll for the address artifact (driver runner allocation
-      can tail past 30 min). n0 discovery remains the fallback.
-    default: "2400"
+      How long to poll for the address artifact. n0 discovery remains the
+      fallback. Long-sweep fleets should raise this - driver runner
+      allocation can tail past 30 min.
+    default: "450"
   serve-timeout-secs:
     description: Hard cap on the serve step (guards a driver that never shows).
-    default: "20400"
+    default: "1500"
   connect-wait-secs:
     description: --connect-wait-secs passed to the worker.
-    default: "1800"
+    default: "600"
   extra-args:
     description: Extra raw flags appended to `rebuck2 worker`.
     default: ""
@@ -54,6 +64,36 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Resolve rebuck2 rev
+      id: rev
+      if: inputs.rebuck2-rev != 'skip'
+      shell: bash
+      env:
+        IN_GIT: ${{ inputs.rebuck2-git }}
+        IN_REV: ${{ inputs.rebuck2-rev }}
+        ACTION_REF: ${{ github.action_ref }}
+      run: |
+        echo "rev=$(bash "$GITHUB_ACTION_PATH/../resolve-rev.sh" "$IN_GIT" "$IN_REV" "" "$ACTION_REF")" \
+          >> "$GITHUB_OUTPUT"
+
+    - name: Cache rebuck2 binary (keyed by rebuck commit)
+      id: bin
+      if: inputs.rebuck2-rev != 'skip'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: |
+          ~/.cargo/bin/rebuck2
+          ~/.cargo/bin/rebuck2.exe
+        key: rebuck2-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.rev.outputs.rev }}
+
+    - name: Install rebuck2 (cache miss only)
+      if: inputs.rebuck2-rev != 'skip' && steps.bin.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        IN_GIT: ${{ inputs.rebuck2-git }}
+        REV: ${{ steps.rev.outputs.rev }}
+      run: cargo install --locked --git "$IN_GIT" --rev "$REV" rebuck2
+
     - name: Resolve store + scratch paths
       shell: bash
       env:

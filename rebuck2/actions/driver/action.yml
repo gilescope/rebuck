@@ -1,17 +1,33 @@
 name: rebuck2 driver
 description: >-
-  Bring up a rebuck2 driver on this runner: seed its store from the newest
-  snapshot, start the driver (plus optional co-worker), publish the mesh
-  address as a run artifact for workers to dial, wait for worker quorum,
-  and point buck2 at it via .buckconfig.local. Pair with the
-  `driver-finish` action (called with `if: always()`) for teardown:
-  finalize shards, re-snapshot the store, upload logs, stop the driver.
-  Requires rebuck2 on PATH (see the sibling `setup` action).
+  Bring up a rebuck2 driver on this runner: install buck2 + the rebuck2
+  engine, seed the store from the newest snapshot, start the driver (plus
+  optional co-worker), publish the mesh address as a run artifact for
+  workers to dial, wait for worker quorum, and point buck2 at it via
+  .buckconfig.local. Pair with the `driver-finish` action (called with
+  `if: always()`) for teardown: finalize shards, re-snapshot the store,
+  upload logs, stop the driver. Needs a rust toolchain on PATH for the
+  engine's cache-miss cargo install.
 
 inputs:
   session:
     description: Mesh session id. Workers must pass the same one.
     required: true
+  buck2-version:
+    description: >-
+      Pinned facebook/buck2 release tag to install (a floating buck2
+      invalidates every warm cache hit). Empty = you manage buck2
+      yourself (e.g. a fork binary).
+    default: ""
+  rebuck2-git:
+    description: Git URL of the rebuck repo to install the engine from.
+    default: https://github.com/gilescope/rebuck
+  rebuck2-rev:
+    description: >-
+      Engine commit to install. Empty = the ref this action was pinned at
+      (github.action_ref) - pin the action by full sha for that to work.
+      Set to "skip" if rebuck2 is already on PATH.
+    default: ""
   store:
     description: >-
       Store root. Driver store = <root>/driver, co-worker = <root>/co-worker.
@@ -92,6 +108,44 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Install buck2 (pinned)
+      if: inputs.buck2-version != ''
+      shell: bash
+      env:
+        IN_VERSION: ${{ inputs.buck2-version }}
+        PLATFORM: ${{ runner.os }}-${{ runner.arch }}
+      run: bash "$GITHUB_ACTION_PATH/../install-buck2.sh" "$IN_VERSION" "$PLATFORM"
+
+    - name: Resolve rebuck2 rev
+      id: rev
+      if: inputs.rebuck2-rev != 'skip'
+      shell: bash
+      env:
+        IN_GIT: ${{ inputs.rebuck2-git }}
+        IN_REV: ${{ inputs.rebuck2-rev }}
+        ACTION_REF: ${{ github.action_ref }}
+      run: |
+        echo "rev=$(bash "$GITHUB_ACTION_PATH/../resolve-rev.sh" "$IN_GIT" "$IN_REV" "" "$ACTION_REF")" \
+          >> "$GITHUB_OUTPUT"
+
+    - name: Cache rebuck2 binary (keyed by rebuck commit)
+      id: bin
+      if: inputs.rebuck2-rev != 'skip'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: |
+          ~/.cargo/bin/rebuck2
+          ~/.cargo/bin/rebuck2.exe
+        key: rebuck2-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.rev.outputs.rev }}
+
+    - name: Install rebuck2 (cache miss only)
+      if: inputs.rebuck2-rev != 'skip' && steps.bin.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        IN_GIT: ${{ inputs.rebuck2-git }}
+        REV: ${{ steps.rev.outputs.rev }}
+      run: cargo install --locked --git "$IN_GIT" --rev "$REV" rebuck2
+
     - name: Resolve store + scratch paths
       id: paths
       shell: bash

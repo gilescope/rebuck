@@ -5,17 +5,18 @@ one **driver** job owning the buck2 invocation, N **worker** jobs lending
 CPU over the iroh mesh. The actions carry all the driver/worker plumbing
 so a workflow only declares fleet shape and build targets.
 
-| action          | role                                               |
-| --------------- | -------------------------------------------------- |
-| `setup`         | Install `rebuck2` (cache keyed by rebuck commit)   |
-| `buck2`         | Install a pinned facebook/buck2 release            |
-| `driver`        | Seed store, start driver, addr, quorum, buckconfig |
-| `driver-finish` | Finalize shards, re-snapshot, stats, logs, stop    |
-| `worker`        | Restore shard, poll addr, serve, publish shard     |
+| action          | role                                                  |
+| --------------- | ----------------------------------------------------- |
+| `driver`        | Install, seed store, start, addr, quorum, buckconfig  |
+| `driver-finish` | Finalize shards, re-snapshot, stats, logs, stop       |
+| `worker`        | Install, restore shard, serve, publish shard          |
+| `setup`         | Standalone `rebuck2` install (driver/worker embed it) |
+| `buck2`         | Standalone pinned buck2 install (driver embeds it)    |
 
-Pin all five to the **same full sha**: `setup` defaults to installing the
-engine at `github.action_ref`, so one sha pins engine + choreography
-together and the warm binary cache stays honest.
+A distributed build is two `uses:` lines: `driver` and `worker` install
+buck2 + the engine themselves. Pin everything to the **same full sha**:
+the engine install defaults to `github.action_ref`, so one sha pins
+engine + choreography together and the warm binary cache stays honest.
 
 ## Example
 
@@ -31,12 +32,10 @@ jobs:
       # pinned rustc (dtolnay/rust-toolchain master)
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with: { toolchain: "1.92.0" }
-      - uses: gilescope/rebuck/rebuck2/actions/buck2@<sha>
-        with: { version: "2026-06-01" }
-      - uses: gilescope/rebuck/rebuck2/actions/setup@<sha>
       - uses: gilescope/rebuck/rebuck2/actions/driver@<sha>
         with:
           session: mesh-${{ github.run_id }}
+          buck2-version: "2026-06-01"
           min-workers: "1"          # quorum BELOW fleet size: one no-show
           co-worker-slots: "3"      # must not scrap the run
           execution-platforms: root//platforms:re-exec
@@ -57,7 +56,6 @@ jobs:
       # pinned rustc (dtolnay/rust-toolchain master)
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
         with: { toolchain: "1.92.0" }
-      - uses: gilescope/rebuck/rebuck2/actions/setup@<sha>
       - uses: gilescope/rebuck/rebuck2/actions/worker@<sha>
         with:
           session: mesh-${{ github.run_id }}
@@ -82,11 +80,15 @@ evicted whole shard sets within an hour):
           snapshot-subdirs: ac
 
       # worker <n> preloads shard <n-1> and publishes whichever shard the
-      # driver assigns it at finalize
+      # driver assigns it at finalize. Long sweeps raise the smallish
+      # defaults - driver runner allocation can tail past 30 min.
       - uses: gilescope/rebuck/rebuck2/actions/worker@<sha>
         with:
           session: mesh-${{ github.run_id }}
           shard: ${{ matrix.shard }}
+          addr-poll-secs: "2400"
+          serve-timeout-secs: "20400"
+          connect-wait-secs: "1800"
 ```
 
 Shard artifact names (`cas-shard-N`) are content-addressed slices, so
