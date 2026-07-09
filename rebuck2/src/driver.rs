@@ -704,49 +704,83 @@ impl Driver {
         if let Some(bytes) = self.store.get(d).await? {
             return Ok(Some(bytes));
         }
-        let mut candidates: Vec<String> = Vec::new();
-        if let Some(e) = self.providers.lock().await.get(&d.hash).cloned() {
-            candidates.push(e);
-        }
-        {
-            let blooms = self.blooms.lock().await;
-            candidates.extend(
-                blooms
-                    .iter()
-                    .filter(|(_, b)| b.contains(&d.hash))
-                    .map(|(e, _)| e.clone()),
-            );
-        }
         let _permit = self.mesh_fetches.acquire().await;
-        let mut tried: std::collections::BTreeSet<String> = Default::default();
-        for round in 0..2 {
-            for endpoint in std::mem::take(&mut candidates) {
-                if !tried.insert(endpoint.clone()) {
-                    continue;
+        // Retry rounds with backoff, candidates rebuilt fresh each round: a
+        // saturated holder's transient fetch error must NOT become Missing.
+        // Reader 29007342337 lost 3,212 actions to exactly that - the sole
+        // holder of a hot shard range erroring under 25k-fetch load, the
+        // one-shot chain concluding Missing, buck2 failing the action hard.
+        let mut claimed_but_failed = false;
+        for round in 0..4u32 {
+            if round > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(250 * u64::from(round))).await;
+            }
+            let mut candidates: Vec<String> = Vec::new();
+            if let Some(e) = self.providers.lock().await.get(&d.hash).cloned() {
+                candidates.push(e);
+            }
+            {
+                let blooms = self.blooms.lock().await;
+                candidates.extend(
+                    blooms
+                        .iter()
+                        .filter(|(_, b)| b.contains(&d.hash))
+                        .map(|(e, _)| e.clone()),
+                );
+            }
+            if candidates.is_empty() {
+                // Gossip is 30s-periodic and a dice-warm client outruns it:
+                // exact fan-out probe (also reseeds the provider index).
+                match self.probe_workers(d).await {
+                    Some(e) => candidates.push(e),
+                    // Nobody claims it and nobody failed us: honest Missing.
+                    None if !claimed_but_failed => return Ok(None),
+                    None => break,
                 }
+            }
+            candidates.dedup();
+            let mut denied = 0usize;
+            let total = candidates.len();
+            for endpoint in candidates {
                 match self.fetch_blob_from(&endpoint, d).await {
                     Ok(Some(bytes)) => {
                         self.store.put(Some(d), &bytes).await?;
                         self.providers.lock().await.insert(d.hash.clone(), endpoint);
                         return Ok(Some(bytes));
                     }
-                    Ok(None) | Err(_) => {
+                    Ok(None) => {
+                        // Peer explicitly lacks it (bloom false positive or
+                        // eviction): drop the stale hint, count the denial.
+                        denied += 1;
                         let mut providers = self.providers.lock().await;
                         if providers.get(&d.hash) == Some(&endpoint) {
                             providers.remove(&d.hash);
                         }
                     }
+                    Err(e) => {
+                        claimed_but_failed = true;
+                        println!(
+                            "[driver] blob {} fetch from {endpoint} failed (round {round}): {e:#}",
+                            d.hash
+                        );
+                        self.drop_peer_conn(&endpoint).await;
+                    }
                 }
             }
-            // Last resort, once: exact fan-out probe of every worker
-            // (gossip is 30s-periodic and a dice-warm client outruns it;
-            // the probe also reseeds the index).
-            if round == 0 {
-                match self.probe_workers(d).await {
-                    Some(e) if !tried.contains(&e) => candidates.push(e),
-                    _ => break,
-                }
+            if denied == total {
+                // Every claimant explicitly denied: not transient, stop.
+                break;
             }
+        }
+        if claimed_but_failed {
+            // A holder exists but would not serve: this is an INFRA error,
+            // retryable at the job layer (another worker, another route) -
+            // never Missing, which clients treat as a hard verdict.
+            bail!(
+                "blob {}/{} is held by a peer but unfetchable after retries",
+                d.hash,
+                d.size
+            );
         }
         Ok(None)
     }
@@ -1372,11 +1406,12 @@ mod tests {
             .insert(dig.hash.clone(), "unreachable-peer".into());
         // Validation must verify the entry (unreachable peer = unproven).
         assert_eq!(d.has_blobs(&[dig.clone()]).await, vec![false]);
-        // The serve path must degrade to discovery (nothing else holds it
-        // here) and evict the stale entry - not error, not trust it.
-        let got = d.get_blob(&dig).await.unwrap();
-        assert!(got.is_none());
-        assert!(!d.providers.lock().await.contains_key(&dig.hash));
+        // The serve path must classify a claimed-but-unfetchable blob as an
+        // INFRA error (retryable at the job layer), never Ok(None): reader
+        // 29007342337 lost 3,212 actions to transient fetch failures being
+        // reported as Missing. The hint is kept - it may recover.
+        assert!(d.get_blob(&dig).await.is_err());
+        assert!(d.providers.lock().await.contains_key(&dig.hash));
     }
 
     /// Pull-model invariant: a worker's outstanding count never exceeds
