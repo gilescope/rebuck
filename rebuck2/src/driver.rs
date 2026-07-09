@@ -95,6 +95,9 @@ struct WorkerConn {
     arch: String,
     /// Mesh endpoint id, for direct blob probes (gossip-independent).
     endpoint: String,
+    /// CI shard the worker restored before joining; finalize is sticky to
+    /// it (a worker packs the range its store is rich in).
+    preloaded_shard: Option<u8>,
 }
 
 /// What platform an action demands, from its REAPI platform properties.
@@ -338,7 +341,13 @@ impl Driver {
         let hello: W2D = mesh::recv_frame(&mut ctrl_recv)
             .await?
             .context("worker hung up before Hello")?;
-        let W2D::Hello { os, arch, slots } = hello else {
+        let W2D::Hello {
+            os,
+            arch,
+            slots,
+            preloaded_shard,
+        } = hello
+        else {
             bail!("expected Hello, got {hello:?}");
         };
         let worker_id = self.next_worker.fetch_add(1, Ordering::Relaxed);
@@ -365,6 +374,7 @@ impl Driver {
             os,
             arch,
             endpoint: endpoint.clone(),
+            preloaded_shard,
         });
         self.worker_arrived.notify_waiters();
         self.pump().await;
@@ -866,12 +876,47 @@ impl Driver {
         // One shard, one worker: duplicate assignments produced duplicate
         // shard artifacts whose contents depended on each packer's sync
         // progress — the fetch-side "newest first" then picked one
-        // arbitrarily (reader 28957851178 hit the holes). Extra workers
-        // get no assignment and just exit clean.
+        // arbitrarily (reader 28957851178 hit the holes).
+        //
+        // PRELOAD-STICKY: a worker packs the shard it restored - its store
+        // is rich in exactly that range. Join-order round-robin repacked
+        // ranges the assignee barely held, thinning the pool every lap
+        // (reader 29007342337 published 47-92MB shards over healing6's
+        // 452-500MB ones), and its first assignee was always the driver's
+        // co-worker, whose store nothing ever packs - the eternally-absent
+        // cas-shard-0. Workers without a preload are ineligible; a shard
+        // with no eligible worker keeps its previous artifact.
         let workers = self.workers.lock().await;
-        let n = usize::from(of).min(workers.len());
-        for (i, w) in workers.iter().take(n).enumerate() {
-            let _ = w.tx.send(D2W::Finalize { shard: i as u8, of });
+        let mut assigned: Vec<Option<u64>> = vec![None; usize::from(of)];
+        let mut taken: std::collections::BTreeSet<u64> = Default::default();
+        for w in workers.iter() {
+            if let Some(p) = w.preloaded_shard {
+                let p = usize::from(p);
+                if p < assigned.len() && assigned[p].is_none() {
+                    assigned[p] = Some(w.id);
+                    taken.insert(w.id);
+                }
+            }
+        }
+        for slot in assigned.iter_mut().filter(|s| s.is_none()) {
+            if let Some(w) = workers
+                .iter()
+                .find(|w| w.preloaded_shard.is_some() && !taken.contains(&w.id))
+            {
+                *slot = Some(w.id);
+                taken.insert(w.id);
+            }
+        }
+        let mut n = 0;
+        for (i, wid) in assigned.iter().enumerate() {
+            let Some(wid) = wid else {
+                println!("[driver] finalize: no eligible worker for shard {i} - previous artifact stands");
+                continue;
+            };
+            if let Some(w) = workers.iter().find(|w| w.id == *wid) {
+                let _ = w.tx.send(D2W::Finalize { shard: i as u8, of });
+                n += 1;
+            }
         }
         n
     }
@@ -1330,6 +1375,7 @@ mod tests {
             os: os.into(),
             arch: "test_arch".into(),
             endpoint: String::new(),
+            preloaded_shard: None,
         });
         handle
     }
@@ -1385,6 +1431,7 @@ mod tests {
                 os: "test".into(),
                 arch: "test_arch".into(),
                 endpoint: String::new(),
+                preloaded_shard: None,
             });
         }
 
@@ -1503,6 +1550,47 @@ mod tests {
         assert!(matches!(d.validated_ac_get(&key).await, AcLookup::Hit(_)));
     }
 
+    /// Finalize is preload-sticky: a worker packs the range its store is
+    /// rich in, and preload-less workers (the driver's co-worker) are
+    /// never assigned - nothing packs their store, so an assignment there
+    /// silently loses the shard (the eternally-absent cas-shard-0).
+    #[tokio::test]
+    async fn finalize_is_preload_sticky_and_skips_ineligible() {
+        let d = test_driver(false);
+        let mut rxs = Vec::new();
+        for (id, preload) in [(1u64, None), (2, Some(2u8)), (3, Some(0u8))] {
+            let (tx, rx) = mpsc::unbounded_channel::<D2W>();
+            d.workers.lock().await.push(WorkerConn {
+                id,
+                tx,
+                inflight: Arc::new(AtomicU32::new(0)),
+                slots: 1,
+                os: "linux".into(),
+                arch: "test_arch".into(),
+                endpoint: String::new(),
+                preloaded_shard: preload,
+            });
+            rxs.push((id, rx));
+        }
+        // 3 shards, 2 eligible workers: sticky shards 0 and 2 assigned,
+        // shard 1 has no unassigned eligible worker and is dropped.
+        assert_eq!(d.finalize_shards(3).await, 2);
+        for (id, rx) in &mut rxs {
+            let mut got = Vec::new();
+            while let Ok(msg) = rx.try_recv() {
+                if let D2W::Finalize { shard, .. } = msg {
+                    got.push(shard);
+                }
+            }
+            match id {
+                1 => assert!(got.is_empty(), "co-worker must not be assigned"),
+                2 => assert_eq!(got, vec![2], "sticky to its preload"),
+                3 => assert_eq!(got, vec![0], "sticky to its preload"),
+                _ => unreachable!(),
+            }
+        }
+    }
+
     /// Pull-model invariant: a worker's outstanding count never exceeds
     /// slots + max prefetch, and every job completes exactly once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1586,6 +1674,7 @@ mod tests {
             os: os.into(),
             arch: "test_arch".into(),
             endpoint: String::new(),
+            preloaded_shard: None,
         });
     }
 

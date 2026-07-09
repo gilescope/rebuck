@@ -33,6 +33,9 @@ pub struct WorkerCfg {
     /// Hardlink inputs from the store into exec dirs (default). Off for
     /// filesystems/tools where shared inodes are problematic.
     pub hardlinks: bool,
+    /// CI shard this worker restored before joining; finalize hands it
+    /// the same shard back (see W2D::Hello::preloaded_shard).
+    pub preloaded_shard: Option<u8>,
 }
 
 pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
@@ -106,6 +109,7 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
             os: std::env::consts::OS.into(),
             arch: std::env::consts::ARCH.into(),
             slots: cfg.slots as u32,
+            preloaded_shard: cfg.preloaded_shard,
         },
     )
     .await?;

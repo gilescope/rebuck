@@ -106,6 +106,11 @@ pub enum W2D {
         os: String,
         arch: String,
         slots: u32,
+        /// CI shard this worker restored before joining (see the sweep
+        /// workflows). Finalize assigns it the SAME shard back - its store
+        /// is rich in exactly that range; join-order round-robin repacked
+        /// ranges the assignee barely held, thinning the pool every lap.
+        preloaded_shard: Option<u8>,
     },
     /// prost-encoded ActionResult. `stored` lists blob hashes this action
     /// persisted on the worker — the driver's provider index in

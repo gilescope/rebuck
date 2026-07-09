@@ -26,7 +26,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: rebuck2 driver [--grpc-port N] [--store DIR] [--session S] \
          [--min-workers N] [--no-local-exec] [--decentralized-cas] [--no-hardlinks] [--no-reflink] [--cache-failures]\n       \
-         rebuck2 worker [--store DIR] [--session S] [--slots N] [--connect-wait-secs N] [--no-hardlinks] [--no-reflink]"
+         rebuck2 worker [--store DIR] [--session S] [--slots N] [--preloaded-shard N] [--connect-wait-secs N] [--no-hardlinks] [--no-reflink]"
     );
     std::process::exit(2)
 }
@@ -114,6 +114,9 @@ async fn main() -> Result<()> {
                         .unwrap_or(600),
                 ),
                 hardlinks: !args.flag("--no-hardlinks"),
+                preloaded_shard: args
+                    .opt("--preloaded-shard")
+                    .map(|s| s.parse().expect("--preloaded-shard: number")),
             };
             args.done();
             std::fs::create_dir_all(&cfg.scratch)?;
