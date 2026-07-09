@@ -129,7 +129,9 @@ runs:
         # Silent-cache-regression tripwire: an AC was seeded but served
         # nothing. Green + fast-ish laps hid exactly this once (the shard
         # zips clobbered the AC tar); hit-rates are the only witness.
-        hb=$(grep -a "\[stats\]" "$REBUCK2_DRIVER_LOG" | tail -1)
+        # || true: a lap can finish inside the first 30s heartbeat interval
+        # (fully-warm builds) - an empty log is not an error here.
+        hb=$(grep -a "\[stats\]" "$REBUCK2_DRIVER_LOG" | tail -1 || true)
         hits=$(printf '%s' "$hb" | sed -n 's/.*grpc\[ac \([0-9]*\)\/.*/\1/p')
         misses=$(printf '%s' "$hb" | sed -n 's/.*grpc\[ac [0-9]*\/\([0-9]*\)\/.*/\1/p')
         if [ "${REBUCK2_SEEDED_AC_COUNT:-0}" -gt 0 ] && [ "${hits:-0}" -eq 0 ] && [ "${misses:-0}" -gt 0 ]; then
