@@ -327,6 +327,20 @@ impl Store {
 
     /// Like `list_hashes` but with sizes (for shard listings, where the
     /// fetcher needs full digests).
+    /// CAS entries whose first hex nibble falls in shard `shard` of `of`.
+    pub fn list_shard(&self, shard: u8, of: u8) -> Vec<crate::mesh::Dig> {
+        let of = of.max(1);
+        self.list_entries()
+            .into_iter()
+            .filter(|(hash, _)| {
+                u8::from_str_radix(&hash[..1], 16)
+                    .map(|n| n / (16 / of.min(16)) == shard)
+                    .unwrap_or(false)
+            })
+            .map(|(hash, size)| crate::mesh::Dig { hash, size })
+            .collect()
+    }
+
     pub fn list_entries(&self) -> Vec<(String, i64)> {
         let mut out = Vec::new();
         let Ok(subs) = std::fs::read_dir(self.root.join("cas")) else {

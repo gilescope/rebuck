@@ -1302,16 +1302,46 @@ async fn serve_blob_stream(
             mesh::send_frame(&mut send, &BlobResp::HaveMany(have)).await?;
         }
         BlobReq::ListShard { shard, of } => {
-            let of = of.max(1);
-            let digs: Vec<Dig> = driver
+            // Union across the FLEET, not just this store: the driver holds
+            // only what it relayed, and blobs built on other workers
+            // in-range otherwise never reach the banked shard - the
+            // structural plateau (the same ~23.7k unservable entries
+            // re-executed on every 76-minute lap). A peer that fails to
+            // answer is skipped: partial union still beats local-only.
+            let mut by_hash: std::collections::BTreeMap<String, i64> = driver
                 .store
-                .list_entries()
+                .list_shard(shard, of)
                 .into_iter()
-                .filter(|(hash, _)| {
-                    u8::from_str_radix(&hash[..1], 16)
-                        .map(|n| n / (16 / of.min(16)) == shard)
-                        .unwrap_or(false)
-                })
+                .map(|d| (d.hash, d.size))
+                .collect();
+            let peers: Vec<String> = driver
+                .workers
+                .lock()
+                .await
+                .iter()
+                .map(|w| w.endpoint.clone())
+                .filter(|e| !e.is_empty())
+                .collect();
+            let lists = futures::future::join_all(peers.into_iter().map(|ep| {
+                let driver = driver.clone();
+                async move {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        driver.peer_request(&ep, &BlobReq::ListShard { shard, of }),
+                    )
+                    .await
+                }
+            }))
+            .await;
+            for l in lists {
+                if let Ok(Ok(BlobResp::HashList(v))) = l {
+                    for d in v {
+                        by_hash.entry(d.hash).or_insert(d.size);
+                    }
+                }
+            }
+            let digs: Vec<Dig> = by_hash
+                .into_iter()
                 .map(|(hash, size)| Dig { hash, size })
                 .collect();
             mesh::send_frame(&mut send, &BlobResp::HashList(digs)).await?;

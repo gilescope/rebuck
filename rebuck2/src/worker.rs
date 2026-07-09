@@ -288,6 +288,12 @@ async fn serve_get(
             }
             mesh::send_frame(&mut send, &BlobResp::HaveMany(have)).await?;
         }
+        BlobReq::ListShard { shard, of } => {
+            // Finalize union sync: the driver aggregates every worker's
+            // range list so banked shards cover the FLEET's holdings.
+            let digs = store.list_shard(shard, of);
+            mesh::send_frame(&mut send, &BlobResp::HashList(digs)).await?;
+        }
         other => {
             mesh::send_frame(
                 &mut send,
