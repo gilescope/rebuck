@@ -17,7 +17,7 @@ use iroh::Endpoint;
 use prost::Message;
 use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 
-use crate::exec;
+use crate::exec::{self, crate_affinity_key};
 use crate::mesh::{self, BlobReq, BlobResp, Dig, D2W, W2D};
 use crate::store::Store;
 
@@ -58,22 +58,6 @@ pub enum AcLookup {
     /// callers must report a miss so the client re-executes and re-uploads.
     Unservable,
     Miss,
-}
-
-/// Affinity key for a command: the crate output prefix (buck2 rust rules
-/// place every emit flavour of one crate under `.../__<crate>__/`). A
-/// crate's pipelined metadata compile and its rlib compile MUST run on one
-/// machine — split across CI machines their crate hashes diverged and every
-/// downstream link died with E0460 (gooseberry PR#23). The input root can't
-/// pair them (output skeletons differ); the output prefix can.
-fn crate_affinity_key(cmd: &re::Command) -> Option<String> {
-    let first = cmd
-        .output_paths
-        .first()
-        .or_else(|| cmd.output_files.first())
-        .or_else(|| cmd.output_directories.first())?;
-    let end = first.find("__/")? + 3;
-    Some(first[..end].to_string())
 }
 
 /// Every CAS digest a cached result commits the server to delivering.

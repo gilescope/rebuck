@@ -48,6 +48,58 @@ pub struct Outcome {
     pub do_not_cache: bool,
 }
 
+/// Affinity key for a command: the crate output prefix (buck2 rules place
+/// every emit flavour of one target under `.../__<name>__/`). A crate's
+/// pipelined metadata compile and its rlib compile MUST run on one machine
+/// AND in one directory path — the prelude wrapper absolutizes `--path-env`
+/// values (CARGO_MANIFEST_DIR & co) against the action cwd and rustc tracks
+/// `env!`-read values into the crate hash (SVH), so twins in per-action temp
+/// dirs hash differently and every downstream link dies with E0460. The
+/// input root can't pair them (argsfiles differ); the output prefix can.
+pub fn crate_affinity_key(cmd: &re::Command) -> Option<String> {
+    #[allow(deprecated)] // pre-v2.1 clients send output_files/output_directories
+    let first = cmd
+        .output_paths
+        .first()
+        .or_else(|| cmd.output_files.first())
+        .or_else(|| cmd.output_directories.first())?;
+    let end = first.find("__/")? + 3;
+    Some(first[..end].to_string())
+}
+
+/// Canonical exec dir for a crate key: identical across actions, workers
+/// and RUNS (a cached metadata result must agree with a later fresh rlib
+/// compile). Hence a fixed OS-family base, not the worker store or a temp
+/// dir (mac's $TMPDIR is per-boot random). REBUCK2_EXEC_BASE overrides —
+/// every worker in a fleet must then agree on it. Leaf is a short hash:
+/// windows MAX_PATH is part of the budget.
+fn canonical_exec_dir(key: &str) -> PathBuf {
+    let base = std::env::var_os("REBUCK2_EXEC_BASE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                PathBuf::from(r"C:\rb2x")
+            } else {
+                PathBuf::from("/tmp/rebuck2-exec")
+            }
+        });
+    base.join(&crate::store::sha256_hex(key.as_bytes())[..16])
+}
+
+/// Canonical dirs are shared mutable state: flavours of one key serialize
+/// within the process. Affinity routing pins a key to one process, so an
+/// in-process lock suffices (a usurped owner's old action is already dead).
+fn crate_lock(key: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut map = LOCKS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("crate lock table poisoned");
+    map.entry(key.to_string()).or_default().clone()
+}
+
 pub async fn run_action(blobs: &dyn Blobs, action_digest: &Dig, scratch: &Path) -> Result<Outcome> {
     let action =
         re::Action::decode(blobs.get(action_digest).await?.as_slice()).context("decode Action")?;
@@ -67,8 +119,25 @@ pub async fn run_action(blobs: &dyn Blobs, action_digest: &Dig, scratch: &Path) 
     // REBUCK2_KEEP_SCRATCH=1 keeps exec dirs and logs each action's argv/cwd
     // — the debug lever for "worked locally, failed on the worker".
     let keep_scratch = std::env::var_os("REBUCK2_KEEP_SCRATCH").is_some();
-    let exec_dir = tempfile::tempdir_in(scratch).context("mk exec dir")?;
-    let root = exec_dir.path();
+    // Keyed commands (all of a target's emit flavours) run in a canonical
+    // run-stable dir so absolutized path-envs agree across the flavours —
+    // see crate_affinity_key. Unkeyed commands keep per-action temp dirs.
+    let (root_buf, exec_dir, _key_guard) = match crate_affinity_key(&command) {
+        Some(key) => {
+            let guard = crate_lock(&key).lock_owned().await;
+            let dir = canonical_exec_dir(&key);
+            let _ = tokio::fs::remove_dir_all(&dir).await; // stale from a crash
+            tokio::fs::create_dir_all(&dir)
+                .await
+                .context("mk canonical exec dir")?;
+            (dir, None, Some(guard))
+        }
+        None => {
+            let td = tempfile::tempdir_in(scratch).context("mk exec dir")?;
+            (td.path().to_path_buf(), Some(td), None)
+        }
+    };
+    let root = root_buf.as_path();
     materialize(blobs, &root_dig, root).await?;
 
     let cwd = if command.working_directory.is_empty() {
@@ -271,7 +340,13 @@ pub async fn run_action(blobs: &dyn Blobs, action_digest: &Dig, scratch: &Path) 
 
     if keep_scratch {
         // Leak the tempdir so the workflow can inspect scripts post-mortem.
-        std::mem::forget(exec_dir);
+        // (Canonical dirs persist anyway until the next same-key action.)
+        if let Some(td) = exec_dir {
+            std::mem::forget(td);
+        }
+    } else if exec_dir.is_none() {
+        // Canonical dir: no TempDir RAII, reclaim the disk ourselves.
+        let _ = tokio::fs::remove_dir_all(root).await;
     }
     Ok(Outcome {
         action_result: result,
@@ -492,4 +567,39 @@ pub(crate) async fn set_exec(p: &Path) -> Result<()> {
 #[cfg(not(unix))]
 pub(crate) async fn set_exec(_p: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Twin pipelined compiles (metadata-full / rlib) of one crate must see
+    // the SAME absolutized --path-env values or their SVHs diverge (E0460).
+    // The exec dir is the only variable: same key -> same canonical dir,
+    // stable across actions, workers and runs.
+    #[test]
+    fn canonical_exec_dirs_stable_per_crate_key() {
+        let a1 = canonical_exec_dir("gen/root/1a2b/__polkavm-0.21.0__/");
+        let a2 = canonical_exec_dir("gen/root/1a2b/__polkavm-0.21.0__/");
+        let b = canonical_exec_dir("gen/root/1a2b/__serde-1.0.228__/");
+        assert_eq!(a1, a2);
+        assert_ne!(a1, b);
+        // Same crate under a different buck configuration is a different key
+        // (twins always share a configuration; cross-config reuse would leak).
+        let c = canonical_exec_dir("gen/root/9f8e/__polkavm-0.21.0__/");
+        assert_ne!(a1, c);
+        // Short leaf: windows MAX_PATH is part of the budget.
+        assert!(a1.file_name().unwrap().len() <= 16);
+    }
+
+    // Canonical dirs are shared mutable state: flavours of one key must
+    // serialize within the process (affinity pins them to one process).
+    #[test]
+    fn same_key_shares_one_lock() {
+        let l1 = crate_lock("__k__/");
+        let l2 = crate_lock("__k__/");
+        let other = crate_lock("__other__/");
+        assert!(std::sync::Arc::ptr_eq(&l1, &l2));
+        assert!(!std::sync::Arc::ptr_eq(&l1, &other));
+    }
 }
