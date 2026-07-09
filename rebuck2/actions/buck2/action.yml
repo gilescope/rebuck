@@ -1,0 +1,38 @@
+name: install buck2 (pinned)
+description: >-
+  Install a pinned facebook/buck2 release for the runner's OS/arch.
+  Pinned because action digests must be stable - a floating buck2
+  invalidates every warm cache hit.
+
+inputs:
+  version:
+    description: buck2 release tag (e.g. "2026-06-01"). Pin it.
+    required: true
+  dest:
+    description: Directory to install the binary into (added to PATH).
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install buck2
+      shell: bash
+      env:
+        BUCK2_VERSION: ${{ inputs.version }}
+        IN_DEST: ${{ inputs.dest }}
+      run: |
+        case "${{ runner.os }}-${{ runner.arch }}" in
+          Linux-X64)     TRIPLE=x86_64-unknown-linux-musl; EXE="" ;;
+          Linux-ARM64)   TRIPLE=aarch64-unknown-linux-gnu; EXE="" ;;
+          macOS-ARM64)   TRIPLE=aarch64-apple-darwin;      EXE="" ;;
+          macOS-X64)     TRIPLE=x86_64-apple-darwin;       EXE="" ;;
+          Windows-X64)   TRIPLE=x86_64-pc-windows-msvc;    EXE=".exe" ;;
+          *) echo "unsupported runner: ${{ runner.os }}-${{ runner.arch }}"; exit 1 ;;
+        esac
+        DEST="${IN_DEST:-$HOME/bin}"
+        mkdir -p "$DEST"
+        curl -fsSL "https://github.com/facebook/buck2/releases/download/${BUCK2_VERSION}/buck2-${TRIPLE}${EXE}.zst" \
+          | zstd -d > "$DEST/buck2$EXE"
+        chmod +x "$DEST/buck2$EXE"
+        echo "$DEST" >> "$GITHUB_PATH"
+        "$DEST/buck2$EXE" --version

@@ -1,0 +1,86 @@
+name: rebuck2 driver-finish
+description: >-
+  Teardown for the `driver` action - call it with `if: always()` after the
+  build steps. Finalizes CAS shards across the fleet (when the driver was
+  started with finalize), re-snapshots the store unless unchanged since
+  seed, prints dispatch stats, uploads the driver log, and stops the
+  driver. Reads its state from the env the `driver` action exported.
+
+inputs:
+  log-artifact:
+    description: Artifact name for the driver + co-worker logs. Empty = skip.
+    default: "driver-log"
+  finalize-wait-secs:
+    description: How long to wait for the fleet to acknowledge shard finalize.
+    default: "1000"
+
+runs:
+  using: composite
+  steps:
+    # Hand CAS persistence to the fleet: driver assigns shards, workers
+    # sync + save them in their own teardown (parallel, off our path).
+    - name: Finalize shards across the fleet
+      if: always()
+      shell: bash
+      env:
+        IN_WAIT: ${{ inputs.finalize-wait-secs }}
+      run: |
+        [ -n "${REBUCK2_FINALIZE_FILE:-}" ] || { echo "finalize not enabled - skipping"; exit 0; }
+        touch "$REBUCK2_FINALIZE_FILE"
+        for _ in $(seq 1 $((IN_WAIT / 5))); do
+          [ -f "$REBUCK2_FINALIZE_FILE.done" ] && { echo "finalized: $(cat "$REBUCK2_FINALIZE_FILE.done") workers"; exit 0; }
+          kill -0 "$(cat "$REBUCK2_DRIVER_PID_FILE")" 2>/dev/null || { echo "driver gone before finalize"; exit 0; }
+          sleep 5
+        done
+        echo "finalize timed out (workers save what they synced)"
+
+    - name: Pack store snapshot (skip when unchanged)
+      id: pack
+      if: always()
+      shell: bash
+      run: |
+        [ -n "${REBUCK2_SNAPSHOT_KEY_PREFIX:-}" ] || { echo "skip=1" >> "$GITHUB_OUTPUT"; echo "snapshots disabled"; exit 0; }
+        if bash "$GITHUB_ACTION_PATH/../store-snapshot.sh" unchanged \
+             "$REBUCK2_STORE/driver" "$REBUCK2_SEEDED_MANIFEST" "$REBUCK2_SNAPSHOT_SUBDIRS"; then
+          echo "[snapshot] store unchanged since seed - skipping pack + upload"
+          echo "skip=1" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        mkdir -p "$REBUCK2_SNAPSHOT_DIR"
+        # shellcheck disable=SC2086 # subdirs intentionally word-splits
+        tar -c -C "$REBUCK2_STORE/driver" $REBUCK2_SNAPSHOT_SUBDIRS \
+          | zstd -T0 --long=27 -8 > "$REBUCK2_SNAPSHOT_DIR/bulk.tar.zst"
+        ls -lh "$REBUCK2_SNAPSHOT_DIR/"
+
+    - name: Save store snapshot
+      if: always() && steps.pack.outputs.skip != '1'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ${{ runner.temp }}/rebuck2-driver/snapshot
+        key: ${{ env.REBUCK2_SNAPSHOT_KEY_PREFIX }}${{ github.run_id }}
+
+    - name: Dispatch stats
+      if: always()
+      shell: bash
+      run: |
+        kill -0 "$(cat "$REBUCK2_DRIVER_PID_FILE")" 2>/dev/null \
+          || echo "*** DRIVER PROCESS DIED - check the driver log tail below ***"
+        echo "jobs dispatched: $(grep -c -- '-> worker ' "$REBUCK2_DRIVER_LOG" || true)"
+        grep -o -- '-> worker [0-9]*' "$REBUCK2_DRIVER_LOG" | sort | uniq -c || true
+        grep -a "\[stats\]" "$REBUCK2_DRIVER_LOG" | tail -2 || true
+        tail -5 "$REBUCK2_DRIVER_LOG"
+
+    - name: Upload driver log
+      if: always() && inputs.log-artifact != ''
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ inputs.log-artifact }}
+        path: |
+          ${{ runner.temp }}/rebuck2-driver/driver.log
+          ${{ runner.temp }}/rebuck2-driver/co-worker.log
+        if-no-files-found: ignore
+
+    - name: Stop driver
+      if: always()
+      shell: bash
+      run: kill "$(cat "$REBUCK2_DRIVER_PID_FILE")" 2>/dev/null || true
