@@ -251,6 +251,10 @@ runs:
         # a CAS filename IS the content sha256; mismatches are deleted
         # (poisoning degrades to a cold shard, never to execution).
         bash "$GITHUB_ACTION_PATH/../verify-cas.sh" "$REBUCK2_STORE/driver"
+        # Remember how many AC entries were seeded: driver-finish flags a
+        # lap that restored an AC yet served zero hits (silent cache
+        # regression - an AC-clobber bug hid behind three green laps).
+        echo "REBUCK2_SEEDED_AC_COUNT=$(find "$REBUCK2_STORE/driver/ac" -type f 2>/dev/null | wc -l | tr -d ' ')" >> "$GITHUB_ENV"
         if [ "${REBUCK2_CAS_SHARDS:-false}" = "true" ]; then
           # Per-shard manifests: shard i covers hex prefixes 4i..4i+3, and
           # an unchanged shard skips its pack + upload independently.

@@ -126,6 +126,15 @@ runs:
         kill -0 "$(cat "$REBUCK2_DRIVER_PID_FILE")" 2>/dev/null \
           || echo "*** DRIVER PROCESS DIED - check the driver log tail below ***"
         echo "jobs dispatched: $(grep -c -- '-> worker ' "$REBUCK2_DRIVER_LOG" || true)"
+        # Silent-cache-regression tripwire: an AC was seeded but served
+        # nothing. Green + fast-ish laps hid exactly this once (the shard
+        # zips clobbered the AC tar); hit-rates are the only witness.
+        hb=$(grep -a "\[stats\]" "$REBUCK2_DRIVER_LOG" | tail -1)
+        hits=$(printf '%s' "$hb" | sed -n 's/.*grpc\[ac \([0-9]*\)\/.*/\1/p')
+        misses=$(printf '%s' "$hb" | sed -n 's/.*grpc\[ac [0-9]*\/\([0-9]*\)\/.*/\1/p')
+        if [ "${REBUCK2_SEEDED_AC_COUNT:-0}" -gt 0 ] && [ "${hits:-0}" -eq 0 ] && [ "${misses:-0}" -gt 0 ]; then
+          echo "::warning::rebuck2: $REBUCK2_SEEDED_AC_COUNT AC entries were seeded but served ZERO hits ($misses misses) - the cache is silently cold; check the seed path"
+        fi
         grep -o -- '-> worker [0-9]*' "$REBUCK2_DRIVER_LOG" | sort | uniq -c || true
         grep -a "\[stats\]" "$REBUCK2_DRIVER_LOG" | tail -2 || true
         tail -5 "$REBUCK2_DRIVER_LOG"

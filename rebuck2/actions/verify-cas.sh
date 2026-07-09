@@ -12,22 +12,26 @@ store="${1:?store dir required}"
 [ -d "$store/cas" ] || { echo "verify-cas: no cas/ - nothing to verify"; exit 0; }
 
 if command -v sha256sum >/dev/null 2>&1; then
-  H() { sha256sum "$1" | cut -d' ' -f1; }
+  HASHER=sha256sum
 else
-  H() { shasum -a 256 "$1" | cut -d' ' -f1; } # macOS
+  HASHER="shasum -a 256" # macOS
 fi
 
+# One hasher invocation per batch, not per file: 26k per-file process
+# spawns cost ~100s/lap; batched xargs hashes the same store in seconds.
 ok=0 bad=0
-while IFS= read -r f; do
-  name=$(basename "$f")
-  if [ "$(H "$f")" = "$name" ]; then
+# shellcheck disable=SC2086 # HASHER intentionally word-splits (shasum -a 256)
+while IFS= read -r line; do
+  hash=${line%% *}
+  f=${line#* }; f=${f# } # hasher pads with two spaces
+  if [ "$(basename "$f")" = "$hash" ]; then
     ok=$((ok + 1))
   else
-    echo "verify-cas: DIGEST MISMATCH - deleting $name" >&2
+    echo "verify-cas: DIGEST MISMATCH - deleting $(basename "$f")" >&2
     rm -f "$f"
     bad=$((bad + 1))
   fi
-done < <(find "$store/cas" -type f)
+done < <(find "$store/cas" -type f -print0 | xargs -0 -r $HASHER)
 
 echo "verify-cas: $ok verified, $bad rejected"
 [ "$bad" -eq 0 ] || echo "verify-cas: WARNING - rejected blobs suggest a poisoned or corrupt shard artifact" >&2
