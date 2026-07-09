@@ -69,6 +69,19 @@ inputs:
       saved by driver-finish as <prefix><run_id>). Empty = no snapshot
       restore/save.
     default: "rebuck2-store-"
+  cas-shard-artifacts:
+    description: >-
+      Persist the driver's CAS as 4 digest-range shard artifacts
+      ("true"/"false"). Artifacts do not LRU-evict and are not
+      branch-scoped, each shard skips its re-upload when unchanged, and
+      losing one costs 1/4 of the warmth instead of all of it - the
+      monolith snapshot is all-or-nothing. Pair with snapshot-subdirs:
+      "ac" (the AC stays a small cache entry) and driver-finish packs +
+      publishes the shards. Restore pulls each shard's newest artifact.
+    default: "false"
+  shard-artifact-prefix:
+    description: Artifact name prefix for the CAS shards.
+    default: "cas-shard-"
   snapshot-subdirs:
     description: >-
       Store subdirs the snapshot covers. "ac cas" = monolith; "ac" =
@@ -156,6 +169,8 @@ runs:
         IN_SNAP_PREFIX: ${{ inputs.snapshot-key-prefix }}
         IN_SNAP_SUBDIRS: ${{ inputs.snapshot-subdirs }}
         IN_FINALIZE: ${{ inputs.finalize }}
+        IN_CAS_SHARDS: ${{ inputs.cas-shard-artifacts }}
+        IN_SHARD_PREFIX: ${{ inputs.shard-artifact-prefix }}
       run: |
         WORK="$RUNNER_TEMP/rebuck2-driver"
         mkdir -p "$WORK"
@@ -173,6 +188,8 @@ runs:
           echo "REBUCK2_SNAPSHOT_DIR=$WORK/snapshot"
           echo "REBUCK2_SNAPSHOT_KEY_PREFIX=$IN_SNAP_PREFIX"
           echo "REBUCK2_SNAPSHOT_SUBDIRS=$IN_SNAP_SUBDIRS"
+          echo "REBUCK2_CAS_SHARDS=$IN_CAS_SHARDS"
+          echo "REBUCK2_SHARD_PREFIX=$IN_SHARD_PREFIX"
           [ "$IN_FINALIZE" = "true" ] && echo "REBUCK2_FINALIZE_FILE=$WORK/finalize.signal"
           true
         } >> "$GITHUB_ENV"
@@ -185,6 +202,23 @@ runs:
         path: ${{ runner.temp }}/rebuck2-driver/snapshot
         key: ${{ inputs.snapshot-key-prefix }}${{ github.run_id }}
         restore-keys: ${{ inputs.snapshot-key-prefix }}
+
+    - name: Restore CAS shards (newest artifact each, any branch)
+      if: inputs.cas-shard-artifacts == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        mkdir -p "$REBUCK2_SNAPSHOT_DIR"
+        for i in 0 1 2 3; do
+          AID=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$REBUCK2_SHARD_PREFIX$i&per_page=1"             --jq '[.artifacts[] | select(.expired==false)][0].id // empty' 2>/dev/null || true)
+          if [ -n "$AID" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$AID/zip" > "$REBUCK2_WORK/shard.zip"               && unzip -o -q "$REBUCK2_WORK/shard.zip" -d "$REBUCK2_SNAPSHOT_DIR"               && rm -f "$REBUCK2_WORK/shard.zip"               && mv "$REBUCK2_SNAPSHOT_DIR/bulk.tar.zst" "$REBUCK2_SNAPSHOT_DIR/shard-$i.tar.zst" 2>/dev/null               || echo "shard $i fetch failed - partial warmth is fine"
+          else
+            echo "no $REBUCK2_SHARD_PREFIX$i artifact yet"
+          fi
+        done
+        ls -lh "$REBUCK2_SNAPSHOT_DIR/" 2>/dev/null || true
 
     - name: Seed the driver store
       shell: bash
@@ -202,6 +236,15 @@ runs:
         bash "$GITHUB_ACTION_PATH/../store-snapshot.sh" manifest "$REBUCK2_STORE/driver" "$REBUCK2_SNAPSHOT_SUBDIRS" \
           > "$REBUCK2_SEEDED_MANIFEST"
         echo "seeded manifest: $(cat "$REBUCK2_SEEDED_MANIFEST")"
+        if [ "${REBUCK2_CAS_SHARDS:-false}" = "true" ]; then
+          # Per-shard manifests: shard i covers hex prefixes 4i..4i+3, and
+          # an unchanged shard skips its pack + upload independently.
+          for i in 0 1 2 3; do
+            p=$(printf 'cas/%x* cas/%x* cas/%x* cas/%x*' $((i*4)) $((i*4+1)) $((i*4+2)) $((i*4+3)))
+            bash "$GITHUB_ACTION_PATH/../store-snapshot.sh" manifest "$REBUCK2_STORE/driver" "$p" \
+              > "$REBUCK2_SEEDED_MANIFEST.shard$i"
+          done
+        fi
 
     - name: Start driver (+ co-worker)
       shell: bash

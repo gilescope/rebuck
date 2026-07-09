@@ -59,6 +59,58 @@ runs:
         path: ${{ runner.temp }}/rebuck2-driver/snapshot
         key: ${{ env.REBUCK2_SNAPSHOT_KEY_PREFIX }}${{ github.run_id }}
 
+    - name: Pack CAS shards (skip unchanged ones)
+      id: shards
+      if: always()
+      shell: bash
+      run: |
+        [ "${REBUCK2_CAS_SHARDS:-false}" = "true" ] || { echo "cas shards disabled"; exit 0; }
+        mkdir -p "$REBUCK2_WORK/shard-out"
+        for i in 0 1 2 3; do
+          p=$(printf 'cas/%x* cas/%x* cas/%x* cas/%x*' $((i*4)) $((i*4+1)) $((i*4+2)) $((i*4+3)))
+          if bash "$GITHUB_ACTION_PATH/../store-snapshot.sh" unchanged \
+               "$REBUCK2_STORE/driver" "$REBUCK2_SEEDED_MANIFEST.shard$i" "$p"; then
+            echo "[shard] $i unchanged since seed - skipping"
+            continue
+          fi
+          mkdir -p "$REBUCK2_WORK/shard-out/$i"
+          # shellcheck disable=SC2086 # prefix list intentionally word-splits
+          (cd "$REBUCK2_STORE/driver" && find $p -mindepth 1 -maxdepth 1 -type f 2>/dev/null) \
+            | tar -c -C "$REBUCK2_STORE/driver" -T - \
+            | zstd -T0 --long=27 -8 > "$REBUCK2_WORK/shard-out/$i/bulk.tar.zst"
+          echo "up$i=1" >> "$GITHUB_OUTPUT"
+        done
+        ls -lhR "$REBUCK2_WORK/shard-out/" 2>/dev/null || true
+
+    - name: Publish CAS shard 0
+      if: always() && steps.shards.outputs.up0 == '1'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ env.REBUCK2_SHARD_PREFIX }}0
+        path: ${{ runner.temp }}/rebuck2-driver/shard-out/0/bulk.tar.zst
+        compression-level: 0
+    - name: Publish CAS shard 1
+      if: always() && steps.shards.outputs.up1 == '1'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ env.REBUCK2_SHARD_PREFIX }}1
+        path: ${{ runner.temp }}/rebuck2-driver/shard-out/1/bulk.tar.zst
+        compression-level: 0
+    - name: Publish CAS shard 2
+      if: always() && steps.shards.outputs.up2 == '1'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ env.REBUCK2_SHARD_PREFIX }}2
+        path: ${{ runner.temp }}/rebuck2-driver/shard-out/2/bulk.tar.zst
+        compression-level: 0
+    - name: Publish CAS shard 3
+      if: always() && steps.shards.outputs.up3 == '1'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ env.REBUCK2_SHARD_PREFIX }}3
+        path: ${{ runner.temp }}/rebuck2-driver/shard-out/3/bulk.tar.zst
+        compression-level: 0
+
     - name: Dispatch stats
       if: always()
       shell: bash

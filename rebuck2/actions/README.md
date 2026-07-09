@@ -105,6 +105,19 @@ within a heartbeat. Summoned workers run in their own workflow run, so
 they pass `addr-run-id: <the driver's run id>` to find the addr
 artifact. The dispatching job needs `actions: write`.
 
+## Driver-side CAS shards (no-fleet or small-fleet lanes)
+
+The monolith snapshot is all-or-nothing: one LRU eviction or era bump
+and the lane is stone cold, even though the underlying model (per-action
+AC, per-blob CAS) is perfectly incremental. `cas-shard-artifacts: "true"`
+on `driver` makes the transport match the model: the CAS persists as 4
+digest-range shard artifacts (artifacts do not LRU-evict and are not
+branch-scoped), each shard skips its re-upload when unchanged, and
+losing one costs a quarter of the warmth instead of all of it. Pair with
+`snapshot-subdirs: "ac"` - the AC stays a small cache entry. Fleets with
+long-lived workers can instead use `finalize:` + the worker action's
+`shard:` preload (workers pack shards in parallel at teardown).
+
 ## Notes
 
 - **Rendezvous** is keyless: pass the same `session` to driver and
