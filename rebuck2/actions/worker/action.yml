@@ -130,8 +130,10 @@ runs:
         IN_PREFIX: ${{ inputs.shard-artifact-prefix }}
       run: |
         mkdir -p "$REBUCK2_WORK/shard-in" "$REBUCK2_STORE/worker"
-        AID=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$IN_PREFIX$IN_SHARD&per_page=1" \
-          --jq '[.artifacts[] | select(.expired==false)][0].id // empty' 2>/dev/null || true)
+        # Provenance filter: fork PR runs share this artifact namespace -
+        # only accept shards uploaded by runs of THIS repo's own branches.
+        AID=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$IN_PREFIX$IN_SHARD&per_page=10" \
+          --jq '[.artifacts[] | select(.expired==false and .workflow_run.head_repository_id == .workflow_run.repository_id)][0].id // empty' 2>/dev/null || true)
         if [ -n "$AID" ]; then
           gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$AID/zip" > "$REBUCK2_WORK/shard.zip" \
             && unzip -o -q "$REBUCK2_WORK/shard.zip" -d "$REBUCK2_WORK/shard-in" \
@@ -147,6 +149,9 @@ runs:
           fi
         done
         rm -rf "$REBUCK2_WORK/shard-in"
+        # Blobs that crossed the artifact wall must prove themselves:
+        # a CAS filename IS the content sha256; mismatches are deleted.
+        bash "$GITHUB_ACTION_PATH/../verify-cas.sh" "$REBUCK2_STORE/worker"
         # Record the restored shard's manifest - if finalize assigns this
         # same shard back and nothing changed, the re-save is skipped.
         a=$(printf '%x' $((IN_SHARD * 2))); b=$(printf '%x' $((IN_SHARD * 2 + 1)))
