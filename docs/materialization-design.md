@@ -18,7 +18,7 @@ full scale:
 1. CAS blobs are not marked read-only after `Store::put` — hardlinks share the
    inode, so a careless action writing to an input path silently corrupts the
    blob for every consumer.
-2. `exec.rs:287-289` calls `set_exec(&fp)` after materialising a hardlinked
+2. `exec.rs` `materialize()` calls `set_exec(&fp)` after materialising a hardlinked
    file, which `chmod 0o755`s the shared CAS inode — stomping the read-only
    protection and leaking to all concurrent actions sharing that blob.
 
@@ -92,6 +92,14 @@ to `<store_root>/exec/` so exec dirs are always on the same mount as the CAS.
 Alternatively accept `$RUNNER_TEMP`, which GitHub guarantees to be on the root
 filesystem on hosted runners.
 
+> Shipped differently (61f9189): keyed commands use canonical run-stable dirs
+> (`/tmp/rebuck2-exec` resp `C:\rb2x`, `REBUCK2_EXEC_BASE` overrides) because
+> SVH stability requires the SAME path across workers and runs — a
+> store-relative default would vary with `--store`. tmpfs `/tmp` therefore
+> degrades to the copy fallback (all link sites already catch
+> `CrossesDevices`), it does not break. Unkeyed commands still use
+> per-action temp dirs under the worker scratch.
+
 ### Windows (NTFS, windows-2025)
 
 ```text
@@ -106,7 +114,7 @@ Tighten: only silently fall back on `ErrorKind::TooManyLinks` and
 not hide.
 
 **Dev Drive (opt-in)**: add `samypr100/setup-dev-drive@v3` to CI, point both
-`REBUCK_CAS_ROOT` and `REBUCK_EXEC_TEMP` at the mounted ReFS drive. With both
+the store (`--store`) and `REBUCK2_EXEC_BASE` at the mounted ReFS drive. With both
 on the same ReFS volume, `reflink_or_copy` uses `FSCTL_DUPLICATE_EXTENTS_TO_FILE`
 -- CoW with no link count ceiling and Defender performance mode. Treat as
 experimental until the `reflink-copy` Windows path exits its "probably buggy"
@@ -151,7 +159,7 @@ custom drop that does `chmod 0o644` on all files in the exec dir before
 
 ### Executable-bit fix (existing bug, store.rs + exec.rs)
 
-`exec.rs:287-289` calls `set_exec(&fp)` -- `chmod 0o755` -- on the file at
+`exec.rs` `materialize()` calls `set_exec(&fp)` -- `chmod 0o755` -- on the file at
 `fp` after materialising it. If `fp` is a hardlink to a CAS blob:
 
 - The chmod mutates the shared inode, overwriting the `0o444` protection.
@@ -162,7 +170,7 @@ custom drop that does `chmod 0o644` on all files in the exec dir before
 1. Add `is_executable: bool` parameter to `Store::put`. After
    `tokio::fs::write(&tmp, bytes)`, set mode `0o555` (executable, not writable)
    if `is_executable`, else `0o444`.
-2. In `materialize()` (exec.rs:283-289): skip `set_exec(&fp)` when the blob
+2. In `materialize()` (exec.rs): skip `set_exec(&fp)` when the blob
    was materialised via `link_out` (hardlink or CoW clone). The permissions are
    already correct on the shared inode. Call `set_exec` only when the file is
    a private copy (i.e. link_out returned the copy-fallback path).
@@ -186,7 +194,7 @@ the CoW clone is `0o555`. No `set_exec` call needed.
 
 ## Output-collection path
 
-Current (`exec.rs:367-370`): `tokio::fs::read` -> `blobs.put(bytes)` ->
+Current (`run_action` output collection, exec.rs): `tokio::fs::read` -> `blobs.put(bytes)` ->
 `Store::put` writes a tmp file and renames. The read is unavoidable (SHA-256
 hash requires it). The write is avoidable.
 
@@ -222,7 +230,7 @@ This is Priority 2; implement after the read-only + exec-bit fix is green in CI.
 | `store.rs` | `put()`: chmod blob to `0o444`/`0o555` after tmp write; add `is_executable: bool` param; tighten `link_out` fallback to only match `TooManyLinks`/`CrossesDevices`/`PermissionDenied` | ~25 |
 | `exec.rs` | macOS: use `std::fs::copy` in `materialize_file` default or override; skip `set_exec` when hardlinked; pass `is_executable` to `put` in `build_dir` | ~30 |
 | `worker.rs`, `driver.rs` | Thread `is_executable` through call sites; update `StoreBlobs::put` and `RemoteBlobs::put` signatures | ~20 |
-| `main.rs` | Change scratch default from `temp_dir()/rebuck2-exec` to `<store_root>/exec/` | ~5 |
+| `main.rs` | Scratch default: superseded for keyed commands by canonical dirs (`REBUCK2_EXEC_BASE`, 61f9189); `<store_root>/exec/` remains an option for unkeyed ones | ~5 |
 
 ### Crates
 
@@ -262,15 +270,17 @@ Write the test before the fix (red -> green proves the bug existed).
 3. **macOS CoW path**: low risk -- `std::fs::copy` is always correct; CoW is
    transparent. Can land in the same PR as Priority 1.
 
-4. **Exec-dir placement fix** (`temp_dir` -> `<store_root>/exec/`): low risk
-   on current ubuntu-24.04 runners; fixes a latent break on ubuntu-24.10+
-   runners. Land promptly.
+4. **Exec-dir placement fix** (`temp_dir` -> `<store_root>/exec/`): partially
+   superseded — keyed commands now use canonical run-stable dirs (61f9189)
+   and every link site copy-falls-back on `CrossesDevices`, so tmpfs `/tmp`
+   costs copies, not correctness. `<store_root>/exec/` stays open as a perf
+   option for unkeyed commands only.
 
 5. **Priority 2 - output-collection hardlink**: after Priority 1 is green in
    CI for at least one sweep run. Measure `stored_bytes` reduction.
 
 6. **Dev Drive opt-in (Windows)**: CI YAML change; add `setup-dev-drive@v3`
-   step, set `REBUCK_CAS_ROOT` and `REBUCK_EXEC_TEMP` to the ReFS drive letter.
+   step, set `--store` and `REBUCK2_EXEC_BASE` to the ReFS drive letter.
    Gated behind its own CI job variant; does not affect the default Windows
    path. Treat `reflink-copy` Windows support as experimental until confirmed
    with an actual Dev Drive workload.

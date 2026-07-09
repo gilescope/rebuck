@@ -1,6 +1,12 @@
 //! Action execution: materialize the input tree, run the command, collect
 //! outputs. Used by workers and by the driver's local fallback — the only
 //! difference is where blobs come from (`Blobs` impl).
+//!
+//! Keyed commands (a target's emit flavours) run in canonical run-stable
+//! dirs (`REBUCK2_EXEC_BASE` overrides the base) so absolutized path-envs
+//! agree across pipelined twins — see [`crate_affinity_key`]. Unkeyed
+//! commands get per-action temp dirs. `REBUCK2_KEEP_SCRATCH=1` keeps exec
+//! dirs and logs argv/cwd per action.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
