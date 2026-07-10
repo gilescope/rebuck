@@ -522,7 +522,10 @@ async fn sync_shard(
         "[worker] shard {shard}: fetching {} missing blobs",
         missing.len()
     );
-    let sem = Arc::new(tokio::sync::Semaphore::new(8));
+    // 8 permits made a ~thousand-blob range sync a double-digit-minutes
+    // finalize (all fetches relay through one driver conn); the driver's
+    // own mesh_fetches bound (64) still applies globally.
+    let sem = Arc::new(tokio::sync::Semaphore::new(24));
     let mut tasks = Vec::new();
     for d in missing {
         let sem = sem.clone();
