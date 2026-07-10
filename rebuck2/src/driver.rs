@@ -295,8 +295,12 @@ impl Driver {
                     if tokio::fs::metadata(&sig).await.is_ok() {
                         let told = this.finalize_shards(8).await as u64;
                         println!("[driver] finalize signalled: told {told} workers");
+                        // Acks land within seconds when they land at all;
+                        // a lost ack (observed: 6/8, 2 never arrived) must
+                        // cost ~2min, not a 15min deadline - stragglers
+                        // degrade to partial save by design.
                         let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(900);
+                            std::time::Instant::now() + std::time::Duration::from_secs(120);
                         while this.finalized_count() < told && std::time::Instant::now() < deadline
                         {
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
