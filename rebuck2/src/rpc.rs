@@ -382,10 +382,12 @@ impl re::action_cache_server::ActionCache for Ac {
             .action_result
             .clone()
             .ok_or_else(|| Status::invalid_argument("no result"))?;
+        let hash = dig(d)?.hash;
         self.store
-            .ac_put(&dig(d)?.hash, &result.encode_to_vec())
+            .ac_put(&hash, &result.encode_to_vec())
             .await
             .map_err(|e| Status::internal(format!("{e:#}")))?;
+        self.driver.note_ac_written(&hash).await;
         Ok(Response::new(result))
     }
 }
@@ -448,6 +450,7 @@ impl re::execution_server::Execution for Exec {
                 .store
                 .ac_put(&d.hash, &outcome.action_result.encode_to_vec())
                 .await;
+            self.driver.note_ac_written(&d.hash).await;
         }
         Ok(op_stream(&d, outcome.action_result, false))
     }
@@ -568,12 +571,15 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::NotFound);
         assert_eq!(ac.stats.ac_unservable.load(Relaxed), 1);
 
-        // Store the referenced blob -> the same entry becomes servable.
+        // Store the referenced blob; the unservable verdict is memoized
+        // until the entry is rewritten - drive the real invalidation via
+        // the driver's note_ac_written (what UpdateActionResult calls).
         let d = crate::mesh::Dig {
             hash: ABC.into(),
             size: 3,
         };
         ac.store.put(Some(&d), b"abc").await.unwrap();
+        ac.driver.note_ac_written(&key).await;
         ac.get_action_result(req(&key)).await.expect("now servable");
         assert_eq!(ac.stats.ac_hits.load(Relaxed), 1);
     }

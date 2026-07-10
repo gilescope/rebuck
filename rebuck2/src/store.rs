@@ -91,6 +91,11 @@ impl Store {
         ok
     }
 
+    #[cfg(test)]
+    pub fn cas_path_for_test(&self, hash: &str) -> PathBuf {
+        self.cas_path(hash)
+    }
+
     fn cas_path(&self, hash: &str) -> PathBuf {
         self.root.join("cas").join(&hash[..2]).join(hash)
     }

@@ -198,6 +198,15 @@ pub struct Driver {
     providers: Mutex<HashMap<String, String>>,
     /// Diagnostic: how many unservable samples we have logged.
     unservable_logged: AtomicU64,
+    /// Session-scope validation memo. Serving a hit costs a full
+    /// transitive validation (tree fetches + fleet HasMany batches); a
+    /// warm lap makes ~59k lookups over ~20k unique entries, so verdicts
+    /// are memoized. Servable verdicts clear when ANY worker disconnects
+    /// (a holder may have left); unservable verdicts expire on a short
+    /// TTL (blobs may arrive) - staleness there is over-conservative,
+    /// never dishonest.
+    memo_servable: Mutex<std::collections::HashSet<String>>,
+    memo_unservable: Mutex<HashMap<String, std::time::Instant>>,
     /// Bloom gossip: worker endpoint id -> summary of its store.
     blooms: Mutex<HashMap<String, mesh::Bloom>>,
     /// One QUIC connection per peer, multiplexed bi-streams. Per-call dials
@@ -242,6 +251,8 @@ impl Driver {
             queue: Mutex::new(HashMap::new()),
             providers: Mutex::new(HashMap::new()),
             unservable_logged: AtomicU64::new(0),
+            memo_servable: Mutex::new(std::collections::HashSet::new()),
+            memo_unservable: Mutex::new(HashMap::new()),
             blooms: Mutex::new(HashMap::new()),
             peer_conns: Mutex::new(HashMap::new()),
             affinity_owner: Mutex::new(HashMap::new()),
@@ -461,6 +472,9 @@ impl Driver {
         .await;
 
         self.workers.lock().await.retain(|w| w.id != worker_id);
+        // A departed worker may have been the sole holder behind memoized
+        // servable verdicts - revalidate everything from here on.
+        self.memo_servable.lock().await.clear();
         self.blooms.lock().await.remove(&endpoint);
         println!("[driver] worker {worker_id} left");
         writer.abort();
@@ -655,6 +669,16 @@ impl Driver {
         let Some(bytes) = self.store.ac_get(hash).await else {
             return AcLookup::Miss;
         };
+        if self.memo_servable.lock().await.contains(hash) {
+            if let Ok(result) = re::ActionResult::decode(bytes.as_slice()) {
+                return AcLookup::Hit(result);
+            }
+        }
+        if let Some(at) = self.memo_unservable.lock().await.get(hash) {
+            if at.elapsed() < std::time::Duration::from_secs(120) {
+                return AcLookup::Unservable;
+            }
+        }
         let Ok(result) = re::ActionResult::decode(bytes.as_slice()) else {
             // Corrupt entry: re-execution overwrites it. Safer than serving.
             return AcLookup::Miss;
@@ -669,9 +693,17 @@ impl Driver {
             let Some(td) = &od.tree_digest else { continue };
             let tdig: Dig = td.into();
             let Ok(Some(tree_bytes)) = self.get_blob(&tdig).await else {
+                self.memo_unservable
+                    .lock()
+                    .await
+                    .insert(hash.to_string(), std::time::Instant::now());
                 return AcLookup::Unservable;
             };
             let Ok(tree) = re::Tree::decode(tree_bytes.as_slice()) else {
+                self.memo_unservable
+                    .lock()
+                    .await
+                    .insert(hash.to_string(), std::time::Instant::now());
                 return AcLookup::Unservable;
             };
             for dir in tree.root.iter().chain(tree.children.iter()) {
@@ -713,10 +745,21 @@ impl Driver {
                         result.output_directories.len()
                     );
                 }
+                self.memo_unservable
+                    .lock()
+                    .await
+                    .insert(hash.to_string(), std::time::Instant::now());
                 return AcLookup::Unservable;
             }
         }
+        self.memo_servable.lock().await.insert(hash.to_string());
         AcLookup::Hit(result)
+    }
+
+    /// A fresh result was written for this key: any cached unservable
+    /// verdict is obsolete.
+    pub async fn note_ac_written(&self, hash: &str) {
+        self.memo_unservable.lock().await.remove(hash);
     }
 
     /// Direct HasMany probe of every connected worker for one digest.
@@ -1591,12 +1634,15 @@ mod tests {
             matches!(d.validated_ac_get(&key).await, AcLookup::Unservable),
             "tree proto present but interior file absent must be Unservable"
         );
-        // Store the interior file -> the same entry becomes servable.
+        // Store the interior file; the unservable verdict is memoized
+        // until the entry is rewritten (the real-world invalidation:
+        // re-execution re-puts the result), then it becomes servable.
         let f = Dig {
             hash: file_hash,
             size: 7,
         };
         d.store.put(Some(&f), b"1234567").await.unwrap();
+        d.note_ac_written(&key).await;
         assert!(matches!(d.validated_ac_get(&key).await, AcLookup::Hit(_)));
     }
 
@@ -1639,6 +1685,47 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    /// Validation verdicts are session-memoized: ~59k lookups over ~20k
+    /// unique entries per lap, each costing tree fetches + fleet HasMany.
+    /// Servable memos survive blob loss until a worker disconnects (the
+    /// invalidation event); unservable memos expire on TTL/rewrite.
+    #[tokio::test]
+    async fn validation_verdicts_are_memoized_per_session() {
+        let d = test_driver(false);
+        let blob = d.store.put(None, b"abc").await.unwrap();
+        let result = re::ActionResult {
+            output_files: vec![re::OutputFile {
+                path: "out".into(),
+                digest: Some(blob.to_proto()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let key = "c".repeat(64);
+        d.store.ac_put(&key, &result.encode_to_vec()).await.unwrap();
+        assert!(matches!(d.validated_ac_get(&key).await, AcLookup::Hit(_)));
+        // Remove the blob behind the memo: still a Hit (memoized verdict),
+        // proving the second lookup skipped revalidation.
+        let p = d.store.cas_path_for_test(&blob.hash);
+        std::fs::remove_file(&p).unwrap();
+        assert!(matches!(d.validated_ac_get(&key).await, AcLookup::Hit(_)));
+        // Worker-disconnect invalidation: verdicts revalidate -> Unservable.
+        d.memo_servable.lock().await.clear();
+        assert!(matches!(
+            d.validated_ac_get(&key).await,
+            AcLookup::Unservable
+        ));
+        // ...and the unservable verdict is memoized until the entry is
+        // rewritten (note_ac_written), after which blobs restored = Hit.
+        d.store.put(Some(&blob), b"abc").await.unwrap();
+        assert!(matches!(
+            d.validated_ac_get(&key).await,
+            AcLookup::Unservable
+        ));
+        d.note_ac_written(&key).await;
+        assert!(matches!(d.validated_ac_get(&key).await, AcLookup::Hit(_)));
     }
 
     /// Pull-model invariant: a worker's outstanding count never exceeds
