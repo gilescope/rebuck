@@ -196,6 +196,8 @@ pub struct Driver {
     queue: Mutex<HashMap<PlatKey, std::collections::VecDeque<u64>>>,
     /// Decentralized mode: blob hash -> producing worker's endpoint id.
     providers: Mutex<HashMap<String, String>>,
+    /// Diagnostic: how many unservable samples we have logged.
+    unservable_logged: AtomicU64,
     /// Bloom gossip: worker endpoint id -> summary of its store.
     blooms: Mutex<HashMap<String, mesh::Bloom>>,
     /// One QUIC connection per peer, multiplexed bi-streams. Per-call dials
@@ -239,6 +241,7 @@ impl Driver {
             local_slots: Semaphore::new(cores),
             queue: Mutex::new(HashMap::new()),
             providers: Mutex::new(HashMap::new()),
+            unservable_logged: AtomicU64::new(0),
             blooms: Mutex::new(HashMap::new()),
             peer_conns: Mutex::new(HashMap::new()),
             affinity_owner: Mutex::new(HashMap::new()),
@@ -693,8 +696,25 @@ impl Driver {
                 }
             }
         }
-        if !digs.is_empty() && self.has_blobs(&digs).await.iter().any(|p| !p) {
-            return AcLookup::Unservable;
+        if !digs.is_empty() {
+            let have = self.has_blobs(&digs).await;
+            if let Some(i) = have.iter().position(|p| !p) {
+                // Sample the unservable class: ~23k entries stayed
+                // unservable across laps even after fleet-union banking
+                // (shard sizes unmoved - the blobs exist NOWHERE). Name
+                // them so the next fix targets the right reference class.
+                let n = self.unservable_logged.fetch_add(1, Ordering::Relaxed);
+                if n < 20 {
+                    println!(
+                        "[driver] unservable sample {n}: action {hash} missing blob {}/{} ({} outputs, {} dirs)",
+                        digs[i].hash,
+                        digs[i].size,
+                        result.output_files.len(),
+                        result.output_directories.len()
+                    );
+                }
+                return AcLookup::Unservable;
+            }
         }
         AcLookup::Hit(result)
     }
