@@ -48,6 +48,41 @@ pub struct Store {
     pub read_bytes: std::sync::atomic::AtomicU64,
 }
 
+/// Hash-verify every CAS blob under `dir` (filename IS the content
+/// sha256), deleting mismatches. Native replacement for the shell
+/// verify-cas: one sequential msys hasher took 31min over 95k blobs on
+/// windows, and parallel shell hashers interleaved their stdout and
+/// "mismatch"-deleted good files (run 29082052036's mac fleet).
+/// Returns (verified, rejected).
+pub fn verify_cas(dir: &std::path::Path) -> anyhow::Result<(u64, u64)> {
+    let cas = dir.join("cas");
+    let (mut ok, mut bad) = (0u64, 0u64);
+    if !cas.is_dir() {
+        return Ok((0, 0));
+    }
+    for sub in std::fs::read_dir(&cas)?.flatten() {
+        if !sub.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        for f in std::fs::read_dir(sub.path())?.flatten() {
+            let p = f.path();
+            if !p.is_file() {
+                continue;
+            }
+            let name = f.file_name().to_string_lossy().into_owned();
+            let bytes = std::fs::read(&p)?;
+            if sha256_hex(&bytes) == name {
+                ok += 1;
+            } else {
+                eprintln!("verify-store: DIGEST MISMATCH - deleting {name}");
+                let _ = std::fs::remove_file(&p);
+                bad += 1;
+            }
+        }
+    }
+    Ok((ok, bad))
+}
+
 impl Store {
     pub fn new(root: PathBuf) -> Result<Self> {
         for sub in ["cas", "ac", "tmp"] {
@@ -382,6 +417,22 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn verify_cas_keeps_good_deletes_bad() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = crate::store::sha256_hex(b"abc");
+        let sub = dir.path().join("cas").join(&good[..2]);
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(&good), b"abc").unwrap();
+        let evil = dir.path().join("cas").join("aa");
+        std::fs::create_dir_all(&evil).unwrap();
+        std::fs::write(evil.join("aa".repeat(32)), b"evil").unwrap();
+        let (ok, bad) = crate::store::verify_cas(dir.path()).unwrap();
+        assert_eq!((ok, bad), (1, 1));
+        assert!(sub.join(&good).exists());
+        assert!(!evil.join("aa".repeat(32)).exists());
+    }
+
     use super::*;
 
     /// Regression: concurrent puts of the SAME content must all succeed.

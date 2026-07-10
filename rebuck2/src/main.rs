@@ -26,7 +26,8 @@ fn usage() -> ! {
     eprintln!(
         "usage: rebuck2 driver [--grpc-port N] [--store DIR] [--session S] \
          [--min-workers N] [--no-local-exec] [--decentralized-cas] [--no-hardlinks] [--no-reflink] [--cache-failures]\n       \
-         rebuck2 worker [--store DIR] [--session S] [--slots N] [--preloaded-shard N] [--connect-wait-secs N] [--no-hardlinks] [--no-reflink]"
+         rebuck2 worker [--store DIR] [--session S] [--slots N] [--preloaded-shard N] [--connect-wait-secs N] [--no-hardlinks] [--no-reflink]\n       \
+         rebuck2 verify-store --store DIR"
     );
     std::process::exit(2)
 }
@@ -85,6 +86,21 @@ async fn main() -> Result<()> {
     let mut args = Args(argv);
     match role.as_str() {
         "driver" => run_driver(args).await,
+        "verify-store" => {
+            let dir: std::path::PathBuf = args
+                .opt("--store")
+                .map(Into::into)
+                .unwrap_or_else(|| usage());
+            args.done();
+            let (ok, bad) = store::verify_cas(&dir)?;
+            println!("verify-store: {ok} verified, {bad} rejected");
+            if bad > 0 {
+                eprintln!(
+                    "verify-store: WARNING - rejected blobs suggest a poisoned or corrupt shard artifact"
+                );
+            }
+            Ok(())
+        }
         "worker" => {
             let store_root: std::path::PathBuf = args
                 .opt("--store")
