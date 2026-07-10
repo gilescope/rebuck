@@ -301,7 +301,12 @@ impl Driver {
                         {
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         }
-                        let done = sig.with_extension("done");
+                        // APPEND .done - with_extension REPLACES the last
+                        // extension ("finalize.signal" -> "finalize.done")
+                        // and the CI poll for finalize.signal.done burned
+                        // its full 1000s cap on EVERY lap (~16.7min/lap,
+                        // in every decomposition as "finalize 16m40s").
+                        let done = std::path::PathBuf::from(format!("{}.done", sig.display()));
                         let _ =
                             tokio::fs::write(&done, format!("{}", this.finalized_count())).await;
                         println!(
