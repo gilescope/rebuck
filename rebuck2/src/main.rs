@@ -8,6 +8,7 @@
 //! Rendezvous needs no service: both sides derive the driver's iroh key from
 //! `--session` (default $GITHUB_RUN_ID), see mesh.rs.
 
+mod bench;
 mod driver;
 mod exec;
 mod mesh;
@@ -27,7 +28,8 @@ fn usage() -> ! {
         "usage: rebuck2 driver [--grpc-port N] [--store DIR] [--session S] \
          [--min-workers N] [--no-local-exec] [--decentralized-cas] [--no-hardlinks] [--no-reflink] [--cache-failures]\n       \
          rebuck2 worker [--store DIR] [--session S] [--slots N] [--preloaded-shard N] [--connect-wait-secs N] [--no-hardlinks] [--no-reflink]\n       \
-         rebuck2 verify-store --store DIR"
+         rebuck2 verify-store --store DIR\n       \
+         rebuck2 bench [--grpc URL] [--entries N] [--poisoned-pct P] [--plant-dir DIR] [--concurrency C] [--rounds R]"
     );
     std::process::exit(2)
 }
@@ -86,6 +88,32 @@ async fn main() -> Result<()> {
     let mut args = Args(argv);
     match role.as_str() {
         "driver" => run_driver(args).await,
+        "bench" => {
+            let cfg = bench::BenchCfg {
+                grpc: args
+                    .opt("--grpc")
+                    .unwrap_or_else(|| "http://127.0.0.1:9092".into()),
+                plant_dir: args.opt("--plant-dir").map(Into::into),
+                entries: args
+                    .opt("--entries")
+                    .map(|s| s.parse().expect("--entries: number"))
+                    .unwrap_or(2000),
+                poisoned_pct: args
+                    .opt("--poisoned-pct")
+                    .map(|s| s.parse().expect("--poisoned-pct: 0-100"))
+                    .unwrap_or(20),
+                concurrency: args
+                    .opt("--concurrency")
+                    .map(|s| s.parse().expect("--concurrency: number"))
+                    .unwrap_or(16),
+                rounds: args
+                    .opt("--rounds")
+                    .map(|s| s.parse().expect("--rounds: number"))
+                    .unwrap_or(3),
+            };
+            args.done();
+            bench::run(cfg).await
+        }
         "verify-store" => {
             let dir: std::path::PathBuf = args
                 .opt("--store")
