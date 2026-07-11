@@ -219,7 +219,12 @@ pub struct Driver {
     /// (a holder may have left); unservable verdicts expire on a short
     /// TTL (blobs may arrive) - staleness there is over-conservative,
     /// never dishonest.
-    memo_servable: Mutex<std::collections::HashSet<String>>,
+    /// Validated-servable AC entries -> their encoded ActionResult bytes.
+    /// Read-mostly under RwLock: a warm hit is served from memory with no
+    /// disk read, no revalidation, and concurrent readers (~110k lookups
+    /// per hetero lap otherwise serialized on one Mutex + one file read
+    /// each). Cleared when a worker disconnects (a holder may have left).
+    memo_servable: tokio::sync::RwLock<HashMap<String, Arc<Vec<u8>>>>,
     memo_unservable: Mutex<HashMap<String, std::time::Instant>>,
     /// Bloom gossip: worker endpoint id -> summary of its store.
     blooms: Mutex<HashMap<String, mesh::Bloom>>,
@@ -265,7 +270,7 @@ impl Driver {
             queue: Mutex::new(HashMap::new()),
             providers: Mutex::new(HashMap::new()),
             unservable_logged: AtomicU64::new(0),
-            memo_servable: Mutex::new(std::collections::HashSet::new()),
+            memo_servable: tokio::sync::RwLock::new(HashMap::new()),
             memo_unservable: Mutex::new(HashMap::new()),
             blooms: Mutex::new(HashMap::new()),
             peer_conns: Mutex::new(HashMap::new()),
@@ -501,7 +506,7 @@ impl Driver {
         self.workers.lock().await.retain(|w| w.id != worker_id);
         // A departed worker may have been the sole holder behind memoized
         // servable verdicts - revalidate everything from here on.
-        self.memo_servable.lock().await.clear();
+        self.memo_servable.write().await.clear();
         self.blooms.lock().await.remove(&endpoint);
         println!("[driver] worker {worker_id} left");
         writer.abort();
@@ -693,14 +698,16 @@ impl Driver {
     /// blob-less results after cache eviction (writer 28935304124, 34,208
     /// extract_artifacts failures).
     pub async fn validated_ac_get(self: &Arc<Self>, hash: &str) -> AcLookup {
-        let Some(bytes) = self.store.ac_get(hash).await else {
-            return AcLookup::Miss;
-        };
-        if self.memo_servable.lock().await.contains(hash) {
-            if let Ok(result) = re::ActionResult::decode(bytes.as_slice()) {
+        // Fast path: a validated-servable entry is served from memory -
+        // no disk read, no revalidation, concurrent readers.
+        if let Some(cached) = self.memo_servable.read().await.get(hash).cloned() {
+            if let Ok(result) = re::ActionResult::decode(cached.as_slice()) {
                 return AcLookup::Hit(result);
             }
         }
+        let Some(bytes) = self.store.ac_get(hash).await else {
+            return AcLookup::Miss;
+        };
         if let Some(at) = self.memo_unservable.lock().await.get(hash) {
             if at.elapsed() < std::time::Duration::from_secs(120) {
                 return AcLookup::Unservable;
@@ -779,7 +786,10 @@ impl Driver {
                 return AcLookup::Unservable;
             }
         }
-        self.memo_servable.lock().await.insert(hash.to_string());
+        self.memo_servable
+            .write()
+            .await
+            .insert(hash.to_string(), Arc::new(bytes));
         AcLookup::Hit(result)
     }
 
@@ -787,6 +797,7 @@ impl Driver {
     /// verdict is obsolete.
     pub async fn note_ac_written(&self, hash: &str) {
         self.memo_unservable.lock().await.remove(hash);
+        self.memo_servable.write().await.remove(hash);
     }
 
     /// Direct HasMany probe of every connected worker for one digest.
@@ -1853,7 +1864,7 @@ mod tests {
         std::fs::remove_file(&p).unwrap();
         assert!(matches!(d.validated_ac_get(&key).await, AcLookup::Hit(_)));
         // Worker-disconnect invalidation: verdicts revalidate -> Unservable.
-        d.memo_servable.lock().await.clear();
+        d.memo_servable.write().await.clear();
         assert!(matches!(
             d.validated_ac_get(&key).await,
             AcLookup::Unservable
