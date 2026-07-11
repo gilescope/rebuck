@@ -413,6 +413,20 @@ impl Store {
         tokio::fs::rename(&tmp, self.root.join("ac").join(action_hash)).await?;
         Ok(())
     }
+
+    /// Every action hash present in the AC (filenames are the hashes).
+    pub fn ac_list(&self) -> Vec<String> {
+        std::fs::read_dir(self.root.join("ac"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+            .collect()
+    }
+
+    pub async fn ac_delete(&self, action_hash: &str) {
+        let _ = tokio::fs::remove_file(self.root.join("ac").join(action_hash)).await;
+    }
 }
 
 #[cfg(test)]

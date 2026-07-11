@@ -307,6 +307,10 @@ impl Driver {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     if tokio::fs::metadata(&sig).await.is_ok() {
+                        // Scrub dead AC rows BEFORE banking so the snapshot
+                        // is clean and next lap skips their revalidation.
+                        let (scanned, deleted) = this.scrub_ac().await;
+                        println!("[driver] ac scrub: {deleted}/{scanned} unservable rows deleted");
                         let told = this.finalize_shards(8).await as u64;
                         println!("[driver] finalize signalled: told {told} workers");
                         // Acks land within seconds when they land at all;
@@ -1043,6 +1047,36 @@ impl Driver {
             }
         }
         n
+    }
+
+    /// Delete AC entries whose referenced blobs are unservable across the
+    /// fleet - dead rows from prior poisoned eras (13.5k on the 2026-07
+    /// warm laps). buck2 ignores their refusal anyway (the consuming
+    /// compile hits), so a scrubbed row becomes a clean fast Miss next
+    /// lap instead of a repeated transitive-validation walk. Returns
+    /// (scanned, deleted). Concurrency-bounded; validation is memoized.
+    pub async fn scrub_ac(self: &Arc<Self>) -> (usize, usize) {
+        let keys = self.store.ac_list();
+        let scanned = keys.len();
+        let sem = Arc::new(Semaphore::new(32));
+        let deleted = Arc::new(AtomicU64::new(0));
+        let mut tasks = Vec::new();
+        for k in keys {
+            let this = self.clone();
+            let sem = sem.clone();
+            let deleted = deleted.clone();
+            tasks.push(tokio::spawn(async move {
+                let _p = sem.acquire().await.expect("sem open");
+                if matches!(this.validated_ac_get(&k).await, AcLookup::Unservable) {
+                    this.store.ac_delete(&k).await;
+                    deleted.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        for t in tasks {
+            let _ = t.await;
+        }
+        (scanned, deleted.load(Ordering::Relaxed) as usize)
     }
 
     pub fn finalized_count(&self) -> u64 {
@@ -1899,6 +1933,48 @@ mod tests {
         }
         d.execute(&action_dig).await.unwrap();
         assert_eq!(*ran.lock().await, vec!["epB"], "job must go to the data");
+    }
+
+    /// scrub_ac deletes only unservable rows, keeps servable ones.
+    #[tokio::test]
+    async fn scrub_ac_deletes_only_dead_rows() {
+        let d = test_driver(false);
+        // Servable: references a blob present in the store.
+        let blob = d.store.put(None, b"live").await.unwrap();
+        let live = re::ActionResult {
+            output_files: vec![re::OutputFile {
+                path: "o".into(),
+                digest: Some(blob.to_proto()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        d.store
+            .ac_put(&"a".repeat(64), &live.encode_to_vec())
+            .await
+            .unwrap();
+        // Dead: references a blob nobody holds.
+        let dead = re::ActionResult {
+            output_files: vec![re::OutputFile {
+                path: "o".into(),
+                digest: Some(re::Digest {
+                    hash: "ff".repeat(32),
+                    size_bytes: 9,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        d.store
+            .ac_put(&"b".repeat(64), &dead.encode_to_vec())
+            .await
+            .unwrap();
+
+        let (scanned, deleted) = d.scrub_ac().await;
+        assert_eq!(scanned, 2);
+        assert_eq!(deleted, 1);
+        assert!(d.store.ac_get(&"a".repeat(64)).await.is_some(), "live kept");
+        assert!(d.store.ac_get(&"b".repeat(64)).await.is_none(), "dead gone");
     }
 
     /// Pull-model invariant: a worker's outstanding count never exceeds
