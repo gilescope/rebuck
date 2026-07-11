@@ -336,11 +336,15 @@ impl Driver {
                         // a lost ack (observed: 6/8, 2 never arrived) must
                         // cost ~2min, not a 15min deadline - stragglers
                         // degrade to partial save by design.
-                        // Acks land in seconds; a worker that hasn't
-                        // acked in 45s has left - waiting the old 120s
-                        // burned ~90s of every warm lap's finalize.
+                        // Warm laps SKIP unchanged shards -> ack in
+                        // seconds regardless, so a generous deadline costs
+                        // nothing there; it only spends time on TRANSITION
+                        // laps that actually re-pack (scrub/re-exec changed
+                        // the era) - where a complete 8/8 bank is worth it
+                        // (a partial bank re-poisons the next era). 45s cut
+                        // a re-packing lap to 4/8; 180s lets it finish.
                         let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(45);
+                            std::time::Instant::now() + std::time::Duration::from_secs(180);
                         while this.finalized_shards.lock().await.len() < shards_needed
                             && std::time::Instant::now() < deadline
                         {
