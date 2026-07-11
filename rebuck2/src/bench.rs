@@ -337,6 +337,40 @@ pub async fn fleet(cfg: FleetCfg) -> Result<()> {
             ok += 1;
         }
     }
+    // --- Hot-CAS lever: client-download latency, relayed vs driver-local.
+    // Place small metadata blobs on ONE worker; time get_blob first-touch
+    // (relay from worker, then cached) vs second-touch (driver-local) -
+    // the exact win of seeding the driver's metadata locally.
+    {
+        let mut metas: Vec<crate::mesh::Dig> = Vec::new();
+        for i in 0..500usize {
+            let b = format!("-Ldependency={i}-rmeta\n").repeat(32).into_bytes();
+            let dg = digest_of(&b);
+            let d: crate::mesh::Dig = (&dg).into();
+            wstores[0].put(Some(&d), &b).await?;
+            metas.push(d);
+        }
+        tokio::time::sleep(Duration::from_millis(1500)).await; // bloom
+        let t0 = std::time::Instant::now();
+        for m in &metas {
+            let _ = driver.get_blob(m).await;
+        }
+        let relay = t0.elapsed().as_secs_f64();
+        let t1 = std::time::Instant::now();
+        for m in &metas {
+            let _ = driver.get_blob(m).await;
+        }
+        let local = t1.elapsed().as_secs_f64();
+        println!(
+            "[fleet] metadata reads (500): relay {:.3}s ({:.1}/s) vs driver-local {:.3}s ({:.1}/s) = {:.0}x",
+            relay,
+            metas.len() as f64 / relay,
+            local,
+            metas.len() as f64 / local.max(0.0001),
+            relay / local.max(0.0001),
+        );
+    }
+
     let wall = start.elapsed().as_secs_f64();
     let served: u64 = wstores
         .iter()
