@@ -204,3 +204,155 @@ pub async fn run(cfg: BenchCfg) -> Result<()> {
     }
     Ok(())
 }
+
+/// In-process fleet bench (no Docker): brings up a driver + N workers over
+/// the real loopback iroh mesh, PRE-PLACES each action's heavy input on
+/// exactly one worker (asymmetric data), fires Execute for all of them,
+/// and reports wall time + bytes the driver had to relay across the mesh.
+/// Run with locality on vs off to price moving-task-to-data.
+pub struct FleetCfg {
+    pub workers: usize,
+    pub actions: usize,
+    pub rlib_kb: usize,
+    pub locality: bool,
+}
+
+pub async fn fleet(cfg: FleetCfg) -> Result<()> {
+    use crate::{driver::Driver, driver::DriverCfg, mesh::Dig, store::Store, worker};
+    use std::time::Duration;
+
+    let root = tempfile::tempdir()?.keep();
+    let session = format!("bench-fleet-{}", cfg.workers);
+    let addr_file = root.join("addr.json");
+
+    let dstore = Arc::new(Store::new(root.join("driver"))?);
+    let driver = Driver::new(
+        dstore.clone(),
+        DriverCfg {
+            session: session.clone(),
+            min_workers: cfg.workers,
+            local_exec: false,
+            decentralized: false,
+            hardlinks: true,
+            cache_failures: false,
+            locality: cfg.locality,
+            addr_file: Some(addr_file.clone()),
+            finalize_file: None,
+            scratch: root.join("driver-exec"),
+        },
+    );
+    {
+        let d = driver.clone();
+        tokio::spawn(async move { d.serve_mesh().await });
+    }
+    for _ in 0..100 {
+        if addr_file.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Build the action set and PRE-PLACE each heavy rlib on one worker's
+    // on-disk store BEFORE the workers boot, so their FIRST bloom (sent
+    // immediately on connect) already announces the placement. The driver
+    // holds only the tree/command/action protos - never the rlib bytes,
+    // so a mis-routed job MUST cross the mesh to fetch.
+    let rlib = vec![0xABu8; cfg.rlib_kb * 1024];
+    let mut actions: Vec<Dig> = Vec::new();
+    let wpaths: Vec<_> = (0..cfg.workers)
+        .map(|w| root.join(format!("w{w}")))
+        .collect();
+    let wstores: Vec<Arc<Store>> = wpaths
+        .iter()
+        .map(|p| Store::new(p.clone()).map(Arc::new))
+        .collect::<Result<_>>()?;
+    for i in 0..cfg.actions {
+        let mut bytes = rlib.clone();
+        bytes.extend_from_slice(&(i as u64).to_le_bytes());
+        let rlib_dig = digest_of(&bytes);
+        let owner = i % cfg.workers;
+        let rlib_d: crate::mesh::Dig = (&rlib_dig).into();
+        wstores[owner].put(Some(&rlib_d), &bytes).await?;
+        let dir = re::Directory {
+            files: vec![re::FileNode {
+                name: format!("lib{i}.rlib"),
+                digest: Some(rlib_dig),
+                is_executable: false,
+                node_properties: None,
+            }],
+            ..Default::default()
+        };
+        let dir_dig = dstore.put(None, &dir.encode_to_vec()).await?;
+        let cmd = re::Command {
+            arguments: vec![if cfg!(windows) { "cmd" } else { "true" }.into()],
+            output_paths: vec![],
+            ..Default::default()
+        };
+        let cmd_dig = dstore.put(None, &cmd.encode_to_vec()).await?;
+        let action = re::Action {
+            command_digest: Some(cmd_dig.to_proto()),
+            input_root_digest: Some(dir_dig.to_proto()),
+            ..Default::default()
+        };
+        actions.push(dstore.put(None, &action.encode_to_vec()).await?);
+    }
+    // Now boot the workers over their pre-seeded stores.
+    for (w, wstore) in wstores.iter().enumerate() {
+        let wstore = wstore.clone();
+        let cfgw = worker::WorkerCfg {
+            session: session.clone(),
+            slots: 8,
+            scratch: root.join(format!("w{w}-exec")),
+            connect_wait: Duration::from_secs(30),
+            driver_addr_file: Some(addr_file.clone()),
+            hardlinks: true,
+            preloaded_shard: None,
+        };
+        std::fs::create_dir_all(&cfgw.scratch)?;
+        tokio::spawn(async move { worker::run(wstore, cfgw).await });
+    }
+    for _ in 0..200 {
+        if driver.worker_count().await >= cfg.workers {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // First bloom lands right after join; give it a beat to reach the driver.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    println!(
+        "[fleet] {} workers joined + announced",
+        driver.worker_count().await
+    );
+
+    let start = std::time::Instant::now();
+    let mut tasks = Vec::new();
+    for a in &actions {
+        let d = driver.clone();
+        let a = a.clone();
+        tasks.push(tokio::spawn(async move { d.execute(&a).await.map(|_| ()) }));
+    }
+    let mut ok = 0;
+    for t in tasks {
+        if t.await?.is_ok() {
+            ok += 1;
+        }
+    }
+    let wall = start.elapsed().as_secs_f64();
+    let served: u64 = wstores
+        .iter()
+        .map(|s| s.read_bytes.load(std::sync::atomic::Ordering::Relaxed))
+        .sum();
+    // Every action's data lives on exactly one worker, so perfect routing
+    // moves ZERO bytes across the mesh; the non-locality baseline pays
+    // ~(1 - 1/workers) x total (a job lands off-data that fraction of the
+    // time and must fetch).
+    println!(
+        "[fleet] locality={:5} workers={} actions={} rlib={}KB -> {ok} ok in {wall:.2}s, mesh-served {:.1} MB (ideal 0)",
+        cfg.locality,
+        cfg.workers,
+        cfg.actions,
+        cfg.rlib_kb,
+        served as f64 / (1024.0 * 1024.0),
+    );
+    Ok(())
+}

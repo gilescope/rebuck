@@ -114,6 +114,25 @@ async fn main() -> Result<()> {
             args.done();
             bench::run(cfg).await
         }
+        "bench-fleet" => {
+            let cfg = bench::FleetCfg {
+                workers: args
+                    .opt("--workers")
+                    .map(|s| s.parse().expect("--workers"))
+                    .unwrap_or(4),
+                actions: args
+                    .opt("--actions")
+                    .map(|s| s.parse().expect("--actions"))
+                    .unwrap_or(200),
+                rlib_kb: args
+                    .opt("--rlib-kb")
+                    .map(|s| s.parse().expect("--rlib-kb"))
+                    .unwrap_or(512),
+                locality: args.flag("--locality"),
+            };
+            args.done();
+            bench::fleet(cfg).await
+        }
         "verify-store" => {
             let dir: std::path::PathBuf = args
                 .opt("--store")
