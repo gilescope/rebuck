@@ -322,8 +322,11 @@ impl Driver {
                         // a lost ack (observed: 6/8, 2 never arrived) must
                         // cost ~2min, not a 15min deadline - stragglers
                         // degrade to partial save by design.
+                        // Acks land in seconds; a worker that hasn't
+                        // acked in 45s has left - waiting the old 120s
+                        // burned ~90s of every warm lap's finalize.
                         let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(120);
+                            std::time::Instant::now() + std::time::Duration::from_secs(45);
                         while this.finalized_count() < told && std::time::Instant::now() < deadline
                         {
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -1069,10 +1072,20 @@ impl Driver {
     pub async fn scrub_ac(self: &Arc<Self>) -> (usize, usize) {
         let keys = self.store.ac_list();
         let scanned = keys.len();
+        // Use the session validation memo: an entry proven servable this
+        // lap needs no re-check (a warm lap validated 58k to delete 0 -
+        // 120s of pure waste). Only entries NOT in the servable memo are
+        // candidates - the unserved/suspect tail.
+        let servable = self.memo_servable.read().await;
+        let candidates: Vec<String> = keys
+            .into_iter()
+            .filter(|k| !servable.contains_key(k))
+            .collect();
+        drop(servable);
         let sem = Arc::new(Semaphore::new(32));
         let deleted = Arc::new(AtomicU64::new(0));
         let mut tasks = Vec::new();
-        for k in keys {
+        for k in candidates {
             let this = self.clone();
             let sem = sem.clone();
             let deleted = deleted.clone();
