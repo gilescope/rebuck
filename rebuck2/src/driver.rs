@@ -1150,40 +1150,24 @@ impl Driver {
                 taken.insert(w.id);
             }
         }
-        // Redundant backup per shard: a SECOND eligible worker (prefer a
-        // different OS so an OS-wide runner hiccup can't drop both).
-        // Union-sync makes both copies complete, so whichever uploads
-        // last is a full artifact - no partial-overwrite holes. A slow or
-        // departed primary no longer leaves a shard stale (the 5-7/8
-        // finalize that re-poisoned the next era).
-        let mut backup: Vec<Option<u64>> = vec![None; usize::from(of)];
-        for (i, prim) in assigned.iter().enumerate() {
-            let Some(prim) = prim else { continue };
-            let prim_os = workers.iter().find(|w| w.id == *prim).map(|w| w.os.clone());
-            if let Some(w) = workers.iter().find(|w| {
-                w.id != *prim && !taken.contains(&w.id) && Some(&w.os) != prim_os.as_ref()
-            }) {
-                backup[i] = Some(w.id);
-                taken.insert(w.id);
-            }
-        }
+        // Primary-only: workers run the whole build (39-42min) and do NOT
+        // leave mid-lap, so a shard's holder is present at finalize - it
+        // just needs TIME to pack+upload (the 180s deadline covers that).
+        // Redundant backups were tried and reverted: they doubled the pack
+        // work and published DUPLICATE artifacts (shard-1/2/4 twice)
+        // without reliably improving coverage. On a warm era the pack SKIPS
+        // (unchanged), so this is fast AND complete in steady state.
+        let _ = &taken;
         let mut shards_assigned = 0;
         for (i, wid) in assigned.iter().enumerate() {
             let Some(wid) = wid else {
                 println!("[driver] finalize: no eligible worker for shard {i} - previous artifact stands");
                 continue;
             };
-            let mut sent = false;
-            for w in workers
-                .iter()
-                .filter(|w| w.id == *wid || Some(w.id) == backup[i])
-            {
+            if let Some(w) = workers.iter().find(|w| w.id == *wid) {
                 if w.tx.send(D2W::Finalize { shard: i as u8, of }).is_ok() {
-                    sent = true;
+                    shards_assigned += 1;
                 }
-            }
-            if sent {
-                shards_assigned += 1;
             }
         }
         shards_assigned
