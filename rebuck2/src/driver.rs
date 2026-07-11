@@ -47,6 +47,11 @@ pub struct DriverCfg {
     /// window (delay scheduling); blooms only lie in the safe direction
     /// (a false positive costs the fetch we'd have done anyway).
     pub locality: bool,
+    /// Eagerly pull the fleet's small (<256KB) metadata blobs into the
+    /// driver store once the pool forms, so buck2's client downloads are
+    /// driver-LOCAL (immune to worker mesh-latency variance - the linux-36m
+    /// slow-leg root cause) instead of relayed per-blob at build time.
+    pub prefetch_metadata: bool,
     /// Write the driver's full EndpointAddr (id + relay) here once bound.
     /// CI publishes it as a run artifact so workers can dial directly -
     /// n0 discovery becomes a fallback instead of a single point of
@@ -202,6 +207,8 @@ pub struct Driver {
     /// not re-arm when workers are lost mid-run (a CI fleet cannot refill;
     /// re-blocking would hang the build until the job timeout).
     pool_formed: std::sync::atomic::AtomicBool,
+    /// Latch so eager metadata prefetch fires once.
+    prefetch_started: std::sync::atomic::AtomicBool,
     next_job: AtomicU64,
     next_worker: AtomicU64,
     local_slots: Semaphore,
@@ -263,6 +270,7 @@ impl Driver {
             jobs: Mutex::new(HashMap::new()),
             workers: Mutex::new(Vec::new()),
             worker_arrived: tokio::sync::Notify::new(),
+            prefetch_started: std::sync::atomic::AtomicBool::new(false),
             pool_formed: std::sync::atomic::AtomicBool::new(false),
             next_job: AtomicU64::new(1),
             next_worker: AtomicU64::new(1),
@@ -427,6 +435,17 @@ impl Driver {
         });
         self.worker_arrived.notify_waiters();
         self.pump().await;
+
+        // Eager metadata prefetch: once the pool is up, warm the driver's
+        // hot-CAS from the fleet in the background so client downloads are
+        // local, not relayed at build time.
+        if self.cfg.prefetch_metadata
+            && self.workers.lock().await.len() >= self.cfg.min_workers.max(1)
+            && !self.prefetch_started.swap(true, Ordering::Relaxed)
+        {
+            let this = self.clone();
+            tokio::spawn(async move { this.eager_prefetch_metadata().await });
+        }
 
         // writer: job dispatches -> control stream
         let writer = tokio::spawn(async move {
@@ -1014,6 +1033,77 @@ impl Driver {
     /// connected fleet and tell each worker to sync + save its shard.
     /// Returns how many workers were told (each shard covered when the
     /// fleet is >= `of`; extras double up for redundancy).
+    /// Pull every small (<256KB) blob the fleet holds into the driver
+    /// store, in parallel. Metadata (rmetas, dirs argsfiles) is small and
+    /// is exactly what buck2 clients download to compute pipelined keys;
+    /// having it driver-local turns those downloads from per-blob mesh
+    /// relays (whose latency swings with worker network placement - the
+    /// 36-minute linux leg) into local-disk reads. One startup burst that
+    /// overlaps buck2's analysis phase.
+    async fn eager_prefetch_metadata(self: &Arc<Self>) {
+        const OF: u8 = 8;
+        const SMALL: i64 = 256 * 1024;
+        // Union each shard range across the fleet, keep the small ones we
+        // do not already hold.
+        let mut want: std::collections::BTreeMap<String, Dig> = Default::default();
+        let peers: Vec<String> = self
+            .workers
+            .lock()
+            .await
+            .iter()
+            .map(|w| w.endpoint.clone())
+            .filter(|e| !e.is_empty())
+            .collect();
+        for shard in 0..OF {
+            let lists = futures::future::join_all(peers.iter().map(|ep| {
+                let this = self.clone();
+                let ep = ep.clone();
+                async move {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        this.peer_request(&ep, &BlobReq::ListShard { shard, of: OF }),
+                    )
+                    .await
+                }
+            }))
+            .await;
+            for l in lists {
+                if let Ok(Ok(BlobResp::HashList(v))) = l {
+                    for d in v {
+                        if d.size > 0 && d.size <= SMALL && !self.store.has(&d).await {
+                            want.entry(d.hash.clone()).or_insert(d);
+                        }
+                    }
+                }
+            }
+        }
+        let n = want.len();
+        println!("[driver] eager prefetch: pulling {n} small metadata blobs from the fleet");
+        let sem = Arc::new(Semaphore::new(48));
+        let got = Arc::new(AtomicU64::new(0));
+        let tasks: Vec<_> = want
+            .into_values()
+            .map(|d| {
+                let this = self.clone();
+                let sem = sem.clone();
+                let got = got.clone();
+                tokio::spawn(async move {
+                    let _p = sem.acquire().await.expect("sem open");
+                    if matches!(this.get_blob(&d).await, Ok(Some(_))) {
+                        got.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+        for t in tasks {
+            let _ = t.await;
+        }
+        println!(
+            "[driver] eager prefetch done: {}/{n} blobs now driver-local",
+            got.load(Ordering::Relaxed)
+        );
+    }
+
     pub async fn finalize_shards(&self, of: u8) -> usize {
         // One shard, one worker: duplicate assignments produced duplicate
         // shard artifacts whose contents depended on each packer's sync
@@ -1580,6 +1670,7 @@ mod tests {
             finalize_file: None,
             cache_failures: false,
             locality: false,
+            prefetch_metadata: false,
             scratch: std::env::temp_dir(),
         };
         f(&mut cfg);
@@ -1600,6 +1691,7 @@ mod tests {
                 finalize_file: None,
                 cache_failures: false,
                 locality: false,
+                prefetch_metadata: false,
                 scratch: std::env::temp_dir(),
             },
         )

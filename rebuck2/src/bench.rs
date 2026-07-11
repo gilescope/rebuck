@@ -215,6 +215,7 @@ pub struct FleetCfg {
     pub actions: usize,
     pub rlib_kb: usize,
     pub locality: bool,
+    pub prefetch: bool,
 }
 
 /// Deterministic performance metrics from a fleet run - the regression
@@ -253,6 +254,7 @@ pub async fn fleet(cfg: FleetCfg) -> Result<FleetMetrics> {
             hardlinks: true,
             cache_failures: false,
             locality: cfg.locality,
+            prefetch_metadata: cfg.prefetch,
             addr_file: Some(addr_file.clone()),
             finalize_file: None,
             scratch: root.join("driver-exec"),
@@ -441,6 +443,7 @@ mod perf_regression {
             actions: ACTIONS,
             rlib_kb: RLIB_KB,
             locality: true,
+            prefetch: false,
         })
         .await
         .expect("fleet run");

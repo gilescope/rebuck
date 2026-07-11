@@ -129,6 +129,7 @@ async fn main() -> Result<()> {
                     .map(|s| s.parse().expect("--rlib-kb"))
                     .unwrap_or(512),
                 locality: args.flag("--locality"),
+                prefetch: args.flag("--prefetch"),
             };
             let assert = args.flag("--assert");
             args.done();
@@ -228,6 +229,7 @@ async fn run_driver(mut args: Args) -> Result<()> {
         hardlinks: !args.flag("--no-hardlinks"),
         cache_failures: args.flag("--cache-failures"),
         locality: args.flag("--locality"),
+        prefetch_metadata: args.flag("--prefetch-metadata"),
         addr_file: args.opt("--addr-file").map(Into::into),
         finalize_file: args.opt("--finalize-file").map(Into::into),
         scratch,

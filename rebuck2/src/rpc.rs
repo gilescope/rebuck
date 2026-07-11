@@ -522,6 +522,7 @@ mod tests {
                 hardlinks: true,
                 cache_failures: false,
                 locality: false,
+                prefetch_metadata: false,
                 addr_file: None,
                 finalize_file: None,
                 scratch: std::env::temp_dir(),
