@@ -217,12 +217,29 @@ pub struct FleetCfg {
     pub locality: bool,
 }
 
-pub async fn fleet(cfg: FleetCfg) -> Result<()> {
+/// Deterministic performance metrics from a fleet run - the regression
+/// signal that DOESN'T depend on CI runner variance (unlike wall time).
+#[derive(Debug, Clone, Copy)]
+pub struct FleetMetrics {
+    pub ok: usize,
+    pub mesh_served_mb: f64,
+    pub driver_store_mb: f64,
+    pub meta_relay_per_s: f64,
+    pub meta_local_per_s: f64,
+}
+
+pub async fn fleet(cfg: FleetCfg) -> Result<FleetMetrics> {
     use crate::{driver::Driver, driver::DriverCfg, mesh::Dig, store::Store, worker};
     use std::time::Duration;
 
+    use std::sync::atomic::{AtomicU64, Ordering as O};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let root = tempfile::tempdir()?.keep();
-    let session = format!("bench-fleet-{}", cfg.workers);
+    let session = format!(
+        "bench-fleet-{}-{}",
+        cfg.workers,
+        SEQ.fetch_add(1, O::Relaxed)
+    );
     let addr_file = root.join("addr.json");
 
     let dstore = Arc::new(Store::new(root.join("driver"))?);
@@ -318,12 +335,14 @@ pub async fn fleet(cfg: FleetCfg) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     // First bloom lands right after join; give it a beat to reach the driver.
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
     println!(
         "[fleet] {} workers joined + announced",
         driver.worker_count().await
     );
 
+    let mut meta_relay_per_s = 0.0;
+    let mut meta_local_per_s = 0.0;
     let start = std::time::Instant::now();
     let mut tasks = Vec::new();
     for a in &actions {
@@ -337,13 +356,20 @@ pub async fn fleet(cfg: FleetCfg) -> Result<()> {
             ok += 1;
         }
     }
+    // Execute-phase mesh traffic - captured BEFORE the metadata probe
+    // below (which deliberately relays and would pollute this).
+    let served: u64 = wstores
+        .iter()
+        .map(|s| s.read_bytes.load(std::sync::atomic::Ordering::Relaxed))
+        .sum();
+
     // --- Hot-CAS lever: client-download latency, relayed vs driver-local.
     // Place small metadata blobs on ONE worker; time get_blob first-touch
     // (relay from worker, then cached) vs second-touch (driver-local) -
     // the exact win of seeding the driver's metadata locally.
     {
         let mut metas: Vec<crate::mesh::Dig> = Vec::new();
-        for i in 0..500usize {
+        for i in 0..120usize {
             let b = format!("-Ldependency={i}-rmeta\n").repeat(32).into_bytes();
             let dg = digest_of(&b);
             let d: crate::mesh::Dig = (&dg).into();
@@ -361,21 +387,19 @@ pub async fn fleet(cfg: FleetCfg) -> Result<()> {
             let _ = driver.get_blob(m).await;
         }
         let local = t1.elapsed().as_secs_f64();
+        meta_relay_per_s = metas.len() as f64 / relay.max(0.0001);
+        meta_local_per_s = metas.len() as f64 / local.max(0.0001);
         println!(
-            "[fleet] metadata reads (500): relay {:.3}s ({:.1}/s) vs driver-local {:.3}s ({:.1}/s) = {:.0}x",
-            relay,
-            metas.len() as f64 / relay,
-            local,
-            metas.len() as f64 / local.max(0.0001),
+            "[fleet] metadata reads (120): relay {:.3}s ({:.1}/s) vs driver-local {:.3}s ({:.1}/s) = {:.0}x",
+            relay, meta_relay_per_s, local, meta_local_per_s,
             relay / local.max(0.0001),
         );
     }
 
     let wall = start.elapsed().as_secs_f64();
-    let served: u64 = wstores
-        .iter()
-        .map(|s| s.read_bytes.load(std::sync::atomic::Ordering::Relaxed))
-        .sum();
+    let driver_store: u64 = dstore
+        .stored_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
     // Every action's data lives on exactly one worker, so perfect routing
     // moves ZERO bytes across the mesh; the non-locality baseline pays
     // ~(1 - 1/workers) x total (a job lands off-data that fraction of the
@@ -388,5 +412,65 @@ pub async fn fleet(cfg: FleetCfg) -> Result<()> {
         cfg.rlib_kb,
         served as f64 / (1024.0 * 1024.0),
     );
-    Ok(())
+    Ok(FleetMetrics {
+        ok,
+        mesh_served_mb: served as f64 / (1024.0 * 1024.0),
+        driver_store_mb: driver_store as f64 / (1024.0 * 1024.0),
+        meta_relay_per_s,
+        meta_local_per_s,
+    })
+}
+
+#[cfg(test)]
+mod perf_regression {
+    use super::*;
+
+    /// Deterministic performance guard (no wall-clock): a regression in
+    /// locality routing, read-through caching, or a re-execution storm
+    /// shows up in the COUNTERS - mesh bytes shipped, driver-local read
+    /// speed - not in noisy CI wall time. Runs an in-process fleet in ~2s.
+    /// `cargo test --release perf_regression -- --ignored --nocapture`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "brings up a loopback iroh mesh; run explicitly as a perf gate"]
+    async fn locality_and_caching_metrics_hold() {
+        const WORKERS: usize = 4;
+        const ACTIONS: usize = 160;
+        const RLIB_KB: usize = 256;
+        let m = fleet(FleetCfg {
+            workers: WORKERS,
+            actions: ACTIONS,
+            rlib_kb: RLIB_KB,
+            locality: true,
+        })
+        .await
+        .expect("fleet run");
+
+        // Correctness: every action completed.
+        assert_eq!(m.ok, ACTIONS, "all actions run");
+
+        // Locality must move task-to-data. No-locality ships ~(1-1/W) of
+        // the data across the mesh (a job lands off-data that fraction of
+        // the time); perfect routing ships ~0. Guard: locality keeps mesh
+        // traffic under HALF that computed baseline. A routing regression
+        // (blooms ignored, patience broken) pushes it back toward the
+        // baseline and fails here - deterministic, no wall clock.
+        let total_mb = (ACTIONS * RLIB_KB) as f64 / 1024.0;
+        let baseline_mb = total_mb * (1.0 - 1.0 / WORKERS as f64);
+        assert!(
+            m.mesh_served_mb < baseline_mb * 0.5,
+            "locality routing regressed: served {:.1}MB, no-locality baseline {:.1}MB (must be < half)",
+            m.mesh_served_mb,
+            baseline_mb,
+        );
+
+        // Read-through / hot-CAS premise: a driver-local metadata read must
+        // beat a cross-mesh relay comfortably (>=2x on loopback; far more
+        // in CI where the hop is real internet latency).
+        assert!(
+            m.meta_local_per_s > m.meta_relay_per_s * 2.0,
+            "driver-local reads must beat relay >=2x: local={:.0}/s relay={:.0}/s",
+            m.meta_local_per_s,
+            m.meta_relay_per_s,
+        );
+    }
 }

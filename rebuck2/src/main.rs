@@ -130,8 +130,21 @@ async fn main() -> Result<()> {
                     .unwrap_or(512),
                 locality: args.flag("--locality"),
             };
+            let assert = args.flag("--assert");
             args.done();
-            bench::fleet(cfg).await
+            let m = bench::fleet(cfg).await?;
+            if assert {
+                // CI perf gate: fail loudly on a metrics regression.
+                anyhow::ensure!(m.ok > 0, "no actions completed");
+                anyhow::ensure!(
+                    m.meta_local_per_s > m.meta_relay_per_s * 2.0,
+                    "driver-local reads not beating relay: local={:.0}/s relay={:.0}/s",
+                    m.meta_local_per_s,
+                    m.meta_relay_per_s
+                );
+                println!("[fleet] ASSERT OK");
+            }
+            Ok(())
         }
         "verify-store" => {
             let dir: std::path::PathBuf = args
