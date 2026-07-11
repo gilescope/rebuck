@@ -252,6 +252,10 @@ pub struct Driver {
     /// by do_not_cache actions (the prelude's diag wrappers).
     /// Workers that completed their post-build shard sync.
     pub finalized: AtomicU64,
+    /// Distinct shards acked (redundant assignment: a shard is banked
+    /// when ANY of its assignees uploads - union-sync makes both copies
+    /// complete, so whichever wins is a full artifact).
+    finalized_shards: Mutex<std::collections::BTreeSet<u8>>,
     pub ac_hit_ok: AtomicU64,
     pub ac_hit_fail: AtomicU64,
     pub dnc_exec: AtomicU64,
@@ -285,6 +289,7 @@ impl Driver {
             affinity_owner: Mutex::new(HashMap::new()),
             mesh_fetches: Semaphore::new(64),
             finalized: AtomicU64::new(0),
+            finalized_shards: Mutex::new(std::collections::BTreeSet::new()),
             ac_hit_ok: AtomicU64::new(0),
             ac_hit_fail: AtomicU64::new(0),
             dnc_exec: AtomicU64::new(0),
@@ -324,7 +329,8 @@ impl Driver {
                         // is clean and next lap skips their revalidation.
                         let (scanned, deleted) = this.scrub_ac().await;
                         println!("[driver] ac scrub: {deleted}/{scanned} unservable rows deleted");
-                        let told = this.finalize_shards(8).await as u64;
+                        let shards_needed = this.finalize_shards(8).await;
+                        let told = shards_needed as u64;
                         println!("[driver] finalize signalled: told {told} workers");
                         // Acks land within seconds when they land at all;
                         // a lost ack (observed: 6/8, 2 never arrived) must
@@ -335,21 +341,21 @@ impl Driver {
                         // burned ~90s of every warm lap's finalize.
                         let deadline =
                             std::time::Instant::now() + std::time::Duration::from_secs(45);
-                        while this.finalized_count() < told && std::time::Instant::now() < deadline
+                        while this.finalized_shards.lock().await.len() < shards_needed
+                            && std::time::Instant::now() < deadline
                         {
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                         }
                         // APPEND .done - with_extension REPLACES the last
                         // extension ("finalize.signal" -> "finalize.done")
                         // and the CI poll for finalize.signal.done burned
                         // its full 1000s cap on EVERY lap (~16.7min/lap,
                         // in every decomposition as "finalize 16m40s").
+                        let banked = this.finalized_shards.lock().await.len();
                         let done = std::path::PathBuf::from(format!("{}.done", sig.display()));
-                        let _ =
-                            tokio::fs::write(&done, format!("{}", this.finalized_count())).await;
+                        let _ = tokio::fs::write(&done, format!("{banked}")).await;
                         println!(
-                            "[driver] finalize complete: {}/{told} workers",
-                            this.finalized_count()
+                            "[driver] finalize complete: {banked}/{shards_needed} shards banked"
                         );
                         return;
                     }
@@ -502,6 +508,7 @@ impl Driver {
                     W2D::Finalized { shard } => {
                         println!("[driver] worker {worker_id} finalized shard {shard}");
                         self.finalized.fetch_add(1, Ordering::Relaxed);
+                        self.finalized_shards.lock().await.insert(shard);
                     }
                     W2D::Holdings { bloom } => {
                         self.blooms.lock().await.insert(endpoint.clone(), bloom);
@@ -1139,18 +1146,43 @@ impl Driver {
                 taken.insert(w.id);
             }
         }
-        let mut n = 0;
+        // Redundant backup per shard: a SECOND eligible worker (prefer a
+        // different OS so an OS-wide runner hiccup can't drop both).
+        // Union-sync makes both copies complete, so whichever uploads
+        // last is a full artifact - no partial-overwrite holes. A slow or
+        // departed primary no longer leaves a shard stale (the 5-7/8
+        // finalize that re-poisoned the next era).
+        let mut backup: Vec<Option<u64>> = vec![None; usize::from(of)];
+        for (i, prim) in assigned.iter().enumerate() {
+            let Some(prim) = prim else { continue };
+            let prim_os = workers.iter().find(|w| w.id == *prim).map(|w| w.os.clone());
+            if let Some(w) = workers.iter().find(|w| {
+                w.id != *prim && !taken.contains(&w.id) && Some(&w.os) != prim_os.as_ref()
+            }) {
+                backup[i] = Some(w.id);
+                taken.insert(w.id);
+            }
+        }
+        let mut shards_assigned = 0;
         for (i, wid) in assigned.iter().enumerate() {
             let Some(wid) = wid else {
                 println!("[driver] finalize: no eligible worker for shard {i} - previous artifact stands");
                 continue;
             };
-            if let Some(w) = workers.iter().find(|w| w.id == *wid) {
-                let _ = w.tx.send(D2W::Finalize { shard: i as u8, of });
-                n += 1;
+            let mut sent = false;
+            for w in workers
+                .iter()
+                .filter(|w| w.id == *wid || Some(w.id) == backup[i])
+            {
+                if w.tx.send(D2W::Finalize { shard: i as u8, of }).is_ok() {
+                    sent = true;
+                }
+            }
+            if sent {
+                shards_assigned += 1;
             }
         }
-        n
+        shards_assigned
     }
 
     /// Delete AC entries whose referenced blobs are unservable across the
