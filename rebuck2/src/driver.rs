@@ -41,6 +41,12 @@ pub struct DriverCfg {
     /// (Finalize), await their Finalized replies, then write
     /// `<file>.done` for the workflow to proceed on.
     pub finalize_file: Option<std::path::PathBuf>,
+    /// Locality-aware dispatch: prefer the worker whose bloom already
+    /// claims a job's heaviest inputs - move the task to the data, not
+    /// GiBs of rlibs to the task. Soft preference with a short patience
+    /// window (delay scheduling); blooms only lie in the safe direction
+    /// (a false positive costs the fetch we'd have done anyway).
+    pub locality: bool,
     /// Write the driver's full EndpointAddr (id + relay) here once bound.
     /// CI publishes it as a run artifact so workers can dial directly -
     /// n0 discovery becomes a fallback instead of a single point of
@@ -171,7 +177,15 @@ struct Job {
     /// every downstream link died with E0460 (gooseberry PR#23 takes 5-8).
     /// Locality is the free side benefit.
     affinity: Option<u64>,
+    /// Soft data-locality preference: worker id whose bloom claims this
+    /// job's heaviest inputs. Honoured while `submitted` is younger than
+    /// LOCALITY_PATIENCE, then anyone may take the job (delay scheduling).
+    locality: Option<u64>,
+    submitted: std::time::Instant,
 }
+
+/// How long a job waits for its data-local worker before running anywhere.
+const LOCALITY_PATIENCE: std::time::Duration = std::time::Duration::from_millis(500);
 
 const MAX_ATTEMPTS: u32 = 3;
 /// A running job must be at least this old before the tail races it on a
@@ -808,6 +822,44 @@ impl Driver {
         found
     }
 
+    /// Data-locality preference: the worker whose bloom claims the most
+    /// BYTES of this input root's top-level files. Blooms are already
+    /// gossiped to the driver, so scoring is in-memory bit-tests - the
+    /// who-has-what oracle costs nothing extra. Returns None when no
+    /// worker claims anything (cold data: any worker is equally far).
+    async fn locality_pref(&self, input_root: &Dig) -> Option<u64> {
+        let bytes = self.get_blob(input_root).await.ok()??;
+        let dir = re::Directory::decode(bytes.as_slice()).ok()?;
+        // Top-K heaviest files decide; small files follow cheaply anyway.
+        let mut files: Vec<(&str, i64)> = dir
+            .files
+            .iter()
+            .filter_map(|f| f.digest.as_ref().map(|d| (d.hash.as_str(), d.size_bytes)))
+            .collect();
+        files.sort_by_key(|(_, s)| -*s);
+        files.truncate(8);
+        if files.is_empty() {
+            return None;
+        }
+        let blooms = self.blooms.lock().await;
+        let workers = self.workers.lock().await;
+        let mut best: Option<(u64, i64)> = None;
+        for w in workers.iter() {
+            let Some(bloom) = blooms.get(&w.endpoint) else {
+                continue;
+            };
+            let score: i64 = files
+                .iter()
+                .filter(|(h, _)| bloom.contains(h))
+                .map(|(_, s)| *s)
+                .sum();
+            if score > 0 && best.map(|(_, b)| score > b).unwrap_or(true) {
+                best = Some((w.id, score));
+            }
+        }
+        best.map(|(id, _)| id)
+    }
+
     /// Read-through get: local store first, then fetch from the fleet and
     /// cache. Used by the gRPC surface (buck2's reads) and the mesh serve
     /// arm (workers' exec inputs).
@@ -1070,7 +1122,19 @@ impl Driver {
                         .find_map(|k| {
                             let q = queue.get_mut(&k)?;
                             let pos = q.iter().position(|id| {
-                                match jobs.get(id).and_then(|j| j.affinity) {
+                                let Some(j) = jobs.get(id) else { return true };
+                                // Soft data-locality: within the patience
+                                // window only the preferred (live) worker
+                                // takes the job; after it, anyone.
+                                if let Some(pref) = j.locality {
+                                    if pref != w.id
+                                        && live_ids.contains(&pref)
+                                        && j.submitted.elapsed() < LOCALITY_PATIENCE
+                                    {
+                                        return false;
+                                    }
+                                }
+                                match j.affinity {
                                     None => true,
                                     Some(a) => match owners.get(&a) {
                                         Some(owner) => *owner == w.id || !live_ids.contains(owner),
@@ -1192,7 +1256,7 @@ impl Driver {
         // action/command blobs live on worker shards; a local-only read
         // silently degraded routing to PlatKey::default() and put /bin/sh
         // actions on windows workers (reader 28957851178).
-        let (plat, do_not_cache, affinity) = match self.get_blob(action_digest).await? {
+        let (plat, do_not_cache, affinity, input_root) = match self.get_blob(action_digest).await? {
             Some(bytes) => match re::Action::decode(bytes.as_slice()) {
                 Ok(action) => {
                     let mut plat = PlatKey::from_properties(action.platform.as_ref());
@@ -1223,11 +1287,24 @@ impl Driver {
                             key.hash(&mut h);
                             h.finish()
                         });
-                    (plat, action.do_not_cache, affinity)
+                    (
+                        plat,
+                        action.do_not_cache,
+                        affinity,
+                        action.input_root_digest,
+                    )
                 }
-                Err(_) => (PlatKey::default(), false, None),
+                Err(_) => (PlatKey::default(), false, None, None),
             },
-            None => (PlatKey::default(), false, None),
+            None => (PlatKey::default(), false, None, None),
+        };
+        let locality = if self.cfg.locality {
+            match &input_root {
+                Some(d) => self.locality_pref(&d.into()).await,
+                None => None,
+            }
+        } else {
+            None
         };
 
         let job_id = self.next_job.fetch_add(1, Ordering::Relaxed);
@@ -1243,6 +1320,8 @@ impl Driver {
                 started: None,
                 speculated: false,
                 affinity,
+                locality,
+                submitted: std::time::Instant::now(),
             },
         );
         self.queue
@@ -1431,6 +1510,24 @@ mod tests {
         test_driver_min(local_exec, 0)
     }
 
+    fn test_driver_with(f: impl FnOnce(&mut DriverCfg)) -> Arc<Driver> {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let mut cfg = DriverCfg {
+            session: "test".into(),
+            min_workers: 0,
+            local_exec: false,
+            decentralized: false,
+            hardlinks: true,
+            addr_file: None,
+            finalize_file: None,
+            cache_failures: false,
+            locality: false,
+            scratch: std::env::temp_dir(),
+        };
+        f(&mut cfg);
+        Driver::new(Arc::new(Store::new(dir).unwrap()), cfg)
+    }
+
     fn test_driver_min(local_exec: bool, min_workers: usize) -> Arc<Driver> {
         let dir = tempfile::tempdir().unwrap().keep();
         Driver::new(
@@ -1444,6 +1541,7 @@ mod tests {
                 addr_file: None,
                 finalize_file: None,
                 cache_failures: false,
+                locality: false,
                 scratch: std::env::temp_dir(),
             },
         )
@@ -1735,6 +1833,72 @@ mod tests {
         ));
         d.note_ac_written(&key).await;
         assert!(matches!(d.validated_ac_get(&key).await, AcLookup::Hit(_)));
+    }
+
+    /// Locality routing: a job whose heaviest input a worker already
+    /// holds (per its bloom) is dispatched to THAT worker - moving the
+    /// task to the data instead of GiBs of rlibs to the task.
+    #[tokio::test]
+    async fn locality_prefers_the_worker_holding_the_inputs() {
+        let d = test_driver_with(|cfg| cfg.locality = true);
+        // Input tree: one 1MB file. Worker B's bloom claims it; A's doesn't.
+        let file_hash = crate::store::sha256_hex(b"big-rlib-bytes");
+        let dir = re::Directory {
+            files: vec![re::FileNode {
+                name: "libbig.rlib".into(),
+                digest: Some(re::Digest {
+                    hash: file_hash.clone(),
+                    size_bytes: 1_000_000,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let dir_dig = d.store.put(None, &dir.encode_to_vec()).await.unwrap();
+        let cmd = re::Command {
+            arguments: vec!["true".into()],
+            ..Default::default()
+        };
+        let cmd_dig = d.store.put(None, &cmd.encode_to_vec()).await.unwrap();
+        let action = re::Action {
+            command_digest: Some(cmd_dig.to_proto()),
+            input_root_digest: Some(dir_dig.to_proto()),
+            ..Default::default()
+        };
+        let action_dig = d.store.put(None, &action.encode_to_vec()).await.unwrap();
+
+        let mut bloom_b = crate::mesh::Bloom::with_capacity(64);
+        bloom_b.insert(&file_hash);
+        d.blooms.lock().await.insert("epB".into(), bloom_b);
+
+        let ran = Arc::new(Mutex::new(Vec::<&str>::new()));
+        for (id, ep) in [(1u64, "epA"), (2, "epB")] {
+            let (tx, mut rx) = mpsc::unbounded_channel::<D2W>();
+            let inflight = Arc::new(AtomicU32::new(0));
+            let d2 = Arc::clone(&d);
+            let inf = inflight.clone();
+            let ran2 = ran.clone();
+            tokio::spawn(async move {
+                while let Some(D2W::Run { job, .. }) = rx.recv().await {
+                    ran2.lock().await.push(ep);
+                    inf.fetch_sub(1, Ordering::Relaxed);
+                    d2.complete(job, Ok(re::ActionResult::default())).await;
+                    d2.pump().await;
+                }
+            });
+            d.workers.lock().await.push(WorkerConn {
+                id,
+                tx,
+                inflight,
+                slots: 4,
+                os: std::env::consts::OS.into(),
+                arch: std::env::consts::ARCH.into(),
+                endpoint: ep.into(),
+                preloaded_shard: None,
+            });
+        }
+        d.execute(&action_dig).await.unwrap();
+        assert_eq!(*ran.lock().await, vec!["epB"], "job must go to the data");
     }
 
     /// Pull-model invariant: a worker's outstanding count never exceeds

@@ -521,6 +521,7 @@ mod tests {
                 decentralized: false,
                 hardlinks: true,
                 cache_failures: false,
+                locality: false,
                 addr_file: None,
                 finalize_file: None,
                 scratch: std::env::temp_dir(),
