@@ -154,6 +154,13 @@ pub enum D2W {
         shard: u8,
         of: u8,
     },
+    /// Liveness heartbeat (every 20s). Workers treat a long heartbeat gap
+    /// as a dead driver and exit: a SIGTERM'd/crashed driver sends no QUIC
+    /// close, and a worker blocked in recv_frame otherwise idles until its
+    /// CI timeout cap (win worker 1, run 29194749613: 5h of dead runner).
+    Ping,
+    /// Orderly shutdown: exit now (driver teardown, no shard assignment).
+    Exit,
 }
 
 /// Worker → driver, each on a fresh bi-stream (header, then raw bytes for Put).

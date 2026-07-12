@@ -359,7 +359,34 @@ impl Driver {
                         println!(
                             "[driver] finalize complete: {banked}/{shards_needed} shards banked"
                         );
+                        // Everyone still connected (unassigned workers,
+                        // lost-ack packers) exits NOW instead of idling
+                        // until their CI timeout cap: the driver's own
+                        // teardown is a SIGTERM, which sends no QUIC close.
+                        let n = {
+                            let workers = this.workers.lock().await;
+                            for w in workers.iter() {
+                                let _ = w.tx.send(D2W::Exit);
+                            }
+                            workers.len()
+                        };
+                        println!("[driver] exit broadcast: told {n} remaining workers");
                         return;
+                    }
+                }
+            });
+        }
+
+        // Liveness heartbeat: event-driven gossip goes silent on idle legs,
+        // and a worker can't tell a quiet driver from a dead one (see
+        // D2W::Ping). 20s beat, 90s worker patience.
+        {
+            let this = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    for w in this.workers.lock().await.iter() {
+                        let _ = w.tx.send(D2W::Ping);
                     }
                 }
             });

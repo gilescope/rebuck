@@ -196,12 +196,34 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
     }
 
     loop {
-        let Some(msg) = mesh::recv_frame::<D2W>(&mut ctrl_recv).await? else {
-            println!("[worker] driver closed control stream — done");
-            return Ok(());
+        // Liveness watchdog: the driver pings every 20s; a long silence
+        // means it died without a QUIC close (SIGTERM/crash) and this
+        // worker would otherwise idle until the CI timeout cap.
+        let msg = match tokio::time::timeout(
+            Duration::from_secs(90),
+            mesh::recv_frame::<D2W>(&mut ctrl_recv),
+        )
+        .await
+        {
+            Err(_) => {
+                println!("[worker] no driver traffic for 90s — assuming driver gone, exiting");
+                return Ok(());
+            }
+            Ok(frame) => match frame? {
+                Some(msg) => msg,
+                None => {
+                    println!("[worker] driver closed control stream — done");
+                    return Ok(());
+                }
+            },
         };
         let (job, action) = match msg {
             D2W::Run { job, action } => (job, action),
+            D2W::Ping => continue,
+            D2W::Exit => {
+                println!("[worker] driver said exit — done");
+                return Ok(());
+            }
             D2W::Blooms { peers } => {
                 let mut map = peer_blooms.lock().await;
                 map.clear();
