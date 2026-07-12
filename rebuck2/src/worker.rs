@@ -654,35 +654,38 @@ async fn sync_shard(
         "[worker] shard {shard}: fetching {} missing blobs",
         missing.len()
     );
-    // 8 permits made a ~thousand-blob range sync a double-digit-minutes
-    // finalize (all fetches relay through one driver conn); the driver's
-    // own mesh_fetches bound (64) still applies globally.
-    let sem = Arc::new(tokio::sync::Semaphore::new(24));
-    let mut tasks = Vec::new();
-    for d in missing {
-        let sem = sem.clone();
-        let store = store.clone();
-        let conn = conn.clone();
-        tasks.push(tokio::spawn(async move {
-            let _p = sem.acquire().await.expect("semaphore open");
-            let (mut send, mut recv) = conn.open_bi().await?;
-            mesh::send_frame(&mut send, &BlobReq::Get(d.clone())).await?;
-            send.finish()?;
-            match mesh::recv_frame::<BlobResp>(&mut recv)
-                .await?
-                .context("driver closed blob stream")?
-            {
-                BlobResp::Found { size } => {
-                    let bytes = mesh::recv_raw(&mut recv, size).await?;
-                    store.put(Some(&d), &bytes).await?;
+    // Chunked GetMany: 24 per-blob streams still cost a stream open and a
+    // request round-trip PER BLOB through one driver conn — during the
+    // finalize window, times every worker at once. One request per chunk
+    // streams the bytes back-to-back; 4 chunks concurrent keeps the
+    // driver's read-through fanned out (its GetMany arm is serial per
+    // stream). Per-item Missing/Err skipped: shard save is best-effort.
+    use futures::StreamExt;
+    futures::stream::iter(missing.chunks(512))
+        .for_each_concurrent(4, |chunk| {
+            let store = store.clone();
+            let conn = conn.clone();
+            async move {
+                let fetch = async {
+                    let (mut send, mut recv) = conn.open_bi().await?;
+                    mesh::send_frame(&mut send, &BlobReq::GetMany(chunk.to_vec())).await?;
+                    send.finish()?;
+                    for d in chunk {
+                        if let BlobResp::Found { size } = mesh::recv_frame::<BlobResp>(&mut recv)
+                            .await?
+                            .context("driver closed mid-batch")?
+                        {
+                            let bytes = mesh::recv_raw(&mut recv, size).await?;
+                            store.put(Some(d), &bytes).await?;
+                        }
+                    }
                     Ok::<(), anyhow::Error>(())
+                };
+                if let Err(e) = fetch.await {
+                    eprintln!("[worker] shard {shard}: chunk fetch failed (partial): {e:#}");
                 }
-                _ => Ok(()), // missing/err: shard save is best-effort
             }
-        }));
-    }
-    for t in tasks {
-        let _ = t.await;
-    }
+        })
+        .await;
     Ok(())
 }

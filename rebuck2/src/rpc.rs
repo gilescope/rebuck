@@ -168,21 +168,37 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Cas {
         &self,
         req: Request<re::BatchUpdateBlobsRequest>,
     ) -> Result<Response<re::BatchUpdateBlobsResponse>, Status> {
-        let mut responses = Vec::new();
-        for r in &req.get_ref().requests {
-            let Some(d) = &r.digest else { continue };
-            self.stats
-                .blob_write_bytes
-                .fetch_add(r.data.len() as u64, Relaxed);
-            let status = match self.driver.store.put(Some(&dig(d)?), &r.data).await {
-                Ok(_) => ok_status(),
-                Err(e) => rpc_status(tonic::Code::InvalidArgument, &format!("{e:#}")),
-            };
-            responses.push(re::batch_update_blobs_response::Response {
-                digest: Some(d.clone()),
-                status: Some(status),
-            });
-        }
+        // Concurrent puts (store tmp-names are collision-free per call);
+        // `buffered` keeps REAPI reply order matching the request. Futures
+        // built eagerly, streamed lazily: mapping an async closure over
+        // borrowed items trips HRTB inference inside async trait methods.
+        use futures::StreamExt;
+        let futs: Vec<_> = req
+            .get_ref()
+            .requests
+            .iter()
+            .map(|r| async move {
+                let Some(d) = &r.digest else { return Ok(None) };
+                self.stats
+                    .blob_write_bytes
+                    .fetch_add(r.data.len() as u64, Relaxed);
+                let status = match self.driver.store.put(Some(&dig(d)?), &r.data).await {
+                    Ok(_) => ok_status(),
+                    Err(e) => rpc_status(tonic::Code::InvalidArgument, &format!("{e:#}")),
+                };
+                Ok::<_, Status>(Some(re::batch_update_blobs_response::Response {
+                    digest: Some(d.clone()),
+                    status: Some(status),
+                }))
+            })
+            .collect();
+        let responses: Vec<_> = futures::stream::iter(futs).buffered(16).collect().await;
+        let responses = responses
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect();
         Ok(Response::new(re::BatchUpdateBlobsResponse { responses }))
     }
 
@@ -190,32 +206,44 @@ impl re::content_addressable_storage_server::ContentAddressableStorage for Cas {
         &self,
         req: Request<re::BatchReadBlobsRequest>,
     ) -> Result<Response<re::BatchReadBlobsResponse>, Status> {
-        let mut responses = Vec::new();
-        for d in &req.get_ref().digests {
-            let (data, status) = match self.driver.get_blob(&dig(d)?).await {
-                Ok(Some(bytes)) => {
-                    self.stats.blobs_read.fetch_add(1, Relaxed);
-                    self.stats
-                        .blob_read_bytes
-                        .fetch_add(bytes.len() as u64, Relaxed);
-                    (bytes, ok_status())
-                }
-                Ok(None) => (
-                    Vec::new(),
-                    rpc_status(tonic::Code::NotFound, "blob not found"),
-                ),
-                Err(e) => (
-                    Vec::new(),
-                    rpc_status(tonic::Code::Internal, &format!("{e:#}")),
-                ),
-            };
-            responses.push(re::batch_read_blobs_response::Response {
-                digest: Some(d.clone()),
-                data,
-                compressor: 0,
-                status: Some(status),
-            });
-        }
+        // Concurrent reads: a cold blob is a full mesh fetch, and buck2
+        // batches these on the hot path. `buffered` (not `buffer_unordered`)
+        // keeps reply order; get_blob's mesh_fetches permit is acquired
+        // inside each future, so a big batch can't starve the fleet.
+        // Futures built eagerly for the same HRTB reason as above.
+        use futures::StreamExt;
+        let futs: Vec<_> = req
+            .get_ref()
+            .digests
+            .iter()
+            .map(|d| async move {
+                let (data, status) = match self.driver.get_blob(&dig(d)?).await {
+                    Ok(Some(bytes)) => {
+                        self.stats.blobs_read.fetch_add(1, Relaxed);
+                        self.stats
+                            .blob_read_bytes
+                            .fetch_add(bytes.len() as u64, Relaxed);
+                        (bytes, ok_status())
+                    }
+                    Ok(None) => (
+                        Vec::new(),
+                        rpc_status(tonic::Code::NotFound, "blob not found"),
+                    ),
+                    Err(e) => (
+                        Vec::new(),
+                        rpc_status(tonic::Code::Internal, &format!("{e:#}")),
+                    ),
+                };
+                Ok::<_, Status>(re::batch_read_blobs_response::Response {
+                    digest: Some(d.clone()),
+                    data,
+                    compressor: 0,
+                    status: Some(status),
+                })
+            })
+            .collect();
+        let responses: Vec<_> = futures::stream::iter(futs).buffered(32).collect().await;
+        let responses = responses.into_iter().collect::<Result<Vec<_>, _>>()?;
         Ok(Response::new(re::BatchReadBlobsResponse { responses }))
     }
 

@@ -698,13 +698,24 @@ impl Driver {
                 }
             }
         }
-        for (peer, idxs) in by_peer {
+        // All peers concurrently — this sits under buck2's FindMissingBlobs,
+        // and sequential per-peer round-trips scale with fleet size (same
+        // lesson probe_workers already carries). Permit INSIDE each future:
+        // holding one across the fan-out would starve the fleet on big
+        // batches. Merges stay sequential after the RTTs.
+        let verdicts = futures::future::join_all(by_peer.into_iter().map(|(peer, idxs)| {
             let batch: Vec<Dig> = idxs.iter().map(|&i| digs[i].clone()).collect();
-            let _permit = self.mesh_fetches.acquire().await;
-            let confirmed = match self.peer_request(&peer, &BlobReq::HasMany(batch)).await {
-                Ok(BlobResp::HaveMany(v)) => Some(v),
-                _ => None,
-            };
+            async move {
+                let _permit = self.mesh_fetches.acquire().await;
+                let confirmed = match self.peer_request(&peer, &BlobReq::HasMany(batch)).await {
+                    Ok(BlobResp::HaveMany(v)) => Some(v),
+                    _ => None,
+                };
+                (peer, idxs, confirmed)
+            }
+        }))
+        .await;
+        for (peer, idxs, confirmed) in verdicts {
             let mut providers = self.providers.lock().await;
             for (k, &i) in idxs.iter().enumerate() {
                 let ok = confirmed
@@ -756,10 +767,22 @@ impl Driver {
         // interior files of validated directory outputs that existed
         // nowhere. Expand each tree (small, cached after first fetch) and
         // demand its files and child Directory protos too.
-        for od in &result.output_directories {
-            let Some(td) = &od.tree_digest else { continue };
-            let tdig: Dig = td.into();
-            let Ok(Some(tree_bytes)) = self.get_blob(&tdig).await else {
+        // Tree fetches in parallel — scrub_ac funnels tens of thousands of
+        // entries through here 32-wide, so an inner per-directory await
+        // multiplies. Decode/expand stays sequential on the results.
+        let tree_blobs = futures::future::join_all(
+            result
+                .output_directories
+                .iter()
+                .filter_map(|od| od.tree_digest.as_ref())
+                .map(|td| {
+                    let tdig: Dig = td.into();
+                    async move { self.get_blob(&tdig).await }
+                }),
+        )
+        .await;
+        for fetched in tree_blobs {
+            let Ok(Some(tree_bytes)) = fetched else {
                 self.memo_unservable
                     .lock()
                     .await
@@ -1036,6 +1059,31 @@ impl Driver {
         unreachable!("loop returns on second attempt")
     }
 
+    /// One GetMany round-trip to a worker: pull `digs` into the local store.
+    /// Returns the digests NOT obtained. Mirror of the worker's helper —
+    /// `peer_request` can't carry the multi-frame reply. No redirect
+    /// handling: workers' GetMany arm serves store-only.
+    async fn fetch_many_from(&self, peer: &str, digs: &[Dig]) -> Result<Vec<Dig>> {
+        let conn = self.peer_conn(peer).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        mesh::send_frame(&mut send, &BlobReq::GetMany(digs.to_vec())).await?;
+        send.finish()?;
+        let mut unfetched = Vec::new();
+        for d in digs {
+            match mesh::recv_frame::<BlobResp>(&mut recv)
+                .await?
+                .context("holder closed mid-batch")?
+            {
+                BlobResp::Found { size } => {
+                    let bytes = mesh::recv_raw(&mut recv, size).await?;
+                    self.store.put(Some(d), &bytes).await?;
+                }
+                _ => unfetched.push(d.clone()),
+            }
+        }
+        Ok(unfetched)
+    }
+
     pub async fn worker_count(&self) -> usize {
         self.workers.lock().await.len()
     }
@@ -1090,10 +1138,52 @@ impl Driver {
         }
         let n = want.len();
         println!("[driver] eager prefetch: pulling {n} small metadata blobs from the fleet");
-        let sem = Arc::new(Semaphore::new(48));
+        // Group by bloom/provider claimant and pull chunked GetMany batches
+        // per holder — request overhead per chunk, not per blob (this was
+        // 48-wide but still one routed get_blob per blob). Unclaimed or
+        // unfetched leftovers keep the per-blob path: get_blob's retry
+        // rounds and fan-out probe are the honesty layer, not overhead.
+        let mut by_peer: HashMap<String, Vec<Dig>> = HashMap::new();
+        let mut unrouted: Vec<Dig> = Vec::new();
+        {
+            let providers = self.providers.lock().await;
+            let blooms = self.blooms.lock().await;
+            for d in want.into_values() {
+                let peer = providers.get(&d.hash).cloned().or_else(|| {
+                    blooms
+                        .iter()
+                        .find(|(_, b)| b.contains(&d.hash))
+                        .map(|(e, _)| e.clone())
+                });
+                match peer {
+                    Some(p) => by_peer.entry(p).or_default().push(d),
+                    None => unrouted.push(d),
+                }
+            }
+        }
         let got = Arc::new(AtomicU64::new(0));
-        let tasks: Vec<_> = want
-            .into_values()
+        let leftovers = futures::future::join_all(by_peer.into_iter().map(|(peer, group)| {
+            let got = got.clone();
+            async move {
+                let mut missed: Vec<Dig> = Vec::new();
+                for chunk in group.chunks(512) {
+                    let _permit = self.mesh_fetches.acquire().await;
+                    match self.fetch_many_from(&peer, chunk).await {
+                        Ok(rest) => {
+                            got.fetch_add((chunk.len() - rest.len()) as u64, Ordering::Relaxed);
+                            missed.extend(rest);
+                        }
+                        Err(_) => missed.extend_from_slice(chunk),
+                    }
+                }
+                missed
+            }
+        }))
+        .await;
+        unrouted.extend(leftovers.into_iter().flatten());
+        let sem = Arc::new(Semaphore::new(48));
+        let tasks: Vec<_> = unrouted
+            .into_iter()
             .map(|d| {
                 let this = self.clone();
                 let sem = sem.clone();
