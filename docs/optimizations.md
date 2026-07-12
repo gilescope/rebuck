@@ -55,11 +55,30 @@ byte-pristine.
 | mesh Get read-through | worker exec inputs live on *other* workers' shards; a store-only serve returned Missing 2,756× | driver's Get serve arm relays + caches from the holder |
 | platform routing via mesh | AC-only-seeded driver read Actions locally → put `/bin/sh` on windows workers | read Action/Command through the mesh, not the local store |
 | session validation memo | ~59k lookups over ~20k unique entries/lap, each re-validating (tree fetch + fleet HasMany) | memoize verdicts per session; servable cleared on worker disconnect, unservable on rewrite/TTL. In-memory read-mostly (RwLock) serves a hit with no disk read |
+| **parallel input staging** | `materialize()` fetched one blob per awaited round-trip (~12/s peer-bound); big substrate crate forests spent **10-22 min staging before rustc started** — run 29160244348's 72-min mac leg was almost entirely these silent gaps (compiles took seconds) | level-by-level tree walk with one batched `prefetch` per depth, then one batch over all file blobs and 64-wide concurrent writes; warm store makes each write a hardlink, not a byte-copy |
+| `BlobReq::GetMany` | request overhead (stream open + frame round-trip) paid **per blob** everywhere blobs move in bulk | one request per batch, per-digest reply frames + bytes back-to-back on one stream; served by worker (store-only) and driver (read-through, per-item Provider redirect preserved) |
+| sequential-await sweep | six more sites serialized independent awaits: `has_blobs` peer verification (≤12 sequential RTTs under FindMissingBlobs), `batch_read_blobs`/`batch_update_blobs` (one at a time), `sync_shard` (one stream per blob during fleet-wide finalize), AC tree expansion (×32 under scrub), eager metadata prefetch (routed per-blob) | fan-out with `join_all`/`buffered`; GetMany chunks (512, 4 concurrent) for shard sync and prefetch-by-holder; `mesh_fetches` permits acquired *inside* concurrent closures; REAPI reply order kept via `buffered` |
+| staging observability | staging was invisible — a 20-min input fetch read as a dead scheduler | `[action] staging <label> (n files)` before the fetch phase, `(staged in X.Xs)` on the start line: the next stall diagnoses itself from the CI log |
 
 Locality is *soft*: blooms only err toward false positives (cost = a fetch
 we'd do anyway), and the patience window means a busy/dead preferred worker
 never starves a job. Proven on the fleet bench before CI: **146× less mesh
 traffic, 3.2× faster** at 4 workers.
+
+### Sequential staging — the invisible 40 minutes
+
+Run 29160244348 (85 min) looked like a scheduler bug: buck2 "Waiting on"
+one crate for 22 min while three mac workers sat idle. The worker logs
+showed nothing — because the `[action] start` line printed *after* input
+materialization, and materialization was the whole stall: one awaited
+fetch per file, tens of thousands of files, rlibs scattered across the
+fleet. Deeper dep tree → longer stall (4 → 10 → 22 min up the substrate
+stack). Three aggravators: the slot permit was held while staging (a
+0.8s compile queued 14 min behind staging jobs), canonical exec dirs
+re-staged the identical tree for each emit flavour, and affinity jobs
+are (correctly) exempt from tail speculation, so nothing rescued them.
+The fix is the staging rows above; the log line exists so this class of
+stall can never hide again.
 
 ## 3. Persistence — warmth across CI runs
 
