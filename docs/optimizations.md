@@ -115,13 +115,14 @@ workers sync + save them in their own (parallel, off-path) teardown.
 | bank-time AC scrub | ~13.5k dead-era rows re-validated ~13×/lap (120s memo TTL over a 27min lap) | delete unservable rows at finalize (buck2 ignores their refusal anyway); scrub skips memo-proven-servable entries so a warm lap validates almost nothing |
 | done-file / deadline fixes | `Path::with_extension("done")` REPLACED `.signal` → CI polled a file that never appeared → **16m40s of pure sleep every lap**; a 900s ack wait burned 90s waiting for departed workers | append `.done`; ack deadline 900→180s (warm laps skip-pack and ack in seconds; the deadline only spends time on transition laps that re-pack) |
 
-**Open item — reliable 8/8 banking.** Finalize reliably banks only 5-7 of 8
-shards (workers slow to union-sync + pack ~500MB), and each partial bank
+**Open item — reliable 8/8 banking.** Finalize historically banked only 5-7
+of 8 shards (workers slow to union-sync + pack ~500MB), and each partial bank
 leaves missing ranges that force a ~60-min transition lap to rebuild. This is
-the one thing gating *reproducible* sub-10. Once a single lap banks a complete
-8/8, warm laps skip-pack and stay fast. Redundant assignment was tried
+the one thing gating *reproducible* sub-10. Redundant assignment was tried
 (doubled pack work, published duplicate artifacts, still 6/8) and reverted to
-primary-only + 180s.
+primary-only + 180s. Run 29194749613 (chunked-GetMany shard sync) banked the
+first complete **8/8 in 65s** — one clean bank, not yet proven reliable;
+watch the next laps.
 
 ## 5. CI — reusable, self-installing, self-healing
 
@@ -159,6 +160,7 @@ Wall-clock on CI is hostage to runner variance (the same code ran 17m and
 | + locality | ~35 min | mesh traffic −60× |
 | clean warm lap | **14m01s** | all 3 legs sub-10, mac 6m40s |
 | single leg (clean) | **6m40s** | proves per-leg sub-10 |
+| parallel staging + batching | 24m48s | run 29194749613 vs its 85-min predecessor: mac leg **72m → 5m35s** (staging p50 0.9s / p99 5.4s / max 11.3s over 558 actions), finalize 3m10s → **65s with the first 8/8 shard bank**; win leg (15m25s) is the new long pole |
 
 Reproducible sub-10 *total* remains gated on reliable 8/8 shard banking (§4).
 The engine speedup is done and proven; the tail is a stabilization tuning
