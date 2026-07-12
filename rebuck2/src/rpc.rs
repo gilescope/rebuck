@@ -385,7 +385,7 @@ impl re::action_cache_server::ActionCache for Ac {
                 self.stats
                     .ac_bytes
                     .fetch_add(result.encoded_len() as u64, Relaxed);
-                Ok(Response::new(result))
+                Ok(Response::new(*result))
             }
             AcLookup::Unservable => {
                 self.stats.ac_unservable.fetch_add(1, Relaxed);
@@ -450,7 +450,7 @@ impl re::execution_server::Execution for Exec {
                     } else {
                         self.driver.ac_hit_fail.fetch_add(1, Relaxed);
                     }
-                    return Ok(op_stream(&d, result, true));
+                    return Ok(op_stream(&d, *result, true));
                 }
                 AcLookup::Unservable => {
                     self.stats.ac_unservable.fetch_add(1, Relaxed);

@@ -343,8 +343,6 @@ pub async fn fleet(cfg: FleetCfg) -> Result<FleetMetrics> {
         driver.worker_count().await
     );
 
-    let mut meta_relay_per_s = 0.0;
-    let mut meta_local_per_s = 0.0;
     let start = std::time::Instant::now();
     let mut tasks = Vec::new();
     for a in &actions {
@@ -369,7 +367,7 @@ pub async fn fleet(cfg: FleetCfg) -> Result<FleetMetrics> {
     // Place small metadata blobs on ONE worker; time get_blob first-touch
     // (relay from worker, then cached) vs second-touch (driver-local) -
     // the exact win of seeding the driver's metadata locally.
-    {
+    let (meta_relay_per_s, meta_local_per_s) = {
         let mut metas: Vec<crate::mesh::Dig> = Vec::new();
         for i in 0..120usize {
             let b = format!("-Ldependency={i}-rmeta\n").repeat(32).into_bytes();
@@ -389,14 +387,15 @@ pub async fn fleet(cfg: FleetCfg) -> Result<FleetMetrics> {
             let _ = driver.get_blob(m).await;
         }
         let local = t1.elapsed().as_secs_f64();
-        meta_relay_per_s = metas.len() as f64 / relay.max(0.0001);
-        meta_local_per_s = metas.len() as f64 / local.max(0.0001);
+        let relay_per_s = metas.len() as f64 / relay.max(0.0001);
+        let local_per_s = metas.len() as f64 / local.max(0.0001);
         println!(
             "[fleet] metadata reads (120): relay {:.3}s ({:.1}/s) vs driver-local {:.3}s ({:.1}/s) = {:.0}x",
-            relay, meta_relay_per_s, local, meta_local_per_s,
+            relay, relay_per_s, local, local_per_s,
             relay / local.max(0.0001),
         );
-    }
+        (relay_per_s, local_per_s)
+    };
 
     let wall = start.elapsed().as_secs_f64();
     let driver_store: u64 = dstore
@@ -406,21 +405,18 @@ pub async fn fleet(cfg: FleetCfg) -> Result<FleetMetrics> {
     // moves ZERO bytes across the mesh; the non-locality baseline pays
     // ~(1 - 1/workers) x total (a job lands off-data that fraction of the
     // time and must fetch).
-    println!(
-        "[fleet] locality={:5} workers={} actions={} rlib={}KB -> {ok} ok in {wall:.2}s, mesh-served {:.1} MB (ideal 0)",
-        cfg.locality,
-        cfg.workers,
-        cfg.actions,
-        cfg.rlib_kb,
-        served as f64 / (1024.0 * 1024.0),
-    );
-    Ok(FleetMetrics {
+    let m = FleetMetrics {
         ok,
         mesh_served_mb: served as f64 / (1024.0 * 1024.0),
         driver_store_mb: driver_store as f64 / (1024.0 * 1024.0),
         meta_relay_per_s,
         meta_local_per_s,
-    })
+    };
+    println!(
+        "[fleet] locality={:5} workers={} actions={} rlib={}KB -> {ok} ok in {wall:.2}s, mesh-served {:.1} MB (ideal 0), driver-store {:.1} MB",
+        cfg.locality, cfg.workers, cfg.actions, cfg.rlib_kb, m.mesh_served_mb, m.driver_store_mb,
+    );
+    Ok(m)
 }
 
 #[cfg(test)]

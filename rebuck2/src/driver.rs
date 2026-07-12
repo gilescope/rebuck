@@ -63,8 +63,9 @@ pub struct DriverCfg {
 
 /// Outcome of a validated AC lookup ([`Driver::validated_ac_get`]).
 pub enum AcLookup {
-    /// Cached result whose referenced blobs are all fetchable.
-    Hit(re::ActionResult),
+    /// Cached result whose referenced blobs are all fetchable. Boxed:
+    /// ActionResult is ~528 bytes and the other variants carry nothing.
+    Hit(Box<re::ActionResult>),
     /// Entry exists but at least one referenced blob is gone (evicted CAS):
     /// callers must report a miss so the client re-executes and re-uploads.
     Unservable,
@@ -250,8 +251,6 @@ pub struct Driver {
     /// Cache outcome accounting for the stats heartbeat: AC hits that were
     /// successes, AC hits that were cached failures, and executions forced
     /// by do_not_cache actions (the prelude's diag wrappers).
-    /// Workers that completed their post-build shard sync.
-    pub finalized: AtomicU64,
     /// Distinct shards acked (redundant assignment: a shard is banked
     /// when ANY of its assignees uploads - union-sync makes both copies
     /// complete, so whichever wins is a full artifact).
@@ -288,7 +287,6 @@ impl Driver {
             peer_conns: Mutex::new(HashMap::new()),
             affinity_owner: Mutex::new(HashMap::new()),
             mesh_fetches: Semaphore::new(64),
-            finalized: AtomicU64::new(0),
             finalized_shards: Mutex::new(std::collections::BTreeSet::new()),
             ac_hit_ok: AtomicU64::new(0),
             ac_hit_fail: AtomicU64::new(0),
@@ -511,7 +509,6 @@ impl Driver {
                     }
                     W2D::Finalized { shard } => {
                         println!("[driver] worker {worker_id} finalized shard {shard}");
-                        self.finalized.fetch_add(1, Ordering::Relaxed);
                         self.finalized_shards.lock().await.insert(shard);
                     }
                     W2D::Holdings { bloom } => {
@@ -602,14 +599,6 @@ impl Driver {
         } else {
             parts.join(" ")
         }
-    }
-
-    /// Blob presence, counting provider-indexed blobs as present.
-    pub async fn has_blob(&self, d: &Dig) -> bool {
-        if self.store.has(d).await {
-            return true;
-        }
-        self.providers.lock().await.contains_key(&d.hash)
     }
 
     /// Batch presence over the whole mesh: local store + provider index
@@ -746,7 +735,7 @@ impl Driver {
         // no disk read, no revalidation, concurrent readers.
         if let Some(cached) = self.memo_servable.read().await.get(hash).cloned() {
             if let Ok(result) = re::ActionResult::decode(cached.as_slice()) {
-                return AcLookup::Hit(result);
+                return AcLookup::Hit(Box::new(result));
             }
         }
         let Some(bytes) = self.store.ac_get(hash).await else {
@@ -846,7 +835,7 @@ impl Driver {
             .write()
             .await
             .insert(hash.to_string(), Arc::new(bytes));
-        AcLookup::Hit(result)
+        AcLookup::Hit(Box::new(result))
     }
 
     /// A fresh result was written for this key: any cached unservable
@@ -1303,10 +1292,6 @@ impl Driver {
         (scanned, deleted.load(Ordering::Relaxed) as usize)
     }
 
-    pub fn finalized_count(&self) -> u64 {
-        self.finalized.load(Ordering::Relaxed)
-    }
-
     /// Resolve a job's oneshot and drop it from the table.
     async fn complete(&self, job_id: u64, result: Result<re::ActionResult, String>) {
         if let Some(job) = self.jobs.lock().await.remove(&job_id) {
@@ -1529,7 +1514,12 @@ impl Driver {
                         {
                             if let Ok(cmd) = re::Command::decode(cmd_bytes.as_slice()) {
                                 if plat == PlatKey::default() {
-                                    plat = PlatKey::from_properties(cmd.platform.as_ref());
+                                    // pre-v2.1 clients (buck2 included) put
+                                    // platform on Command, not Action.
+                                    #[allow(deprecated)]
+                                    {
+                                        plat = PlatKey::from_properties(cmd.platform.as_ref());
+                                    }
                                 }
                                 affinity_key = crate_affinity_key(&cmd);
                             }
@@ -1981,7 +1971,7 @@ mod tests {
             .insert(dig.hash.clone(), "unreachable-peer".into());
         // Validation must verify the entry (unreachable peer = unproven)
         // and evict the failed hint so rediscovery stays honest.
-        assert_eq!(d.has_blobs(&[dig.clone()]).await, vec![false]);
+        assert_eq!(d.has_blobs(std::slice::from_ref(&dig)).await, vec![false]);
         assert!(!d.providers.lock().await.contains_key(&dig.hash));
         // The serve path must classify a claimed-but-unfetchable blob as an
         // INFRA error (retryable at the job layer), never Ok(None): reader
