@@ -609,17 +609,40 @@ impl Driver {
 
     /// Per-platform queued-work summary for the stats heartbeat, e.g.
     /// "windows/x86_64:12 macos/aarch64:340" ("-" when nothing queued).
+    /// A bucket whose oldest job has waited >120s gets its age appended
+    /// (":12 oldest 340s!") AND a dedicated warning line naming the job,
+    /// its platform, and its affinity owner - a starved-but-live queue
+    /// previously looked exactly like an idle one, and one unroutable job
+    /// wedged a whole lap invisibly (run 29202575268, affinity deadlock).
     pub async fn queue_summary(&self) -> String {
         let queue = self.queue.lock().await;
-        let mut parts: Vec<String> = queue
-            .iter()
-            .filter(|(_, q)| !q.is_empty())
-            .map(|(k, q)| {
-                let os = if k.os.is_empty() { "*" } else { &k.os };
-                let arch = if k.arch.is_empty() { "*" } else { &k.arch };
-                format!("{os}/{arch}:{}", q.len())
-            })
-            .collect();
+        let jobs = self.jobs.lock().await;
+        let owners = self.affinity_owner.lock().await;
+        let mut parts: Vec<String> = Vec::new();
+        for (k, q) in queue.iter().filter(|(_, q)| !q.is_empty()) {
+            let os = if k.os.is_empty() { "*" } else { &k.os };
+            let arch = if k.arch.is_empty() { "*" } else { &k.arch };
+            let oldest = q
+                .iter()
+                .filter_map(|id| jobs.get(id).map(|j| (*id, j)))
+                .max_by_key(|(_, j)| j.submitted.elapsed());
+            match oldest {
+                Some((id, j)) if j.submitted.elapsed().as_secs() > 120 => {
+                    let age = j.submitted.elapsed().as_secs();
+                    parts.push(format!("{os}/{arch}:{} oldest {age}s!", q.len()));
+                    let owner = j
+                        .affinity
+                        .and_then(|a| owners.get(&a))
+                        .map(|w| format!("worker {w}"))
+                        .unwrap_or_else(|| "-".to_owned());
+                    println!(
+                        "[driver] STARVED job {id} ({}) queued {age}s on {os}/{arch}, affinity owner {owner}",
+                        j.action.hash
+                    );
+                }
+                _ => parts.push(format!("{os}/{arch}:{}", q.len())),
+            }
+        }
         parts.sort();
         if parts.is_empty() {
             "-".to_owned()
@@ -1554,12 +1577,20 @@ impl Driver {
                     }
                     // Fall back to the input root when no crate prefix is
                     // recognisable — same-input actions still colocate.
+                    // PLATFORM-SCOPED: the E0460 twin-pinning rationale only
+                    // applies within one platform (twins share a config), and
+                    // an unscoped key deadlocks under single-daemon sweeps -
+                    // content-based output paths carry no config hash, so all
+                    // legs' rustc_cfg shared one key, its owner was another
+                    // OS's worker, and the job starved forever (run
+                    // 29202575268: whole fleet idle behind one queued job).
                     let affinity = affinity_key
                         .or_else(|| action.input_root_digest.as_ref().map(|d| d.hash.clone()))
                         .map(|key| {
                             use std::hash::{Hash, Hasher};
                             let mut h = std::collections::hash_map::DefaultHasher::new();
                             key.hash(&mut h);
+                            plat.hash(&mut h);
                             h.finish()
                         });
                     (
