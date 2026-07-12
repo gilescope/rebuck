@@ -142,7 +142,29 @@ pub async fn run_action(blobs: &dyn Blobs, action_digest: &Dig, scratch: &Path) 
         Some(key) => {
             let guard = crate_lock(&key).lock_owned().await;
             let dir = canonical_exec_dir(&key);
-            let _ = tokio::fs::remove_dir_all(&dir).await; // stale from a crash
+            // Clear stale content (crash leftovers or the previous emit
+            // flavour) by renaming aside and deleting in the background:
+            // an inline remove_dir_all of a dereferenced __srcs forest is
+            // a minute of windows fs latency on the action's critical
+            // path, and invisible to the staging timer.
+            static TRASH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let trash = dir.with_extension(format!(
+                "trash{}",
+                TRASH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            match tokio::fs::rename(&dir, &trash).await {
+                Ok(()) => {
+                    tokio::spawn(async move {
+                        let _ = tokio::fs::remove_dir_all(&trash).await;
+                    });
+                }
+                // NotFound = nothing to clear; anything else (open handle,
+                // cross-device oddity) falls back to the inline delete.
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    let _ = tokio::fs::remove_dir_all(&dir).await;
+                }
+                Err(_) => {}
+            }
             tokio::fs::create_dir_all(&dir)
                 .await
                 .context("mk canonical exec dir")?;
@@ -388,9 +410,13 @@ async fn materialize(
     dest: &Path,
     label: &str,
 ) -> Result<usize> {
-    // Phase 1 — BFS the Directory forest, creating dirs and collecting file
-    // work. Iterative: recursion in async fns needs boxing.
+    // Phase 1 — BFS the Directory forest collecting work; NO fs ops here.
+    // Iterative: recursion in async fns needs boxing. A sequential awaited
+    // create_dir_all per directory put ~15ms of windows fs latency on every
+    // dir of a dereferenced __srcs forest (windows buck2 ships those as full
+    // file lists, ~4k dirs) — 60s+ of the win leg's per-action staging.
     let mut files: Vec<(Dig, PathBuf, bool)> = Vec::new();
+    let mut dirs: Vec<PathBuf> = Vec::new();
     let mut seen: HashMap<Dig, re::Directory> = HashMap::new();
     // Symlinks last: windows needs to know file-vs-dir at creation time, so
     // the targets must exist first (buck2's __srcs trees link to sibling dirs).
@@ -405,7 +431,6 @@ async fn materialize(
         blobs.prefetch(&unseen).await?;
         let mut next: Vec<(Dig, PathBuf)> = Vec::new();
         for (dig, path) in frontier {
-            tokio::fs::create_dir_all(&path).await?;
             let dir = match seen.get(&dig) {
                 Some(d) => d.clone(),
                 None => {
@@ -426,17 +451,28 @@ async fn materialize(
                 let ddig: Dig = (&d.digest.clone().context("DirectoryNode.digest")?).into();
                 next.push((ddig, path.join(&d.name)));
             }
+            dirs.push(path);
         }
         frontier = next;
     }
 
-    // Phase 2 — warm the local store in batches, then fan out the
+    // Phase 2 — one concurrent mkdir pass. create_dir_all is idempotent and
+    // makes parents, so ordering and same-path races don't matter.
+    println!("[action] staging {label} ({} files)", files.len());
+    use futures::TryStreamExt;
+    futures::stream::iter(dirs.iter().map(anyhow::Ok))
+        .try_for_each_concurrent(64, |p| async move {
+            tokio::fs::create_dir_all(p)
+                .await
+                .map_err(anyhow::Error::from)
+        })
+        .await?;
+
+    // Phase 3 — warm the local store in batches, then fan out the
     // filesystem writes (post-prefetch these are local link/copy, so the
     // bound is about syscall parallelism, not network).
-    println!("[action] staging {label} ({} files)", files.len());
     let digs: Vec<Dig> = files.iter().map(|(d, _, _)| d.clone()).collect();
     blobs.prefetch(&digs).await?;
-    use futures::TryStreamExt;
     futures::stream::iter(files.iter().map(Ok))
         .try_for_each_concurrent(64, |(d, p, x)| async move {
             blobs.materialize_file(d, p, *x).await
