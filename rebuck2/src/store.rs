@@ -245,6 +245,22 @@ impl Store {
                     .with_context(|| format!("materialize {} -> {}", d.hash, dest.display()))?;
                 Ok(Materialized::Private)
             }
+            // Case-insensitivity collision: a linux-unpacked crate tree can
+            // carry files differing only in case (windows-core), and the
+            // second hardlink onto NTFS/APFS hits AlreadyExists. Replace -
+            // last-wins, the same semantics tar gave these trees when each
+            // OS unpacked its own copy (run 29199153837, error 183). Also
+            // covers staging over leftovers generally: materialization is
+            // declarative, the CAS copy is the truth.
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                tokio::fs::remove_file(dest).await.with_context(|| {
+                    format!("replace existing {} before relink", dest.display())
+                })?;
+                tokio::fs::hard_link(&src, dest)
+                    .await
+                    .with_context(|| format!("relink {} -> {}", d.hash, dest.display()))?;
+                Ok(Materialized::Linked)
+            }
             Err(e) => {
                 // Field forensics: which leg of the link vanished? A stat
                 // burst is cheap next to a failed action, and one retry
@@ -431,6 +447,24 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    /// Case-collision / leftover tolerance: materializing onto an existing
+    /// dest replaces it (last-wins - the semantics tar gave case-colliding
+    /// trees when each OS unpacked its own copy). Run 29199153837: a
+    /// linux-unpacked windows-core tree hit error 183 on NTFS. On macOS
+    /// the copy path overwrites natively; elsewhere this exercises the
+    /// AlreadyExists relink arm.
+    #[tokio::test]
+    async fn link_out_replaces_existing_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::new(dir.path().join("store")).unwrap();
+        let d = store.put(None, b"new contents").await.unwrap();
+        let dest = dir.path().join("out/README.md");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        std::fs::write(&dest, b"stale case-colliding twin").unwrap();
+        store.link_out(&d, &dest).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new contents");
+    }
+
     #[test]
     fn verify_cas_keeps_good_deletes_bad() {
         let dir = tempfile::tempdir().unwrap();
