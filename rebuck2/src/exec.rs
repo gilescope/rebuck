@@ -47,6 +47,16 @@ pub trait Blobs: Send + Sync {
         }
         Ok(())
     }
+
+    /// Best-effort bulk warm-up: make `digs` locally available so subsequent
+    /// per-blob calls don't each pay a network round-trip. Never fails the
+    /// action — a blob it couldn't obtain surfaces later through `get`'s
+    /// per-blob error path, which names the digest. Default: no-op (store-
+    /// backed impls are already local). Wrapper impls MUST delegate or the
+    /// batching silently vanishes.
+    async fn prefetch(&self, _digs: &[Dig]) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct Outcome {
@@ -144,14 +154,6 @@ pub async fn run_action(blobs: &dyn Blobs, action_digest: &Dig, scratch: &Path) 
         }
     };
     let root = root_buf.as_path();
-    materialize(blobs, &root_dig, root).await?;
-
-    let cwd = if command.working_directory.is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(&command.working_directory)
-    };
-    tokio::fs::create_dir_all(&cwd).await?;
 
     // REAPI: the worker creates parent dirs of every declared output path.
     #[allow(deprecated)] // pre-v2.1 clients send output_files/output_directories
@@ -165,16 +167,33 @@ pub async fn run_action(blobs: &dyn Blobs, action_digest: &Dig, scratch: &Path) 
             .cloned()
             .collect()
     };
+    let (argv0, args) = command
+        .arguments
+        .split_first()
+        .context("Command.arguments empty")?;
+    // The first output path is the most human-readable handle we have for an
+    // action; needed before materialize so staging announces itself.
+    let label = out_paths
+        .first()
+        .map(String::as_str)
+        .unwrap_or(argv0)
+        .to_owned();
+
+    let staging = std::time::Instant::now();
+    materialize(blobs, &root_dig, root, &label).await?;
+    let staged_secs = staging.elapsed().as_secs_f64();
+
+    let cwd = if command.working_directory.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(&command.working_directory)
+    };
+    tokio::fs::create_dir_all(&cwd).await?;
     for p in &out_paths {
         if let Some(parent) = cwd.join(p).parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
     }
-
-    let (argv0, args) = command
-        .arguments
-        .split_first()
-        .context("Command.arguments empty")?;
     // Windows resolves a relative argv0 against the PARENT process's cwd,
     // not `current_dir` (documented std::process behaviour) — project-relative
     // scripts (buck-out\...\foo.bat) then miss. Absolutize against the action
@@ -239,15 +258,11 @@ pub async fn run_action(blobs: &dyn Blobs, action_digest: &Dig, scratch: &Path) 
             }
         }
     }
-    // One start/finish line per action, always — makes a worker's CI log a
-    // live view of what it's building. The first output path is the most
-    // human-readable handle we have for an action.
-    let label = out_paths
-        .first()
-        .map(String::as_str)
-        .unwrap_or(argv0)
-        .to_owned();
-    println!("[action] start {label}");
+    // One staging/start/finish line per action, always — makes a worker's CI
+    // log a live view of what it's building AND what it's waiting for
+    // (staging used to be silent, and 20-minute input-forest fetches read as
+    // a dead scheduler — run 29160244348).
+    println!("[action] start {label} (staged in {staged_secs:.1}s)");
     if keep_scratch {
         eprintln!(
             "[exec] action {} argv={:?} cwd={} outs={:?}",
@@ -360,37 +375,73 @@ pub async fn run_action(blobs: &dyn Blobs, action_digest: &Dig, scratch: &Path) 
     })
 }
 
-async fn materialize(blobs: &dyn Blobs, dir_digest: &Dig, dest: &Path) -> Result<()> {
-    // Iterative BFS; recursion in async fns needs boxing and trees are shallow-ish.
-    let mut queue: Vec<(Dig, PathBuf)> = vec![(dir_digest.clone(), dest.to_path_buf())];
+/// Stage the input tree under `dest`, returning the file count. Staging was
+/// invisible and strictly sequential (one awaited fetch per file, one per
+/// directory) — at RTT-bound peer-fetch rates the big substrate crate
+/// forests spent 10-22 min here before rustc even started, and the whole
+/// mac leg of run 29160244348 was exactly these gaps. Now: walk the tree
+/// level by level (one `prefetch` batch per depth), then batch-fetch every
+/// file blob and materialize with bounded fan-out.
+async fn materialize(
+    blobs: &dyn Blobs,
+    dir_digest: &Dig,
+    dest: &Path,
+    label: &str,
+) -> Result<usize> {
+    // Phase 1 — BFS the Directory forest, creating dirs and collecting file
+    // work. Iterative: recursion in async fns needs boxing.
+    let mut files: Vec<(Dig, PathBuf, bool)> = Vec::new();
     let mut seen: HashMap<Dig, re::Directory> = HashMap::new();
     // Symlinks last: windows needs to know file-vs-dir at creation time, so
     // the targets must exist first (buck2's __srcs trees link to sibling dirs).
     let mut symlinks: Vec<(PathBuf, String)> = Vec::new();
-    while let Some((dig, path)) = queue.pop() {
-        tokio::fs::create_dir_all(&path).await?;
-        let dir = match seen.get(&dig) {
-            Some(d) => d.clone(),
-            None => {
-                let d = re::Directory::decode(blobs.get(&dig).await?.as_slice())
-                    .context("decode Directory")?;
-                seen.insert(dig.clone(), d.clone());
-                d
+    let mut frontier: Vec<(Dig, PathBuf)> = vec![(dir_digest.clone(), dest.to_path_buf())];
+    while !frontier.is_empty() {
+        let unseen: Vec<Dig> = frontier
+            .iter()
+            .filter(|(d, _)| !seen.contains_key(d))
+            .map(|(d, _)| d.clone())
+            .collect();
+        blobs.prefetch(&unseen).await?;
+        let mut next: Vec<(Dig, PathBuf)> = Vec::new();
+        for (dig, path) in frontier {
+            tokio::fs::create_dir_all(&path).await?;
+            let dir = match seen.get(&dig) {
+                Some(d) => d.clone(),
+                None => {
+                    let d = re::Directory::decode(blobs.get(&dig).await?.as_slice())
+                        .context("decode Directory")?;
+                    seen.insert(dig.clone(), d.clone());
+                    d
+                }
+            };
+            for f in &dir.files {
+                let fdig: Dig = (&f.digest.clone().context("FileNode.digest")?).into();
+                files.push((fdig, path.join(&f.name), f.is_executable));
             }
-        };
-        for f in &dir.files {
-            let fdig: Dig = (&f.digest.clone().context("FileNode.digest")?).into();
-            let fp = path.join(&f.name);
-            blobs.materialize_file(&fdig, &fp, f.is_executable).await?;
+            for s in &dir.symlinks {
+                symlinks.push((path.join(&s.name), s.target.clone()));
+            }
+            for d in &dir.directories {
+                let ddig: Dig = (&d.digest.clone().context("DirectoryNode.digest")?).into();
+                next.push((ddig, path.join(&d.name)));
+            }
         }
-        for s in &dir.symlinks {
-            symlinks.push((path.join(&s.name), s.target.clone()));
-        }
-        for d in &dir.directories {
-            let ddig: Dig = (&d.digest.clone().context("DirectoryNode.digest")?).into();
-            queue.push((ddig, path.join(&d.name)));
-        }
+        frontier = next;
     }
+
+    // Phase 2 — warm the local store in batches, then fan out the
+    // filesystem writes (post-prefetch these are local link/copy, so the
+    // bound is about syscall parallelism, not network).
+    println!("[action] staging {label} ({} files)", files.len());
+    let digs: Vec<Dig> = files.iter().map(|(d, _, _)| d.clone()).collect();
+    blobs.prefetch(&digs).await?;
+    use futures::TryStreamExt;
+    futures::stream::iter(files.iter().map(Ok))
+        .try_for_each_concurrent(64, |(d, p, x)| async move {
+            blobs.materialize_file(d, p, *x).await
+        })
+        .await?;
     for (link, target) in symlinks {
         // Canonical topology: buck2 ships the SAME logical tree sometimes as
         // SymlinkNodes and sometimes dereferenced FileNodes (observed on the
@@ -412,7 +463,7 @@ async fn materialize(blobs: &dyn Blobs, dir_digest: &Dig, dest: &Path) -> Result
                 .with_context(|| format!("symlink {} -> {}", link.display(), target))?;
         }
     }
-    Ok(())
+    Ok(files.len())
 }
 
 /// Lexically normalize `r` (resolving `..`) and check it stays inside `root`.
@@ -607,5 +658,113 @@ mod tests {
         let other = crate_lock("__other__/");
         assert!(std::sync::Arc::ptr_eq(&l1, &l2));
         assert!(!std::sync::Arc::ptr_eq(&l1, &other));
+    }
+
+    /// In-memory Blobs: records every digest handed to `prefetch` so tests
+    /// can assert the batching contract, serves blobs from a map.
+    struct MemBlobs {
+        blobs: HashMap<String, Vec<u8>>,
+        prefetched: std::sync::Mutex<Vec<Vec<String>>>,
+    }
+
+    impl MemBlobs {
+        fn dig(bytes: &[u8]) -> Dig {
+            Dig {
+                hash: crate::store::sha256_hex(bytes),
+                size: bytes.len() as i64,
+            }
+        }
+        fn insert(&mut self, bytes: &[u8]) -> Dig {
+            let d = Self::dig(bytes);
+            self.blobs.insert(d.hash.clone(), bytes.to_vec());
+            d
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Blobs for MemBlobs {
+        async fn get(&self, d: &Dig) -> Result<Vec<u8>> {
+            self.blobs
+                .get(&d.hash)
+                .cloned()
+                .with_context(|| format!("blob {} missing", d.hash))
+        }
+        async fn put(&self, bytes: Vec<u8>) -> Result<Dig> {
+            Ok(Self::dig(&bytes))
+        }
+        async fn prefetch(&self, digs: &[Dig]) -> Result<()> {
+            self.prefetched
+                .lock()
+                .unwrap()
+                .push(digs.iter().map(|d| d.hash.clone()).collect());
+            Ok(())
+        }
+    }
+
+    fn file_node(name: &str, d: &Dig, exec: bool) -> re::FileNode {
+        re::FileNode {
+            name: name.into(),
+            digest: Some(re::Digest {
+                hash: d.hash.clone(),
+                size_bytes: d.size,
+            }),
+            is_executable: exec,
+            ..Default::default()
+        }
+    }
+
+    // The parallel rewrite must materialize the same tree the sequential
+    // walk did: nested dirs, duplicate digests fanned to distinct paths,
+    // exec bits — and hand every file digest to ONE batched prefetch.
+    #[tokio::test]
+    async fn materialize_stages_tree_and_batches_prefetch() {
+        let mut mem = MemBlobs {
+            blobs: HashMap::new(),
+            prefetched: std::sync::Mutex::new(Vec::new()),
+        };
+        let body = mem.insert(b"fn main() {}");
+        let tool = mem.insert(b"#!/bin/sh\n");
+        let sub = re::Directory {
+            files: vec![file_node("dup.rs", &body, false)],
+            ..Default::default()
+        };
+        let sub_bytes = sub.encode_to_vec();
+        let sub_dig = mem.insert(&sub_bytes);
+        let root = re::Directory {
+            files: vec![
+                file_node("main.rs", &body, false),
+                file_node("run.sh", &tool, true),
+            ],
+            directories: vec![re::DirectoryNode {
+                name: "nested".into(),
+                digest: Some(re::Digest {
+                    hash: sub_dig.hash.clone(),
+                    size_bytes: sub_dig.size,
+                }),
+            }],
+            ..Default::default()
+        };
+        let root_bytes = root.encode_to_vec();
+        let root_dig = mem.insert(&root_bytes);
+
+        let dest = tempfile::tempdir().unwrap();
+        let n = materialize(&mem, &root_dig, dest.path(), "test")
+            .await
+            .unwrap();
+
+        assert_eq!(n, 3);
+        let read = |p: &str| std::fs::read(dest.path().join(p)).unwrap();
+        assert_eq!(read("main.rs"), b"fn main() {}");
+        assert_eq!(read("nested/dup.rs"), b"fn main() {}");
+        assert_eq!(read("run.sh"), b"#!/bin/sh\n");
+        #[cfg(unix)]
+        assert!(is_exec(
+            &std::fs::metadata(dest.path().join("run.sh")).unwrap()
+        ));
+        // Last prefetch batch = the file phase: every file digest, one call.
+        let batches = mem.prefetched.lock().unwrap();
+        let files = batches.last().unwrap();
+        assert_eq!(files.len(), 3);
+        assert!(files.contains(&body.hash) && files.contains(&tool.hash));
     }
 }

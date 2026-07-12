@@ -255,7 +255,7 @@ Expected effect: seed+save drop from ~8-10min of driver critical path to
 monolith, so eviction hits one shard (self-heals: that shard rebuilds
 cold) instead of the whole store.
 
-Protocol additions (as built): `BlobReq::{HasMany, ListShard}`,
+Protocol additions (as built): `BlobReq::{HasMany, ListShard, GetMany}`,
 `BlobResp::{HaveMany, HashList}`, `D2W::Finalize`, `W2D::Finalized`;
 driver flags `--addr-file` (published-addr dialing) and
 `--finalize-file` (shard handoff signal); worker flag

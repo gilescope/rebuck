@@ -288,6 +288,27 @@ async fn serve_get(
             }
             mesh::send_frame(&mut send, &BlobResp::HaveMany(have)).await?;
         }
+        // One BlobResp frame per digest in request order, bytes inline after
+        // each Found. get-then-reply per item: no Found promise can outlive
+        // an LRU eviction between a batched presence check and the read.
+        BlobReq::GetMany(digs) => {
+            for d in &digs {
+                match store.get(d).await {
+                    Ok(Some(bytes)) => {
+                        mesh::send_frame(
+                            &mut send,
+                            &BlobResp::Found {
+                                size: bytes.len() as u64,
+                            },
+                        )
+                        .await?;
+                        send.write_all(&bytes).await?;
+                    }
+                    Ok(None) => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
+                    Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
+                }
+            }
+        }
         BlobReq::ListShard { shard, of } => {
             // Finalize union sync: the driver aggregates every worker's
             // range list so banked shards cover the FLEET's holdings.
@@ -316,6 +337,11 @@ struct TrackingBlobs {
 impl exec::Blobs for TrackingBlobs {
     async fn get(&self, d: &Dig) -> Result<Vec<u8>> {
         self.inner.get(d).await
+    }
+    // Not the trait's no-op default: dropping this delegation silently
+    // reverts staging to one round-trip per blob.
+    async fn prefetch(&self, digs: &[Dig]) -> Result<()> {
+        self.inner.prefetch(digs).await
     }
     async fn put(&self, bytes: Vec<u8>) -> Result<Dig> {
         let d = self.inner.put(bytes).await?;
@@ -386,6 +412,56 @@ impl RemoteBlobs {
             other => bail!("provider {endpoint} for {}: {other:?}", d.hash),
         }
     }
+
+    /// One GetMany round-trip: pull `digs` from `endpoint` (None = the
+    /// driver) into the local store. Returns the digests NOT obtained
+    /// (missing on the holder, or redirected and the redirect also failed)
+    /// — callers decide the next hop. Driver `Provider` redirects are
+    /// followed with one further batched hop per provider.
+    async fn fetch_many_from(&self, endpoint: Option<&str>, digs: &[Dig]) -> Result<Vec<Dig>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let conn = match endpoint {
+            Some(ep) => {
+                let id: iroh::EndpointId = ep
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("bad provider endpoint {ep:?}"))?;
+                self.ep.connect(id, mesh::ALPN).await?
+            }
+            None => self.conn.clone(),
+        };
+        let (mut send, mut recv) = conn.open_bi().await?;
+        mesh::send_frame(&mut send, &BlobReq::GetMany(digs.to_vec())).await?;
+        send.finish()?;
+        let mut unfetched: Vec<Dig> = Vec::new();
+        let mut redirects: HashMap<String, Vec<Dig>> = HashMap::new();
+        for d in digs {
+            match mesh::recv_frame::<BlobResp>(&mut recv)
+                .await?
+                .context("holder closed mid-batch")?
+            {
+                BlobResp::Found { size } => {
+                    let bytes = mesh::recv_raw(&mut recv, size).await?;
+                    self.store.put(Some(d), &bytes).await?;
+                    if endpoint.is_some() {
+                        self.hits_peer.fetch_add(1, Relaxed);
+                    } else {
+                        self.hits_driver.fetch_add(1, Relaxed);
+                    }
+                }
+                BlobResp::Provider { endpoint } => {
+                    redirects.entry(endpoint).or_default().push(d.clone());
+                }
+                _ => unfetched.push(d.clone()),
+            }
+        }
+        for (ep, group) in redirects {
+            match Box::pin(self.fetch_many_from(Some(&ep), &group)).await {
+                Ok(rest) => unfetched.extend(rest),
+                Err(_) => unfetched.extend(group),
+            }
+        }
+        Ok(unfetched)
+    }
 }
 
 #[async_trait::async_trait]
@@ -437,6 +513,62 @@ impl exec::Blobs for RemoteBlobs {
             BlobResp::Missing => bail!("driver CAS missing blob {}/{}", d.hash, d.size),
             other => bail!("unexpected blob response: {other:?}"),
         }
+    }
+
+    /// Batched warm-up for materialize: group missing digests by bloom-
+    /// claimed holder (same deterministic pick as `get`), one GetMany per
+    /// group concurrently, driver fallback in concurrent chunks. Best
+    /// effort by contract — whatever stays missing is refetched (and
+    /// properly diagnosed) by the per-blob `get` path.
+    async fn prefetch(&self, digs: &[Dig]) -> Result<()> {
+        let mut missing: Vec<Dig> = Vec::new();
+        let mut dedup: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for d in digs {
+            if dedup.insert(&d.hash) && !self.store.has(d).await {
+                missing.push(d.clone());
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let mut by_peer: HashMap<String, Vec<Dig>> = HashMap::new();
+        let mut for_driver: Vec<Dig> = Vec::new();
+        {
+            let peers = self.peers.lock().await;
+            for d in missing {
+                let candidates: Vec<&String> = peers
+                    .iter()
+                    .filter(|(id, b)| **id != self.my_id && b.contains(&d.hash))
+                    .map(|(id, _)| id)
+                    .collect();
+                if candidates.is_empty() {
+                    for_driver.push(d);
+                } else {
+                    let pick =
+                        usize::from_str_radix(&d.hash[..4], 16).unwrap_or(0) % candidates.len();
+                    by_peer.entry(candidates[pick].clone()).or_default().push(d);
+                }
+            }
+        }
+        // Peer groups in parallel; a failed group falls through to the
+        // driver (read-through there re-heals the hot set, same as `get`).
+        let groups = futures::future::join_all(by_peer.iter().map(|(peer, group)| async move {
+            match self.fetch_many_from(Some(peer), group).await {
+                Ok(rest) => rest,
+                Err(_) => group.clone(),
+            }
+        }))
+        .await;
+        for_driver.extend(groups.into_iter().flatten());
+        // Chunked so one stream never serializes tens of thousands of blobs,
+        // concurrent so the driver's read-through fans out too.
+        use futures::StreamExt;
+        futures::stream::iter(for_driver.chunks(512))
+            .for_each_concurrent(4, |chunk| async move {
+                let _ = self.fetch_many_from(None, chunk).await;
+            })
+            .await;
+        Ok(())
     }
 
     async fn materialize_file(

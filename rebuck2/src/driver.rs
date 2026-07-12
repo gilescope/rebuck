@@ -1620,6 +1620,38 @@ async fn serve_blob_stream(
             }
             mesh::send_frame(&mut send, &BlobResp::HaveMany(have)).await?;
         }
+        // Batched Get: one BlobResp frame per digest in request order, bytes
+        // inline after each Found. Same per-item semantics as Get (Provider
+        // redirect in decentralized mode, read-through get_blob otherwise);
+        // workers issue chunks on parallel streams, so the read-through
+        // relaying fans out across streams even though each stream is serial.
+        BlobReq::GetMany(digs) => {
+            for d in &digs {
+                let redirect = if driver.cfg.decentralized {
+                    driver.providers.lock().await.get(&d.hash).cloned()
+                } else {
+                    None
+                };
+                if let Some(endpoint) = redirect {
+                    mesh::send_frame(&mut send, &BlobResp::Provider { endpoint }).await?;
+                    continue;
+                }
+                match driver.get_blob(d).await {
+                    Ok(Some(bytes)) => {
+                        mesh::send_frame(
+                            &mut send,
+                            &BlobResp::Found {
+                                size: bytes.len() as u64,
+                            },
+                        )
+                        .await?;
+                        send.write_all(&bytes).await?;
+                    }
+                    Ok(None) => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
+                    Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
+                }
+            }
+        }
         BlobReq::ListShard { shard, of } => {
             // Union across the FLEET, not just this store: the driver holds
             // only what it relayed, and blobs built on other workers

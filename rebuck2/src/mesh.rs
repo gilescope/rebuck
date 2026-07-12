@@ -171,6 +171,12 @@ pub enum BlobReq {
         shard: u8,
         of: u8,
     },
+    /// Batch fetch: the reply is one `BlobResp` frame PER digest, in request
+    /// order (`Found` frames followed immediately by that blob's raw bytes),
+    /// all on the same stream. One round-trip where `Get` cost one per blob —
+    /// sequential per-file staging at ~12 RTT-bound fetches/s was a 20-minute
+    /// pre-rustc stall on the big crate forests (run 29160244348).
+    GetMany(Vec<Dig>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
