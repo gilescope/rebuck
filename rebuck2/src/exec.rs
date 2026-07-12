@@ -571,10 +571,36 @@ fn make_symlink(link: &Path, target: &str) -> Result<()> {
     Ok(())
 }
 
-/// Build + upload a Tree proto for an output directory; returns the Tree digest.
+/// Build + upload a Tree proto for an output directory; returns the Tree
+/// digest. Ingestion was one awaited put per file — the 10-15k-file crate
+/// unpacks (windows-sys, openssl-src) took 60-90s here and sat on BOTH
+/// legs' critical paths. Now: sync walk (one spawn_blocking, no per-op
+/// executor hops), concurrent file ingestion, then a deterministic
+/// assembly pass that reproduces the original post-order children layout
+/// byte-for-byte (tree digests must not shift across engine versions).
 async fn upload_tree(blobs: &dyn Blobs, dir: &Path) -> Result<Dig> {
+    let walked = {
+        let dir = dir.to_path_buf();
+        tokio::task::spawn_blocking(move || walk_out_dir(&dir))
+            .await
+            .context("walk join")??
+    };
+    // Ingest every file concurrently; digests keyed by path for assembly.
+    // Futures built eagerly then streamed: mapping async closures over
+    // borrowed items trips HRTB inference (same fix as rpc.rs).
+    let mut file_paths: Vec<(PathBuf, bool)> = Vec::new();
+    collect_walk_files(&walked, &mut file_paths);
+    use futures::{StreamExt, TryStreamExt};
+    let futs: Vec<_> = file_paths
+        .iter()
+        .map(|(p, _)| async move { Ok::<_, anyhow::Error>((p.clone(), blobs.put_file(p).await?)) })
+        .collect();
+    let digests: HashMap<PathBuf, Dig> = futures::stream::iter(futs)
+        .buffer_unordered(64)
+        .try_collect()
+        .await?;
     let mut children: Vec<re::Directory> = Vec::new();
-    let root = build_dir(blobs, dir, &mut children).await?;
+    let root = assemble_dir(blobs, &walked, &digests, &mut children).await?;
     let tree = re::Tree {
         root: Some(root),
         children,
@@ -582,14 +608,21 @@ async fn upload_tree(blobs: &dyn Blobs, dir: &Path) -> Result<Dig> {
     blobs.put(tree.encode_to_vec()).await
 }
 
-/// Post-order directory build. Entries sorted by name — REAPI canonical form,
-/// and tree digests must be deterministic.
-async fn build_dir(
-    blobs: &dyn Blobs,
-    dir: &Path,
-    children: &mut Vec<re::Directory>,
-) -> Result<re::Directory> {
-    let mut out = re::Directory::default();
+/// One output directory's entries, name-sorted (REAPI canonical form).
+struct WalkedDir {
+    files: Vec<(String, PathBuf, bool)>,
+    symlinks: Vec<(String, String)>,
+    dirs: Vec<(String, WalkedDir)>,
+}
+
+/// Sync recursive walk — a single blocking task beats one executor
+/// round-trip per metadata call on 15k-entry forests.
+fn walk_out_dir(dir: &Path) -> Result<WalkedDir> {
+    let mut out = WalkedDir {
+        files: Vec::new(),
+        symlinks: Vec::new(),
+        dirs: Vec::new(),
+    };
     let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
     entries.sort_by_key(|e| e.file_name());
     for e in entries {
@@ -597,30 +630,62 @@ async fn build_dir(
         let meta = e.metadata()?;
         let p = e.path();
         if meta.file_type().is_symlink() {
-            out.symlinks.push(re::SymlinkNode {
-                name,
-                target: std::fs::read_link(&p)?.to_string_lossy().into_owned(),
-                node_properties: None,
-            });
+            out.symlinks
+                .push((name, std::fs::read_link(&p)?.to_string_lossy().into_owned()));
         } else if meta.is_dir() {
-            let sub = Box::pin(build_dir(blobs, &p, children)).await?;
-            let digest = blobs.put(sub.encode_to_vec()).await?;
-            children.push(sub);
-            out.directories.push(re::DirectoryNode {
-                name,
-                digest: Some(digest.to_proto()),
-            });
+            out.dirs.push((name, walk_out_dir(&p)?));
         } else {
-            let bytes = tokio::fs::read(&p).await?;
-            let is_executable = is_exec(&meta);
-            let digest = blobs.put(bytes).await?;
-            out.files.push(re::FileNode {
-                name,
-                digest: Some(digest.to_proto()),
-                is_executable,
-                node_properties: None,
-            });
+            out.files.push((name, p, is_exec(&meta)));
         }
+    }
+    Ok(out)
+}
+
+fn collect_walk_files(w: &WalkedDir, into: &mut Vec<(PathBuf, bool)>) {
+    for (_, p, x) in &w.files {
+        into.push((p.clone(), *x));
+    }
+    for (_, d) in &w.dirs {
+        collect_walk_files(d, into);
+    }
+}
+
+/// Post-order assembly from the walk + digest map. Children push order and
+/// entry sorting reproduce the sequential builder exactly — same bytes,
+/// same tree digest.
+async fn assemble_dir(
+    blobs: &dyn Blobs,
+    walked: &WalkedDir,
+    digests: &HashMap<PathBuf, Dig>,
+    children: &mut Vec<re::Directory>,
+) -> Result<re::Directory> {
+    let mut out = re::Directory::default();
+    for (name, target) in &walked.symlinks {
+        out.symlinks.push(re::SymlinkNode {
+            name: name.clone(),
+            target: target.clone(),
+            node_properties: None,
+        });
+    }
+    for (name, sub_walked) in &walked.dirs {
+        let sub = Box::pin(assemble_dir(blobs, sub_walked, digests, children)).await?;
+        let digest = blobs.put(sub.encode_to_vec()).await?;
+        children.push(sub);
+        out.directories.push(re::DirectoryNode {
+            name: name.clone(),
+            digest: Some(digest.to_proto()),
+        });
+    }
+    for (name, p, is_executable) in &walked.files {
+        let digest = digests
+            .get(p)
+            .with_context(|| format!("digest missing for {}", p.display()))?;
+        out.files.push(re::FileNode {
+            name: name.clone(),
+            digest: Some(digest.to_proto()),
+            is_executable: *is_executable,
+            node_properties: None,
+        });
     }
     Ok(out)
 }
@@ -802,5 +867,88 @@ mod tests {
         let files = batches.last().unwrap();
         assert_eq!(files.len(), 3);
         assert!(files.contains(&body.hash) && files.contains(&tool.hash));
+    }
+
+    /// The old, strictly sequential tree builder — kept as the reference
+    /// the concurrent upload_tree must byte-match: a shifted tree digest
+    /// silently invalidates every cached directory output across laps.
+    async fn reference_build_dir(
+        blobs: &dyn Blobs,
+        dir: &Path,
+        children: &mut Vec<re::Directory>,
+    ) -> Result<re::Directory> {
+        let mut out = re::Directory::default();
+        let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let meta = e.metadata()?;
+            let p = e.path();
+            if meta.file_type().is_symlink() {
+                out.symlinks.push(re::SymlinkNode {
+                    name,
+                    target: std::fs::read_link(&p)?.to_string_lossy().into_owned(),
+                    node_properties: None,
+                });
+            } else if meta.is_dir() {
+                let sub = Box::pin(reference_build_dir(blobs, &p, children)).await?;
+                let digest = blobs.put(sub.encode_to_vec()).await?;
+                children.push(sub);
+                out.directories.push(re::DirectoryNode {
+                    name,
+                    digest: Some(digest.to_proto()),
+                });
+            } else {
+                let bytes = tokio::fs::read(&p).await?;
+                let is_executable = is_exec(&meta);
+                let digest = blobs.put(bytes).await?;
+                out.files.push(re::FileNode {
+                    name,
+                    digest: Some(digest.to_proto()),
+                    is_executable,
+                    node_properties: None,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn upload_tree_matches_sequential_reference() {
+        let mem = MemBlobs {
+            blobs: HashMap::new(),
+            prefetched: std::sync::Mutex::new(Vec::new()),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/nested")).unwrap();
+        std::fs::create_dir_all(root.join("aaa")).unwrap(); // sorts before src
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), b"[package]").unwrap();
+        std::fs::write(root.join("src/lib.rs"), b"pub fn f() {}").unwrap();
+        std::fs::write(root.join("src/nested/deep.rs"), b"mod deep;").unwrap();
+        std::fs::write(root.join("aaa/z.txt"), b"z").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../Cargo.toml", root.join("src/link.toml")).unwrap();
+
+        let got = upload_tree(&mem, root).await.unwrap();
+        let mut children = Vec::new();
+        let root_dir = reference_build_dir(&mem, root, &mut children)
+            .await
+            .unwrap();
+        let want = mem
+            .put(
+                re::Tree {
+                    root: Some(root_dir),
+                    children,
+                }
+                .encode_to_vec(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            got, want,
+            "concurrent tree digest diverged from the sequential reference"
+        );
     }
 }
