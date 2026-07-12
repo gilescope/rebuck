@@ -161,6 +161,8 @@ Wall-clock on CI is hostage to runner variance (the same code ran 17m and
 | clean warm lap | **14m01s** | all 3 legs sub-10, mac 6m40s |
 | single leg (clean) | **6m40s** | proves per-leg sub-10 |
 | parallel staging + batching | 24m48s | run 29194749613 vs its 85-min predecessor: mac leg **72m → 5m35s** (staging p50 0.9s / p99 5.4s / max 11.3s over 558 actions), finalize 3m10s → **65s with the first 8/8 shard bank**; win leg (15m25s) is the new long pole |
+| + win staging fs fixes | legs 8m44s | run 29195973667: concurrent mkdir pass + rename-aside delete; win staging p90 **18.7s → 3s** (max 89s → 20s), win leg 15m25s → 8m39s, second straight 8/8 bank |
+| + concurrent output ingestion | **17m39s** | run 29198032688: upload_tree fan-out; openssl-src unpack 254s → **56s**, legs converge (linux 4m01s / mac 4m55s / win 5m31s, build step 5m37s); exit broadcast ends worker idling (7/8 bank — the reliability tail remains) |
 
 Reproducible sub-10 *total* remains gated on reliable 8/8 shard banking (§4).
 The engine speedup is done and proven; the tail is a stabilization tuning
