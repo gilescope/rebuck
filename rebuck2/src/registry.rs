@@ -60,29 +60,41 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
+use futures::StreamExt;
 
-use crate::store::Store;
+use crate::store::{Store, Upload};
 
-/// Ceiling on a single blob upload. Uploads are buffered, so this is also the
-/// per-upload memory cost — the reason it is not simply "unlimited".
-const MAX_UPLOAD: usize = 2 * 1024 * 1024 * 1024;
+/// Ceiling on a single blob, enforced while streaming. Not a memory bound —
+/// blobs go to disk a chunk at a time — just a sanity limit.
+const MAX_UPLOAD: u64 = 16 * 1024 * 1024 * 1024;
+
+/// A manifest is small by construction (it is a list of descriptors), and we
+/// have to read it anyway to serve its `mediaType` back. Blobs stream; only
+/// this is buffered, and this bounds it.
+const MAX_MANIFEST: usize = 32 * 1024 * 1024;
 
 const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 
 /// What the registry needs of a blob store. Implemented for the local [`Store`]
-/// today; the mesh-backed driver is the same five methods with a network hop,
-/// which is the point of naming them.
+/// today; the mesh-backed driver is the same methods with a network hop, which
+/// is the point of naming them.
+///
+/// Blob writes go through [`Store::Upload`], never `&[u8]`: a layer is
+/// hundreds of MB and this runs on a CI runner next to a compiler.
 #[async_trait::async_trait]
 pub trait RegistryStore: Send + Sync + 'static {
     async fn blob_size(&self, hash: &str) -> Option<u64>;
     async fn blob_get(&self, hash: &str) -> Result<Option<Vec<u8>>>;
+    /// Small, known-bounded values only (manifests). Layers must stream.
     async fn blob_put(&self, bytes: &[u8]) -> Result<String>;
+    async fn upload_begin(&self) -> Result<Upload>;
+    async fn upload_finish(&self, up: Upload, expected: Option<&str>) -> Result<String>;
     /// `<repo>:<ref>` -> manifest digest.
     async fn tag_get(&self, key: &str) -> Option<String>;
     async fn tag_put(&self, key: &str, manifest_hash: &str) -> Result<()>;
@@ -99,6 +111,12 @@ impl RegistryStore for Store {
     async fn blob_put(&self, bytes: &[u8]) -> Result<String> {
         Ok(self.put(None, bytes).await?.hash)
     }
+    async fn upload_begin(&self) -> Result<Upload> {
+        self.begin_upload().await
+    }
+    async fn upload_finish(&self, up: Upload, expected: Option<&str>) -> Result<String> {
+        self.finish_upload(up, expected).await
+    }
     async fn tag_get(&self, key: &str) -> Option<String> {
         Store::tag_get(self, key).await
     }
@@ -110,18 +128,20 @@ impl RegistryStore for Store {
 struct Reg<S> {
     store: Arc<S>,
     next_upload: AtomicU64,
-    /// Open chunked-upload sessions: id -> bytes so far.
+    /// Open upload sessions: id -> the blob being streamed to disk.
     ///
-    /// BuildKit itself never needs these (containerd's pusher does monolithic
-    /// POST-then-PUT and leaves chunked upload as a `// TODO`), but every other
-    /// OCI client does — skopeo, crane and `docker push` all PATCH. Supporting
-    /// it costs ~20 lines and buys us verification against a real, independent
-    /// client instead of only against our own idea of the protocol.
+    /// Holds [`Upload`]s, not buffers: bytes go straight to a tmp file, hashed
+    /// on the way. An abandoned session's tmp file is reaped by `Upload`'s Drop
+    /// when the map is dropped.
     ///
-    /// An abandoned session leaks until the process exits. Acceptable for a
-    /// localhost sidecar with a single trusted client; a TTL sweep is the fix
-    /// if this ever faces anything else.
-    sessions: std::sync::Mutex<HashMap<u64, Vec<u8>>>,
+    /// A session is TAKEN from the map for the duration of a write and put back
+    /// after — so the (std, non-async) lock is never held across an await. A
+    /// client PATCHes one session sequentially, so there is nothing to contend.
+    ///
+    /// BuildKit itself never opens a chunked session (containerd's pusher does
+    /// monolithic POST-then-PUT and leaves chunked upload a `// TODO`), but
+    /// every other OCI client does — skopeo, crane and `docker push` all PATCH.
+    sessions: std::sync::Mutex<HashMap<u64, Upload>>,
 }
 
 /// Canonical `sha256:<64 lowercase hex>` -> the hex. Anything else is rejected
@@ -170,12 +190,44 @@ fn blob_response(method: &Method, bytes: Vec<u8>, digest: &str, ctype: &str) -> 
     (StatusCode::OK, h, bytes).into_response()
 }
 
+/// Drain a request body into an open [`Upload`], chunk by chunk. Bytes are
+/// hashed and written as they arrive and never accumulate, so peak memory is
+/// one chunk regardless of layer size. [`MAX_UPLOAD`] is enforced here: the
+/// streaming path deliberately bypasses the extractor's body limit.
+async fn drain_into(up: &mut Upload, body: Body) -> Result<(), Response> {
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "BLOB_UPLOAD_INVALID",
+                &format!("body stream: {e}"),
+            )
+        })?;
+        if up.len() + chunk.len() as u64 > MAX_UPLOAD {
+            return Err(err(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "BLOB_UPLOAD_INVALID",
+                "blob exceeds the upload ceiling",
+            ));
+        }
+        up.write(&chunk).await.map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "BLOB_UPLOAD_INVALID",
+                &e.to_string(),
+            )
+        })?;
+    }
+    Ok(())
+}
+
 async fn handle<S: RegistryStore>(
     State(reg): State<Arc<Reg<S>>>,
     method: Method,
     Path(path): Path<String>,
     Query(q): Query<HashMap<String, String>>,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     // POST /v2/<name>/blobs/uploads/ — begin an upload.
     // Checked before the generic blobs arm: this path *contains* "/blobs/".
@@ -197,8 +249,18 @@ async fn handle<S: RegistryStore>(
         }
         // Otherwise: 202 + Location. NOT 404/400 — the client treats those as a
         // hard error rather than "fall back to a normal upload".
+        let up = match reg.store.upload_begin().await {
+            Ok(u) => u,
+            Err(e) => {
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "BLOB_UPLOAD_INVALID",
+                    &e.to_string(),
+                )
+            }
+        };
         let id = reg.next_upload.fetch_add(1, Ordering::Relaxed);
-        reg.sessions.lock().unwrap().insert(id, Vec::new());
+        reg.sessions.lock().unwrap().insert(id, up);
         let mut h = HeaderMap::new();
         h.insert(
             header::LOCATION,
@@ -217,13 +279,20 @@ async fn handle<S: RegistryStore>(
             Err(_) => return err(StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", id),
         };
 
+        // Take the session out to write to it and put it back after: the lock
+        // is std, so it must never be held across an await.
+        let Some(mut up) = reg.sessions.lock().unwrap().remove(&id) else {
+            return err(StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", "no session");
+        };
+
         if method == Method::PATCH {
-            let mut s = reg.sessions.lock().unwrap();
-            let Some(buf) = s.get_mut(&id) else {
-                return err(StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", "no session");
-            };
-            buf.extend_from_slice(&body);
-            let end = buf.len().saturating_sub(1);
+            // On a stream error the session is NOT reinstated: `up` drops here
+            // and takes its tmp file with it. A half-written blob must not be
+            // resumable into a valid-looking digest.
+            if let Err(resp) = drain_into(&mut up, body).await {
+                return resp;
+            }
+            let end = up.len().saturating_sub(1);
             let mut h = HeaderMap::new();
             h.insert(
                 header::LOCATION,
@@ -233,10 +302,12 @@ async fn handle<S: RegistryStore>(
                 header::RANGE,
                 HeaderValue::from_str(&format!("0-{end}")).unwrap(),
             );
+            reg.sessions.lock().unwrap().insert(id, up);
             return (StatusCode::ACCEPTED, h).into_response();
         }
 
         if method != Method::PUT {
+            reg.sessions.lock().unwrap().insert(id, up);
             return err(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "UNSUPPORTED",
@@ -246,26 +317,16 @@ async fn handle<S: RegistryStore>(
         let Some(want) = q.get("digest").and_then(|d| parse_digest(d)) else {
             return err(StatusCode::BAD_REQUEST, "DIGEST_INVALID", "bad ?digest");
         };
-        // Whatever was PATCHed, plus whatever this PUT carries.
-        let mut bytes = reg.sessions.lock().unwrap().remove(&id).unwrap_or_default();
-        bytes.extend_from_slice(&body);
-        let got = match reg.store.blob_put(&bytes).await {
-            Ok(h) => h,
-            Err(e) => {
-                return err(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "BLOB_UPLOAD_INVALID",
-                    &e.to_string(),
-                )
-            }
-        };
-        if got != want {
-            return err(
-                StatusCode::BAD_REQUEST,
-                "DIGEST_INVALID",
-                &format!("digest mismatch: claimed sha256:{want}, got sha256:{got}"),
-            );
+        // The PUT may carry the final chunk on top of whatever was PATCHed.
+        if let Err(resp) = drain_into(&mut up, body).await {
+            return resp;
         }
+        // finish_upload rejects a mismatch: the CAS's contract is that a name
+        // means its content, so a lying client must not get to write it.
+        let got = match reg.store.upload_finish(up, Some(want)).await {
+            Ok(h) => h,
+            Err(e) => return err(StatusCode::BAD_REQUEST, "DIGEST_INVALID", &e.to_string()),
+        };
         let mut h = HeaderMap::new();
         h.insert(
             header::LOCATION,
@@ -283,7 +344,20 @@ async fn handle<S: RegistryStore>(
         let key = format!("{repo}:{reference}");
         match method {
             Method::PUT => {
-                let hash = match reg.store.blob_put(&body).await {
+                // The only buffered body in the registry, and bounded: a
+                // manifest is a short list of descriptors, and we must read it
+                // to serve its mediaType back anyway.
+                let bytes = match axum::body::to_bytes(body, MAX_MANIFEST).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        return err(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "MANIFEST_INVALID",
+                            &e.to_string(),
+                        )
+                    }
+                };
+                let hash = match reg.store.blob_put(&bytes).await {
                     Ok(h) => h,
                     Err(e) => {
                         return err(
@@ -385,7 +459,10 @@ pub fn router<S: RegistryStore>(store: Arc<S>) -> Router {
         // The `/v2/` probe: clients use a 200 here as "this is a registry".
         .route("/v2/", any(|| async { StatusCode::OK }))
         .route("/v2/{*path}", any(handle::<S>))
-        .layer(DefaultBodyLimit::max(MAX_UPLOAD))
+        // Blobs stream to disk, so the extractor's buffering limit must not
+        // apply — `drain_into` enforces MAX_UPLOAD as the bytes go past, and
+        // the manifest arm bounds itself with MAX_MANIFEST.
+        .layer(DefaultBodyLimit::disable())
         .with_state(reg)
 }
 
@@ -591,6 +668,43 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(body, payload);
+    }
+
+    /// A layer far bigger than any buffered body limit must round-trip. axum's
+    /// default extractor cap is 2 MiB and we disable it precisely because blobs
+    /// stream to disk a chunk at a time — this is the test that would fail the
+    /// moment someone reintroduces a `Bytes` extractor on the blob path.
+    #[tokio::test]
+    async fn blob_far_larger_than_any_buffer_limit_streams_through() {
+        let r = router(store());
+        let payload: Vec<u8> = (0..16 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let digest = format!("sha256:{}", crate::store::sha256_hex(&payload));
+
+        let (_, h, _) = call(&r, post("/v2/c/blobs/uploads/")).await;
+        let loc = h[header::LOCATION].to_str().unwrap().to_string();
+        let (st, _, _) = call(
+            &r,
+            Request::put(format!("{loc}?digest={digest}"))
+                .body(Body::from(payload.clone()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "16 MiB blob must stream through");
+
+        let (st, h, body) = call(
+            &r,
+            Request::get(format!("/v2/c/blobs/{digest}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body.len(), payload.len());
+        assert_eq!(body, payload);
+        assert_eq!(
+            h[header::CONTENT_LENGTH].to_str().unwrap(),
+            payload.len().to_string()
+        );
     }
 
     /// A PUT whose bytes do not match the digest it claims must be refused —
