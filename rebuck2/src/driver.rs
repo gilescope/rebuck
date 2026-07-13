@@ -198,6 +198,32 @@ const MAX_ATTEMPTS: u32 = 3;
 /// second worker — otherwise every action in a small build runs twice.
 const SPECULATE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Waiters attached to one single-flight leader, keyed by action hash.
+type InflightMap = HashMap<String, Vec<oneshot::Sender<Result<re::ActionResult, String>>>>;
+
+/// Clears a single-flight leader's entry if the leader is dropped before it
+/// completes (client disconnect, cancellation). Dropping the waiters' senders
+/// without sending makes each follower's `recv` fail, which sends it back
+/// around the claim loop to elect a NEW leader. An abandoned leader must not
+/// strand its followers — that would trade duplicate work for a hang.
+///
+/// `done` is set once the leader has taken the waiters out of the map, so the
+/// guard cannot remove a *successor's* entry (the ABA the flag exists to stop).
+struct LeaderGuard<'a> {
+    inflight: &'a std::sync::Mutex<InflightMap>,
+    hash: &'a str,
+    armed: bool,
+    done: bool,
+}
+
+impl Drop for LeaderGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed && !self.done {
+            self.inflight.lock().unwrap().remove(self.hash);
+        }
+    }
+}
+
 pub struct Driver {
     pub store: Arc<Store>,
     cfg: DriverCfg,
@@ -255,9 +281,21 @@ pub struct Driver {
     /// when ANY of its assignees uploads - union-sync makes both copies
     /// complete, so whichever wins is a full artifact).
     finalized_shards: Mutex<std::collections::BTreeSet<u8>>,
+    /// Single-flight index: action hash -> waiters on the leader's result.
+    /// Two concurrent Execute calls for one action execute it ONCE; the
+    /// second attaches. BuildKit gets this for free inside one daemon
+    /// (solver edge-merge) and loses it across daemons — the same property,
+    /// here, is what stops a CI matrix compiling the identical action on
+    /// every machine at once. See docs/buildkit-plan.md P2.
+    ///
+    /// std, not tokio, Mutex: [`LeaderGuard::drop`] must clear the entry and
+    /// cannot await. Never held across an await.
+    inflight: std::sync::Mutex<InflightMap>,
     pub ac_hit_ok: AtomicU64,
     pub ac_hit_fail: AtomicU64,
     pub dnc_exec: AtomicU64,
+    /// Executions elided by single-flight (followers that attached).
+    pub sf_merged: AtomicU64,
     /// Mesh endpoint, for read-through fetches from providers.
     mesh_ep: tokio::sync::OnceCell<Endpoint>,
 }
@@ -288,9 +326,11 @@ impl Driver {
             affinity_owner: Mutex::new(HashMap::new()),
             mesh_fetches: Semaphore::new(64),
             finalized_shards: Mutex::new(std::collections::BTreeSet::new()),
+            inflight: std::sync::Mutex::new(HashMap::new()),
             ac_hit_ok: AtomicU64::new(0),
             ac_hit_fail: AtomicU64::new(0),
             dnc_exec: AtomicU64::new(0),
+            sf_merged: AtomicU64::new(0),
             mesh_ep: tokio::sync::OnceCell::new(),
         })
     }
@@ -1582,40 +1622,110 @@ impl Driver {
             None
         };
 
-        let job_id = self.next_job.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.jobs.lock().await.insert(
-            job_id,
-            Job {
-                tx,
-                action: action_digest.clone(),
-                plat: plat.clone(),
-                worker: 0,
-                attempts: 0,
-                started: None,
-                speculated: false,
-                affinity,
-                locality,
-                submitted: std::time::Instant::now(),
-            },
-        );
-        self.queue
-            .lock()
-            .await
-            .entry(plat)
-            .or_default()
-            .push_back(job_id);
-        self.pump().await;
+        // Single-flight. `do_not_cache` actions must never merge: REAPI is
+        // explicit that "in-flight requests for the same Action may not be
+        // merged" for them (the prelude's diag wrappers want a real re-run).
+        let merge = !do_not_cache;
 
-        let action_result = rx
-            .await
-            .context("job dropped without completion")?
-            .map_err(|e| anyhow::anyhow!("execution failed: {e}"))?;
+        loop {
+            let waiter = if merge {
+                use std::collections::hash_map::Entry;
+                match self
+                    .inflight
+                    .lock()
+                    .unwrap()
+                    .entry(action_digest.hash.clone())
+                {
+                    Entry::Occupied(mut e) => {
+                        let (tx, rx) = oneshot::channel();
+                        e.get_mut().push(tx);
+                        Some(rx)
+                    }
+                    // We are the leader: claim the slot, then execute.
+                    Entry::Vacant(e) => {
+                        e.insert(Vec::new());
+                        None
+                    }
+                }
+            } else {
+                None
+            };
 
-        Ok(exec::Outcome {
-            action_result,
-            do_not_cache,
-        })
+            if let Some(rx) = waiter {
+                self.sf_merged.fetch_add(1, Ordering::Relaxed);
+                match rx.await {
+                    Ok(Ok(action_result)) => {
+                        return Ok(exec::Outcome {
+                            action_result,
+                            do_not_cache,
+                        })
+                    }
+                    // A genuine execution failure is the same failure for
+                    // every waiter — this action is this result.
+                    Ok(Err(e)) => bail!("execution failed: {e}"),
+                    // Leader abandoned before completing: re-elect.
+                    Err(_) => continue,
+                }
+            }
+
+            let mut guard = LeaderGuard {
+                inflight: &self.inflight,
+                hash: &action_digest.hash,
+                armed: merge,
+                done: false,
+            };
+
+            let job_id = self.next_job.fetch_add(1, Ordering::Relaxed);
+            let (tx, rx) = oneshot::channel();
+            self.jobs.lock().await.insert(
+                job_id,
+                Job {
+                    tx,
+                    action: action_digest.clone(),
+                    plat: plat.clone(),
+                    worker: 0,
+                    attempts: 0,
+                    started: None,
+                    speculated: false,
+                    affinity,
+                    locality,
+                    submitted: std::time::Instant::now(),
+                },
+            );
+            self.queue
+                .lock()
+                .await
+                .entry(plat.clone())
+                .or_default()
+                .push_back(job_id);
+            self.pump().await;
+
+            let res = rx.await;
+
+            // Take the waiters BEFORE disarming the guard, so a panic between
+            // the two still leaves the map clean.
+            let waiters = if merge {
+                self.inflight
+                    .lock()
+                    .unwrap()
+                    .remove(&action_digest.hash)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            guard.done = true;
+
+            let outcome = res.unwrap_or_else(|_| Err("job dropped without completion".to_string()));
+            for w in waiters {
+                let _ = w.send(outcome.clone());
+            }
+
+            let action_result = outcome.map_err(|e| anyhow::anyhow!("execution failed: {e}"))?;
+            return Ok(exec::Outcome {
+                action_result,
+                do_not_cache,
+            });
+        }
     }
 }
 
@@ -1887,6 +1997,156 @@ mod tests {
             preloaded_shard: None,
         });
         handle
+    }
+
+    /// Like `fake_worker`, but counts the Runs it was dispatched — the
+    /// execution counter a single-flight assertion needs.
+    async fn counting_worker(d: &Arc<Driver>, id: u64, slots: u32, os: &str) -> Arc<AtomicU32> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<D2W>();
+        let runs = Arc::new(AtomicU32::new(0));
+        let inflight = Arc::new(AtomicU32::new(0));
+        let d2 = d.clone();
+        let inf = inflight.clone();
+        let cnt = runs.clone();
+        tokio::spawn(async move {
+            while let Some(D2W::Run { job, .. }) = rx.recv().await {
+                cnt.fetch_add(1, Ordering::Relaxed);
+                let d3 = d2.clone();
+                let inf = inf.clone();
+                tokio::spawn(async move {
+                    // Long enough that a second execute() for the same
+                    // action is genuinely concurrent with the first.
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    inf.fetch_sub(1, Ordering::Relaxed);
+                    d3.complete(job, Ok(re::ActionResult::default())).await;
+                    d3.pump().await;
+                });
+            }
+        });
+        d.workers.lock().await.push(WorkerConn {
+            id,
+            tx,
+            inflight,
+            slots,
+            os: os.into(),
+            arch: "test_arch".into(),
+            endpoint: String::new(),
+            preloaded_shard: None,
+        });
+        runs
+    }
+
+    fn dig(hex: char) -> Dig {
+        Dig {
+            hash: std::iter::repeat_n(hex, 64).collect(),
+            size: 1,
+        }
+    }
+
+    /// Single-flight: two concurrent Execute calls for the SAME action must
+    /// execute it ONCE — the second attaches to the first's result. Without
+    /// this, a CI matrix (or two racing PRs) burns the identical compile on
+    /// every machine at once. This is the in-process half of the distributed
+    /// lease (docs/buildkit-plan.md P2); BuildKit gets the same property for
+    /// free inside one daemon and loses it across daemons.
+    #[tokio::test]
+    async fn concurrent_identical_actions_execute_once() {
+        let d = test_driver(false);
+        let runs = counting_worker(&d, 1, 4, "test").await;
+        let a = dig('a');
+
+        let (d1, d2, a1, a2) = (d.clone(), d.clone(), a.clone(), a.clone());
+        let h1 = tokio::spawn(async move { d1.execute(&a1).await });
+        let h2 = tokio::spawn(async move { d2.execute(&a2).await });
+        h1.await.unwrap().expect("leader failed");
+        h2.await.unwrap().expect("follower failed");
+
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            1,
+            "identical concurrent actions must execute once, not twice"
+        );
+    }
+
+    /// An abandoned leader (client disconnect / cancellation) must not strand
+    /// its followers. Dropping the leader's future drops the waiters' senders;
+    /// each follower's recv fails, it loops, and one of them becomes the new
+    /// leader. Trading duplicate work for a hang would be a bad bargain.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn abandoned_leader_re_elects_rather_than_hanging() {
+        let d = test_driver(false);
+        let runs = counting_worker(&d, 1, 4, "test").await;
+        let a = dig('c');
+
+        // Leader claims, then is cancelled mid-flight.
+        let (d1, a1) = (d.clone(), a.clone());
+        let leader = tokio::spawn(async move { d1.execute(&a1).await });
+        // Let it claim the slot and dispatch.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let (d2, a2) = (d.clone(), a.clone());
+        let follower = tokio::spawn(async move { d2.execute(&a2).await });
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        leader.abort();
+
+        // The follower must still complete — re-elected as leader.
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), follower)
+            .await
+            .expect("follower stranded by an abandoned leader");
+        got.unwrap().expect("re-elected follower must complete");
+        assert!(runs.load(Ordering::Relaxed) >= 1);
+        assert!(
+            d.inflight.lock().unwrap().is_empty(),
+            "in-flight entry leaked"
+        );
+    }
+
+    /// `do_not_cache` actions must never merge — REAPI is explicit that
+    /// in-flight requests for such an Action may not be coalesced. buck2's
+    /// prelude uses them for diagnostic wrappers that want a real re-run.
+    #[tokio::test]
+    async fn do_not_cache_actions_never_merge() {
+        use prost::Message;
+        let d = test_driver(false);
+        let runs = counting_worker(&d, 1, 4, "test").await;
+
+        let action = re::Action {
+            do_not_cache: true,
+            ..Default::default()
+        };
+        let mut bytes = Vec::new();
+        action.encode(&mut bytes).unwrap();
+        let a = d.store.put(None, &bytes).await.unwrap();
+
+        let (d1, d2, a1, a2) = (d.clone(), d.clone(), a.clone(), a.clone());
+        let h1 = tokio::spawn(async move { d1.execute(&a1).await });
+        let h2 = tokio::spawn(async move { d2.execute(&a2).await });
+        h1.await.unwrap().unwrap();
+        h2.await.unwrap().unwrap();
+
+        assert_eq!(
+            runs.load(Ordering::Relaxed),
+            2,
+            "do_not_cache actions must both execute"
+        );
+    }
+
+    /// Distinct actions must NOT be merged — the coalescing is keyed on the
+    /// action digest, not on "something is already running".
+    #[tokio::test]
+    async fn distinct_actions_still_both_execute() {
+        let d = test_driver(false);
+        let runs = counting_worker(&d, 1, 4, "test").await;
+
+        let (d1, d2) = (d.clone(), d.clone());
+        let (a, b) = (dig('a'), dig('b'));
+        let h1 = tokio::spawn(async move { d1.execute(&a).await });
+        let h2 = tokio::spawn(async move { d2.execute(&b).await });
+        h1.await.unwrap().unwrap();
+        h2.await.unwrap().unwrap();
+
+        assert_eq!(runs.load(Ordering::Relaxed), 2);
     }
 
     /// The join barrier is a latch: once the pool has formed, losing a
@@ -2340,7 +2600,11 @@ mod tests {
     }
 
     /// Store an Action demanding `os` and return its digest.
-    async fn platformed_action(d: &Arc<Driver>, os: &str) -> Dig {
+    /// `salt` keeps otherwise-identical actions distinct — REAPI's own field
+    /// for the purpose. Without it every action for a given os hashes the
+    /// same, and single-flight (correctly) collapses them into one execution,
+    /// which is not what a routing test means to measure.
+    async fn platformed_action(d: &Arc<Driver>, os: &str, salt: u32) -> Dig {
         use prost::Message;
         let action = re::Action {
             platform: Some(re::Platform {
@@ -2349,6 +2613,7 @@ mod tests {
                     value: os.into(),
                 }],
             }),
+            salt: salt.to_le_bytes().to_vec(),
             ..Default::default()
         };
         let mut bytes = Vec::new();
@@ -2369,7 +2634,7 @@ mod tests {
         let mut want: HashMap<String, &str> = HashMap::new();
         for i in 0..20u32 {
             let os = if i % 2 == 0 { "windows" } else { "macos" };
-            let dig = platformed_action(&d, os).await;
+            let dig = platformed_action(&d, os, i).await;
             want.insert(dig.hash.clone(), os);
             let d2 = d.clone();
             runs.push(tokio::spawn(async move { d2.execute(&dig).await }));
