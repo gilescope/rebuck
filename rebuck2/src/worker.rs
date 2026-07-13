@@ -219,7 +219,12 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
         };
         let (job, action) = match msg {
             D2W::Run { job, action } => (job, action),
-            D2W::Ping => continue,
+            D2W::Ping { vitals } => {
+                if let Some(v) = vitals {
+                    println!("[driver-vitals] {v}");
+                }
+                continue;
+            }
             D2W::Exit => {
                 println!("[worker] driver said exit — done");
                 return Ok(());

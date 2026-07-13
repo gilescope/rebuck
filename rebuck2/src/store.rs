@@ -84,6 +84,10 @@ pub fn verify_cas(dir: &std::path::Path) -> anyhow::Result<(u64, u64)> {
 }
 
 impl Store {
+    pub fn root_dir(&self) -> PathBuf {
+        self.root.clone()
+    }
+
     pub fn new(root: PathBuf) -> Result<Self> {
         for sub in ["cas", "ac", "tmp"] {
             std::fs::create_dir_all(root.join(sub))?;

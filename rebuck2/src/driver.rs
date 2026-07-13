@@ -83,6 +83,43 @@ pub enum AcLookup {
 
 /// Every CAS digest a cached result commits the server to delivering.
 /// Zero-size blobs are implicit in RE and skipped.
+/// One-line host memory/disk readout for the heartbeat. Best-effort and
+/// linux-oriented (the driver runs on ubuntu in CI); other hosts report
+/// what they can. Never fails - a vitals gap must not cost a heartbeat.
+fn host_vitals(store_root: &std::path::Path) -> String {
+    let mem = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            let field = |name: &str| {
+                s.lines()
+                    .find(|l| l.starts_with(name))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|kb| kb / 1024)
+            };
+            Some(format!(
+                "mem avail {}MB of {}MB, swap free {}MB",
+                field("MemAvailable:")?,
+                field("MemTotal:")?,
+                field("SwapFree:").unwrap_or(0),
+            ))
+        })
+        .unwrap_or_else(|| "mem ?".to_owned());
+    let disk = std::process::Command::new("df")
+        .arg("-Pm")
+        .arg(store_root)
+        .output()
+        .ok()
+        .and_then(|o| {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let l = out.lines().nth(1)?;
+            let avail = l.split_whitespace().nth(3)?;
+            Some(format!("disk avail {avail}MB at store"))
+        })
+        .unwrap_or_else(|| "disk ?".to_owned());
+    format!("{mem}; {disk}")
+}
+
 pub fn result_digests(r: &re::ActionResult) -> Vec<Dig> {
     let mut digs = Vec::new();
     let mut push = |d: &Option<re::Digest>| {
@@ -393,14 +430,27 @@ impl Driver {
 
         // Liveness heartbeat: event-driven gossip goes silent on idle legs,
         // and a worker can't tell a quiet driver from a dead one (see
-        // D2W::Ping). 20s beat, 90s worker patience.
+        // D2W::Ping). 20s beat, 90s worker patience. Every third beat
+        // carries the driver's memory/disk vitals: workers print them, so
+        // when the driver box dies (OOM killed the runner agent on
+        // 29232220897) its final vitals survive in every worker's log.
         {
             let this = self.clone();
+            let store_root = self.store.root_dir();
             tokio::spawn(async move {
+                let mut beat = 0u64;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    beat += 1;
+                    let vitals = if beat.is_multiple_of(3) {
+                        Some(host_vitals(&store_root))
+                    } else {
+                        None
+                    };
                     for w in this.workers.lock().await.iter() {
-                        let _ = w.tx.send(D2W::Ping);
+                        let _ = w.tx.send(D2W::Ping {
+                            vitals: vitals.clone(),
+                        });
                     }
                 }
             });
