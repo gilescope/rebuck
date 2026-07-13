@@ -34,6 +34,45 @@ Rendezvous is keyless: both sides derive the driver's iroh key from
 `--session` (default `$GITHUB_RUN_ID`), so runners in the same workflow run
 find each other with no service and no secrets.
 
+## Name-independent caching (on by default)
+
+Two targets that perform byte-identical work under different labels — the
+same crate vendored twice, a snapshot universe sharing versions with the
+base, two repos building the same dependency — normally miss each other's
+cache: the label leaks into the action digest via output paths,
+`-Cmetadata`, and path-env absolutization. The driver closes that gap with
+a second, canonical key (`norm.rs`):
+
+```text
+canonical key = SHA-256( normalize(Command)
+                       ∥ normalize(each @-argsfile blob, one level deep)
+                       ∥ sorted source-input content hash )
+```
+
+Normalization collapses label-derived tokens (`-Cmetadata`,
+`--buck-target`, `__target__/<hash>/` path segments, `lib*-<hash>.`
+filename suffixes) to fixed placeholders; work-relevant tokens (crate
+versions, `--target` triples, features) pass through untouched. A hit
+serves the original result's blobs under the requester's declared output
+paths, gated by the same blob-reachability check as the digest-keyed AC.
+
+Correctness properties:
+
+- a hit requires identical normalized command, identical argsfile content,
+  and an identical source tree — any divergence changes the key;
+- canonical-layer errors degrade to plain misses, never fail an action;
+- hit-consumers ingest byte-identical dep artifacts, so dedupe propagates
+  up the dependency graph one honest level per build.
+
+The one observable behaviour change: twin labels now receive identical
+symbol hashes, so linking two byte-identical twins into ONE binary fails
+loudly (duplicate symbols) where label-salted metadata previously let it
+slip through — a shape dependency resolvers don't produce. If you need
+that, or want the old behaviour: `--no-name-independent`.
+
+Currently probed for rustc actions (the first validated category); the
+mechanism is category-agnostic and widens as categories are proven.
+
 ## buck2 wiring
 
 `.buckconfig.local` in your project root (see `tests/e2e-local.sh`):

@@ -551,7 +551,7 @@ mod tests {
                 cache_failures: false,
                 locality: false,
                 prefetch_metadata: false,
-                name_independent: false,
+                name_independent: true,
                 addr_file: None,
                 finalize_file: None,
                 scratch: std::env::temp_dir(),

@@ -54,7 +54,12 @@ pub struct DriverCfg {
     pub prefetch_metadata: bool,
     /// Name-independent caching: consult/populate the canonical action
     /// cache (see norm.rs) so identical work under different labels shares
-    /// results. Opt-in; default off.
+    /// results. ON by default (--no-name-independent disables): a canonical
+    /// hit requires identical normalized command + argsfile content + source
+    /// tree, misses degrade silently, and the one behaviour change - twin
+    /// labels now get identical symbol hashes, so linking both into ONE
+    /// binary fails loudly instead of "working" via label-salted metadata -
+    /// is a shape dependency resolvers do not produce.
     pub name_independent: bool,
     /// Write the driver's full EndpointAddr (id + relay) here once bound.
     /// CI publishes it as a run artifact so workers can dial directly -
@@ -1568,11 +1573,16 @@ impl Driver {
     }
 
     /// Content hash of the input tree: sorted (rel-path, blob-hash) pairs
-    /// over every file EXCEPT .args files (those are normalized separately —
-    /// their raw bytes carry label tokens). Directory-proto digests are
-    /// deliberately not used: they embed nothing but names+digests anyway,
-    /// and walking files keeps .args exclusion simple.
-    async fn source_content_hash(&self, input_root: &Dig) -> Result<[u8; 32]> {
+    /// over every file EXCEPT the argsfiles actually reachable from the
+    /// command's @-references (those are normalized separately — their raw
+    /// bytes carry label tokens). Exact-path exclusion, not extension
+    /// matching: a crate shipping a data file named `*.args` must still
+    /// reach the key, or two actions differing only in it would share.
+    async fn source_content_hash(
+        &self,
+        input_root: &Dig,
+        exclude: &std::collections::HashSet<String>,
+    ) -> Result<[u8; 32]> {
         use sha2::{Digest as _, Sha256};
         let mut pairs: Vec<(String, String)> = Vec::new();
         let mut stack: Vec<(Dig, String)> = vec![(input_root.clone(), String::new())];
@@ -1582,7 +1592,7 @@ impl Driver {
             };
             let dir = re::Directory::decode(bytes.as_slice()).context("decode Directory")?;
             for f in &dir.files {
-                if f.name.ends_with(".args") {
+                if exclude.contains(&format!("{prefix}{}", f.name)) {
                     continue;
                 }
                 if let Some(d) = &f.digest {
@@ -1616,6 +1626,7 @@ impl Driver {
     async fn compute_canonical_key(&self, cmd: &re::Command, input_root: &Dig) -> Result<String> {
         let norm_cmd = crate::norm::normalize_command(cmd);
         let mut argsfiles: Vec<Vec<u8>> = Vec::new();
+        let mut reachable: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut queue: Vec<String> = cmd
             .arguments
             .iter()
@@ -1634,11 +1645,12 @@ impl Driver {
                     }
                 }
                 argsfiles.push(crate::norm::normalize_argsfile(&bytes));
+                reachable.insert(rel);
             }
             queue = next;
             depth += 1;
         }
-        let src = self.source_content_hash(input_root).await?;
+        let src = self.source_content_hash(input_root, &reachable).await?;
         Ok(crate::norm::canonical_key_from_parts(
             &norm_cmd, &argsfiles, &src,
         ))
@@ -2064,7 +2076,7 @@ mod tests {
             cache_failures: false,
             locality: false,
             prefetch_metadata: false,
-            name_independent: false,
+            name_independent: true,
             scratch: std::env::temp_dir(),
         };
         f(&mut cfg);
