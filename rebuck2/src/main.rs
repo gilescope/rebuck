@@ -12,6 +12,7 @@ mod bench;
 mod driver;
 mod exec;
 mod mesh;
+mod registry;
 mod rpc;
 mod store;
 mod worker;
@@ -28,6 +29,7 @@ fn usage() -> ! {
         "usage: rebuck2 driver [--grpc-port N] [--store DIR] [--session S] [--locality] \
          [--min-workers N] [--no-local-exec] [--decentralized-cas] [--no-hardlinks] [--no-reflink] [--cache-failures]\n       \
          rebuck2 worker [--store DIR] [--session S] [--slots N] [--preloaded-shard N] [--connect-wait-secs N] [--no-hardlinks] [--no-reflink]\n       \
+         rebuck2 registry [--store DIR] [--port N]\n       \
          rebuck2 verify-store --store DIR\n       \
          rebuck2 bench [--grpc URL] [--entries N] [--poisoned-pct P] [--plant-dir DIR] [--concurrency C] [--rounds R]"
     );
@@ -88,6 +90,22 @@ async fn main() -> Result<()> {
     let mut args = Args(argv);
     match role.as_str() {
         "driver" => run_driver(args).await,
+        // Serves the CAS as an OCI registry, so a buildkitd can point
+        // `--cache-to/--cache-from type=registry` at localhost. Standalone for
+        // now; the worker will stand one up per box (docs/buildkit-plan.md P1).
+        "registry" => {
+            let store = args
+                .opt("--store")
+                .map(Into::into)
+                .unwrap_or_else(|| default_store("registry"));
+            let port: u16 = args
+                .opt("--port")
+                .map(|s| s.parse().expect("--port: number"))
+                .unwrap_or(5000);
+            args.done();
+            let store = std::sync::Arc::new(store::Store::new(store)?);
+            registry::serve(([127, 0, 0, 1], port).into(), store).await
+        }
         "bench" => {
             let cfg = bench::BenchCfg {
                 grpc: args

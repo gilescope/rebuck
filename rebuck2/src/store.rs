@@ -85,7 +85,7 @@ pub fn verify_cas(dir: &std::path::Path) -> anyhow::Result<(u64, u64)> {
 
 impl Store {
     pub fn new(root: PathBuf) -> Result<Self> {
-        for sub in ["cas", "ac", "tmp"] {
+        for sub in ["cas", "ac", "tmp", "tags"] {
             std::fs::create_dir_all(root.join(sub))?;
         }
         Ok(Self {
@@ -442,6 +442,64 @@ impl Store {
 
     pub async fn ac_delete(&self, action_hash: &str) {
         let _ = tokio::fs::remove_file(self.root.join("ac").join(action_hash)).await;
+    }
+
+    /// Size of blob `hash`, if present. OCI hands us a digest with no size
+    /// (unlike REAPI, where every `Digest` carries one), so presence and
+    /// `Content-Length` both have to come off the filesystem. Getting the
+    /// length wrong is not cosmetic: BuildKit's cache importer caps the config
+    /// blob at 1 MiB and rejects a size mismatch *silently*.
+    pub async fn size_of(&self, hash: &str) -> Option<u64> {
+        if hash == EMPTY_SHA256 {
+            return Some(0);
+        }
+        tokio::fs::metadata(self.cas_path(hash))
+            .await
+            .ok()
+            .map(|m| m.len())
+    }
+
+    /// Blob by hash alone. See [`Store::size_of`] for why OCI needs this.
+    pub async fn get_by_hash(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        if hash == EMPTY_SHA256 {
+            return Ok(Some(Vec::new()));
+        }
+        match tokio::fs::read(self.cas_path(hash)).await {
+            Ok(b) => {
+                self.read_bytes
+                    .fetch_add(b.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                Ok(Some(b))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Tag namespace: an OCI ref (`<repo>:<tag>`) -> the manifest digest it
+    /// points at. The manifest bytes themselves are a CAS blob like any other;
+    /// a tag is only ever a mutable pointer into it.
+    ///
+    /// The key is HASHED, not used as a path component: `<repo>` arrives from
+    /// an HTTP path and would otherwise be a directory-traversal vector
+    /// (`/v2/../../etc/passwd/manifests/x`). Hashing makes traversal
+    /// unrepresentable rather than merely filtered.
+    fn tag_path(&self, key: &str) -> PathBuf {
+        self.root.join("tags").join(sha256_hex(key.as_bytes()))
+    }
+
+    pub async fn tag_get(&self, key: &str) -> Option<String> {
+        tokio::fs::read_to_string(self.tag_path(key)).await.ok()
+    }
+
+    pub async fn tag_put(&self, key: &str, manifest_hash: &str) -> Result<()> {
+        let hashed = sha256_hex(key.as_bytes());
+        let tmp = self
+            .root
+            .join("tmp")
+            .join(format!("tag-{hashed}.{}", std::process::id()));
+        tokio::fs::write(&tmp, manifest_hash).await?;
+        tokio::fs::rename(&tmp, self.tag_path(key)).await?;
+        Ok(())
     }
 }
 
