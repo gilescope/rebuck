@@ -14,6 +14,7 @@ use prost::Message;
 use re::action_cache_client::ActionCacheClient;
 use re::content_addressable_storage_client::ContentAddressableStorageClient;
 
+use crate::lease;
 use crate::store::sha256_hex;
 
 pub struct BenchCfg {
@@ -258,6 +259,7 @@ pub async fn fleet(cfg: FleetCfg) -> Result<FleetMetrics> {
             addr_file: Some(addr_file.clone()),
             finalize_file: None,
             scratch: root.join("driver-exec"),
+            lease_ttl: lease::DEFAULT_LEASE_TTL,
         },
         Arc::new(crate::payload::reapi::Reapi),
     );

@@ -11,6 +11,7 @@
 mod bench;
 mod driver;
 mod exec;
+mod lease;
 mod mesh;
 mod payload;
 mod registry;
@@ -28,9 +29,10 @@ use bazel_remote_apis::google::bytestream as bs;
 fn usage() -> ! {
     eprintln!(
         "usage: rebuck2 driver [--grpc-port N] [--registry-port N] [--store DIR] [--session S] [--locality] \
-         [--min-workers N] [--no-local-exec] [--decentralized-cas] [--no-hardlinks] [--no-reflink] [--cache-failures]\n       \
+         [--lease-ttl-secs N] [--min-workers N] [--no-local-exec] [--decentralized-cas] [--no-hardlinks] [--no-reflink] [--cache-failures]\n       \
          rebuck2 worker [--store DIR] [--session S] [--slots N] [--preloaded-shard N] [--connect-wait-secs N] [--no-hardlinks] [--no-reflink]\n       \
          rebuck2 registry [--store DIR] [--port N] [--bind IP]\n       \
+         rebuck2 claim --key K [--session S]   (stdin = result to publish)\n       \
          rebuck2 verify-store --store DIR\n       \
          rebuck2 bench [--grpc URL] [--entries N] [--poisoned-pct P] [--plant-dir DIR] [--concurrency C] [--rounds R]"
     );
@@ -193,6 +195,19 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        // Cross-machine single-flight from a standalone process — the shape a
+        // forked buildkitd takes (docs/buildkit-plan.md P2). Also the only way
+        // to exercise the mesh lease path until that fork exists.
+        "claim" => {
+            let session = args.opt("--session").unwrap_or_else(default_session);
+            let key = args.opt("--key").unwrap_or_else(|| usage());
+            args.done();
+            // Leader: prints "leader", holds the lease until stdin closes, then
+            // publishes what stdin yielded. Follower: blocks, prints the
+            // leader's result. Exits 75 if the leader vanished (re-claim).
+            let code = worker::claim_once(&session, &key).await?;
+            std::process::exit(code);
+        }
         "worker" => {
             let store_root: std::path::PathBuf = args
                 .opt("--store")
@@ -244,6 +259,14 @@ async fn run_driver(mut args: Args) -> Result<()> {
     let registry_port: Option<u16> = args
         .opt("--registry-port")
         .map(|s| s.parse().expect("--registry-port: port"));
+    // How long a silent lease holder is presumed alive. This is the worst-case
+    // stall a follower suffers when a leader is hard-killed (no QUIC close), so
+    // short-job fleets may want it lower — at the risk of evicting a live
+    // leader and duplicating the work the lease exists to save.
+    let lease_ttl = args
+        .opt("--lease-ttl-secs")
+        .map(|s| Duration::from_secs(s.parse().expect("--lease-ttl-secs: number")))
+        .unwrap_or(lease::DEFAULT_LEASE_TTL);
     let store_root: std::path::PathBuf = args
         .opt("--store")
         .map(Into::into)
@@ -269,6 +292,7 @@ async fn run_driver(mut args: Args) -> Result<()> {
         addr_file: args.opt("--addr-file").map(Into::into),
         finalize_file: args.opt("--finalize-file").map(Into::into),
         scratch,
+        lease_ttl,
     };
     args.done();
 
@@ -308,7 +332,7 @@ async fn run_driver(mut args: Args) -> Result<()> {
                     d.ac_hit_ok.load(Relaxed),
                     d.ac_hit_fail.load(Relaxed),
                     d.dnc_exec.load(Relaxed),
-                    d.sf_merged.load(Relaxed),
+                    d.sf_merged(),
                     d.queue_summary().await,
                     rs.ac_hits.load(Relaxed),
                     rs.ac_misses.load(Relaxed),

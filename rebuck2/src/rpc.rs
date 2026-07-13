@@ -534,6 +534,7 @@ fn rpc_status(code: tonic::Code, msg: &str) -> bazel_remote_apis::google::rpc::S
 mod tests {
     use super::*;
     use crate::driver::{Driver, DriverCfg};
+    use crate::lease;
     use tonic::Request;
 
     /// sha256("abc") - the store verifies content digests on put.
@@ -556,6 +557,7 @@ mod tests {
                 addr_file: None,
                 finalize_file: None,
                 scratch: std::env::temp_dir(),
+                lease_ttl: lease::DEFAULT_LEASE_TTL,
             },
             Arc::new(crate::payload::reapi::Reapi),
         );

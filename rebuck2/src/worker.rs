@@ -403,6 +403,146 @@ struct RemoteBlobs {
     hits_driver: std::sync::atomic::AtomicU64,
 }
 
+/// Claim a key over the mesh from a standalone process — the shape a forked
+/// buildkitd takes: dial the driver, ask, act. Exposed as `rebuck2 claim` so
+/// the mesh lease path is exercisable (and debuggable) without a fork existing.
+///
+/// Prints `leader` and exits 0 if you must build it; prints the leader's result
+/// to stdout and exits 0 if someone else did; exits 75 (EX_TEMPFAIL) to say
+/// "re-claim" if the leader vanished.
+pub async fn claim_once(session: &str, key: &str) -> Result<i32> {
+    use tokio::io::AsyncReadExt;
+
+    let ep = Endpoint::builder(iroh::endpoint::presets::N0)
+        .alpns(vec![mesh::ALPN.to_vec()])
+        .bind()
+        .await?;
+    let conn = ep.connect(mesh::driver_id(session), mesh::ALPN).await?;
+    // Announce as a client, not a worker: we want a lease, not a job.
+    let (mut ctrl, _ctrl_recv) = conn.open_bi().await?;
+    mesh::send_frame(&mut ctrl, &W2D::ClientHello).await?;
+
+    match claim(&conn, key).await? {
+        Claimed::Leader => {
+            println!("leader");
+            // HOLD the lease while "building". A lease lives only as long as
+            // its holder's connection does — drop it and the driver rightly
+            // hands the job to someone else. A real builder keeps its
+            // connection open for exactly this reason; here stdin stands in
+            // for the build, and what it yields is the result.
+            let mut result = Vec::new();
+            tokio::io::stdin().read_to_end(&mut result).await?;
+            release_lease(&conn, key, Ok(result)).await?;
+            Ok(0)
+        }
+        Claimed::Done(result) => {
+            use std::io::Write;
+            std::io::stdout().write_all(&result)?;
+            Ok(0)
+        }
+        Claimed::Failed(e) => {
+            eprintln!("leader failed: {e}");
+            Ok(1)
+        }
+        Claimed::Retry => {
+            eprintln!("leader vanished; re-claim");
+            Ok(75) // EX_TEMPFAIL
+        }
+    }
+}
+
+/// What a claimant is told (see [`crate::lease`]).
+pub enum Claimed {
+    /// You build it. Heartbeat until you publish, or the driver will assume you
+    /// died and hand the job to someone else.
+    Leader,
+    /// A peer built it (or is about to). These are its result bytes.
+    Done(Vec<u8>),
+    /// The leader failed. Same job, same failure.
+    Failed(String),
+    /// The leader vanished without publishing. Claim again.
+    Retry,
+}
+
+/// Cross-machine single-flight, worker side.
+///
+/// A buildkitd fork calls this before executing a vertex, keyed on its fast
+/// cache key: the first daemon to ask builds, the rest wait and reuse. That is
+/// the property one buildkitd gets free from its own solver, and which N
+/// ephemeral daemons otherwise lose. See docs/buildkit-plan.md P2.
+pub async fn claim(conn: &iroh::endpoint::Connection, key: &str) -> Result<Claimed> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    mesh::send_frame(
+        &mut send,
+        &BlobReq::Claim {
+            key: key.to_string(),
+        },
+    )
+    .await?;
+    send.finish()?;
+    match mesh::recv_frame::<BlobResp>(&mut recv)
+        .await?
+        .context("driver closed the lease stream")?
+    {
+        BlobResp::LeaseGranted => Ok(Claimed::Leader),
+        // The driver keeps this stream open and PUSHES the outcome, so a
+        // leader's death arrives as LeaseRetry rather than as silence. A closed
+        // stream means the driver itself went away: retry, never hang.
+        BlobResp::LeaseHeld => match mesh::recv_frame::<BlobResp>(&mut recv).await? {
+            Some(BlobResp::LeaseDone(Ok(r))) => Ok(Claimed::Done(r)),
+            Some(BlobResp::LeaseDone(Err(e))) => Ok(Claimed::Failed(e)),
+            _ => Ok(Claimed::Retry),
+        },
+        other => bail!("unexpected reply to Claim: {other:?}"),
+    }
+}
+
+/// Tell the driver we are still working. `false` means we no longer hold the
+/// lease (we were reaped as silent, and someone else owns the job now) — stop,
+/// and re-claim.
+///
+/// Unused in-tree: a leader that finishes inside [`crate::lease::LEASE_TTL`]
+/// never needs to heartbeat, and `rebuck2 claim` is one-shot. The consumer is
+/// the forked buildkitd, whose vertices can outrun the TTL. Kept (and kept
+/// tested via `Leases::heartbeat`) because adding it later means discovering
+/// the need through 90-second timeouts in CI.
+#[allow(dead_code)]
+pub async fn heartbeat(conn: &iroh::endpoint::Connection, key: &str) -> Result<bool> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    mesh::send_frame(
+        &mut send,
+        &BlobReq::Heartbeat {
+            key: key.to_string(),
+        },
+    )
+    .await?;
+    send.finish()?;
+    match mesh::recv_frame::<BlobResp>(&mut recv).await? {
+        Some(BlobResp::LeaseAlive(alive)) => Ok(alive),
+        _ => Ok(false),
+    }
+}
+
+/// Publish our result and wake every follower.
+pub async fn release_lease(
+    conn: &iroh::endpoint::Connection,
+    key: &str,
+    result: Result<Vec<u8>, String>,
+) -> Result<()> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    mesh::send_frame(
+        &mut send,
+        &BlobReq::Release {
+            key: key.to_string(),
+            result,
+        },
+    )
+    .await?;
+    send.finish()?;
+    let _ = mesh::recv_frame::<BlobResp>(&mut recv).await?;
+    Ok(())
+}
+
 impl RemoteBlobs {
     async fn upload_bytes(&self, d: &Dig, bytes: &[u8]) -> Result<()> {
         let (mut send, mut recv) = self.conn.open_bi().await?;

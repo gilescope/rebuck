@@ -84,6 +84,10 @@ impl Bloom {
 /// Worker → driver, on the control stream.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum W2D {
+    /// A peer that is NOT a worker: it wants blobs or a lease, not jobs. The
+    /// driver serves its streams without enrolling it in the pool — otherwise
+    /// a one-shot `rebuck2 claim` would be scheduled work it cannot do.
+    ClientHello,
     Hello {
         os: String,
         arch: String,
@@ -166,10 +170,43 @@ pub enum BlobReq {
     /// sequential per-file staging at ~12 RTT-bound fetches/s was a 20-minute
     /// pre-rustc stall on the big crate forests (run 29160244348).
     GetMany(Vec<Dig>),
+
+    /// Cross-machine single-flight (see [`crate::lease`]). A worker asks the
+    /// driver — the fleet's single coordinator, so there is no consensus
+    /// problem here, only a liveness one — whether it should build `key` or
+    /// wait for a peer that already is.
+    ///
+    /// The reply stream stays OPEN for a follower: the driver pushes
+    /// `LeaseDone`/`LeaseRetry` when the leader publishes or dies, rather than
+    /// making the worker poll.
+    Claim {
+        key: String,
+    },
+    /// "Still working" — extend the claim. A holder that stops heartbeating is
+    /// assumed dead and its followers are freed.
+    Heartbeat {
+        key: String,
+    },
+    /// Publish a result (or a failure) and wake every follower.
+    Release {
+        key: String,
+        result: Result<Vec<u8>, String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum BlobResp {
+    /// You own `key`: build it, heartbeat, then `Release`.
+    LeaseGranted,
+    /// A peer owns it. Keep this stream open — the result arrives on it.
+    LeaseHeld,
+    /// The leader published. This is the payload's encoded result.
+    LeaseDone(Result<Vec<u8>, String>),
+    /// The leader died without publishing. Claim again; one of the waiters
+    /// becomes the new leader. Never a hang.
+    LeaseRetry,
+    /// Heartbeat accepted (false = you no longer hold it; stop and re-claim).
+    LeaseAlive(bool),
     /// Raw bytes follow on the same stream.
     Found {
         size: u64,

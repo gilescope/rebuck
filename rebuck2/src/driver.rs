@@ -15,6 +15,7 @@ use iroh::endpoint::Connection;
 use iroh::Endpoint;
 use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 
+use crate::lease;
 use crate::mesh::{self, BlobReq, BlobResp, Dig, D2W, W2D};
 use crate::payload::Payload;
 use crate::store::Store;
@@ -57,6 +58,11 @@ pub struct DriverCfg {
     /// for their whole 30-minute window).
     pub addr_file: Option<std::path::PathBuf>,
     pub scratch: std::path::PathBuf,
+    /// How long a remote lease holder may go silent before it is presumed dead
+    /// and its followers re-elect. This is the detection latency for a hard
+    /// kill (no QUIC close frame), so it is also the worst-case stall a
+    /// follower can suffer. See [`crate::lease`].
+    pub lease_ttl: std::time::Duration,
 }
 
 /// Outcome of a validated AC lookup ([`Driver::validated_ac_get`]).
@@ -153,28 +159,27 @@ const MAX_ATTEMPTS: u32 = 3;
 /// second worker — otherwise every action in a small build runs twice.
 const SPECULATE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Waiters attached to one single-flight leader, keyed by action hash.
-type InflightMap = HashMap<String, Vec<oneshot::Sender<Result<Vec<u8>, String>>>>;
-
-/// Clears a single-flight leader's entry if the leader is dropped before it
-/// completes (client disconnect, cancellation). Dropping the waiters' senders
-/// without sending makes each follower's `recv` fail, which sends it back
-/// around the claim loop to elect a NEW leader. An abandoned leader must not
-/// strand its followers — that would trade duplicate work for a hang.
-///
-/// `done` is set once the leader has taken the waiters out of the map, so the
-/// guard cannot remove a *successor's* entry (the ABA the flag exists to stop).
+/// Frees a local leader's followers if the leader is dropped before it publishes
+/// (client disconnect, cancellation, panic). Without this they wait on a result
+/// nobody is computing — trading duplicate work for a hang, which is the worse
+/// bug of the two.
 struct LeaderGuard<'a> {
-    inflight: &'a std::sync::Mutex<InflightMap>,
-    hash: &'a str,
+    leases: &'a lease::Leases,
+    key: &'a str,
     armed: bool,
     done: bool,
+}
+
+impl LeaderGuard<'_> {
+    fn disarm(mut self) {
+        self.done = true;
+    }
 }
 
 impl Drop for LeaderGuard<'_> {
     fn drop(&mut self) {
         if self.armed && !self.done {
-            self.inflight.lock().unwrap().remove(self.hash);
+            self.leases.abandon_local(self.key);
         }
     }
 }
@@ -246,20 +251,20 @@ pub struct Driver {
     /// here, is what stops a CI matrix compiling the identical action on
     /// every machine at once. See docs/buildkit-plan.md P2.
     ///
-    /// std, not tokio, Mutex: [`LeaderGuard::drop`] must clear the entry and
-    /// cannot await. Never held across an await.
-    inflight: std::sync::Mutex<InflightMap>,
+    /// Cross-machine single-flight. Local claims today (one driver = one
+    /// coordinator for buck2); the mesh arm lets a worker's buildkitd claim
+    /// too. See [`crate::lease`].
+    leases: lease::Leases,
     pub ac_hit_ok: AtomicU64,
     pub ac_hit_fail: AtomicU64,
     pub dnc_exec: AtomicU64,
-    /// Executions elided by single-flight (followers that attached).
-    pub sf_merged: AtomicU64,
     /// Mesh endpoint, for read-through fetches from providers.
     mesh_ep: tokio::sync::OnceCell<Endpoint>,
 }
 
 impl Driver {
     pub fn new(store: Arc<Store>, cfg: DriverCfg, payload: Arc<dyn Payload>) -> Arc<Self> {
+        let lease_ttl = cfg.lease_ttl;
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
@@ -285,11 +290,10 @@ impl Driver {
             affinity_owner: Mutex::new(HashMap::new()),
             mesh_fetches: Semaphore::new(64),
             finalized_shards: Mutex::new(std::collections::BTreeSet::new()),
-            inflight: std::sync::Mutex::new(HashMap::new()),
+            leases: lease::Leases::with_ttl(lease_ttl),
             ac_hit_ok: AtomicU64::new(0),
             ac_hit_fail: AtomicU64::new(0),
             dnc_exec: AtomicU64::new(0),
-            sf_merged: AtomicU64::new(0),
             mesh_ep: tokio::sync::OnceCell::new(),
         })
     }
@@ -379,6 +383,12 @@ impl Driver {
         // Liveness heartbeat: event-driven gossip goes silent on idle legs,
         // and a worker can't tell a quiet driver from a dead one (see
         // D2W::Ping). 20s beat, 90s worker patience.
+        //
+        // The same beat reaps dead lease holders. `evict_peer` already handles
+        // a clean disconnect; this is the backstop for the messier deaths — a
+        // hung process, a severed network, a runner yanked mid-action — where
+        // silence is the only signal we get. Without it a follower waits on a
+        // job nobody is building.
         {
             let this = self.clone();
             tokio::spawn(async move {
@@ -386,6 +396,22 @@ impl Driver {
                     tokio::time::sleep(std::time::Duration::from_secs(20)).await;
                     for w in this.workers.lock().await.iter() {
                         let _ = w.tx.send(D2W::Ping);
+                    }
+                }
+            });
+        }
+
+        // Reaper, on its own faster beat. A leader killed with -9 sends no QUIC
+        // close, so `evict_peer` never fires for it; silence is the only signal
+        // and this is what listens for it.
+        {
+            let this = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(lease::REAP_EVERY).await;
+                    let reaped = this.reap_leases();
+                    if reaped > 0 {
+                        println!("[driver] reaped {reaped} lease(s) from silent holders");
                     }
                 }
             });
@@ -427,11 +453,36 @@ impl Driver {
     }
 
     async fn handle_worker(self: &Arc<Self>, conn: Connection) -> Result<()> {
-        // Control stream is the first bi-stream the worker opens.
+        // Control stream is the first bi-stream the peer opens.
         let (ctrl_send, mut ctrl_recv) = conn.accept_bi().await?;
         let hello: W2D = mesh::recv_frame(&mut ctrl_recv)
             .await?
-            .context("worker hung up before Hello")?;
+            .context("peer hung up before Hello")?;
+
+        // A bare client (a lease claimant, a blob reader) is not a worker: it
+        // takes no jobs and joins no pool. Serve its streams and let it go —
+        // enrolling it would schedule work it cannot do.
+        if matches!(hello, W2D::ClientHello) {
+            let endpoint = conn.remote_id().to_string();
+            while let Ok((send, recv)) = conn.accept_bi().await {
+                let driver = self.clone();
+                let peer = endpoint.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = serve_blob_stream(driver, peer, send, recv).await {
+                        eprintln!("[driver] client stream error: {e:#}");
+                    }
+                });
+            }
+            // The client is gone. Anything it was leading is now ownerless —
+            // free its followers immediately rather than making them wait out
+            // the full TTL to discover nobody is building their job.
+            let freed = self.leases.evict_peer(&endpoint);
+            if freed > 0 {
+                println!("[driver] client left holding {freed} lease(s) — followers re-elect");
+            }
+            return Ok(());
+        }
+
         let W2D::Hello {
             os,
             arch,
@@ -493,11 +544,13 @@ impl Driver {
         // blob streams: each request on its own bi-stream
         let blob_conn = conn.clone();
         let blob_driver = self.clone();
+        let blob_ep = endpoint.clone();
         let blobs = tokio::spawn(async move {
             while let Ok((send, recv)) = blob_conn.accept_bi().await {
                 let driver = blob_driver.clone();
+                let peer = blob_ep.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = serve_blob_stream(driver, send, recv).await {
+                    if let Err(e) = serve_blob_stream(driver, peer, send, recv).await {
                         eprintln!("[driver] blob stream error: {e:#}");
                     }
                 });
@@ -553,7 +606,9 @@ impl Driver {
                             });
                         }
                     }
-                    W2D::Hello { .. } => bail!("unexpected second Hello"),
+                    W2D::Hello { .. } | W2D::ClientHello => {
+                        bail!("unexpected second Hello on a worker stream")
+                    }
                 }
             }
         }
@@ -564,6 +619,15 @@ impl Driver {
         // servable verdicts - revalidate everything from here on.
         self.memo_servable.write().await.clear();
         self.blooms.lock().await.remove(&endpoint);
+        // It is also not coming back to heartbeat. Free anyone waiting on a
+        // lease it held NOW, rather than making them wait out the full TTL to
+        // discover that nobody is building their job.
+        let freed = self.leases.evict_peer(&endpoint);
+        if freed > 0 {
+            println!(
+                "[driver] worker {worker_id} left holding {freed} lease(s) — followers re-elect"
+            );
+        }
         println!("[driver] worker {worker_id} left");
         writer.abort();
         blobs.abort();
@@ -617,9 +681,26 @@ impl Driver {
                 locality: false,
                 prefetch_metadata: false,
                 scratch: std::env::temp_dir(),
+                lease_ttl: lease::DEFAULT_LEASE_TTL,
             },
             Arc::new(crate::payload::reapi::Reapi),
         )
+    }
+
+    /// Executions elided by single-flight — followers that attached to a
+    /// leader instead of rebuilding. The whole point, counted.
+    pub fn sf_merged(&self) -> u64 {
+        self.leases.merged.load(Ordering::Relaxed)
+    }
+
+    /// The fleet's lease table — cross-machine single-flight.
+    pub fn lease_table(&self) -> &lease::Leases {
+        &self.leases
+    }
+
+    /// Expire leases whose holder has gone quiet, and free their waiters.
+    pub fn reap_leases(&self) -> usize {
+        self.leases.reap()
     }
 
     pub fn cache_failures(&self) -> bool {
@@ -1546,55 +1627,38 @@ impl Driver {
             None
         };
 
-        // Single-flight. `do_not_cache` actions must never merge: REAPI is
-        // explicit that "in-flight requests for the same Action may not be
-        // merged" for them (the prelude's diag wrappers want a real re-run).
+        // Single-flight. `do_not_cache` jobs never merge: REAPI is explicit that
+        // in-flight requests for such an Action may not be coalesced (the
+        // prelude's diag wrappers want a genuine re-run).
         let merge = !do_not_cache;
+        let key = &action_digest.hash;
 
         loop {
-            let waiter = if merge {
-                use std::collections::hash_map::Entry;
-                match self
-                    .inflight
-                    .lock()
-                    .unwrap()
-                    .entry(action_digest.hash.clone())
-                {
-                    Entry::Occupied(mut e) => {
-                        let (tx, rx) = oneshot::channel();
-                        e.get_mut().push(tx);
-                        Some(rx)
+            if merge {
+                if let lease::Claim::Follower(rx) = self.leases.claim_local(key) {
+                    match rx.await {
+                        Ok(lease::Outcome::Done(result)) => {
+                            return Ok(crate::payload::Done {
+                                result,
+                                do_not_cache,
+                            })
+                        }
+                        // The same job is the same failure for every waiter.
+                        Ok(lease::Outcome::Failed(e)) => bail!("execution failed: {e}"),
+                        // The leader vanished (cancelled, or its channel died).
+                        // Go round again — one of us becomes the new leader
+                        // rather than all of us waiting on a corpse.
+                        Ok(lease::Outcome::Retry) | Err(_) => continue,
                     }
-                    // We are the leader: claim the slot, then execute.
-                    Entry::Vacant(e) => {
-                        e.insert(Vec::new());
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-
-            if let Some(rx) = waiter {
-                self.sf_merged.fetch_add(1, Ordering::Relaxed);
-                match rx.await {
-                    Ok(Ok(result)) => {
-                        return Ok(crate::payload::Done {
-                            result,
-                            do_not_cache,
-                        })
-                    }
-                    // A genuine execution failure is the same failure for
-                    // every waiter — this action is this result.
-                    Ok(Err(e)) => bail!("execution failed: {e}"),
-                    // Leader abandoned before completing: re-elect.
-                    Err(_) => continue,
                 }
             }
 
-            let mut guard = LeaderGuard {
-                inflight: &self.inflight,
-                hash: &action_digest.hash,
+            // We lead. The guard frees our followers if we are dropped before
+            // publishing (client disconnect, cancellation): trading duplicate
+            // work for a hang would be a bad bargain.
+            let guard = LeaderGuard {
+                leases: &self.leases,
+                key,
                 armed: merge,
                 done: false,
             };
@@ -1624,25 +1688,20 @@ impl Driver {
                 .push_back(job_id);
             self.pump().await;
 
-            let res = rx.await;
-
-            // Take the waiters BEFORE disarming the guard, so a panic between
-            // the two still leaves the map clean.
-            let waiters = if merge {
-                self.inflight
-                    .lock()
-                    .unwrap()
-                    .remove(&action_digest.hash)
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            guard.done = true;
-
-            let outcome = res.unwrap_or_else(|_| Err("job dropped without completion".to_string()));
-            for w in waiters {
-                let _ = w.send(outcome.clone());
+            let outcome = rx
+                .await
+                .unwrap_or_else(|_| Err("job dropped without completion".to_string()));
+            if merge {
+                self.leases.release(
+                    key,
+                    None,
+                    match &outcome {
+                        Ok(r) => lease::Outcome::Done(r.clone()),
+                        Err(e) => lease::Outcome::Failed(e.clone()),
+                    },
+                );
             }
+            guard.disarm();
 
             let result = outcome.map_err(|e| anyhow::anyhow!("execution failed: {e}"))?;
             return Ok(crate::payload::Done {
@@ -1725,8 +1784,12 @@ impl crate::store::Blobs for StoreBlobs {
     }
 }
 
+/// `peer` is who is asking. A lease is OWNED by an endpoint: an anonymous claim
+/// could not be heartbeated, evicted on disconnect, or defended against a
+/// zombie's late release.
 async fn serve_blob_stream(
     driver: Arc<Driver>,
+    peer: String,
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
 ) -> Result<()> {
@@ -1785,6 +1848,40 @@ async fn serve_blob_stream(
         // redirect in decentralized mode, read-through get_blob otherwise);
         // workers issue chunks on parallel streams, so the read-through
         // relaying fans out across streams even though each stream is serial.
+        // --- cross-machine single-flight (docs/buildkit-plan.md P2) ---
+        BlobReq::Claim { key } => {
+            match driver.leases.claim_peer(&key, &peer) {
+                lease::Claim::Leader => {
+                    mesh::send_frame(&mut send, &BlobResp::LeaseGranted).await?;
+                }
+                lease::Claim::Follower(rx) => {
+                    // Hold the stream open and PUSH the outcome. The worker
+                    // does not poll, and a leader's death reaches it as a
+                    // LeaseRetry rather than as silence.
+                    mesh::send_frame(&mut send, &BlobResp::LeaseHeld).await?;
+                    let resp = match rx.await {
+                        Ok(lease::Outcome::Done(r)) => BlobResp::LeaseDone(Ok(r)),
+                        Ok(lease::Outcome::Failed(e)) => BlobResp::LeaseDone(Err(e)),
+                        // Sender dropped == the lease was torn down. Same
+                        // remedy: claim again.
+                        Ok(lease::Outcome::Retry) | Err(_) => BlobResp::LeaseRetry,
+                    };
+                    mesh::send_frame(&mut send, &resp).await?;
+                }
+            }
+        }
+        BlobReq::Heartbeat { key } => {
+            let alive = driver.leases.heartbeat(&key, &peer);
+            mesh::send_frame(&mut send, &BlobResp::LeaseAlive(alive)).await?;
+        }
+        BlobReq::Release { key, result } => {
+            let outcome = match result {
+                Ok(r) => lease::Outcome::Done(r),
+                Err(e) => lease::Outcome::Failed(e),
+            };
+            driver.leases.release(&key, Some(&peer), outcome);
+            mesh::send_frame(&mut send, &BlobResp::PutOk).await?;
+        }
         BlobReq::GetMany(digs) => {
             for d in &digs {
                 let redirect = if driver.cfg.decentralized {
@@ -1888,6 +1985,7 @@ mod tests {
             locality: false,
             prefetch_metadata: false,
             scratch: std::env::temp_dir(),
+            lease_ttl: lease::DEFAULT_LEASE_TTL,
         };
         f(&mut cfg);
         Driver::new(
@@ -1913,6 +2011,7 @@ mod tests {
                 locality: false,
                 prefetch_metadata: false,
                 scratch: std::env::temp_dir(),
+                lease_ttl: lease::DEFAULT_LEASE_TTL,
             },
             Arc::new(crate::payload::reapi::Reapi),
         )
@@ -2050,10 +2149,7 @@ mod tests {
             .expect("follower stranded by an abandoned leader");
         got.unwrap().expect("re-elected follower must complete");
         assert!(runs.load(Ordering::Relaxed) >= 1);
-        assert!(
-            d.inflight.lock().unwrap().is_empty(),
-            "in-flight entry leaked"
-        );
+        assert!(d.leases.is_empty(), "the abandoned lease leaked");
     }
 
     /// `do_not_cache` actions must never merge — REAPI is explicit that

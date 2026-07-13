@@ -98,6 +98,12 @@ pub trait RegistryStore: Send + Sync + 'static {
     /// `<repo>:<ref>` -> manifest digest.
     async fn tag_get(&self, key: &str) -> Option<String>;
     async fn tag_put(&self, key: &str, manifest_hash: &str) -> Result<()>;
+
+    /// Cross-machine single-flight, if this backend has a fleet to coordinate.
+    /// A bare store does not (there is nobody to race); a driver does.
+    fn leases(&self) -> Option<&crate::lease::Leases> {
+        None
+    }
 }
 
 #[async_trait::async_trait]
@@ -166,6 +172,9 @@ impl RegistryStore for crate::driver::Driver {
     }
     async fn tag_put(&self, key: &str, manifest_hash: &str) -> Result<()> {
         self.store.tag_put(key, manifest_hash).await
+    }
+    fn leases(&self) -> Option<&crate::lease::Leases> {
+        Some(self.lease_table())
     }
 }
 
@@ -493,6 +502,85 @@ async fn handle<S: RegistryStore>(
     }
 }
 
+/// Cross-machine single-flight over HTTP — the surface a forked buildkitd calls
+/// before executing a vertex, keyed on its fast cache key (`currentIndexKey`,
+/// which is stable across machines by construction: it is what BuildKit already
+/// exports for `--cache-from`).
+///
+/// `claim` BLOCKS for a follower until the leader publishes, so the caller need
+/// not poll, and a leader's death arrives as `409 Conflict` (retry) rather than
+/// as silence. See [`crate::lease`] and docs/buildkit-plan.md P2.
+///
+/// ```text
+/// POST /_rebuck/lease/claim/<key>      200 lead | 200 <result> | 409 retry
+/// POST /_rebuck/lease/heartbeat/<key>  200 alive | 409 you were reaped
+/// POST /_rebuck/lease/release/<key>    body = the result bytes
+/// ```
+async fn lease_handle<S: RegistryStore>(
+    State(reg): State<Arc<Reg<S>>>,
+    method: Method,
+    Path(path): Path<String>,
+    body: Body,
+) -> Response {
+    if method != Method::POST {
+        return err(StatusCode::METHOD_NOT_ALLOWED, "UNSUPPORTED", "POST only");
+    }
+    let Some(leases) = reg.store.leases() else {
+        return err(
+            StatusCode::NOT_IMPLEMENTED,
+            "UNSUPPORTED",
+            "this registry has no fleet to coordinate",
+        );
+    };
+    let Some((op, key)) = path.split_once('/') else {
+        return err(StatusCode::NOT_FOUND, "UNSUPPORTED", &path);
+    };
+    if key.is_empty() {
+        return err(StatusCode::BAD_REQUEST, "UNSUPPORTED", "empty lease key");
+    }
+
+    match op {
+        "claim" => match leases.claim_local(key) {
+            crate::lease::Claim::Leader => {
+                (StatusCode::OK, [("X-Rebuck-Lease", "leader")]).into_response()
+            }
+            crate::lease::Claim::Follower(rx) => match rx.await {
+                Ok(crate::lease::Outcome::Done(result)) => {
+                    (StatusCode::OK, [("X-Rebuck-Lease", "follower")], result).into_response()
+                }
+                Ok(crate::lease::Outcome::Failed(e)) => {
+                    err(StatusCode::BAD_GATEWAY, "LEASE_FAILED", &e)
+                }
+                // The leader died. Never a hang: the caller re-claims and one
+                // of the waiters becomes the new leader.
+                Ok(crate::lease::Outcome::Retry) | Err(_) => err(
+                    StatusCode::CONFLICT,
+                    "LEASE_RETRY",
+                    "leader vanished; re-claim",
+                ),
+            },
+        },
+        "heartbeat" => {
+            // Local holders are drop-guarded and need no heartbeat; this exists
+            // for symmetry with the mesh path and always succeeds for a live key.
+            if leases.heartbeat_local(key) {
+                (StatusCode::OK, "alive").into_response()
+            } else {
+                err(StatusCode::CONFLICT, "LEASE_RETRY", "you no longer hold it")
+            }
+        }
+        "release" => {
+            let bytes = match axum::body::to_bytes(body, MAX_MANIFEST).await {
+                Ok(b) => b,
+                Err(e) => return err(StatusCode::PAYLOAD_TOO_LARGE, "UNSUPPORTED", &e.to_string()),
+            };
+            leases.release(key, None, crate::lease::Outcome::Done(bytes.to_vec()));
+            (StatusCode::OK, "released").into_response()
+        }
+        _ => err(StatusCode::NOT_FOUND, "UNSUPPORTED", op),
+    }
+}
+
 pub fn router<S: RegistryStore>(store: Arc<S>) -> Router {
     let reg = Arc::new(Reg {
         store,
@@ -503,6 +591,7 @@ pub fn router<S: RegistryStore>(store: Arc<S>) -> Router {
         // The `/v2/` probe: clients use a 200 here as "this is a registry".
         .route("/v2/", any(|| async { StatusCode::OK }))
         .route("/v2/{*path}", any(handle::<S>))
+        .route("/_rebuck/lease/{*path}", any(lease_handle::<S>))
         // Blobs stream to disk, so the extractor's buffering limit must not
         // apply — `drain_into` enforces MAX_UPLOAD as the bytes go past, and
         // the manifest arm bounds itself with MAX_MANIFEST.
@@ -892,6 +981,86 @@ mod tests {
 
         let got = d.get_blob_by_hash(&hash).await.unwrap();
         assert_eq!(got.unwrap(), payload);
+    }
+
+    /// The HTTP surface a forked buildkitd calls. Two daemons racing the same
+    /// cache key: one is told to build, the other BLOCKS and is handed the
+    /// result. This is the property one buildkitd gets free from its own solver
+    /// and which N ephemeral daemons otherwise lose — the whole of P2.
+    #[tokio::test]
+    async fn two_daemons_racing_one_key_build_it_once() {
+        let r = router(crate::driver::Driver::for_test());
+
+        let (st, h, _) = call(&r, post("/_rebuck/lease/claim/sha256:abc")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(
+            h["X-Rebuck-Lease"], "leader",
+            "the first claimant must build it"
+        );
+
+        // The second daemon blocks — it must not build the same thing.
+        let r2 = r.clone();
+        let follower =
+            tokio::spawn(async move { call(&r2, post("/_rebuck/lease/claim/sha256:abc")).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !follower.is_finished(),
+            "the follower must WAIT, not rebuild"
+        );
+
+        // Leader publishes; the follower is handed the result it never built.
+        let (st, _, _) = call(
+            &r,
+            Request::post("/_rebuck/lease/release/sha256:abc")
+                .body(Body::from("the one true layer"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+
+        let (st, h, body) = follower.await.unwrap();
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(h["X-Rebuck-Lease"], "follower");
+        assert_eq!(body, b"the one true layer");
+    }
+
+    /// A leader that dies must free its followers to re-elect, not strand them.
+    /// 409 says "claim again"; silence would hang the build, which is a worse
+    /// bug than the duplicate work we set out to prevent.
+    #[tokio::test]
+    async fn a_dead_leader_tells_its_follower_to_retry_not_to_wait() {
+        let d = crate::driver::Driver::for_test();
+        let r = router(d.clone());
+
+        let (st, _, _) = call(&r, post("/_rebuck/lease/claim/k")).await;
+        assert_eq!(st, StatusCode::OK);
+
+        let r2 = r.clone();
+        let follower = tokio::spawn(async move { call(&r2, post("/_rebuck/lease/claim/k")).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The leader vanishes without publishing.
+        d.lease_table().abandon_local("k");
+
+        let (st, _, _) = follower.await.unwrap();
+        assert_eq!(
+            st,
+            StatusCode::CONFLICT,
+            "a stranded follower must be told to re-claim"
+        );
+        // ... and the key is genuinely up for grabs again.
+        let (st, h, _) = call(&r, post("/_rebuck/lease/claim/k")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(h["X-Rebuck-Lease"], "leader");
+    }
+
+    /// A bare store has no fleet to coordinate, and must say so rather than
+    /// pretend to hold a lease nobody is honouring.
+    #[tokio::test]
+    async fn a_storeonly_registry_refuses_leases() {
+        let r = router(store());
+        let (st, _, _) = call(&r, post("/_rebuck/lease/claim/k")).await;
+        assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
     }
 
     /// A repo name is a path segment too. Hashing the tag key makes traversal
