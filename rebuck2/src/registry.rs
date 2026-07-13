@@ -125,6 +125,50 @@ impl RegistryStore for Store {
     }
 }
 
+/// Mesh-backed: a blob we do not hold is fetched from whichever worker does
+/// (provider index -> bloom claimants -> exact probe), cached locally, and
+/// served. This is what makes the registry *distributed* rather than a local
+/// disk cache: a layer built on worker A is served to worker B's buildkitd over
+/// iroh, without either of them knowing the mesh exists.
+///
+/// Tags stay driver-local. The registry runs beside the driver, which is the
+/// one process every worker can already reach, so there is nothing to
+/// propagate yet. A registry *per worker* would need tags gossiped over the
+/// mesh — that is the next step, not this one.
+#[async_trait::async_trait]
+impl RegistryStore for crate::driver::Driver {
+    async fn blob_size(&self, hash: &str) -> Option<u64> {
+        if let Some(n) = self.store.size_of(hash).await {
+            return Some(n);
+        }
+        // A HEAD must be honest about FLEET-wide presence, not just ours, or
+        // BuildKit re-pushes layers the fleet already holds. Costs a fetch on
+        // first probe — and the GET that always follows then finds it local.
+        match self.get_blob_by_hash(hash).await {
+            Ok(Some(bytes)) => Some(bytes.len() as u64),
+            _ => None,
+        }
+    }
+    async fn blob_get(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        self.get_blob_by_hash(hash).await
+    }
+    async fn blob_put(&self, bytes: &[u8]) -> Result<String> {
+        Ok(self.store.put(None, bytes).await?.hash)
+    }
+    async fn upload_begin(&self) -> Result<Upload> {
+        self.store.begin_upload().await
+    }
+    async fn upload_finish(&self, up: Upload, expected: Option<&str>) -> Result<String> {
+        self.store.finish_upload(up, expected).await
+    }
+    async fn tag_get(&self, key: &str) -> Option<String> {
+        self.store.tag_get(key).await
+    }
+    async fn tag_put(&self, key: &str, manifest_hash: &str) -> Result<()> {
+        self.store.tag_put(key, manifest_hash).await
+    }
+}
+
 struct Reg<S> {
     store: Arc<S>,
     next_upload: AtomicU64,
@@ -791,6 +835,63 @@ mod tests {
             .await;
             assert_eq!(st, StatusCode::BAD_REQUEST, "accepted a bad digest: {bad}");
         }
+    }
+
+    /// The registry over a real [`Driver`] (not a bare Store): a blob the
+    /// driver holds is served, and the mesh is never consulted. The
+    /// cross-machine half — a blob only a WORKER holds, fetched over iroh — is
+    /// tests/e2e-registry.sh, which needs a real mesh to mean anything.
+    #[tokio::test]
+    async fn registry_over_driver_serves_a_held_blob() {
+        let d = crate::driver::Driver::for_test();
+        let payload = b"a layer the driver holds".to_vec();
+        let hash = d.store.put(None, &payload).await.unwrap().hash;
+        let r = router(d);
+
+        let (st, h, body) = call(
+            &r,
+            Request::get(format!("/v2/cache/blobs/sha256:{hash}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body, payload);
+        assert_eq!(
+            h[header::CONTENT_LENGTH].to_str().unwrap(),
+            payload.len().to_string()
+        );
+    }
+
+    /// With no workers and no local copy, a miss must be an honest 404 — not a
+    /// hang, and not a 500. BuildKit reads 404 as "push it", which is right;
+    /// anything else stalls or fails the build.
+    #[tokio::test]
+    async fn registry_over_driver_404s_when_nobody_holds_it() {
+        let r = router(crate::driver::Driver::for_test());
+        let absent = format!("sha256:{}", "b".repeat(64));
+        let (st, _, _) = call(
+            &r,
+            Request::get(format!("/v2/c/blobs/{absent}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    /// Regression: an OCI digest carries no size, and the mesh cache-back
+    /// verifies what it fetched. Faking a zero size would make `put(Some(d))`
+    /// reject every non-empty blob as a digest mismatch, so the hash-only path
+    /// must degenerate the size check rather than invent one.
+    #[tokio::test]
+    async fn hash_only_fetch_does_not_trip_the_size_check() {
+        let d = crate::driver::Driver::for_test();
+        let payload = b"non-empty, so a zero size would be a lie".to_vec();
+        let hash = d.store.put(None, &payload).await.unwrap().hash;
+
+        let got = d.get_blob_by_hash(&hash).await.unwrap();
+        assert_eq!(got.unwrap(), payload);
     }
 
     /// A repo name is a path segment too. Hashing the tag key makes traversal

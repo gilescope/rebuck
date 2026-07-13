@@ -26,7 +26,7 @@ use bazel_remote_apis::google::bytestream as bs;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: rebuck2 driver [--grpc-port N] [--store DIR] [--session S] [--locality] \
+        "usage: rebuck2 driver [--grpc-port N] [--registry-port N] [--store DIR] [--session S] [--locality] \
          [--min-workers N] [--no-local-exec] [--decentralized-cas] [--no-hardlinks] [--no-reflink] [--cache-failures]\n       \
          rebuck2 worker [--store DIR] [--session S] [--slots N] [--preloaded-shard N] [--connect-wait-secs N] [--no-hardlinks] [--no-reflink]\n       \
          rebuck2 registry [--store DIR] [--port N]\n       \
@@ -226,6 +226,11 @@ async fn run_driver(mut args: Args) -> Result<()> {
         .opt("--grpc-port")
         .map(|s| s.parse().expect("--grpc-port: port"))
         .unwrap_or(9092);
+    // Off unless asked for: the OCI facade is only useful to a buildkitd, and a
+    // buck2 run should not pay for a listener it will never dial.
+    let registry_port: Option<u16> = args
+        .opt("--registry-port")
+        .map(|s| s.parse().expect("--registry-port: port"));
     let store_root: std::path::PathBuf = args
         .opt("--store")
         .map(Into::into)
@@ -301,6 +306,17 @@ async fn run_driver(mut args: Args) -> Result<()> {
                     gib(rs.blob_write_bytes.load(Relaxed)),
                 );
                 last_read = read;
+            }
+        });
+    }
+
+    // The OCI facade, mesh-backed: a buildkitd's `--cache-to/--cache-from
+    // type=registry` against this port reaches blobs held anywhere on the mesh.
+    if let Some(port) = registry_port {
+        let d = d.clone();
+        tokio::spawn(async move {
+            if let Err(e) = registry::serve(([127, 0, 0, 1], port).into(), d).await {
+                eprintln!("[registry] died: {e:#}");
             }
         });
     }

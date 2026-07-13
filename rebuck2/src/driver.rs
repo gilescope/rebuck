@@ -639,6 +639,29 @@ impl Driver {
         read_result
     }
 
+    /// A driver with a throwaway store and no workers — the registry tests need
+    /// one, and they live in another module.
+    #[cfg(test)]
+    pub fn for_test() -> Arc<Self> {
+        let dir = tempfile::tempdir().unwrap().keep();
+        Driver::new(
+            Arc::new(Store::new(dir).unwrap()),
+            DriverCfg {
+                session: "test".into(),
+                min_workers: 0,
+                local_exec: false,
+                decentralized: false,
+                hardlinks: true,
+                addr_file: None,
+                finalize_file: None,
+                cache_failures: false,
+                locality: false,
+                prefetch_metadata: false,
+                scratch: std::env::temp_dir(),
+            },
+        )
+    }
+
     pub fn cache_failures(&self) -> bool {
         self.cfg.cache_failures
     }
@@ -998,7 +1021,27 @@ impl Driver {
     /// action failures (healing4/5). Failed hints are evicted so
     /// rediscovery stays honest.
     pub async fn get_blob(&self, d: &Dig) -> Result<Option<Vec<u8>>> {
-        if let Some(bytes) = self.store.get(d).await? {
+        self.get_blob_inner(&d.hash, Some(d.size)).await
+    }
+
+    /// Read-through fetch by hash alone — the OCI path.
+    ///
+    /// REAPI digests always carry a size; an OCI digest never does. The size is
+    /// not needed to FIND a blob (store, blooms, provider index and the mesh
+    /// `Get` are all hash-keyed) — only to verify what came back. So a hash-only
+    /// caller verifies by hash, and the size check degenerates rather than
+    /// being faked: passing a zero size would make the cache-back's
+    /// `put(Some(d))` reject every non-empty blob as a digest mismatch.
+    pub async fn get_blob_by_hash(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        self.get_blob_inner(hash, None).await
+    }
+
+    async fn get_blob_inner(&self, hash: &str, size: Option<i64>) -> Result<Option<Vec<u8>>> {
+        let d = &Dig {
+            hash: hash.to_string(),
+            size: size.unwrap_or_default(),
+        };
+        if let Some(bytes) = self.store.get_by_hash(hash).await? {
             return Ok(Some(bytes));
         }
         let _permit = self.mesh_fetches.acquire().await;
@@ -1041,7 +1084,14 @@ impl Driver {
             for endpoint in candidates {
                 match self.fetch_blob_from(&endpoint, d).await {
                     Ok(Some(bytes)) => {
-                        self.store.put(Some(d), &bytes).await?;
+                        // Verify by hash always; by size only when the caller
+                        // knew one. An OCI caller does not, so the size check
+                        // degenerates instead of rejecting every blob.
+                        let expect = Dig {
+                            hash: d.hash.clone(),
+                            size: size.unwrap_or(bytes.len() as i64),
+                        };
+                        self.store.put(Some(&expect), &bytes).await?;
                         self.providers.lock().await.insert(d.hash.clone(), endpoint);
                         return Ok(Some(bytes));
                     }
