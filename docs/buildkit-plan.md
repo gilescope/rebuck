@@ -1,98 +1,94 @@
 # rebuck as a distributed BuildKit — plan
 
-Reuse the fleet (mesh + CAS + lifecycle) to give earthbuild what Earthly
-Satellites gave, but over free GitHub-Actions cache instead of a paid cloud.
-Along the way, split the codebase along the seam that makes a third payload
-cheap.
+Give a fleet of ephemeral earthbuild/buildkitd runners the two things a single
+persistent buildkitd gives for free — a shared warm layer cache, and
+**build-once** (never compile the same thing on two machines at once) — over
+free GitHub-Actions cache instead of a paid cloud. Along the way, split the
+codebase along the seam that makes a third payload cheap.
 
 Companion to [re-engine-plan.md](re-engine-plan.md) (buck2/REAPI, shipped).
 
 ## North star
 
-**Satellites via free GitHub caching.** Earthly Satellites were never
-intra-build target sharding — `earthly --sat X +t` ran the *whole* build on
-one remote buildkitd. What you paid for was the satellite's **persistent warm
-disk**: layer cache *and* `type=cache` mounts surviving across builds. Decompose
-it:
+**Recreate, across N ephemeral daemons, the single-flight that one persistent
+daemon gives for free.** Two wants, one root cause:
 
-| what a Satellite gave | our free-GH equivalent | cost |
-| -------------------------------- | ---------------------------------- | ---- |
-| warm layer cache (persistent disk) | **P1** mesh OCI registry | ~3 wk, no fork |
-| warm `type=cache` mounts (disk) | **P2** mesh-backed snapshotter | fork buildkit |
-| a remote buildkitd | a buildkitd on a runner | none |
+| want | when it bites | mechanism |
+| ------------------------------------ | ----------------------- | --------- |
+| built layers reused elsewhere | build B *after* A | P1 mesh registry (after-the-fact) |
+| **don't build the same thing twice, concurrently** | A and B *at once* | P2 distributed single-flight (in-flight) |
 
-The warm cache — not distribution — is the product. rebuck supplies it from
-the iroh mesh + the `actions/cache` shard machinery already built for buck2.
+The root cause of both: **a single buildkitd already single-flights** — its
+solver edge-merges concurrent identical vertices (`Solver.actives` on the
+vertex digest, `jobs.go:44`; edge merge on the fast key, `scheduler.go:309`;
+`flightcontrol.Group` in `sharedOp`, `jobs.go:956`). Many builds hitting *one*
+daemon get build-once for free; that is *why Earthly Satellites felt good*. The
+moment you have N independent daemons (a CI matrix), each has its own solver and
+the property is lost. rebuck's job is to restore it across the mesh.
 
-## What changed since v2
+We cannot just keep one big daemon: no persistent host is a stated non-goal
+(everything ephemeral on GH runners). The lease is the price of ephemerality.
 
-Two constraints the panel decided under are now lifted, and one version fact
-landed:
+## The gap is real (confirmed)
 
-- **We own both forks.** earthbuild is bumped on branch `giles-update-latest-buildkit`
-  ([EarthBuild/earthbuild#442](https://github.com/EarthBuild/earthbuild/pull/442));
-  the buildkit fork is [EarthBuild/buildkit](https://github.com/EarthBuild/buildkit).
-  "No fork" is no longer a hard rule — the rule is now **minimise fork
-  surface**, spend it only where it kills a load-bearing risk.
-- **That deletes the shim.** v2's P2 impersonated buildkitd
-  (`Control`+`LLBBridge`+`Session`, the reverse-gRPC hijack, the `pullping`
-  relay) *because* we couldn't touch either side. The panel voted registry-only
-  3-0 largely to escape that swamp. With fork freedom the swamp is irrelevant:
-  we don't impersonate buildkitd, we run a real one and point earthbuild at it.
-  **Both v2 fatal objections evaporate** — they were about the shim.
-- **The buildkit bump is a containerd v1 -> v2 jump.** #442 pins buildkit
-  v0.30.0 / containerd v2.2.5 / grpc 1.80 (base `main` is still v0.31.1 /
-  containerd v1). The buildkit semver nominally dips; the real move is
-  containerd **v2**, which is the API the P2 snapshotter targets.
+The container-build world has **no** cross-machine build dedup:
+
+- BuildKit vertex digests are "not between different invocations" — explicitly
+  single-daemon ([solver design](https://crazymax.dev/buildkit/design/solver/)).
+- Depot, Dagger, Nix/nixbuild.net all do *after-the-fact* cache reuse; two
+  concurrent builds of the same thing both run. Depot even scales *out* under
+  load (cache clones), destroying dedup.
+- Bazel RE solved it in 2022: BuildBuddy "action merging" and NativeLink
+  `AwaitedActionDb` — lease keyed on the action digest, heartbeat TTL, waiters
+  attach via `WaitExecution`, hedged execution on stall, crashed holder → TTL
+  expiry. That is the proven design; we port it to the mesh.
 
 ## The finding that still holds
 
-**An LLB `ExecOp` is not dispatchable to an arbitrary worker, and forking does
-not change that.** Inputs are containerd snapshot chains (local overlayfs), not
-Merkle trees; `MountType_SECRET`/`SSH` call back to the client mid-exec;
-network is unrestricted. Forking buildkit does not make snapshots
-content-addressed. So intra-build DAG sharding stays a rewrite of buildkitd's
-executor — [moby/buildkit#62](https://github.com/moby/buildkit/issues/62)
-("RFC: Distributed BuildKit", closed unimplemented), and Dagger's answer
-(Project Theseus, 2024-25) was to *replace* the LLB solver, not distribute it.
+An LLB `ExecOp` is not dispatchable to an arbitrary worker, and forking does
+not change it (snapshot chains are local overlayfs, not Merkle trees). So we do
+**not** shard one build across daemons —
+[moby/buildkit#62](https://github.com/moby/buildkit/issues/62) closed
+unimplemented; Dagger *replaced* the LLB solver rather than distribute it. We
+mirror Satellites (one buildkitd per build) and add cross-daemon coordination,
+not cross-daemon execution.
 
-This is why we mirror Satellites (one buildkitd per build) rather than beat
-them: nobody sharded one LLB graph, and the reason is structural, not
-lack-of-effort.
+## What changed since v2
+
+- **We own both forks.** earthbuild #442 (`giles-update-latest-buildkit`);
+  buildkit fork [EarthBuild/buildkit](https://github.com/EarthBuild/buildkit).
+  The rule is now **minimise fork surface**, not "no fork".
+- **The shim is deleted.** v2's P2 impersonated buildkitd (reverse-gRPC hijack,
+  `pullping` relay) only because we couldn't touch either side; the panel voted
+  registry-only 3-0 to escape it. We run a real buildkitd and point earthbuild
+  at it. Both v2 fatal objections were about the shim.
+- **containerd v1 -> v2.** #442 pins buildkit v0.30.0 / containerd v2.2.5 /
+  grpc 1.80 (the semver dips; the real move is containerd v2).
 
 ## Distribution model — one buildkitd per invocation
 
-Verified in the earthbuild source: `cmd/earthly/subcmd/build_cmd.go:364`
-constructs a single `bkClient`, passed as one `Builder.BkClient` field
-(`:551`); there is no client collection anywhere in non-test code, and
-`BuildkitAddress` is a single string. A satellite name just resolved to that
-one address. **One build -> one buildkitd, always.**
-
-So distribution comes from the CI matrix (N runners, each its own earthbuild +
-buildkitd, sharded by target at the workflow level — the sweep workflows
-already do this for buck2), and *sharing* comes from the mesh cache. This is
-exactly the registry-only design the panel picked, and it needs no shim.
-
-Intra-build target routing (one earthbuild fanning targets across N daemons) is
-an **optional future** earthbuild change — thread a per-target client selector
-through the single `BkClient` at `build_cmd.go:364`. Not needed to match
-Satellites; scope only if a real workload wants it.
+Verified: `cmd/earthly/subcmd/build_cmd.go:364` builds a single `bkClient`, one
+`Builder.BkClient` field (`:551`), no client collection anywhere non-test,
+`BuildkitAddress` is one string. **One build -> one buildkitd, always.** So
+distribution is the CI matrix (as buck2 already shards), coordination is the
+mesh. Intra-build multi-host routing is an optional future earthbuild change at
+`build_cmd.go:364`; not needed here.
 
 ## Sequencing
 
 | phase | what | fork | weeks |
 | ----- | ---- | ---- | ----- |
-| P0 | payload/fleet trait split | none | 1-2 |
+| P0 | payload/fleet trait split (+ lease service) | none | 1-2 |
 | P1 | mesh OCI registry facade | none | ~3 |
-| — | benchmark vs ghcr.io at **steady state** | — | — |
-| P2 | mesh-backed cache mounts | buildkit | 4-8 |
+| P2 | **distributed single-flight** | buildkit ~60 LoC | 3-5 |
+| P3 | mesh-backed cache mounts | buildkit (plugin) | 4-8 |
 
-P1 ships alone and is the whole layer-cache half of Satellites. P2 is what
-turns "registry cache" into "Satellites"; gate it on P1 numbers.
+P1 + P2 are the headline (warm cache + build-once). P3 is the remaining
+Satellite warmth (`type=cache` mounts); gate on P1/P2 numbers.
 
 ## P0 — payload/fleet split
 
-The fleet does not care what a job is. Only four things reach into `re::`:
+Only four things reach into `re::`:
 
 | leak | today | fix |
 | ---- | ----- | --- |
@@ -104,183 +100,195 @@ The fleet does not care what a job is. Only four things reach into `re::`:
 Everything else — queue, blooms, providers, `peer_conns`, `affinity_owner`,
 `memo_servable`, `finalized_shards` — is already payload-blind.
 
-### Traits
+### Traits + the lease service
 
 ```rust
 /// Scheduling metadata extracted from an opaque job spec.
-/// The fleet never decodes the spec itself.
 pub trait JobSpec: Send + Sync {
     fn platform(&self) -> PlatKey;
-
-    /// Pin all jobs sharing this key to ONE worker, ONE directory.
-    /// buck2: the `__<crate>__/` output prefix — rustc folds env!-read
-    ///   values into the SVH, so pipelined twins in different dirs are
-    ///   link-incompatible (E0460).
-    /// buildkit: the Earthly target — type=cache mounts are node-local,
-    ///   so a migrated target loses its warm cargo/npm registry.
-    /// Same mechanism, same reason: some state will not travel.
+    /// Pin jobs sharing this key to ONE worker, ONE dir.
+    /// buck2: `__<crate>__/` prefix (SVH/E0460). buildkit: the target
+    /// (node-local type=cache mounts). Same reason: some state won't travel.
     fn affinity(&self) -> Option<String>;
-
-    /// Heaviest inputs, for delay-scheduled locality. Blooms lie safely.
     fn locality_hints(&self) -> Vec<Dig>;
-
     fn encode(&self) -> Vec<u8>;
 }
 
 /// Driver-side: the protocol the build tool dials.
 #[async_trait]
 pub trait Frontend: Send + Sync + 'static {
-    async fn serve(self: Arc<Self>, fleet: Arc<Fleet>, addr: SocketAddr)
-        -> Result<()>;
-
-    /// Blobs a cached result references. The fleet refuses a cache hit
-    /// whose blobs it cannot produce — the validated-AC invariant is
-    /// generic and load-bearing (17k blob-less hits -> 34k client extract
-    /// failures; optimizations.md). Only the decoding is payload-specific.
+    async fn serve(self: Arc<Self>, fleet: Arc<Fleet>, addr: SocketAddr) -> Result<()>;
+    /// Blobs a cached result references. The fleet refuses a hit whose blobs
+    /// it can't produce (validated-AC invariant; optimizations.md).
     fn result_digests(&self, result: &[u8]) -> Vec<Dig>;
 }
 
-/// Worker-side: run one opaque spec against the mesh CAS.
+/// Cross-daemon single-flight. The BuildBuddy pattern, mesh-native.
+/// buck2 calls it in Driver::execute; the buildkit fork calls it (via the
+/// localhost agent) before sharedOp.Exec.
 #[async_trait]
-pub trait Executor: Send + Sync + 'static {
-    /// Stand up per-worker sidecars before serving.
-    /// buildkit: the localhost mesh registry + buildkitd. buck2: nothing.
-    async fn setup(&self, blobs: Arc<dyn Blobs>) -> Result<()> { Ok(()) }
-
-    async fn run(&self, blobs: &dyn Blobs, spec: &[u8], scratch: &Path)
-        -> Result<Vec<u8>>;
+pub trait LeaseService: Send + Sync {
+    /// Claim `key`. Ok(Claimed) => YOU build it, then publish_result.
+    /// Ok(Wait(rx)) => a peer holds it; await the result (a cache hit).
+    async fn claim(&self, key: &str) -> Result<Lease>;   // heartbeat while held
+    async fn publish(&self, key: &str, result: &[u8]) -> Result<()>;
 }
 ```
 
-`Fleet` is today's `Driver` minus REAPI. Exposes `submit(spec)`, `blobs()`,
-`store()`, `worker_count()`.
+The lease is a new **state** over the existing AC table: `key -> InProgress
+{worker, deadline}` alongside `key -> Result`. TTL + heartbeat; a dead holder's
+lease expires and the next claimant builds; hedged execution if a holder
+over-runs (BuildBuddy §stall). `Fleet` owns it.
 
 ```text
-src/fleet/            mesh.rs store.rs driver.rs(-REAPI) worker.rs(-exec)
+src/fleet/            mesh.rs store.rs driver.rs(-REAPI) worker.rs lease.rs
 src/payload/reapi/    rpc.rs exec.rs        # buck2 today; bazel is a config
 src/payload/buildkit/ registry.rs snapshotter.rs
 ```
 
-For the buildkit payload the `Frontend` is the OCI registry (P1) and the
-`Executor::setup` launches the local buildkitd + the mesh registry; there is
-no per-action `run` dispatch (earthbuild owns the build graph). bazel remains a
-*config* of the reapi payload, not a third one.
-
 ## P1 — mesh OCI registry
 
-An OCI distribution v2 facade over the existing CAS. earthbuild already speaks
-`type=registry` (`builder/solver.go`: `CacheOptionsEntry{Type: "registry"}`).
-No shim, no LLB parsing, no earthbuild changes. Use `mode=max` to export
-intermediate vertex layers; the wire surface is identical to `mode=min`.
+OCI distribution v2 over the existing CAS. earthbuild already speaks
+`type=registry` (`builder/solver.go`). No shim, no earthbuild change. `mode=max`
+to export intermediate vertices; wire surface identical to `mode=min`.
 
 ### Wire surface — six routes
 
-Verified against containerd's `remotes/docker` (what buildkit delegates to):
+Verified against containerd's `remotes/docker`:
 
 | route | methods | notes |
 | ----- | ------- | ----- |
-| `/v2/<name>/manifests/<ref>` | HEAD, GET | Tag namespace. Serve OCI ImageManifest and Index. **Pass annotations through verbatim** — including `containerimage.inlinecache`, which the fork preserves and upstream dropped; strip it and `--use-inline-cache` breaks *silently*. |
-| `/v2/<name>/manifests/<ref>` | PUT | HEAD existence check precedes every PUT. |
-| `/v2/<name>/blobs/<digest>` | HEAD, GET | CAS lookup. **Accurate `Content-Length` is mandatory**: the importer enforces `maxBlobSize = 1<<20` on the config blob (`cache/remotecache/import.go:133-135`) and rejects on mismatch, silently. |
-| `/v2/<name>/blobs/uploads/` | POST | Return `Location`. If `?mount=&from=` present return **202**, not 404 (`pusher.go:210-229`). |
-| `<Location>` | PUT `?digest=` | Full body, verify digest, store. |
+| `/v2/<name>/manifests/<ref>` | HEAD, GET | Serve OCI ImageManifest + Index. **Pass annotations verbatim** — esp. `containerimage.inlinecache` (fork keeps it; strip it and `--use-inline-cache` breaks silently). |
+| `/v2/<name>/manifests/<ref>` | PUT | HEAD existence check first. |
+| `/v2/<name>/blobs/<digest>` | HEAD, GET | **Accurate `Content-Length` mandatory**: importer caps the config blob at `1<<20` and rejects on mismatch, silently (`import.go:133-135`). |
+| `/v2/<name>/blobs/uploads/` | POST | `Location`; if `?mount=&from=` present return **202** not 404 (`pusher.go:210-229`). |
+| `<Location>` | PUT `?digest=` | Full body, verify, store. |
 
-Not needed, each verified from source: no PATCH (chunked upload is `// TODO`,
-`pusher.go:280`), no Range GET (client falls back to serial), no `/v2/` ping,
-no auth, no TLS (`MatchLocalhost` forces plain HTTP for `127.0.0.1`), no
-Referrers API (cache importer never calls it). Config blob mediaType is
-`application/vnd.buildkit.cacheconfig.v0`; do not reject unknown mediaTypes.
+Not needed (verified): no PATCH (`pusher.go:280` TODO), no Range GET, no `/v2/`
+ping, no auth, no TLS (`MatchLocalhost` forces plain HTTP for `127.0.0.1`), no
+Referrers. Config mediaType `application/vnd.buildkit.cacheconfig.v0`.
 
-**Scope: ~200-400 lines of Rust (axum).** `ferro-oci-server` v1.0.0 (35
-downloads) and `buildkit-client`/`bkit` v0.1.4 (349 downloads) are one-person
-projects — crib the route shapes, do not take the dep. ⚠︎ conf 0.8.
+**Scope ~200-400 lines axum.** `ferro-oci-server` (35 dl), `buildkit-client`
+(349 dl) are one-person projects — crib routes, not the dep. ⚠︎ 0.8.
 
-### Done when
+### Done when — P1
 
-Two runners, same Earthfile; runner B hits cache on layers runner A produced,
-blobs demonstrably over iroh, store survives via `actions/cache`.
+Runner B hits cache on runner A's layers, blobs over iroh, store survives via
+`actions/cache`. **Baseline is ghcr.io `type=registry` at steady state** (>=3
+runs, source-changing branch). Honest: punch mean 70.6 MB/s vs ghcr.io
+~100-150; the edge inverts under concurrent egress. The differentiators are
+GH-cache pre-seed overlapping the join window + no external auth. The bar is one
+flag (`--remote-cache=ghcr.io/...`); if P1 can't beat it at steady state, stop.
 
-**Baseline is ghcr.io `type=registry`, not no-cache**, at steady state (>=3
-consecutive runs, source-changing branch, stable lockfile). Be honest: punch
-mean is 70.6 MB/s (16-254 spread) vs ghcr.io ~100-150; the raw-throughput edge
-can invert under concurrent egress. The real differentiators are GH-cache
-pre-seed overlapping the worker-join window, and no external auth dependency.
-**The bar is one flag** (`--remote-cache=ghcr.io/org/repo:cache`). If P1 cannot
-beat that at steady state, stop.
+## P2 — distributed single-flight (the build-once feature)
 
-## P2 — mesh-backed cache mounts (the Satellites feature)
+> The concurrent-dedup half. P1 is the prerequisite (results publish to, and
+> waiters fetch from, the mesh cache).
 
-> Gate on a positive P1 delta. This is where the buildkit fork earns its keep.
-> ⚠︎ conf 0.75.
+**Lease key = the fast cache key** (`currentIndexKey()`, `edge.go:263`) —
+structurally what BuildKit already exports for `--cache-from`, so **stable and
+identical across machines, no machine-local state** (confirmed). The slow
+content key can't be used: it only exists *after* the dep op runs.
 
-Cache mounts are the half of Satellites a registry cache cannot carry. **The
-hard constraint:** `GetRemotes()` exists only on `immutableRef`
-(`cache/refs.go:68`); cache mounts are `MutableRef` with `NoCommit: true`
-(`container.go:237`), released after exec, never reachable by the export
-pipeline. `CacheMap` zeroes the mount ID before hashing
-(`solver/llbsolver/ops/exec.go:127-130`) — exclusion is by design.
-[moby/buildkit#1512](https://github.com/moby/buildkit/issues/1512) is open,
-milestone `v0.future`, no PR. (#1474 is its closed predecessor — cite #1512.)
+**Key stability != output determinism.** The key is deterministic even when the
+output isn't (`RUN apt-get update`). So a non-hermetic step single-flights
+correctly — and it *fixes* divergence: today two racers get two different
+layers; under the lease they share one. Strictly better exactly where you'd
+fear it's worse. Containerized steps have ~0 local state in the key; the one
+carve-out is `LOCALLY` (runs on the host) — **pin to the caller, exclude from
+lease and dispatch** (Earthly already treats it as uncacheable).
 
-**Why it bites every commit, not just dep-update days:** `COPY src/`
-invalidates the layer, so `RUN cargo build` misses the *layer* cache on every
-source change; the cargo-registry CACHE mount is what saves 1-5 min on those
-runs. And on ephemeral runners `/var/lib/buildkit` dies at teardown, so every
-job starts cold. This is the gap P1 alone leaves.
+**Local-source key: prefer the git tree hash.** The one remaining wobble is the
+local-context source key. BuildKit's `fsutil` checksum hashes content+path+mode
+(not mtime) — *should* match across machines but can drift on line-endings,
+symlink handling, or fs quirks. For a git-tracked context, the **git tree hash
+is the same content key by construction** — it already covers names + mode
+(incl. the exec bit) + recursive blob content and *ignores mtime/inode* — and is
+precomputed, identical across machines, zero fs walk. Fast path: when the
+context is a clean checkout, key the local source on `git rev-parse HEAD^{tree}`
+(or a subtree hash) instead of re-walking. Caveats: (1) a dirty working tree
+needs `git write-tree` or falls back to `fsutil`; (2) `.dockerignore`/`.earthlyignore`
+must select the same set git tracks, else the hashes cover different files —
+detect the mismatch and fall back. This is an optimisation + robustness belt on
+P2's prerequisite, not a correctness dependency; the fast key is already stable
+without it.
 
-Options, least fork surface first:
+**Injection point** (three evaluated, only one works):
 
-| option | mechanism | fork | verdict |
-| ------ | --------- | ---- | ------- |
-| (a) sticky affinity | `JobSpec::affinity` = target | none | intra-run only; required regardless, never sufficient alone |
-| (b) copy-out/in | earthbuild **already ships** `CACHE --persist` (`earthfile2llb/converter.go:3453-3476`): a copy-out ExecOp writes mount contents to an `ImmutableRef`, which *is* `GetRemotes()`-traversable and mesh-shippable | none | try first; ~8 min on big caches, deduped by chainID |
-| (c) proxy snapshotter | buildkitd's `proxySnapshotterPath` seam (`cmd/buildkitd/main_oci_worker.go`) routes Prepare/Commit/Mounts to an external gRPC socket. `Commit()` on a dirty mount is the push-to-mesh hook; `Prepare()` the lazy-pull. **Plugin seam, not a core patch** — survives rebases. | plugin only | right long-term answer; ~500 LoC Go over containerd **v2** snapshots proto (no Rust crate). Clipper.dev runs this in prod |
-| (d) native export | patch the fork to commit+export cache mounts (implement #1512 for our backend) | core patch | last resort; a permanent carry against upstream |
+| candidate | verdict |
+| --------- | ------- |
+| blocking cache `Query()` | ✗ runs under the scheduler's `s.mu`; blocking deadlocks it |
+| proxy-snapshotter `Prepare()` | ✗ snapshots get random UUIDs; two daemons can't agree a key pre-result |
+| **`sharedOp.Exec()`** (`jobs.go:1194`) | ✅ runs in a `flightcontrol` goroutine, not under `s.mu`; safe to block |
 
-Decision order (a) always, then (b) [no fork, exists], then (c) [plugin seam],
-(d) only if (c) is too slow. The prime risk becomes the headline feature.
+The fork: before `op.Acquire()`, `claim(fast_key)` against the localhost rebuck
+agent (-> driver over mesh). Claimed -> build, then publish. Wait -> skip exec,
+import the peer's result via the existing remote-cache path for that key.
+**~60 lines** across `jobs.go`/`types.go`/`llbsolver/solver.go`; no scheduler,
+edge, storage, or snapshotter changes. (Wiring "skip + import peer result" may
+add a little; ~60 is the agent's core estimate. ⚠︎ 0.8.)
 
-Note: (c) needs a small Go sidecar (the snapshots gRPC service). That is the
-*only* Go in the design — the fleet, CAS, mesh, dispatch and P1 registry stay
-Rust. Unlike v2's shim sidecar, it speaks a stable containerd proto, not the
-churn-prone earthbuild session surface.
+**buck2 gets it for free.** `Driver::execute` (`driver.rs:1587`) mints a fresh
+`job_id` per call — **no dedup today**. Route it through the same
+`LeaseService` keyed on the action digest and concurrent identical actions
+coalesce. Same component, both payloads; the BuildBuddy pattern, once.
+
+### Done when — P2
+
+Two concurrent runs of the same target across two runners execute the shared
+vertices **once** (the second waits + imports), verified by an execution counter
+on the mesh, build green.
+
+## P3 — mesh-backed cache mounts
+
+> The remaining Satellite warmth. Gate on P1/P2. ⚠︎ 0.75.
+
+`type=cache` mounts (cargo/npm/go registries) are `MutableRef` with
+`NoCommit: true` (`container.go:237`), never committed, unreachable by the
+export pipeline; `GetRemotes()` is `immutableRef`-only (`cache/refs.go:68`).
+[moby/buildkit#1512](https://github.com/moby/buildkit/issues/1512) open, no PR
+(#1474 is its closed predecessor). They matter every commit: `COPY src/`
+invalidates the layer so `RUN cargo build` misses the *layer* cache on every
+source change; the CACHE mount is the 1-5 min saver. Ephemeral runners
+cold-start every job.
+
+Options, least fork first:
+
+| option | mechanism | fork |
+| ------ | --------- | ---- |
+| (a) sticky affinity | `JobSpec::affinity` = target | none — intra-run only, always on |
+| (b) copy-out/in | earthbuild **already ships** `CACHE --persist` (`converter.go:3453`): copy-out to an `ImmutableRef`, mesh-shippable | none — try first |
+| (c) proxy snapshotter | `proxySnapshotterPath` seam: `Commit()` -> push to mesh, `Prepare()` -> lazy pull. **Plugin, not core patch** | ~500 LoC Go over containerd v2 snapshots proto (no Rust crate); Clipper.dev runs it in prod |
+| (d) native export patch | commit+export mounts in the fork | core patch — last resort |
 
 ## Version pinning
 
-Worker buildkitd, the P2 snapshotter proto, and any shim protos must track
-**one EarthBuild/buildkit rev** (go.mod `replace` on the earthbuild branch
-pins it). Protos live in `EarthBuild/buildkit/frontend/gateway/pb/` and
-`EarthBuild/buildkit/session/{filesync,auth,secrets,pullping,localhost,socketforward}`.
-CI-diff the protos on every fork bump. Gateway + session protos were additive
-across v0.29-v0.31, so the risk is the fork's own additions, not upstream drift.
+Worker buildkitd, the P2 fork, and the P3 snapshotter proto track **one
+EarthBuild/buildkit rev** (go.mod `replace` pins it). Gateway + session protos
+were additive across v0.29-v0.31; risk is the fork's own additions. CI-diff
+protos on bump.
 
 ## Risks
 
 | risk | severity | mitigation |
 | ---- | -------- | ---------- |
-| cache-mount transfer complexity | **high** — the core value; (c) is novel Go over containerd v2 | (b) first (already exists, no fork); (c) only if (b) too slow |
-| P2P slower than ghcr.io at steady state | medium | P1 benchmark answers this *before* P2 |
-| economics invert (data >> compute) | medium — `apt-get` layers are data-bound | `cargo`/`npm` targets are compute-bound; benchmark partitions cases |
-| fork maintenance drag | medium — we now carry earthbuild + buildkit forks | prefer plugin seam (c) over core patch (d); pin one rev; CI-diff protos |
-| GH cache budget contention | medium | the 10 GB quota is **per-repo across all caches** — OCI layer shards compete with buck2 shards |
+| P2 lease correctness (stale lease, dead holder, hedge storm) | **high** — distributed lock semantics | copy BuildBuddy exactly: TTL + heartbeat, hedged exec on stall, crashed holder -> expiry; single-writer per key |
+| cache-mount transfer complexity (P3) | high | (b) first (no fork); (c) only if too slow |
+| P2P slower than ghcr.io at steady state | medium | P1 benchmark answers before P2 |
+| economics invert (data >> compute) | medium | `cargo`/`npm` compute-bound; benchmark partitions |
+| fork maintenance drag (2 forks) | medium | prefer plugin seams; pin one rev; CI-diff protos |
+| GH cache budget contention | medium | 10 GB is **per-repo across all caches** — OCI shards compete with buck2 shards |
 
 ## Non-goals
 
-- **The buildkitd shim** (v2's P2). Deleted. We run a real buildkitd and point
-  earthbuild at it; no `Control`/`LLBBridge`/`Session` impersonation, no
-  `pullping` relay, no reverse-gRPC hijack. The two v2 fatal objections were
-  all about the shim.
-- **Intra-build DAG sharding below target granularity.** Snapshot chains make
-  it a buildkitd-executor rewrite; forking does not help. Nobody has done it.
-- **Intra-build multi-host target routing.** Possible (an earthbuild change at
-  `build_cmd.go:364`) but unnecessary to match Satellites; defer until a
-  workload demands it.
-- **Translating LLB -> REAPI actions** (reuse `exec.rs` wholesale). Three
-  independently fatal causes: dropping cache mounts makes every Rust/Go/Node
-  build slower than no rebuck; output paths are unknowable (`RUN cargo build`
-  emits unknown files into `target/`); non-hermetic REAPI caching is wrong for
-  `apt-get` layers. ~18-33 wk to a worse result.
-- **Windows/macOS buildkit workers.** Windows buildkitd is WCOW-only and shares
-  no pool with the MSVC-Rust-via-buck2 sweep; buildkitd does not run on macOS.
-- Chunked PATCH, Referrers, Range GET in the P1 registry — unused by the cache
-  path.
+- **The buildkitd shim** (v2's P2). Deleted; real buildkitd, no impersonation.
+- **Intra-build DAG sharding / multi-host routing.** Snapshot chains block the
+  first; the second is a deferred earthbuild change, not needed to match
+  Satellites.
+- **Blocking the scheduler or the snapshotter for single-flight.** Both dead
+  ends (`s.mu` deadlock; random snapshot UUIDs). The lease lives at
+  `sharedOp.Exec` only.
+- **Translating LLB -> REAPI actions.** Drops cache mounts (slower than no
+  rebuck), output paths unknowable, non-hermetic caching wrong for `apt-get`.
+- **Windows/macOS buildkit workers.** No pool overlap with the MSVC-buck2 sweep;
+  no macOS buildkitd.
