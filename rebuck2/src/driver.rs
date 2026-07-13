@@ -105,6 +105,28 @@ fn host_vitals(store_root: &std::path::Path) -> String {
             ))
         })
         .unwrap_or_else(|| "mem ?".to_owned());
+    // Top memory consumers: WHICH process balloons is the whole question
+    // (buck2 daemon vs dice fork vs rebuck2 driver vs client commands) and
+    // zero profiling has been done - box totals alone can't attribute.
+    let top = std::process::Command::new("ps")
+        .args(["-eo", "rss=,comm=", "--sort=-rss"])
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .take(5)
+                .filter_map(|l| {
+                    let mut it = l.split_whitespace();
+                    let rss_kb: u64 = it.next()?.parse().ok()?;
+                    let comm = it.next()?;
+                    Some(format!("{comm} {}MB", rss_kb / 1024))
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "ps ?".to_owned());
     let disk = std::process::Command::new("df")
         .arg("-Pm")
         .arg(store_root)
@@ -117,7 +139,7 @@ fn host_vitals(store_root: &std::path::Path) -> String {
             Some(format!("disk avail {avail}MB at store"))
         })
         .unwrap_or_else(|| "disk ?".to_owned());
-    format!("{mem}; {disk}")
+    format!("{mem}; {disk}; top: {top}")
 }
 
 pub fn result_digests(r: &re::ActionResult) -> Vec<Dig> {
@@ -665,6 +687,37 @@ impl Driver {
 
     pub fn cache_failures(&self) -> bool {
         self.cfg.cache_failures
+    }
+
+    /// Approximate heap held by the driver's big in-memory maps, for the
+    /// stats heartbeat: zero memory profiling existed when the driver box
+    /// OOM'd (run 29232220897), and these maps are the engine's only
+    /// unbounded growth. Counts + estimated MB, cheap enough per minute.
+    pub async fn mem_summary(&self) -> String {
+        let providers = self.providers.lock().await;
+        // hash String (64) + endpoint String (64) + HashMap slot overhead.
+        let prov_mb = providers.len() * (64 + 64 + 96) / (1024 * 1024);
+        let prov_n = providers.len();
+        drop(providers);
+        let memo_s = self.memo_servable.read().await;
+        let memo_s_mb = memo_s.values().map(|v| v.len() + 128).sum::<usize>() / (1024 * 1024);
+        let memo_s_n = memo_s.len();
+        drop(memo_s);
+        let memo_c = self.memo_canonical.read().await;
+        let memo_c_mb = memo_c.values().map(|v| v.len() + 128).sum::<usize>() / (1024 * 1024);
+        let memo_c_n = memo_c.len();
+        drop(memo_c);
+        let blooms_mb = self
+            .blooms
+            .lock()
+            .await
+            .values()
+            .map(|b| b.bits.len())
+            .sum::<usize>()
+            / (1024 * 1024);
+        format!(
+            "prov {prov_n} (~{prov_mb}MB) memoS {memo_s_n} (~{memo_s_mb}MB) memoC {memo_c_n} (~{memo_c_mb}MB) blooms ~{blooms_mb}MB"
+        )
     }
 
     pub async fn pending_jobs(&self) -> usize {
