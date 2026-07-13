@@ -29,7 +29,7 @@ fn usage() -> ! {
         "usage: rebuck2 driver [--grpc-port N] [--registry-port N] [--store DIR] [--session S] [--locality] \
          [--min-workers N] [--no-local-exec] [--decentralized-cas] [--no-hardlinks] [--no-reflink] [--cache-failures]\n       \
          rebuck2 worker [--store DIR] [--session S] [--slots N] [--preloaded-shard N] [--connect-wait-secs N] [--no-hardlinks] [--no-reflink]\n       \
-         rebuck2 registry [--store DIR] [--port N]\n       \
+         rebuck2 registry [--store DIR] [--port N] [--bind IP]\n       \
          rebuck2 verify-store --store DIR\n       \
          rebuck2 bench [--grpc URL] [--entries N] [--poisoned-pct P] [--plant-dir DIR] [--concurrency C] [--rounds R]"
     );
@@ -102,9 +102,21 @@ async fn main() -> Result<()> {
                 .opt("--port")
                 .map(|s| s.parse().expect("--port: number"))
                 .unwrap_or(5000);
+            // Loopback by default and deliberately: the registry has no auth,
+            // so binding it to the world would hand anyone on the network write
+            // access to the CAS. Opt in explicitly (e.g. 0.0.0.0 so a buildkitd
+            // in a container can reach it) and know what you are doing.
+            let bind: std::net::IpAddr = args
+                .opt("--bind")
+                .unwrap_or_else(|| "127.0.0.1".into())
+                .parse()
+                .expect("--bind: an IP address");
             args.done();
+            if !bind.is_loopback() {
+                eprintln!("[registry] WARNING: bound to {bind} with NO AUTH — anyone who can reach this port can read and write the CAS");
+            }
             let store = std::sync::Arc::new(store::Store::new(store)?);
-            registry::serve(([127, 0, 0, 1], port).into(), store).await
+            registry::serve((bind, port).into(), store).await
         }
         "bench" => {
             let cfg = bench::BenchCfg {
