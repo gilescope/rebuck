@@ -302,6 +302,136 @@ impl Store {
     /// Clone path: store gets private CoW extents, source stays writable.
     /// Hardlink path: source inode goes 0o555 first on unix, so the store
     /// name is read-only from the moment it exists.
+    /// Stream a blob INTO the store: chunked read -> hash-while-writing a
+    /// tmp file -> verify -> 0o555 -> rename. O(chunk) memory where `put`
+    /// is O(blob) - the whole-blob Vec buffering measured 2.4GB peak for
+    /// 48x48MB actions on the loopback bench. When `expected` is already
+    /// present the reader is still DRAINED of exactly `expected.size`
+    /// bytes: batched wire protocols (GetMany) interleave frames and
+    /// payloads on one stream, so short-reading desynchronizes the peer.
+    pub async fn put_stream(
+        &self,
+        expected: Option<&Dig>,
+        reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    ) -> Result<Dig> {
+        use sha2::{Digest as _, Sha256};
+        use tokio::io::AsyncReadExt;
+        if let Some(exp) = expected {
+            if self.has(exp).await {
+                let mut limited = reader.take(exp.size as u64);
+                tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
+                return Ok(exp.clone());
+            }
+        }
+        let tmp = self.root.join("tmp").join(format!(
+            "stream.{}.{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut total: u64 = 0;
+        let limit = expected.map(|e| e.size as u64);
+        loop {
+            let want = match limit {
+                Some(l) if total >= l => 0,
+                Some(l) => (l - total).min(buf.len() as u64) as usize,
+                None => buf.len(),
+            };
+            if want == 0 {
+                break;
+            }
+            let n = reader.read(&mut buf[..want]).await?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            tokio::io::AsyncWriteExt::write_all(&mut file, &buf[..n]).await?;
+            total += n as u64;
+        }
+        tokio::io::AsyncWriteExt::flush(&mut file).await?;
+        drop(file);
+        let d = hasher.finalize();
+        let mut hash = String::with_capacity(64);
+        for b in d {
+            hash.push_str(&format!("{b:02x}"));
+        }
+        if let Some(exp) = expected {
+            if exp.hash != hash || exp.size as u64 != total {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                bail!(
+                    "digest mismatch: expected {}/{}, got {hash}/{total}",
+                    exp.hash,
+                    exp.size
+                );
+            }
+        }
+        let dest = self.cas_path(&hash);
+        if tokio::fs::metadata(&dest).await.is_ok() {
+            let _ = tokio::fs::remove_file(&tmp).await;
+        } else {
+            tokio::fs::create_dir_all(dest.parent().context("cas path has parent")?).await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)).await?;
+            }
+            tokio::fs::rename(&tmp, &dest).await?;
+            self.stored_bytes
+                .fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(Dig {
+            hash,
+            size: total as i64,
+        })
+    }
+
+    /// Stream a blob OUT of the store into `writer`. O(chunk) memory; the
+    /// serve paths previously loaded whole blobs.
+    pub async fn copy_out(
+        &self,
+        d: &Dig,
+        writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    ) -> Result<()> {
+        if d.size == 0 && d.hash == EMPTY_SHA256 {
+            return Ok(());
+        }
+        let mut f = tokio::fs::File::open(self.cas_path(&d.hash)).await?;
+        let n = tokio::io::copy(&mut f, writer).await?;
+        self.read_bytes
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Streaming content digest of a file (for output ingestion - reading
+    /// whole outputs to hash them was half the 2.4GB bench peak).
+    pub async fn hash_file(path: &std::path::Path) -> Result<Dig> {
+        use sha2::{Digest as _, Sha256};
+        use tokio::io::AsyncReadExt;
+        let mut f = tokio::fs::File::open(path).await?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            let n = f.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            total += n as u64;
+        }
+        let d = hasher.finalize();
+        let mut hash = String::with_capacity(64);
+        for b in d {
+            hash.push_str(&format!("{b:02x}"));
+        }
+        Ok(Dig {
+            hash,
+            size: total as i64,
+        })
+    }
+
     pub async fn adopt(&self, expected: &Dig, src: &std::path::Path) -> Result<()> {
         let dest = self.cas_path(&expected.hash);
         if tokio::fs::metadata(&dest).await.is_ok() {

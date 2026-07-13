@@ -294,20 +294,20 @@ async fn serve_get(
         return Ok(());
     };
     match req {
-        BlobReq::Get(d) => match store.get(&d).await {
-            Ok(Some(bytes)) => {
+        BlobReq::Get(d) => {
+            if store.has(&d).await {
                 mesh::send_frame(
                     &mut send,
                     &BlobResp::Found {
-                        size: bytes.len() as u64,
+                        size: d.size as u64,
                     },
                 )
                 .await?;
-                send.write_all(&bytes).await?;
+                store.copy_out(&d, &mut send).await?;
+            } else {
+                mesh::send_frame(&mut send, &BlobResp::Missing).await?;
             }
-            Ok(None) => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
-            Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
-        },
+        }
         BlobReq::HasMany(digs) => {
             let mut have = Vec::with_capacity(digs.len());
             for d in &digs {
@@ -320,19 +320,17 @@ async fn serve_get(
         // an LRU eviction between a batched presence check and the read.
         BlobReq::GetMany(digs) => {
             for d in &digs {
-                match store.get(d).await {
-                    Ok(Some(bytes)) => {
-                        mesh::send_frame(
-                            &mut send,
-                            &BlobResp::Found {
-                                size: bytes.len() as u64,
-                            },
-                        )
-                        .await?;
-                        send.write_all(&bytes).await?;
-                    }
-                    Ok(None) => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
-                    Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
+                if store.has(d).await {
+                    mesh::send_frame(
+                        &mut send,
+                        &BlobResp::Found {
+                            size: d.size as u64,
+                        },
+                    )
+                    .await?;
+                    store.copy_out(d, &mut send).await?;
+                } else {
+                    mesh::send_frame(&mut send, &BlobResp::Missing).await?;
                 }
             }
         }
@@ -423,6 +421,22 @@ impl RemoteBlobs {
         }
     }
 
+    /// Streaming sibling of upload_bytes: file -> wire, O(chunk) memory.
+    async fn upload_file(&self, d: &Dig, path: &std::path::Path) -> Result<()> {
+        let (mut send, mut recv) = self.conn.open_bi().await?;
+        mesh::send_frame(&mut send, &BlobReq::Put(d.clone())).await?;
+        let mut f = tokio::fs::File::open(path).await?;
+        tokio::io::copy(&mut f, &mut send).await?;
+        send.finish()?;
+        let resp: BlobResp = mesh::recv_frame(&mut recv)
+            .await?
+            .context("driver closed blob stream")?;
+        match resp {
+            BlobResp::PutOk => Ok(()),
+            other => bail!("blob put rejected: {other:?}"),
+        }
+    }
+
     async fn fetch_from(&self, endpoint: &str, d: &Dig) -> Result<Vec<u8>> {
         let id: iroh::EndpointId = endpoint.parse().map_err(|_| {
             anyhow::anyhow!("bad provider endpoint {endpoint:?} for blob {}", d.hash)
@@ -467,8 +481,11 @@ impl RemoteBlobs {
                 .context("holder closed mid-batch")?
             {
                 BlobResp::Found { size } => {
-                    let bytes = mesh::recv_raw(&mut recv, size).await?;
-                    self.store.put(Some(d), &bytes).await?;
+                    let expect = Dig {
+                        hash: d.hash.clone(),
+                        size: size as i64,
+                    };
+                    self.store.put_stream(Some(&expect), &mut recv).await?;
                     if endpoint.is_some() {
                         self.hits_peer.fetch_add(1, Relaxed);
                     } else {
@@ -526,10 +543,16 @@ impl exec::Blobs for RemoteBlobs {
             .context("driver closed blob stream")?;
         match resp {
             BlobResp::Found { size } => {
-                let bytes = mesh::recv_raw(&mut recv, size).await?;
+                let expect = Dig {
+                    hash: d.hash.clone(),
+                    size: size as i64,
+                };
+                self.store.put_stream(Some(&expect), &mut recv).await?;
                 self.hits_driver.fetch_add(1, Relaxed);
-                self.store.put(Some(d), &bytes).await?;
-                Ok(bytes)
+                self.store
+                    .get(d)
+                    .await?
+                    .context("just-streamed blob missing")
             }
             BlobResp::Provider { endpoint } => {
                 let bytes = self.fetch_from(&endpoint, d).await?;
@@ -634,18 +657,18 @@ impl exec::Blobs for RemoteBlobs {
     }
 
     async fn put_file(&self, path: &std::path::Path) -> Result<Dig> {
-        let bytes = tokio::fs::read(path).await?;
-        let d = Dig {
-            hash: crate::store::sha256_hex(&bytes),
-            size: bytes.len() as i64,
-        };
+        // Streaming end to end: digest by chunked read, ingest by link or
+        // stream, upload straight from the file. Reading whole outputs into
+        // memory 64-wide was the ingestion half of the 2.4GB bench peak.
+        let d = Store::hash_file(path).await?;
         if self.hardlinks {
             self.store.adopt(&d, path).await?;
         } else {
-            self.store.put(Some(&d), &bytes).await?;
+            let mut f = tokio::fs::File::open(path).await?;
+            self.store.put_stream(Some(&d), &mut f).await?;
         }
         if self.upload {
-            self.upload_bytes(&d, &bytes).await?;
+            self.upload_file(&d, path).await?;
         }
         Ok(d)
     }
@@ -702,8 +725,11 @@ async fn sync_shard(
                             .await?
                             .context("driver closed mid-batch")?
                         {
-                            let bytes = mesh::recv_raw(&mut recv, size).await?;
-                            store.put(Some(d), &bytes).await?;
+                            let expect = Dig {
+                                hash: d.hash.clone(),
+                                size: size as i64,
+                            };
+                            store.put_stream(Some(&expect), &mut recv).await?;
                         }
                     }
                     Ok::<(), anyhow::Error>(())

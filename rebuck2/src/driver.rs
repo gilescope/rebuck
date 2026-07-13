@@ -1098,8 +1098,19 @@ impl Driver {
     /// action failures (healing4/5). Failed hints are evicted so
     /// rediscovery stays honest.
     pub async fn get_blob(&self, d: &Dig) -> Result<Option<Vec<u8>>> {
-        if let Some(bytes) = self.store.get(d).await? {
-            return Ok(Some(bytes));
+        if self.ensure_blob_local(d).await? {
+            return self.store.get(d).await;
+        }
+        Ok(None)
+    }
+
+    /// Read-through presence: make `d` locally available (streaming fetch
+    /// into the store), without ever holding the blob in memory. The serve
+    /// paths pair this with `Store::copy_out` so large blobs relay at
+    /// O(chunk); `get_blob` keeps the Vec API for small proto reads.
+    pub async fn ensure_blob_local(&self, d: &Dig) -> Result<bool> {
+        if self.store.has(d).await {
+            return Ok(true);
         }
         let _permit = self.mesh_fetches.acquire().await;
         // Retry rounds with backoff, candidates rebuilt fresh each round: a
@@ -1131,7 +1142,7 @@ impl Driver {
                 match self.probe_workers(d).await {
                     Some(e) => candidates.push(e),
                     // Nobody claims it and nobody failed us: honest Missing.
-                    None if !claimed_but_failed => return Ok(None),
+                    None if !claimed_but_failed => return Ok(false),
                     None => break,
                 }
             }
@@ -1140,12 +1151,11 @@ impl Driver {
             let total = candidates.len();
             for endpoint in candidates {
                 match self.fetch_blob_from(&endpoint, d).await {
-                    Ok(Some(bytes)) => {
-                        self.store.put(Some(d), &bytes).await?;
+                    Ok(true) => {
                         self.providers.lock().await.insert(d.hash.clone(), endpoint);
-                        return Ok(Some(bytes));
+                        return Ok(true);
                     }
-                    Ok(None) => {
+                    Ok(false) => {
                         // Peer explicitly lacks it (bloom false positive or
                         // eviction): drop the stale hint, count the denial.
                         denied += 1;
@@ -1179,17 +1189,18 @@ impl Driver {
                 d.size
             );
         }
-        Ok(None)
+        Ok(false)
     }
 
-    /// One blob fetch from one peer: two attempts (retry once on a fresh
-    /// connection if the pooled one went stale). Ok(None) = peer answered
-    /// Missing; Err = peer unreachable/protocol error. Callers treat both
-    /// as "not from this peer", never as a global verdict.
-    async fn fetch_blob_from(&self, endpoint: &str, d: &Dig) -> Result<Option<Vec<u8>>> {
+    /// One blob fetch from one peer, streamed straight into the store: two
+    /// attempts (retry once on a fresh connection if the pooled one went
+    /// stale). Ok(false) = peer answered Missing; Err = peer unreachable/
+    /// protocol error. Callers treat both as "not from this peer", never
+    /// as a global verdict.
+    async fn fetch_blob_from(&self, endpoint: &str, d: &Dig) -> Result<bool> {
         for attempt in 0..2 {
             let conn = self.peer_conn(endpoint).await?;
-            let res: Result<Option<Vec<u8>>> = async {
+            let res: Result<bool> = async {
                 let (mut send, mut recv) = conn.open_bi().await?;
                 mesh::send_frame(&mut send, &BlobReq::Get(d.clone())).await?;
                 send.finish()?;
@@ -1198,10 +1209,14 @@ impl Driver {
                     .context("provider closed blob stream")?
                 {
                     BlobResp::Found { size } => {
-                        let bytes = mesh::recv_raw(&mut recv, size).await?;
-                        Ok(Some(bytes))
+                        let expect = Dig {
+                            hash: d.hash.clone(),
+                            size: size as i64,
+                        };
+                        self.store.put_stream(Some(&expect), &mut recv).await?;
+                        Ok(true)
                     }
-                    BlobResp::Missing => Ok(None),
+                    BlobResp::Missing => Ok(false),
                     other => bail!("provider {endpoint} for {}: {other:?}", d.hash),
                 }
             }
@@ -2046,29 +2061,26 @@ async fn serve_blob_stream(
                 // a store-only serve returned Missing for 2,756 input
                 // fetches (run 28959911677). Read-through relays and caches
                 // locally, reconstituting the driver's hot set.
-                match driver.get_blob(&d).await {
-                    Ok(Some(bytes)) => {
+                match driver.ensure_blob_local(&d).await {
+                    Ok(true) => {
                         mesh::send_frame(
                             &mut send,
                             &BlobResp::Found {
-                                size: bytes.len() as u64,
+                                size: d.size as u64,
                             },
                         )
                         .await?;
-                        send.write_all(&bytes).await?;
+                        driver.store.copy_out(&d, &mut send).await?;
                     }
-                    Ok(None) => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
+                    Ok(false) => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
                     Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
                 }
             }
         }
-        BlobReq::Put(d) => {
-            let bytes = mesh::recv_raw(&mut recv, d.size as u64).await?;
-            match driver.store.put(Some(&d), &bytes).await {
-                Ok(_) => mesh::send_frame(&mut send, &BlobResp::PutOk).await?,
-                Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
-            }
-        }
+        BlobReq::Put(d) => match driver.store.put_stream(Some(&d), &mut recv).await {
+            Ok(_) => mesh::send_frame(&mut send, &BlobResp::PutOk).await?,
+            Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
+        },
         BlobReq::HasMany(digs) => {
             let mut have = Vec::with_capacity(digs.len());
             for d in &digs {
@@ -2092,18 +2104,18 @@ async fn serve_blob_stream(
                     mesh::send_frame(&mut send, &BlobResp::Provider { endpoint }).await?;
                     continue;
                 }
-                match driver.get_blob(d).await {
-                    Ok(Some(bytes)) => {
+                match driver.ensure_blob_local(d).await {
+                    Ok(true) => {
                         mesh::send_frame(
                             &mut send,
                             &BlobResp::Found {
-                                size: bytes.len() as u64,
+                                size: d.size as u64,
                             },
                         )
                         .await?;
-                        send.write_all(&bytes).await?;
+                        driver.store.copy_out(d, &mut send).await?;
                     }
-                    Ok(None) => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
+                    Ok(false) => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
                     Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
                 }
             }
