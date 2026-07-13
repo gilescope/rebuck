@@ -12,6 +12,7 @@ mod bench;
 mod driver;
 mod exec;
 mod mesh;
+mod norm;
 mod rpc;
 mod store;
 mod worker;
@@ -26,7 +27,7 @@ use bazel_remote_apis::google::bytestream as bs;
 fn usage() -> ! {
     eprintln!(
         "usage: rebuck2 driver [--grpc-port N] [--store DIR] [--session S] [--locality] \
-         [--min-workers N] [--no-local-exec] [--decentralized-cas] [--no-hardlinks] [--no-reflink] [--cache-failures]\n       \
+         [--min-workers N] [--no-local-exec] [--decentralized-cas] [--no-hardlinks] [--no-reflink] [--cache-failures] [--name-independent]\n       \
          rebuck2 worker [--store DIR] [--session S] [--slots N] [--preloaded-shard N] [--connect-wait-secs N] [--no-hardlinks] [--no-reflink]\n       \
          rebuck2 verify-store --store DIR\n       \
          rebuck2 bench [--grpc URL] [--entries N] [--poisoned-pct P] [--plant-dir DIR] [--concurrency C] [--rounds R]"
@@ -230,6 +231,7 @@ async fn run_driver(mut args: Args) -> Result<()> {
         cache_failures: args.flag("--cache-failures"),
         locality: args.flag("--locality"),
         prefetch_metadata: args.flag("--prefetch-metadata"),
+        name_independent: args.flag("--name-independent"),
         addr_file: args.opt("--addr-file").map(Into::into),
         finalize_file: args.opt("--finalize-file").map(Into::into),
         scratch,

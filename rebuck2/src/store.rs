@@ -420,6 +420,28 @@ impl Store {
             .ok()
     }
 
+    /// Canonical (name-independent) action cache: keyed by the normalized
+    /// action key from [`crate::norm`], holding normalized ActionResults.
+    /// A separate namespace so a normalization-scheme change can never be
+    /// confused with a digest-keyed AC row.
+    pub async fn acn_get(&self, key: &str) -> Option<Vec<u8>> {
+        tokio::fs::read(self.root.join("acn").join(&key[..2]).join(key))
+            .await
+            .ok()
+    }
+
+    pub async fn acn_put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        let dir = self.root.join("acn").join(&key[..2]);
+        tokio::fs::create_dir_all(&dir).await?;
+        let tmp = self
+            .root
+            .join("tmp")
+            .join(format!("acn-{key}.{}", std::process::id()));
+        tokio::fs::write(&tmp, bytes).await?;
+        tokio::fs::rename(&tmp, dir.join(key)).await?;
+        Ok(())
+    }
+
     pub async fn ac_put(&self, action_hash: &str, bytes: &[u8]) -> Result<()> {
         let tmp = self
             .root

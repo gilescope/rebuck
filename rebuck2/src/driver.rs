@@ -52,6 +52,10 @@ pub struct DriverCfg {
     /// driver-LOCAL (immune to worker mesh-latency variance - the linux-36m
     /// slow-leg root cause) instead of relayed per-blob at build time.
     pub prefetch_metadata: bool,
+    /// Name-independent caching: consult/populate the canonical action
+    /// cache (see norm.rs) so identical work under different labels shares
+    /// results. Opt-in; default off.
+    pub name_independent: bool,
     /// Write the driver's full EndpointAddr (id + relay) here once bound.
     /// CI publishes it as a run artifact so workers can dial directly -
     /// n0 discovery becomes a fallback instead of a single point of
@@ -251,6 +255,10 @@ pub struct Driver {
     /// Cache outcome accounting for the stats heartbeat: AC hits that were
     /// successes, AC hits that were cached failures, and executions forced
     /// by do_not_cache actions (the prelude's diag wrappers).
+    /// Canonical (name-independent) action-cache memo: normalized key ->
+    /// encoded normalized ActionResult. Read-mostly hot path beside the
+    /// on-disk acn/ namespace (see norm.rs and store::acn_get).
+    memo_canonical: tokio::sync::RwLock<HashMap<String, Vec<u8>>>,
     /// Distinct shards acked (redundant assignment: a shard is banked
     /// when ANY of its assignees uploads - union-sync makes both copies
     /// complete, so whichever wins is a full artifact).
@@ -287,6 +295,7 @@ impl Driver {
             peer_conns: Mutex::new(HashMap::new()),
             affinity_owner: Mutex::new(HashMap::new()),
             mesh_fetches: Semaphore::new(64),
+            memo_canonical: tokio::sync::RwLock::new(HashMap::new()),
             finalized_shards: Mutex::new(std::collections::BTreeSet::new()),
             ac_hit_ok: AtomicU64::new(0),
             ac_hit_fail: AtomicU64::new(0),
@@ -1524,6 +1533,160 @@ impl Driver {
         }
     }
 
+    /// Fetch a blob by walking the input-root Directory tree to `rel_path`.
+    /// Used by canonical-key computation to read @-argsfile content.
+    async fn fetch_blob_by_rel_path(
+        &self,
+        input_root: &Dig,
+        rel_path: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let mut dir_dig = input_root.clone();
+        let mut parts = rel_path.split('/').peekable();
+        loop {
+            let Some(part) = parts.next() else {
+                return Ok(None);
+            };
+            let Some(bytes) = self.get_blob(&dir_dig).await? else {
+                return Ok(None);
+            };
+            let dir = re::Directory::decode(bytes.as_slice()).context("decode Directory")?;
+            if parts.peek().is_none() {
+                let Some(f) = dir.files.iter().find(|f| f.name == part) else {
+                    return Ok(None);
+                };
+                let Some(d) = &f.digest else { return Ok(None) };
+                return self.get_blob(&d.into()).await;
+            }
+            let Some(sub) = dir.directories.iter().find(|d| d.name == part) else {
+                return Ok(None);
+            };
+            let Some(d) = &sub.digest else {
+                return Ok(None);
+            };
+            dir_dig = d.into();
+        }
+    }
+
+    /// Content hash of the input tree: sorted (rel-path, blob-hash) pairs
+    /// over every file EXCEPT .args files (those are normalized separately —
+    /// their raw bytes carry label tokens). Directory-proto digests are
+    /// deliberately not used: they embed nothing but names+digests anyway,
+    /// and walking files keeps .args exclusion simple.
+    async fn source_content_hash(&self, input_root: &Dig) -> Result<[u8; 32]> {
+        use sha2::{Digest as _, Sha256};
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut stack: Vec<(Dig, String)> = vec![(input_root.clone(), String::new())];
+        while let Some((dig, prefix)) = stack.pop() {
+            let Some(bytes) = self.get_blob(&dig).await? else {
+                anyhow::bail!("input tree dir {} unavailable", dig.hash);
+            };
+            let dir = re::Directory::decode(bytes.as_slice()).context("decode Directory")?;
+            for f in &dir.files {
+                if f.name.ends_with(".args") {
+                    continue;
+                }
+                if let Some(d) = &f.digest {
+                    pairs.push((format!("{prefix}{}", f.name), d.hash.clone()));
+                }
+            }
+            for s in &dir.symlinks {
+                pairs.push((format!("{prefix}{}", s.name), format!("->{}", s.target)));
+            }
+            for d in &dir.directories {
+                if let Some(dd) = &d.digest {
+                    stack.push((dd.into(), format!("{prefix}{}/", d.name)));
+                }
+            }
+        }
+        pairs.sort();
+        let mut h = Sha256::new();
+        for (p, hash) in &pairs {
+            h.update(p.as_bytes());
+            h.update([0u8]);
+            h.update(hash.as_bytes());
+            h.update([0u8]);
+        }
+        Ok(h.finalize().into())
+    }
+
+    /// Canonical (name-independent) key for an action: normalized Command,
+    /// normalized content of every @-argsfile reachable from the arguments
+    /// (one indirection level: argsfiles referencing further @-files are
+    /// followed once), and the source-input content hash.
+    async fn compute_canonical_key(&self, cmd: &re::Command, input_root: &Dig) -> Result<String> {
+        let norm_cmd = crate::norm::normalize_command(cmd);
+        let mut argsfiles: Vec<Vec<u8>> = Vec::new();
+        let mut queue: Vec<String> = cmd
+            .arguments
+            .iter()
+            .filter_map(|a| a.strip_prefix('@').map(str::to_owned))
+            .collect();
+        let mut depth = 0;
+        while !queue.is_empty() && depth < 2 {
+            let mut next = Vec::new();
+            for rel in queue.drain(..) {
+                let Some(bytes) = self.fetch_blob_by_rel_path(input_root, &rel).await? else {
+                    anyhow::bail!("argsfile {rel} not reachable in input tree");
+                };
+                for line in String::from_utf8_lossy(&bytes).split('\n') {
+                    if let Some(r) = line.trim().strip_prefix('@') {
+                        next.push(r.to_owned());
+                    }
+                }
+                argsfiles.push(crate::norm::normalize_argsfile(&bytes));
+            }
+            queue = next;
+            depth += 1;
+        }
+        let src = self.source_content_hash(input_root).await?;
+        Ok(crate::norm::canonical_key_from_parts(
+            &norm_cmd, &argsfiles, &src,
+        ))
+    }
+
+    /// Probe the canonical cache for `cmd`. On a hit whose blobs are still
+    /// fetchable, returns the result rewritten to this action's declared
+    /// output paths. `Ok(None)` = miss (caller executes and then calls
+    /// [`Self::canonical_put`] with the fresh result).
+    async fn canonical_probe(
+        self: &Arc<Self>,
+        key: &str,
+        cmd: &re::Command,
+    ) -> Result<Option<re::ActionResult>> {
+        let cached = {
+            let memo = self.memo_canonical.read().await;
+            memo.get(key).cloned()
+        };
+        let cached = match cached {
+            Some(b) => Some(b),
+            None => self.store.acn_get(key).await,
+        };
+        let Some(bytes) = cached else { return Ok(None) };
+        let Ok(canonical) = re::ActionResult::decode(bytes.as_slice()) else {
+            return Ok(None); // corrupt row: re-execution overwrites it
+        };
+        let rewritten = crate::norm::rewrite_result(canonical, cmd);
+        // Same honesty gate as the digest-keyed AC: never serve a result
+        // whose referenced blobs the fleet can't deliver.
+        let digs = result_digests(&rewritten);
+        if !digs.is_empty() && self.has_blobs(&digs).await.iter().any(|p| !p) {
+            return Ok(None);
+        }
+        println!("[driver] canon-hit {key}");
+        Ok(Some(rewritten))
+    }
+
+    async fn canonical_put(&self, key: String, result: &re::ActionResult) {
+        let normalized = crate::norm::normalize_result(result);
+        let bytes = normalized.encode_to_vec();
+        if let Err(e) = self.store.acn_put(&key, &bytes).await {
+            eprintln!("[driver] canon-put {key} failed: {e:#}");
+            return;
+        }
+        println!("[driver] canon-put {key}");
+        self.memo_canonical.write().await.insert(key, bytes);
+    }
+
     /// Barrier: block until the agreed pool has formed once. A latch, not a
     /// level check — late joiners always add capacity, and a shrinking pool
     /// never re-blocks dispatch.
@@ -1549,11 +1712,15 @@ impl Driver {
         // action/command blobs live on worker shards; a local-only read
         // silently degraded routing to PlatKey::default() and put /bin/sh
         // actions on windows workers (reader 28957851178).
-        let (plat, do_not_cache, affinity, input_root) = match self.get_blob(action_digest).await? {
+        let (plat, do_not_cache, affinity, input_root, canon_cmd) = match self
+            .get_blob(action_digest)
+            .await?
+        {
             Some(bytes) => match re::Action::decode(bytes.as_slice()) {
                 Ok(action) => {
                     let mut plat = PlatKey::from_properties(action.platform.as_ref());
                     let mut affinity_key: Option<String> = None;
+                    let mut canon_cmd: Option<re::Command> = None;
                     if let Some(cd) = &action.command_digest {
                         if let Ok(Some(cmd_bytes)) = self
                             .get_blob(&Dig {
@@ -1572,6 +1739,9 @@ impl Driver {
                                     }
                                 }
                                 affinity_key = crate_affinity_key(&cmd);
+                                if self.cfg.name_independent && crate::norm::is_rustc_action(&cmd) {
+                                    canon_cmd = Some(cmd);
+                                }
                             }
                         }
                     }
@@ -1598,12 +1768,36 @@ impl Driver {
                         action.do_not_cache,
                         affinity,
                         action.input_root_digest,
+                        canon_cmd,
                     )
                 }
-                Err(_) => (PlatKey::default(), false, None, None),
+                Err(_) => (PlatKey::default(), false, None, None, None),
             },
-            None => (PlatKey::default(), false, None, None),
+            None => (PlatKey::default(), false, None, None, None),
         };
+
+        // Name-independent probe: identical work under a different label
+        // may already have a canonical result. Failures here degrade to a
+        // plain miss - the canonical layer must never fail an action.
+        let mut canon_key: Option<String> = None;
+        if let (Some(cmd), Some(root)) = (&canon_cmd, &input_root) {
+            let root: Dig = root.into();
+            match self.compute_canonical_key(cmd, &root).await {
+                Ok(key) => {
+                    if let Ok(Some(result)) = self.canonical_probe(&key, cmd).await {
+                        return Ok(exec::Outcome {
+                            action_result: result,
+                            do_not_cache,
+                        });
+                    }
+                    canon_key = Some(key);
+                }
+                Err(e) => {
+                    // Diagnosable but non-fatal: unsupported shapes just miss.
+                    eprintln!("[driver] canon-key skip: {e:#}");
+                }
+            }
+        }
         let locality = if self.cfg.locality {
             match &input_root {
                 Some(d) => self.locality_pref(&d.into()).await,
@@ -1642,6 +1836,15 @@ impl Driver {
             .await
             .context("job dropped without completion")?
             .map_err(|e| anyhow::anyhow!("execution failed: {e}"))?;
+
+        // Populate the canonical cache with the fresh result so the next
+        // differently-named twin hits. Successes only: failures are not
+        // name-independent facts (they may be env-transient).
+        if let Some(key) = canon_key {
+            if action_result.exit_code == 0 && !do_not_cache {
+                self.canonical_put(key, &action_result).await;
+            }
+        }
 
         Ok(exec::Outcome {
             action_result,
@@ -1861,6 +2064,7 @@ mod tests {
             cache_failures: false,
             locality: false,
             prefetch_metadata: false,
+            name_independent: false,
             scratch: std::env::temp_dir(),
         };
         f(&mut cfg);
@@ -1882,6 +2086,7 @@ mod tests {
                 cache_failures: false,
                 locality: false,
                 prefetch_metadata: false,
+                name_independent: false,
                 scratch: std::env::temp_dir(),
             },
         )
@@ -2016,6 +2221,130 @@ mod tests {
     /// healing4/5: has_blobs testified on the bare index entry, exec-time
     /// get_blob then trusted the same stale entry and turned one peer's
     /// "Missing" into a hard action failure - 3,650 times per lap.
+    /// The caching dream end-to-end at driver level: two actions compiling
+    /// identical source under DIFFERENT labels compute one canonical key;
+    /// the first execution's canonical_put lets the second label
+    /// canonical_probe a hit whose paths are its own and whose blob
+    /// digests are the original's.
+    #[tokio::test]
+    async fn name_independent_twins_share_one_canonical_row() {
+        let d = test_driver_with(|c| c.name_independent = true);
+
+        // Shared source file + per-label argsfiles in per-label trees.
+        let src = b"pub fn f() {}".to_vec();
+        let src_dig = d.store.put(None, &src).await.unwrap();
+        let mk_tree = |args: Vec<u8>| {
+            let store = d.store.clone();
+            let src_dig = src_dig.clone();
+            async move {
+                let args_dig = store.put(None, &args).await.unwrap();
+                let dir = re::Directory {
+                    files: vec![
+                        re::FileNode {
+                            name: "lib.rs".into(),
+                            digest: Some(src_dig.to_proto()),
+                            ..Default::default()
+                        },
+                        re::FileNode {
+                            name: "cmd.args".into(),
+                            digest: Some(args_dig.to_proto()),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                };
+                let bytes = dir.encode_to_vec();
+                store.put(None, &bytes).await.unwrap()
+            }
+        };
+        let main_out = "buck-out/s/art/p/__adler-1__/a1b2c3d4e5f60718/lib.rmeta";
+        let snap_out = "buck-out/s/art/p/snapshots/2024-11/__adler-1__/ffee001122334455/lib.rmeta";
+        let root_main = mk_tree(
+            format!("-Cmetadata=fixups//third-party:adler-1#aa\n{main_out}\n").into_bytes(),
+        )
+        .await;
+        let root_snap = mk_tree(
+            format!("-Cmetadata=fixups//third-party/snapshots/2024-11:adler-1#bb\n{snap_out}\n")
+                .into_bytes(),
+        )
+        .await;
+        let mk_cmd = |out: &str| re::Command {
+            arguments: vec![
+                "python3".into(),
+                "rustc_action.py".into(),
+                "@cmd.args".into(),
+            ],
+            output_paths: vec![out.to_owned()],
+            ..Default::default()
+        };
+        let cmd_main = mk_cmd(main_out);
+        let cmd_snap = mk_cmd(snap_out);
+
+        // Different labels, one canonical key.
+        let k1 = d
+            .compute_canonical_key(&cmd_main, &root_main)
+            .await
+            .unwrap();
+        let k2 = d
+            .compute_canonical_key(&cmd_snap, &root_snap)
+            .await
+            .unwrap();
+        assert_eq!(k1, k2, "labels must not reach the canonical key");
+
+        // First build populates; the twin hits with ITS paths, SAME digest.
+        let rmeta = d.store.put(None, b"compiled bytes").await.unwrap();
+        let result = re::ActionResult {
+            output_files: vec![re::OutputFile {
+                path: main_out.into(),
+                digest: Some(rmeta.to_proto()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(d.canonical_probe(&k1, &cmd_main).await.unwrap().is_none());
+        d.canonical_put(k1, &result).await;
+        let hit = d
+            .canonical_probe(&k2, &cmd_snap)
+            .await
+            .unwrap()
+            .expect("twin must hit");
+        assert_eq!(hit.output_files[0].path, snap_out);
+        assert_eq!(
+            hit.output_files[0].digest.as_ref().unwrap().hash,
+            rmeta.hash
+        );
+
+        // Divergent source = different key: the dream never lies.
+        let src2 = d.store.put(None, b"pub fn f() { panic!() }").await.unwrap();
+        let dir2 = re::Directory {
+            files: vec![
+                re::FileNode {
+                    name: "lib.rs".into(),
+                    digest: Some(src2.to_proto()),
+                    ..Default::default()
+                },
+                re::FileNode {
+                    name: "cmd.args".into(),
+                    digest: Some(
+                        d.store
+                            .put(
+                                None,
+                                format!("-Cmetadata=x:adler-1#cc\n{snap_out}\n").as_bytes(),
+                            )
+                            .await
+                            .unwrap()
+                            .to_proto(),
+                    ),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let root2 = d.store.put(None, &dir2.encode_to_vec()).await.unwrap();
+        let k3 = d.compute_canonical_key(&cmd_snap, &root2).await.unwrap();
+        assert_ne!(k2, k3, "source divergence must change the key");
+    }
+
     #[tokio::test]
     async fn stale_provider_entry_is_a_hint_not_truth() {
         let d = test_driver(false);

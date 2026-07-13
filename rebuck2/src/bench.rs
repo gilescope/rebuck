@@ -255,6 +255,7 @@ pub async fn fleet(cfg: FleetCfg) -> Result<FleetMetrics> {
             cache_failures: false,
             locality: cfg.locality,
             prefetch_metadata: cfg.prefetch,
+            name_independent: false,
             addr_file: Some(addr_file.clone()),
             finalize_file: None,
             scratch: root.join("driver-exec"),
