@@ -380,12 +380,13 @@ impl re::action_cache_server::ActionCache for Ac {
         // validated gate reports a miss instead, so the client re-executes
         // and the fleet re-uploads: self-healing.
         match self.driver.validated_ac_get(&dig(d)?.hash).await {
-            AcLookup::Hit(result) => {
+            AcLookup::Hit(bytes) => {
                 self.stats.ac_hits.fetch_add(1, Relaxed);
-                self.stats
-                    .ac_bytes
-                    .fetch_add(result.encoded_len() as u64, Relaxed);
-                Ok(Response::new(*result))
+                self.stats.ac_bytes.fetch_add(bytes.len() as u64, Relaxed);
+                // The fleet ships opaque bytes; decoding is the frontend's job.
+                let result = re::ActionResult::decode(bytes.as_slice())
+                    .map_err(|e| Status::internal(format!("corrupt cached result: {e}")))?;
+                Ok(Response::new(result))
             }
             AcLookup::Unservable => {
                 self.stats.ac_unservable.fetch_add(1, Relaxed);
@@ -444,13 +445,15 @@ impl re::execution_server::Execution for Exec {
         // blob-less results after cache eviction (writer 28935304124).
         if !r.skip_cache_lookup {
             match self.driver.validated_ac_get(&d.hash).await {
-                AcLookup::Hit(result) => {
+                AcLookup::Hit(bytes) => {
+                    let result = re::ActionResult::decode(bytes.as_slice())
+                        .map_err(|e| Status::internal(format!("corrupt cached result: {e}")))?;
                     if result.exit_code == 0 {
                         self.driver.ac_hit_ok.fetch_add(1, Relaxed);
                     } else {
                         self.driver.ac_hit_fail.fetch_add(1, Relaxed);
                     }
-                    return Ok(op_stream(&d, *result, true));
+                    return Ok(op_stream(&d, result, true));
                 }
                 AcLookup::Unservable => {
                     self.stats.ac_unservable.fetch_add(1, Relaxed);
@@ -470,17 +473,16 @@ impl re::execution_server::Execution for Exec {
                 .dnc_exec
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        let cacheable = !outcome.do_not_cache
-            && (outcome.action_result.exit_code == 0 || self.driver.cache_failures());
+        // The fleet handed back opaque bytes; this frontend owns the meaning.
+        let result = re::ActionResult::decode(outcome.result.as_slice())
+            .map_err(|e| Status::internal(format!("worker returned a bad result: {e}")))?;
+        let cacheable =
+            !outcome.do_not_cache && (result.exit_code == 0 || self.driver.cache_failures());
         if cacheable {
-            let _ = self
-                .driver
-                .store
-                .ac_put(&d.hash, &outcome.action_result.encode_to_vec())
-                .await;
+            let _ = self.driver.store.ac_put(&d.hash, &outcome.result).await;
             self.driver.note_ac_written(&d.hash).await;
         }
-        Ok(op_stream(&d, outcome.action_result, false))
+        Ok(op_stream(&d, result, false))
     }
 
     async fn wait_execution(
@@ -555,6 +557,7 @@ mod tests {
                 finalize_file: None,
                 scratch: std::env::temp_dir(),
             },
+            Arc::new(crate::payload::reapi::Reapi),
         );
         Ac {
             store,

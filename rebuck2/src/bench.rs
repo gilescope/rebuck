@@ -259,6 +259,7 @@ pub async fn fleet(cfg: FleetCfg) -> Result<FleetMetrics> {
             finalize_file: None,
             scratch: root.join("driver-exec"),
         },
+        Arc::new(crate::payload::reapi::Reapi),
     );
     {
         let d = driver.clone();
@@ -328,7 +329,9 @@ pub async fn fleet(cfg: FleetCfg) -> Result<FleetMetrics> {
             preloaded_shard: None,
         };
         std::fs::create_dir_all(&cfgw.scratch)?;
-        tokio::spawn(async move { worker::run(wstore, cfgw).await });
+        tokio::spawn(async move {
+            worker::run(wstore, cfgw, Arc::new(crate::payload::reapi::Reapi)).await
+        });
     }
     for _ in 0..200 {
         if driver.worker_count().await >= cfg.workers {

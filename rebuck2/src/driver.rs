@@ -11,14 +11,12 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use bazel_remote_apis::build::bazel::remote::execution::v2 as re;
 use iroh::endpoint::Connection;
 use iroh::Endpoint;
-use prost::Message;
 use tokio::sync::{mpsc, oneshot, Mutex, Semaphore};
 
-use crate::exec::{self, crate_affinity_key};
 use crate::mesh::{self, BlobReq, BlobResp, Dig, D2W, W2D};
+use crate::payload::Payload;
 use crate::store::Store;
 
 pub struct DriverCfg {
@@ -63,38 +61,13 @@ pub struct DriverCfg {
 
 /// Outcome of a validated AC lookup ([`Driver::validated_ac_get`]).
 pub enum AcLookup {
-    /// Cached result whose referenced blobs are all fetchable. Boxed:
-    /// ActionResult is ~528 bytes and the other variants carry nothing.
-    Hit(Box<re::ActionResult>),
+    /// Cached result whose referenced blobs are all fetchable. The payload's
+    /// own encoding — the fleet ships these bytes without ever reading them.
+    Hit(Arc<Vec<u8>>),
     /// Entry exists but at least one referenced blob is gone (evicted CAS):
     /// callers must report a miss so the client re-executes and re-uploads.
     Unservable,
     Miss,
-}
-
-/// Every CAS digest a cached result commits the server to delivering.
-/// Zero-size blobs are implicit in RE and skipped.
-pub fn result_digests(r: &re::ActionResult) -> Vec<Dig> {
-    let mut digs = Vec::new();
-    let mut push = |d: &Option<re::Digest>| {
-        if let Some(d) = d {
-            if d.size_bytes > 0 {
-                digs.push(Dig {
-                    hash: d.hash.clone(),
-                    size: d.size_bytes,
-                });
-            }
-        }
-    };
-    for f in &r.output_files {
-        push(&f.digest);
-    }
-    for t in &r.output_directories {
-        push(&t.tree_digest);
-    }
-    push(&r.stdout_digest);
-    push(&r.stderr_digest);
-    digs
 }
 
 struct WorkerConn {
@@ -112,8 +85,8 @@ struct WorkerConn {
     preloaded_shard: Option<u8>,
 }
 
-/// What platform an action demands, from its REAPI platform properties.
-/// Empty string = no constraint on that axis (matches any worker).
+/// What platform a job demands. Empty string = no constraint on that axis
+/// (matches any worker). The payload decides how a spec maps onto one.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
 pub struct PlatKey {
     pub os: String,
@@ -143,30 +116,12 @@ impl PlatKey {
             PlatKey::default(),
         ]
     }
-
-    /// Parse from REAPI platform properties (Command.platform /
-    /// Action.platform). Recognised keys (case-insensitive): OSFamily/os,
-    /// Arch/arch. Values are matched verbatim against the worker's
-    /// std::env::consts OS/ARCH strings ("windows"/"linux"/"macos",
-    /// "x86_64"/"aarch64").
-    fn from_properties(platform: Option<&re::Platform>) -> PlatKey {
-        let mut key = PlatKey::default();
-        if let Some(p) = platform {
-            for prop in &p.properties {
-                match prop.name.to_ascii_lowercase().as_str() {
-                    "osfamily" | "os" => key.os = prop.value.to_ascii_lowercase(),
-                    "arch" | "architecture" => key.arch = prop.value.to_ascii_lowercase(),
-                    _ => {}
-                }
-            }
-        }
-        key
-    }
 }
 
 /// An action in flight: who to answer, what to run, where it's running.
 struct Job {
-    tx: oneshot::Sender<Result<re::ActionResult, String>>,
+    /// The payload's encoded result. Opaque to the fleet.
+    tx: oneshot::Sender<Result<Vec<u8>, String>>,
     action: Dig,
     /// Platform this action demands (empty axes = any).
     plat: PlatKey,
@@ -199,7 +154,7 @@ const MAX_ATTEMPTS: u32 = 3;
 const SPECULATE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Waiters attached to one single-flight leader, keyed by action hash.
-type InflightMap = HashMap<String, Vec<oneshot::Sender<Result<re::ActionResult, String>>>>;
+type InflightMap = HashMap<String, Vec<oneshot::Sender<Result<Vec<u8>, String>>>>;
 
 /// Clears a single-flight leader's entry if the leader is dropped before it
 /// completes (client disconnect, cancellation). Dropping the waiters' senders
@@ -226,6 +181,9 @@ impl Drop for LeaderGuard<'_> {
 
 pub struct Driver {
     pub store: Arc<Store>,
+    /// The only thing here that can read a job spec or a result. Every proto
+    /// decode in the system is on the far side of this. See [`crate::payload`].
+    payload: Arc<dyn Payload>,
     cfg: DriverCfg,
     jobs: Mutex<HashMap<u64, Job>>,
     workers: Mutex<Vec<WorkerConn>>,
@@ -301,12 +259,13 @@ pub struct Driver {
 }
 
 impl Driver {
-    pub fn new(store: Arc<Store>, cfg: DriverCfg) -> Arc<Self> {
+    pub fn new(store: Arc<Store>, cfg: DriverCfg, payload: Arc<dyn Payload>) -> Arc<Self> {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
         Arc::new(Self {
             store,
+            payload,
             cfg,
             jobs: Mutex::new(HashMap::new()),
             workers: Mutex::new(Vec::new()),
@@ -564,9 +523,9 @@ impl Driver {
                                 providers.insert(hash, endpoint.clone());
                             }
                         }
-                        let result = re::ActionResult::decode(action_result.as_slice())
-                            .map_err(|e| format!("bad ActionResult from worker: {e}"));
-                        self.complete(job, result).await;
+                        // Opaque to the fleet: the payload encoded it, the
+                        // payload's client will decode it.
+                        self.complete(job, Ok(action_result)).await;
                         self.pump().await;
                     }
                     W2D::Failed { job, msg } => {
@@ -659,6 +618,7 @@ impl Driver {
                 prefetch_metadata: false,
                 scratch: std::env::temp_dir(),
             },
+            Arc::new(crate::payload::reapi::Reapi),
         )
     }
 
@@ -824,9 +784,7 @@ impl Driver {
         // Fast path: a validated-servable entry is served from memory -
         // no disk read, no revalidation, concurrent readers.
         if let Some(cached) = self.memo_servable.read().await.get(hash).cloned() {
-            if let Ok(result) = re::ActionResult::decode(cached.as_slice()) {
-                return AcLookup::Hit(Box::new(result));
-            }
+            return AcLookup::Hit(cached);
         }
         let Some(bytes) = self.store.ac_get(hash).await else {
             return AcLookup::Miss;
@@ -836,67 +794,31 @@ impl Driver {
                 return AcLookup::Unservable;
             }
         }
-        let Ok(result) = re::ActionResult::decode(bytes.as_slice()) else {
-            // Corrupt entry: re-execution overwrites it. Safer than serving.
-            return AcLookup::Miss;
+        // The payload names every blob this result commits us to delivering -
+        // transitively, because a directory output's top-level digest proves
+        // only that its TREE PROTO exists, not its contents (reader
+        // 29010597531 lost 5,390 actions to interior files of "validated"
+        // directory outputs that existed nowhere).
+        //
+        // An error here means "cannot vouch for this result" - a corrupt entry
+        // OR a tree we could not fetch. Both are Unservable rather than Miss:
+        // the client re-executes either way, and refusing to serve is the safe
+        // direction. `note_ac_written` clears the verdict once it is rewritten.
+        let blobs = MeshBlobs(self.clone());
+        let digs = match self.payload.referenced_digests(&bytes, &blobs).await {
+            Ok(d) => d,
+            Err(e) => {
+                let n = self.unservable_logged.fetch_add(1, Ordering::Relaxed);
+                if n < 20 {
+                    println!("[driver] unservable sample {n}: action {hash}: {e:#}");
+                }
+                self.memo_unservable
+                    .lock()
+                    .await
+                    .insert(hash.to_string(), std::time::Instant::now());
+                return AcLookup::Unservable;
+            }
         };
-        let mut digs = result_digests(&result);
-        // Top-level digests prove a directory output's Tree PROTO exists,
-        // not its contents: reader 29010597531 lost 5,390 actions to
-        // interior files of validated directory outputs that existed
-        // nowhere. Expand each tree (small, cached after first fetch) and
-        // demand its files and child Directory protos too.
-        // Tree fetches in parallel — scrub_ac funnels tens of thousands of
-        // entries through here 32-wide, so an inner per-directory await
-        // multiplies. Decode/expand stays sequential on the results.
-        let tree_blobs = futures::future::join_all(
-            result
-                .output_directories
-                .iter()
-                .filter_map(|od| od.tree_digest.as_ref())
-                .map(|td| {
-                    let tdig: Dig = td.into();
-                    async move { self.get_blob(&tdig).await }
-                }),
-        )
-        .await;
-        for fetched in tree_blobs {
-            let Ok(Some(tree_bytes)) = fetched else {
-                self.memo_unservable
-                    .lock()
-                    .await
-                    .insert(hash.to_string(), std::time::Instant::now());
-                return AcLookup::Unservable;
-            };
-            let Ok(tree) = re::Tree::decode(tree_bytes.as_slice()) else {
-                self.memo_unservable
-                    .lock()
-                    .await
-                    .insert(hash.to_string(), std::time::Instant::now());
-                return AcLookup::Unservable;
-            };
-            for dir in tree.root.iter().chain(tree.children.iter()) {
-                for f in &dir.files {
-                    if let Some(d) = &f.digest {
-                        if d.size_bytes > 0 {
-                            digs.push(d.into());
-                        }
-                    }
-                }
-            }
-            // Child Directory protos are separate CAS blobs referenced by
-            // digest during materialization; their digests are computable
-            // locally from the embedded copies.
-            for child in &tree.children {
-                let enc = child.encode_to_vec();
-                if !enc.is_empty() {
-                    digs.push(Dig {
-                        hash: crate::store::sha256_hex(&enc),
-                        size: enc.len() as i64,
-                    });
-                }
-            }
-        }
         if !digs.is_empty() {
             let have = self.has_blobs(&digs).await;
             if let Some(i) = have.iter().position(|p| !p) {
@@ -907,11 +829,10 @@ impl Driver {
                 let n = self.unservable_logged.fetch_add(1, Ordering::Relaxed);
                 if n < 20 {
                     println!(
-                        "[driver] unservable sample {n}: action {hash} missing blob {}/{} ({} outputs, {} dirs)",
+                        "[driver] unservable sample {n}: action {hash} missing blob {}/{} (of {} referenced)",
                         digs[i].hash,
                         digs[i].size,
-                        result.output_files.len(),
-                        result.output_directories.len()
+                        digs.len()
                     );
                 }
                 self.memo_unservable
@@ -921,11 +842,12 @@ impl Driver {
                 return AcLookup::Unservable;
             }
         }
+        let bytes = Arc::new(bytes);
         self.memo_servable
             .write()
             .await
-            .insert(hash.to_string(), Arc::new(bytes));
-        AcLookup::Hit(Box::new(result))
+            .insert(hash.to_string(), bytes.clone());
+        AcLookup::Hit(bytes)
     }
 
     /// A fresh result was written for this key: any cached unservable
@@ -977,20 +899,13 @@ impl Driver {
     /// gossiped to the driver, so scoring is in-memory bit-tests - the
     /// who-has-what oracle costs nothing extra. Returns None when no
     /// worker claims anything (cold data: any worker is equally far).
-    async fn locality_pref(&self, input_root: &Dig) -> Option<u64> {
-        let bytes = self.get_blob(input_root).await.ok()??;
-        let dir = re::Directory::decode(bytes.as_slice()).ok()?;
-        // Top-K heaviest files decide; small files follow cheaply anyway.
-        let mut files: Vec<(&str, i64)> = dir
-            .files
-            .iter()
-            .filter_map(|f| f.digest.as_ref().map(|d| (d.hash.as_str(), d.size_bytes)))
-            .collect();
-        files.sort_by_key(|(_, s)| -*s);
-        files.truncate(8);
+    async fn locality_pref(self: &Arc<Self>, input_root: &Dig) -> Option<u64> {
+        let blobs = MeshBlobs(self.clone());
+        let files = self.payload.heavy_inputs(input_root, &blobs).await;
         if files.is_empty() {
             return None;
         }
+        let files: Vec<(&str, i64)> = files.iter().map(|(h, s)| (h.as_str(), *s)).collect();
         let blooms = self.blooms.lock().await;
         let workers = self.workers.lock().await;
         let mut best: Option<(u64, i64)> = None;
@@ -1410,7 +1325,7 @@ impl Driver {
     }
 
     /// Resolve a job's oneshot and drop it from the table.
-    async fn complete(&self, job_id: u64, result: Result<re::ActionResult, String>) {
+    async fn complete(&self, job_id: u64, result: Result<Vec<u8>, String>) {
         if let Some(job) = self.jobs.lock().await.remove(&job_id) {
             let _ = job.tx.send(result);
         }
@@ -1455,9 +1370,11 @@ impl Driver {
                         store: this.store.clone(),
                         hardlinks: this.cfg.hardlinks,
                     };
-                    let result = exec::run_action(&blobs, &action, &this.cfg.scratch)
+                    let result = this
+                        .payload
+                        .execute(&blobs, &action, &this.cfg.scratch)
                         .await
-                        .map(|o| o.action_result)
+                        .map(|d| d.result)
                         .map_err(|e| format!("{e:#}"));
                     this.complete(job_id, result).await;
                 });
@@ -1605,67 +1522,24 @@ impl Driver {
         self.pool_formed.store(true, Relaxed);
     }
 
-    /// Execute an action: queue it, dispatch (worker or local), await the result.
-    pub async fn execute(self: &Arc<Self>, action_digest: &Dig) -> Result<exec::Outcome> {
+    /// Run a job: queue it, dispatch (worker or local), await the result.
+    /// Returns the payload's ENCODED result — the fleet never looks inside.
+    pub async fn execute(self: &Arc<Self>, action_digest: &Dig) -> Result<crate::payload::Done> {
         self.await_pool_formed().await;
 
-        // Route by the action's demanded platform (REAPI platform
-        // properties live on the Command; Action.platform is the newer
-        // spot — honour both, Command winning only if Action has none).
-        // get_blob, not store.get: with an AC-only-seeded driver the
-        // action/command blobs live on worker shards; a local-only read
-        // silently degraded routing to PlatKey::default() and put /bin/sh
-        // actions on windows workers (reader 28957851178).
-        let (plat, do_not_cache, affinity, input_root) = match self.get_blob(action_digest).await? {
-            Some(bytes) => match re::Action::decode(bytes.as_slice()) {
-                Ok(action) => {
-                    let mut plat = PlatKey::from_properties(action.platform.as_ref());
-                    let mut affinity_key: Option<String> = None;
-                    if let Some(cd) = &action.command_digest {
-                        if let Ok(Some(cmd_bytes)) = self
-                            .get_blob(&Dig {
-                                hash: cd.hash.clone(),
-                                size: cd.size_bytes,
-                            })
-                            .await
-                        {
-                            if let Ok(cmd) = re::Command::decode(cmd_bytes.as_slice()) {
-                                if plat == PlatKey::default() {
-                                    // pre-v2.1 clients (buck2 included) put
-                                    // platform on Command, not Action.
-                                    #[allow(deprecated)]
-                                    {
-                                        plat = PlatKey::from_properties(cmd.platform.as_ref());
-                                    }
-                                }
-                                affinity_key = crate_affinity_key(&cmd);
-                            }
-                        }
-                    }
-                    // Fall back to the input root when no crate prefix is
-                    // recognisable — same-input actions still colocate.
-                    let affinity = affinity_key
-                        .or_else(|| action.input_root_digest.as_ref().map(|d| d.hash.clone()))
-                        .map(|key| {
-                            use std::hash::{Hash, Hasher};
-                            let mut h = std::collections::hash_map::DefaultHasher::new();
-                            key.hash(&mut h);
-                            h.finish()
-                        });
-                    (
-                        plat,
-                        action.do_not_cache,
-                        affinity,
-                        action.input_root_digest,
-                    )
-                }
-                Err(_) => (PlatKey::default(), false, None, None),
-            },
-            None => (PlatKey::default(), false, None, None),
-        };
+        // The payload reads the spec; the fleet only learns where it may run.
+        // MeshBlobs, not the local store: with an AC-only-seeded driver the
+        // spec's blobs live on worker shards, and a local-only read silently
+        // degraded routing to PlatKey::default() - putting /bin/sh actions on
+        // windows workers (reader 28957851178).
+        let blobs = MeshBlobs(self.clone());
+        let meta = self.payload.inspect(action_digest, &blobs).await;
+        let (plat, do_not_cache, affinity, input_root) =
+            (meta.plat, meta.do_not_cache, meta.affinity, meta.input_root);
+
         let locality = if self.cfg.locality {
             match &input_root {
-                Some(d) => self.locality_pref(&d.into()).await,
+                Some(d) => self.locality_pref(d).await,
                 None => None,
             }
         } else {
@@ -1704,9 +1578,9 @@ impl Driver {
             if let Some(rx) = waiter {
                 self.sf_merged.fetch_add(1, Ordering::Relaxed);
                 match rx.await {
-                    Ok(Ok(action_result)) => {
-                        return Ok(exec::Outcome {
-                            action_result,
+                    Ok(Ok(result)) => {
+                        return Ok(crate::payload::Done {
+                            result,
                             do_not_cache,
                         })
                     }
@@ -1770,12 +1644,31 @@ impl Driver {
                 let _ = w.send(outcome.clone());
             }
 
-            let action_result = outcome.map_err(|e| anyhow::anyhow!("execution failed: {e}"))?;
-            return Ok(exec::Outcome {
-                action_result,
+            let result = outcome.map_err(|e| anyhow::anyhow!("execution failed: {e}"))?;
+            return Ok(crate::payload::Done {
+                result,
                 do_not_cache,
             });
         }
+    }
+}
+
+/// Blobs resolved through the driver's read-through path: local store first,
+/// then whichever peer holds them. What the payload gets when it needs to
+/// follow a reference (a tree proto, a command) that may live anywhere on the
+/// mesh — the fleet answers "where", the payload asks "what".
+pub struct MeshBlobs(pub Arc<Driver>);
+
+#[async_trait::async_trait]
+impl crate::store::Blobs for MeshBlobs {
+    async fn get(&self, d: &Dig) -> Result<Vec<u8>> {
+        self.0
+            .get_blob(d)
+            .await?
+            .with_context(|| format!("blob {} missing", d.hash))
+    }
+    async fn put(&self, bytes: Vec<u8>) -> Result<Dig> {
+        self.0.store.put(None, &bytes).await
     }
 }
 
@@ -1786,7 +1679,7 @@ pub struct StoreBlobs {
 }
 
 #[async_trait::async_trait]
-impl exec::Blobs for StoreBlobs {
+impl crate::store::Blobs for StoreBlobs {
     async fn get(&self, d: &Dig) -> Result<Vec<u8>> {
         self.store
             .get(d)
@@ -1819,14 +1712,14 @@ impl exec::Blobs for StoreBlobs {
             let bytes = self.get(d).await?;
             tokio::fs::write(dest, &bytes).await?;
             if is_executable {
-                exec::set_exec(dest).await?;
+                crate::store::set_exec(dest).await?;
             }
             return Ok(());
         }
         if self.store.link_out(d, dest).await? == crate::store::Materialized::Private
             && is_executable
         {
-            exec::set_exec(dest).await?;
+            crate::store::set_exec(dest).await?;
         }
         Ok(())
     }
@@ -1972,6 +1865,10 @@ async fn serve_blob_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The fleet itself no longer speaks REAPI; these tests do, because they
+    // exercise it THROUGH the reapi payload.
+    use bazel_remote_apis::build::bazel::remote::execution::v2 as re;
+    use prost::Message;
 
     fn test_driver(local_exec: bool) -> Arc<Driver> {
         test_driver_min(local_exec, 0)
@@ -1993,7 +1890,11 @@ mod tests {
             scratch: std::env::temp_dir(),
         };
         f(&mut cfg);
-        Driver::new(Arc::new(Store::new(dir).unwrap()), cfg)
+        Driver::new(
+            Arc::new(Store::new(dir).unwrap()),
+            cfg,
+            Arc::new(crate::payload::reapi::Reapi),
+        )
     }
 
     fn test_driver_min(local_exec: bool, min_workers: usize) -> Arc<Driver> {
@@ -2013,6 +1914,7 @@ mod tests {
                 prefetch_metadata: false,
                 scratch: std::env::temp_dir(),
             },
+            Arc::new(crate::payload::reapi::Reapi),
         )
     }
 
@@ -2030,7 +1932,8 @@ mod tests {
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                     inf.fetch_sub(1, Ordering::Relaxed);
-                    d3.complete(job, Ok(re::ActionResult::default())).await;
+                    d3.complete(job, Ok(re::ActionResult::default().encode_to_vec()))
+                        .await;
                     d3.pump().await;
                 });
             }
@@ -2068,7 +1971,8 @@ mod tests {
                     // action is genuinely concurrent with the first.
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                     inf.fetch_sub(1, Ordering::Relaxed);
-                    d3.complete(job, Ok(re::ActionResult::default())).await;
+                    d3.complete(job, Ok(re::ActionResult::default().encode_to_vec()))
+                        .await;
                     d3.pump().await;
                 });
             }
@@ -2157,7 +2061,6 @@ mod tests {
     /// prelude uses them for diagnostic wrappers that want a real re-run.
     #[tokio::test]
     async fn do_not_cache_actions_never_merge() {
-        use prost::Message;
         let d = test_driver(false);
         let runs = counting_worker(&d, 1, 4, "test").await;
 
@@ -2237,7 +2140,8 @@ mod tests {
                     tokio::spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                         inf.fetch_sub(1, Ordering::Relaxed);
-                        d3.complete(job, Ok(re::ActionResult::default())).await;
+                        d3.complete(job, Ok(re::ActionResult::default().encode_to_vec()))
+                            .await;
                         d3.pump().await;
                     });
                 }
@@ -2501,7 +2405,8 @@ mod tests {
                 while let Some(D2W::Run { job, .. }) = rx.recv().await {
                     ran2.lock().await.push(ep);
                     inf.fetch_sub(1, Ordering::Relaxed);
-                    d2.complete(job, Ok(re::ActionResult::default())).await;
+                    d2.complete(job, Ok(re::ActionResult::default().encode_to_vec()))
+                        .await;
                     d2.pump().await;
                 }
             });
@@ -2632,7 +2537,8 @@ mod tests {
                 tokio::spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                     inf.fetch_sub(1, Ordering::Relaxed);
-                    d3.complete(job, Ok(re::ActionResult::default())).await;
+                    d3.complete(job, Ok(re::ActionResult::default().encode_to_vec()))
+                        .await;
                     d3.pump().await;
                 });
             }
@@ -2655,7 +2561,6 @@ mod tests {
     /// same, and single-flight (correctly) collapses them into one execution,
     /// which is not what a routing test means to measure.
     async fn platformed_action(d: &Arc<Driver>, os: &str, salt: u32) -> Dig {
-        use prost::Message;
         let action = re::Action {
             platform: Some(re::Platform {
                 properties: vec![re::platform::Property {

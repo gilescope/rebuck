@@ -14,11 +14,10 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use iroh::endpoint::Connection;
 use iroh::Endpoint;
-use prost::Message;
 use tokio::sync::{Mutex, Semaphore};
 
-use crate::exec;
 use crate::mesh::{self, BlobReq, BlobResp, Dig, D2W, W2D};
+use crate::payload::Payload;
 use crate::store::Store;
 
 pub struct WorkerCfg {
@@ -38,7 +37,7 @@ pub struct WorkerCfg {
     pub preloaded_shard: Option<u8>,
 }
 
-pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
+pub async fn run(store: Arc<Store>, cfg: WorkerCfg, payload: Arc<dyn Payload>) -> Result<()> {
     let ep = Endpoint::builder(iroh::endpoint::presets::N0)
         .alpns(vec![mesh::ALPN.to_vec()])
         .bind()
@@ -256,16 +255,17 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
         let ctrl = ctrl_send.clone();
         let scratch = cfg.scratch.clone();
         let slots = slots.clone();
+        let payload = payload.clone();
         tokio::spawn(async move {
             let _permit = slots.acquire_owned().await.expect("semaphore open");
             let tracking = TrackingBlobs {
                 inner: blobs,
                 stored: Mutex::new(Vec::new()),
             };
-            let reply = match exec::run_action(&tracking, &action, &scratch).await {
-                Ok(outcome) => W2D::Done {
+            let reply = match payload.execute(&tracking, &action, &scratch).await {
+                Ok(done) => W2D::Done {
                     job,
-                    action_result: outcome.action_result.encode_to_vec(),
+                    action_result: done.result,
                     stored: tracking.stored.into_inner(),
                 },
                 Err(e) => W2D::Failed {
@@ -356,7 +356,7 @@ struct TrackingBlobs {
 }
 
 #[async_trait::async_trait]
-impl exec::Blobs for TrackingBlobs {
+impl crate::store::Blobs for TrackingBlobs {
     async fn get(&self, d: &Dig) -> Result<Vec<u8>> {
         self.inner.get(d).await
     }
@@ -487,7 +487,7 @@ impl RemoteBlobs {
 }
 
 #[async_trait::async_trait]
-impl exec::Blobs for RemoteBlobs {
+impl crate::store::Blobs for RemoteBlobs {
     async fn get(&self, d: &Dig) -> Result<Vec<u8>> {
         use std::sync::atomic::Ordering::Relaxed;
         if let Some(bytes) = self.store.get(d).await? {
@@ -603,7 +603,7 @@ impl exec::Blobs for RemoteBlobs {
             let bytes = self.get(d).await?;
             tokio::fs::write(dest, &bytes).await?;
             if is_executable {
-                exec::set_exec(dest).await?;
+                crate::store::set_exec(dest).await?;
             }
             return Ok(());
         }
@@ -615,7 +615,7 @@ impl exec::Blobs for RemoteBlobs {
         if self.store.link_out(d, dest).await? == crate::store::Materialized::Private
             && is_executable
         {
-            exec::set_exec(dest).await?;
+            crate::store::set_exec(dest).await?;
         }
         Ok(())
     }

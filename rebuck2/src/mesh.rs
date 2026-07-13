@@ -39,24 +39,6 @@ pub struct Dig {
     pub size: i64,
 }
 
-impl From<&bazel_remote_apis::build::bazel::remote::execution::v2::Digest> for Dig {
-    fn from(d: &bazel_remote_apis::build::bazel::remote::execution::v2::Digest) -> Self {
-        Self {
-            hash: d.hash.clone(),
-            size: d.size_bytes,
-        }
-    }
-}
-
-impl Dig {
-    pub fn to_proto(&self) -> bazel_remote_apis::build::bazel::remote::execution::v2::Digest {
-        bazel_remote_apis::build::bazel::remote::execution::v2::Digest {
-            hash: self.hash.clone(),
-            size_bytes: self.size,
-        }
-    }
-}
-
 /// Space-efficient "what my store holds" summary, gossiped between peers.
 /// Blob hashes are uniform (sha256), so probe positions are sliced straight
 /// from the hex — no hash functions needed. k=4 at ~12 bits/entry ≈ 0.6% FP;

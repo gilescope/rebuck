@@ -26,6 +26,66 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// Process-wide tmp-file sequence — see the uniqueness note in [`Store::put`].
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Where blobs come from. The one abstraction both halves of the system share:
+/// a payload asks for bytes by digest and does not care whether they are on
+/// local disk (driver) or three hops across the mesh (worker).
+///
+/// Generic on purpose — nothing here knows what a blob *means*. See
+/// [`crate::payload`] for the seam that does.
+#[async_trait::async_trait]
+pub trait Blobs: Send + Sync {
+    async fn get(&self, d: &Dig) -> Result<Vec<u8>>;
+    /// Store bytes, returning their digest.
+    async fn put(&self, bytes: Vec<u8>) -> Result<Dig>;
+    /// Ingest an output file, returning its digest. Default: read + put.
+    /// Store-backed impls adopt the file into the CAS by link/clone instead
+    /// of rewriting it (same --no-hardlinks opt-out as materialization).
+    async fn put_file(&self, path: &std::path::Path) -> Result<Dig> {
+        let bytes = tokio::fs::read(path).await?;
+        self.put(bytes).await
+    }
+
+    /// Write blob `d` to `dest`. Default: fetch + write (+exec bit). Store-
+    /// backed impls override with link/clone-from-store — the write-
+    /// amplification fix — where store perms (0o555) already cover exec, and
+    /// chmod on a shared inode would be a cross-action mutation.
+    async fn materialize_file(
+        &self,
+        d: &Dig,
+        dest: &std::path::Path,
+        is_executable: bool,
+    ) -> Result<()> {
+        let bytes = self.get(d).await?;
+        tokio::fs::write(dest, &bytes).await?;
+        if is_executable {
+            set_exec(dest).await?;
+        }
+        Ok(())
+    }
+
+    /// Best-effort bulk warm-up: make `digs` locally available so subsequent
+    /// per-blob calls don't each pay a network round-trip. Never fails the
+    /// action — a blob it couldn't obtain surfaces later through `get`'s
+    /// per-blob error path, which names the digest. Default: no-op (store-
+    /// backed impls are already local). Wrapper impls MUST delegate or the
+    /// batching silently vanishes.
+    async fn prefetch(&self, _digs: &[Dig]) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+pub(crate) async fn set_exec(p: &std::path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub(crate) async fn set_exec(_p: &std::path::Path) -> Result<()> {
+    Ok(())
+}
+
 /// A blob being streamed into the CAS: hashed as it is written, so the bytes
 /// never accumulate in memory. Created by [`Store::begin_upload`], landed by
 /// [`Store::finish_upload`].

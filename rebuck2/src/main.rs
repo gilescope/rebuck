@@ -12,6 +12,7 @@ mod bench;
 mod driver;
 mod exec;
 mod mesh;
+mod payload;
 mod registry;
 mod rpc;
 mod store;
@@ -227,7 +228,7 @@ async fn main() -> Result<()> {
             };
             args.done();
             std::fs::create_dir_all(&cfg.scratch)?;
-            worker::run(store, cfg).await
+            worker::run(store, cfg, Arc::new(payload::reapi::Reapi)).await
         }
         _ => usage(),
     }
@@ -271,7 +272,7 @@ async fn run_driver(mut args: Args) -> Result<()> {
     };
     args.done();
 
-    let d = driver::Driver::new(store.clone(), cfg);
+    let d = driver::Driver::new(store.clone(), cfg, Arc::new(payload::reapi::Reapi));
 
     let mesh = {
         let d = d.clone();
