@@ -9,6 +9,10 @@ service, no persistent host, no account.
 rebuck (cache-only) stays a supported mode: if you don't need distribution,
 the original action keeps working unchanged — rebuck2 is opt-in on top.
 
+See also [buildkit-plan.md](buildkit-plan.md): reusing this fleet (mesh, CAS,
+lifecycle) for a *second* payload — earthbuild driving a fleet of stock
+buildkitds — and the payload/fleet trait split that makes a third cheap.
+
 ## Why
 
 buck2 is RE-native — remote execution *is* its scaling axis. Two motivations:
