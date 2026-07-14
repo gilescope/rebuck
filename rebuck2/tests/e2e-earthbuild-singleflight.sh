@@ -124,32 +124,27 @@ EOF
 # us afterwards which of them actually ran the command.
 mkdir -p "$SCRATCH/proj"
 #
-# NB: deliberately NOT `SAVE ARTIFACT ... AS LOCAL`. That panics on this
-# earthbuild branch — a nil fsutil.ContentHasher, pre-existing and unrelated to
-# single-flight (it reproduces with the feature OFF; see the note in the repo).
-# So a cheap downstream target CATs the marker instead, and we read it from the
-# build log. That also exercises COPY +target/artifact, which is the Earthfile
-# mechanism a fleet actually leans on.
+# `SAVE ARTIFACT ... AS LOCAL` used to panic here (a nil fsutil.ContentHasher,
+# pre-existing on this branch and unrelated to single-flight). Fixed in
+# EarthBuild/buildkit@895d75fff, which this branch now carries — so the test
+# exercises it for real, along with COPY +target/artifact.
 cat > "$SCRATCH/proj/Earthfile" <<'EOF'
 VERSION 0.8
 FROM alpine:3.20
 
 expensive:
     RUN head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > /marker.txt && sleep 12
-    SAVE ARTIFACT /marker.txt marker
-
-show:
-    COPY +expensive/marker /m.txt
-    RUN echo "MARKER=$(cat /m.txt)"
+    SAVE ARTIFACT /marker.txt AS LOCAL marker.txt
 EOF
 
 run_eb() { # run_eb <outdir> <buildkit-addr>
     mkdir -p "$1"
     cp "$SCRATCH/proj/Earthfile" "$1/"
     ( cd "$1" && EARTHLY_BUILDKIT_HOST="$2" \
-        "$SCRATCH/earthbuild" --no-cache +show ) > "$1/eb.log" 2>&1
+        "$SCRATCH/earthbuild" --no-cache +expensive ) > "$1/eb.log" 2>&1
 }
-marker_of() { grep -oE 'MARKER=[0-9a-f]{32}' "$1/eb.log" | head -1 | cut -d= -f2; }
+# Read the artifact off DISK — which also proves SAVE ARTIFACT AS LOCAL works.
+marker_of() { cat "$1/marker.txt" 2>/dev/null; }
 
 echo
 echo "=== both instances build the SAME target AT THE SAME TIME"
