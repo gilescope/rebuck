@@ -8,10 +8,25 @@ where several of these ideas were already proven).
 
 ## 1. Layers should travel P2P, not through the coordinator
 
-**The one that matters.** Today a leader PUSHES its layer to the coordinator's
-registry and every follower PULLS it back down. The coordinator is on the
-critical path for every byte, so a fleet of N workers funnels N-1 downloads
-through one box's NIC — exactly the centralisation the mesh exists to avoid.
+**The one that matters — and now measured.** A leader PUSHES its layer to the
+coordinator's registry and every follower PULLS it back down, so the coordinator
+is on the critical path for every byte.
+
+Measured by `e2e-buildkit-singleflight.sh` with a realistic 150 MB output layer
+(what a cargo/npm build looks like to the layer store), 2 daemons:
+
+```text
+pushed by leaders:    2 blobs   153.95 MiB
+pulled by followers:  1 blobs   150.05 MiB
+amplification: 0.97x
+```
+
+~1.0x per follower, so **(N-1)x at fleet scale** — 8 workers put ~1 GB through
+one NIC. This is the same centralisation that the buck2 side already fixed.
+
+Note the trap: the FIRST version of this measurement used a 32-byte output layer
+and reported `0.00x`, which would have said "no bottleneck, skip this". The
+workload has to produce something before the number means anything.
 
 The fleet already has the machinery, built for buck2 and unused by the buildkit
 payload:
@@ -92,15 +107,19 @@ Deliberately omitted from v1 — it trades the very work the lease exists to sav
 so it should be driven by a measurement (how often does a leader straggle?) and
 not by instinct. Needs the per-vertex duration history we do not yet collect.
 
-## 7. Base-image layers are pushed needlessly
+## 7. Base-image layers are pushed needlessly — measured, and it is NOISE
 
 The descriptor chain a leader publishes includes the base image's layers, which
-every worker already pulled from Docker Hub. `hasBlob` catches this after the
-first build, but the first leader still uploads a whole alpine/ubuntu.
+every worker already pulled from Docker Hub. I expected this to be worth fixing.
 
-Cheap fix: skip descriptors whose layers came from a `SourceOp` (they are
-already addressable by their original registry), and let the follower pull those
-from where it got them the first time.
+Measured: of 153.95 MiB pushed, the alpine base was **3.9 MiB — 2.5%**. And
+`hasBlob` already dedupes it after the first build. For any build that actually
+produces something, this is noise.
+
+**Deprioritised on the evidence.** It is also riskier than it looks: a follower
+whose base image is still LAZY has not materialised those blobs locally, so a
+leader that skips pushing them would leave the follower unable to fetch them —
+fail-open, rebuild, and single-flight silently does nothing. Not worth it.
 
 ## 8. Registry: no Range GET
 
@@ -117,15 +136,51 @@ coordination; only the mutable tag namespace does. Small, but it blocks (1).
 
 ---
 
+## 10. Does single-flight even PAY? (the question the numbers raised)
+
+The one I did not think to ask until the instrumentation answered it.
+
+A follower avoided an 8-second build by downloading 150 MB. Whether that is a
+win depends entirely on the ratio:
+
+| the vertex | single-flight |
+| ---------- | ------------- |
+| expensive to build, small output (a compiled binary, a linked rlib) | **big win** |
+| cheap to build, large output (unpacking an archive, generating assets) | **may LOSE** — the transfer costs more than the rebuild |
+
+This is the same economics as the whole distribution question (compute >> data,
+or don't bother), and it means single-flight should probably not be
+unconditional. Options, none built:
+
+- **Skip the lease for cheap vertices.** BuildKit does not know a vertex's cost
+  up front, but the coordinator sees every build: a `key -> duration` history is
+  free (the buck2 side already derives one from `ExecutedActionMetadata`).
+- **Skip the lease for huge outputs.** Harder — the size is not known until the
+  build finishes, and by then the followers are already waiting.
+- **Make the transfer cheap instead** — i.e. do (1), and the question mostly
+  goes away.
+
+Which is another argument for (1) being first.
+
 ## Measured, not guessed
 
-None of the above has a number against it yet. The order is by *expected* value
-and could be wrong. Before doing any of them, the thing to build is the
-instrumentation:
+`/_rebuck/stats` now reports what actually crossed the coordinator (uploads,
+serves, bytes each way) and the lease outcomes (led / merged / abandoned). The
+e2e prints it.
 
-- leases claimed / merged / abandoned (the driver already counts `sf_merged`)
-- time a follower spent BLOCKED vs what it would have spent building
-- bytes pushed by leaders vs bytes pulled by followers (is the coordinator
-  actually a bottleneck, or is this all theory?)
+Two of the guesses above have already been overturned by looking:
 
-"Do not optimise this until a profile says so" applies to every line above.
+- (1) **confirmed** at ~1.0x amplification per follower — but only once the
+  workload produced a realistic layer. With a 32-byte output it measured `0.00x`
+  and would have told me to skip it.
+- (7) **demoted**: the base image was 2.5% of a realistic push, not the win I
+  assumed.
+
+Still unmeasured, and next:
+
+- time a follower spent BLOCKED vs what it would have spent building — the
+  numerator of (10)
+- claim latency per vertex (is (3) real, or is a localhost round-trip free?)
+
+"Do not optimise this until a profile says so" applies to every line above,
+including the ones I was most confident about.

@@ -178,8 +178,27 @@ impl RegistryStore for crate::driver::Driver {
     }
 }
 
+/// What actually crossed the coordinator's NIC.
+///
+/// The design's one structural bottleneck: a leader PUSHES its layer here and
+/// every follower PULLS it back down, so one box is on the critical path for
+/// every byte. If `served` approaches `(workers-1) * uploaded`, the coordinator
+/// is the bottleneck and layers should move P2P instead (the fleet already has
+/// the machinery — see docs/buildkit-optimizations.md #1).
+///
+/// Measure before optimising. These counters exist so that decision is made on
+/// a number rather than on a hunch.
+#[derive(Default)]
+pub struct Bandwidth {
+    pub uploaded: AtomicU64,
+    pub upload_bytes: AtomicU64,
+    pub served: AtomicU64,
+    pub serve_bytes: AtomicU64,
+}
+
 struct Reg<S> {
     store: Arc<S>,
+    bw: Bandwidth,
     next_upload: AtomicU64,
     /// Open upload sessions: id -> the blob being streamed to disk.
     ///
@@ -376,10 +395,13 @@ async fn handle<S: RegistryStore>(
         }
         // finish_upload rejects a mismatch: the CAS's contract is that a name
         // means its content, so a lying client must not get to write it.
+        let n = up.len();
         let got = match reg.store.upload_finish(up, Some(want)).await {
             Ok(h) => h,
             Err(e) => return err(StatusCode::BAD_REQUEST, "DIGEST_INVALID", &e.to_string()),
         };
+        reg.bw.uploaded.fetch_add(1, Ordering::Relaxed);
+        reg.bw.upload_bytes.fetch_add(n, Ordering::Relaxed);
         let mut h = HeaderMap::new();
         h.insert(
             header::LOCATION,
@@ -490,6 +512,10 @@ async fn handle<S: RegistryStore>(
             },
             Method::GET => match reg.store.blob_get(hex).await {
                 Ok(Some(bytes)) => {
+                    reg.bw.served.fetch_add(1, Ordering::Relaxed);
+                    reg.bw
+                        .serve_bytes
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     blob_response(&method, bytes, reference, "application/octet-stream")
                 }
                 Ok(None) => err(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", reference),
@@ -589,9 +615,26 @@ async fn lease_handle<S: RegistryStore>(
     }
 }
 
+/// `GET /_rebuck/stats` — what crossed the coordinator, in JSON. The e2e reads
+/// this to answer "is the coordinator a bottleneck?" with a number.
+async fn stats_handle<S: RegistryStore>(State(reg): State<Arc<Reg<S>>>) -> Response {
+    let leases = reg.store.leases();
+    let body = serde_json::json!({
+        "uploads":      reg.bw.uploaded.load(Ordering::Relaxed),
+        "upload_bytes": reg.bw.upload_bytes.load(Ordering::Relaxed),
+        "serves":       reg.bw.served.load(Ordering::Relaxed),
+        "serve_bytes":  reg.bw.serve_bytes.load(Ordering::Relaxed),
+        "leases_led":       leases.map(|l| l.led.load(Ordering::Relaxed)),
+        "leases_merged":    leases.map(|l| l.merged.load(Ordering::Relaxed)),
+        "leases_abandoned": leases.map(|l| l.abandoned.load(Ordering::Relaxed)),
+    });
+    (StatusCode::OK, axum::Json(body)).into_response()
+}
+
 pub fn router<S: RegistryStore>(store: Arc<S>) -> Router {
     let reg = Arc::new(Reg {
         store,
+        bw: Bandwidth::default(),
         next_upload: AtomicU64::new(0),
         sessions: std::sync::Mutex::new(HashMap::new()),
     });
@@ -600,6 +643,7 @@ pub fn router<S: RegistryStore>(store: Arc<S>) -> Router {
         .route("/v2/", any(|| async { StatusCode::OK }))
         .route("/v2/{*path}", any(handle::<S>))
         .route("/_rebuck/lease/{*path}", any(lease_handle::<S>))
+        .route("/_rebuck/stats", any(stats_handle::<S>))
         // Blobs stream to disk, so the extractor's buffering limit must not
         // apply — `drain_into` enforces MAX_UPLOAD as the bytes go past, and
         // the manifest arm bounds itself with MAX_MANIFEST.

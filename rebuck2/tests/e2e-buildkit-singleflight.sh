@@ -71,7 +71,10 @@ curl -sf -o /dev/null "http://127.0.0.1:$PORT/v2/" || { echo "FAIL: coordinator 
 mkdir -p "$SCRATCH/ctx"
 cat > "$SCRATCH/ctx/Dockerfile" <<'EOF'
 FROM alpine:3.20
-RUN head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > /marker.txt && sleep 12
+ARG LAYER_MB
+RUN head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > /marker.txt \
+ && head -c ${LAYER_MB:-150}m /dev/urandom > /big.bin \
+ && sleep 8
 EOF
 
 start_daemon() { # start_daemon <name> [off]
@@ -122,8 +125,22 @@ echo "  daemon 1 marker: $M1"
 echo "  daemon 2 marker: $M2"
 
 echo
-echo "=== did the coordinator see the lease?"
-grep -c 'lease' "$SCRATCH/coord.log" >/dev/null 2>&1 || true
+# Is the coordinator a bandwidth bottleneck, or is that theory? A leader PUSHES
+# its layer here and every follower PULLS it back down, so with N workers the
+# coordinator serves ~(N-1)x what it stored. Print the ratio rather than assert
+# on it: this is a measurement, not a pass/fail.
+echo "=== what actually crossed the coordinator"
+curl -s "http://127.0.0.1:$PORT/_rebuck/stats" | python3 -c '
+import json,sys
+s = json.load(sys.stdin)
+up, srv = s["upload_bytes"], s["serve_bytes"]
+mib = lambda b: b / (1024*1024)
+print(f"  leases:  led={s["leases_led"]} merged={s["leases_merged"]} abandoned={s["leases_abandoned"]}")
+print(f"  pushed by leaders:  {s["uploads"]:>3} blobs  {mib(up):8.2f} MiB")
+print(f"  pulled by followers:{s["serves"]:>3} blobs  {mib(srv):8.2f} MiB")
+if up:
+    print(f"  amplification: {srv/up:.2f}x  (each follower re-downloads the leader'"'"'s layer)")
+'
 
 if [ "$M1" != "$M2" ] || [ "$M1" = "MISSING-1" ]; then
     echo "FAIL: markers differ => both daemons built it independently."

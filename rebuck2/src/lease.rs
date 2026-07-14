@@ -107,6 +107,11 @@ pub struct Leases {
     ttl: Duration,
     /// Followers that attached rather than rebuilding. The whole point, counted.
     pub merged: std::sync::atomic::AtomicU64,
+    /// Leaders elected — i.e. things that actually got built.
+    pub led: std::sync::atomic::AtomicU64,
+    /// Leaders that gave up (failed, cancelled, died). Their followers rebuilt,
+    /// so this is the tax the mechanism levies when it goes wrong.
+    pub abandoned: std::sync::atomic::AtomicU64,
 }
 
 impl Default for Leases {
@@ -121,6 +126,8 @@ impl Leases {
             inner: Mutex::new(HashMap::new()),
             ttl,
             merged: std::sync::atomic::AtomicU64::new(0),
+            led: std::sync::atomic::AtomicU64::new(0),
+            abandoned: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -146,6 +153,7 @@ impl Leases {
                     }
                     e.holder = holder.clone();
                     e.expires = self.deadline(&holder);
+                    self.led.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Claim::Leader;
                 }
                 let (tx, rx) = oneshot::channel();
@@ -164,6 +172,7 @@ impl Leases {
                         waiters: Vec::new(),
                     },
                 );
+                self.led.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 Claim::Leader
             }
         }
@@ -224,6 +233,8 @@ impl Leases {
     pub fn abandon_local(&self, key: &str) {
         let mut map = self.inner.lock().unwrap();
         if map.get(key).is_some_and(|e| e.holder == Holder::Local) {
+            self.abandoned
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let e = map.remove(key).expect("checked above");
             for w in e.waiters {
                 let _ = w.send(Outcome::Retry);
