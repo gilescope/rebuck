@@ -515,6 +515,7 @@ async fn handle<S: RegistryStore>(
 /// POST /_rebuck/lease/claim/<key>      200 lead | 200 <result> | 409 retry
 /// POST /_rebuck/lease/heartbeat/<key>  200 alive | 409 you were reaped
 /// POST /_rebuck/lease/release/<key>    body = the result bytes
+/// POST /_rebuck/lease/abandon/<key>    we failed — followers must rebuild
 /// ```
 async fn lease_handle<S: RegistryStore>(
     State(reg): State<Arc<Reg<S>>>,
@@ -568,6 +569,13 @@ async fn lease_handle<S: RegistryStore>(
             } else {
                 err(StatusCode::CONFLICT, "LEASE_RETRY", "you no longer hold it")
             }
+        }
+        // A leader that FAILED must free its followers to rebuild, not hand them
+        // a bogus result. Without this they would wait out the whole TTL for a
+        // result that is never coming.
+        "abandon" => {
+            leases.abandon_local(key);
+            (StatusCode::OK, "abandoned").into_response()
         }
         "release" => {
             let bytes = match axum::body::to_bytes(body, MAX_MANIFEST).await {
@@ -1052,6 +1060,31 @@ mod tests {
         let (st, h, _) = call(&r, post("/_rebuck/lease/claim/k")).await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(h["X-Rebuck-Lease"], "leader");
+    }
+
+    /// A leader that fails must free its followers to REBUILD, not hand them a
+    /// bogus result and not leave them waiting out the TTL for one that is never
+    /// coming.
+    #[tokio::test]
+    async fn an_abandoning_leader_frees_its_followers_to_rebuild() {
+        let r = router(crate::driver::Driver::for_test());
+        let (st, h, _) = call(&r, post("/_rebuck/lease/claim/k")).await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(h["X-Rebuck-Lease"], "leader");
+
+        let r2 = r.clone();
+        let follower = tokio::spawn(async move { call(&r2, post("/_rebuck/lease/claim/k")).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let (st, _, _) = call(&r, post("/_rebuck/lease/abandon/k")).await;
+        assert_eq!(st, StatusCode::OK);
+
+        let (st, _, _) = follower.await.unwrap();
+        assert_eq!(
+            st,
+            StatusCode::CONFLICT,
+            "the follower must be told to rebuild"
+        );
     }
 
     /// A bare store has no fleet to coordinate, and must say so rather than
