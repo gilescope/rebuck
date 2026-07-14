@@ -163,6 +163,65 @@ fi
 echo "PASS(2/2): with the feature off the daemons DO build independently."
 echo "           So the test can fail, and the pass above is real."
 
+# ------------------------------------------------- the safety property
+# Coalescing builds that must DIFFER is the catastrophic failure — far worse
+# than failing to coalesce. `COPY payload.txt` has the SAME op digest whatever
+# the file contains: the content only enters the cache key through the dependency
+# chain (the slow/content key). If LeaseKey were blind to that, daemon 2 would
+# adopt daemon 1's layer and bake in the WRONG SOURCE.
+#
+# So: same Dockerfile, DIFFERENT payloads, built concurrently. Each daemon must
+# end up with its OWN content.
 echo
-echo "PASS: two buildkitds, one coordinator, ONE build."
+echo "=== SAFETY: same build, DIFFERENT sources — they must NOT coalesce"
+docker rm -f bk-sf-1 bk-sf-2 >/dev/null 2>&1
+
+for n in 1 2; do
+    mkdir -p "$SCRATCH/ctx$n"
+    cat > "$SCRATCH/ctx$n/Dockerfile" <<'EOF'
+FROM alpine:3.20
+COPY payload.txt /payload.txt
+RUN cat /payload.txt > /marker.txt && sleep 10
+EOF
+done
+printf 'ALPHA' > "$SCRATCH/ctx1/payload.txt"
+printf 'BETA'  > "$SCRATCH/ctx2/payload.txt"
+
+start_ctx_daemon() { # start_ctx_daemon <name> <ctxdir>
+    docker run -d --name "$1" --privileged \
+        -e BUILDKIT_SINGLEFLIGHT_URL="http://host.docker.internal:$PORT" \
+        -e BUILDKIT_SINGLEFLIGHT_REGISTRY=cache \
+        -v "$2:/ctx:ro" \
+        bk-singleflight:test \
+        --addr unix:///run/buildkit/buildkitd.sock >/dev/null
+}
+start_ctx_daemon bk-sf-1 "$SCRATCH/ctx1"
+start_ctx_daemon bk-sf-2 "$SCRATCH/ctx2"
+sleep 4
+
+build bk-sf-1 "$SCRATCH/safe1.txt" &
+S1=$!
+sleep 1
+build bk-sf-2 "$SCRATCH/safe2.txt" &
+S2=$!
+wait $S1 || { echo "FAIL: safety build 1 failed"; tail -20 "$SCRATCH/bk-sf-1.log"; exit 1; }
+wait $S2 || { echo "FAIL: safety build 2 failed"; tail -20 "$SCRATCH/bk-sf-2.log"; exit 1; }
+
+A="$(cat "$SCRATCH/safe1.txt" 2>/dev/null || echo MISSING)"
+B="$(cat "$SCRATCH/safe2.txt" 2>/dev/null || echo MISSING)"
+echo "  daemon 1 (source ALPHA) baked: $A"
+echo "  daemon 2 (source BETA)  baked: $B"
+
+[ "$A" = "ALPHA" ] || { echo "FAIL: daemon 1 baked '$A', wanted ALPHA"; exit 1; }
+[ "$B" = "BETA" ]  || {
+    echo "FAIL: daemon 2 baked '$B', wanted BETA."
+    echo "      The lease key is CONTENT-BLIND — a follower adopted a layer built"
+    echo "      from someone else's sources. This is the wrong-artifact bug."
+    exit 1
+}
+echo "PASS(3/3): different sources => different keys => no coalescing."
+echo "           The lease key is content-addressed, as claimed."
+
+echo
+echo "PASS: two buildkitds, one coordinator, ONE build — and never the wrong one."
 exit 0
