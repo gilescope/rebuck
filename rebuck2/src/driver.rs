@@ -693,6 +693,25 @@ impl Driver {
         self.leases.merged.load(Ordering::Relaxed)
     }
 
+    /// Ask some OTHER worker to take a copy of `hash`, so it does not live on a
+    /// single machine. Best-effort and off the critical path: a failure costs
+    /// durability, never correctness.
+    async fn replicate(&self, hash: &str, producer: &str) {
+        let workers = self.workers.lock().await;
+        // Deterministic pick from the hash: spreads replicas evenly, and two
+        // announces of the same blob choose the same second holder rather than
+        // scattering copies.
+        let others: Vec<&WorkerConn> = workers.iter().filter(|w| w.endpoint != producer).collect();
+        if others.is_empty() {
+            return; // a one-worker fleet has nowhere to put a second copy
+        }
+        let pick =
+            usize::from_str_radix(&hash[..4.min(hash.len())], 16).unwrap_or(0) % others.len();
+        let _ = others[pick].tx.send(D2W::Replicate {
+            digest: hash.to_string(),
+        });
+    }
+
     /// The fleet's lease table — cross-machine single-flight.
     pub fn lease_table(&self) -> &lease::Leases {
         &self.leases
@@ -1851,11 +1870,19 @@ async fn serve_blob_stream(
         BlobReq::Announce(digs) => {
             // Record the producer. A follower's fetch is then a redirect to the
             // machine that built it, not a relay through ours.
-            let mut providers = driver.providers.lock().await;
-            for d in digs {
-                providers.insert(d.hash, peer.clone());
+            {
+                let mut providers = driver.providers.lock().await;
+                for d in &digs {
+                    providers.insert(d.hash.clone(), peer.clone());
+                }
             }
-            drop(providers);
+            // Name a second holder. Until someone fetches it, this blob exists on
+            // exactly ONE machine — and a worker that dies takes a downstream
+            // action's INPUT with it, which no requeue can recover. Fire and
+            // forget: nobody waits, and it never lands on the driver's disk.
+            for d in &digs {
+                driver.replicate(&d.hash, &peer).await;
+            }
             mesh::send_frame(&mut send, &BlobResp::PutOk).await?;
         }
 
@@ -2190,6 +2217,73 @@ mod tests {
             2,
             "do_not_cache actions must both execute"
         );
+    }
+
+    /// Decentralized mode's one real hole, closed. A blob lives on exactly ONE
+    /// machine between being produced and first being wanted; a worker that dies
+    /// in that window takes a downstream action's INPUT with it, and no requeue
+    /// can recover an input. So the driver names a SECOND holder the instant a
+    /// blob is announced — off the critical path, and never onto its own disk
+    /// (which was the ceiling that made decentralized mode necessary at all).
+    #[tokio::test]
+    async fn an_announced_blob_is_replicated_to_a_second_worker() {
+        let d = test_driver(false);
+        let (produced_by, other) = ("worker-a", "worker-b");
+        let told = replicating_worker(&d, 1, produced_by).await;
+        let told_other = replicating_worker(&d, 2, other).await;
+
+        d.replicate(&"a".repeat(64), produced_by).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(
+            told.lock().await.is_empty(),
+            "the producer already has it — replicating to itself is not a second copy"
+        );
+        assert_eq!(
+            told_other.lock().await.len(),
+            1,
+            "some OTHER worker must be asked to take a copy"
+        );
+    }
+
+    /// A one-worker fleet has nowhere to put a second copy. It must not ask the
+    /// producer to re-fetch its own blob.
+    #[tokio::test]
+    async fn a_lone_worker_is_not_asked_to_replicate_to_itself() {
+        let d = test_driver(false);
+        let told = replicating_worker(&d, 1, "only-worker").await;
+        d.replicate(&"a".repeat(64), "only-worker").await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(told.lock().await.is_empty());
+    }
+
+    /// A worker that records the Replicate orders it was given.
+    async fn replicating_worker(
+        d: &Arc<Driver>,
+        id: u64,
+        endpoint: &str,
+    ) -> Arc<Mutex<Vec<String>>> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<D2W>();
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let sink = got.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if let D2W::Replicate { digest } = msg {
+                    sink.lock().await.push(digest);
+                }
+            }
+        });
+        d.workers.lock().await.push(WorkerConn {
+            id,
+            tx,
+            inflight: Arc::new(AtomicU32::new(0)),
+            slots: 1,
+            os: "test".into(),
+            arch: "test_arch".into(),
+            endpoint: endpoint.into(),
+            preloaded_shard: None,
+        });
+        got
     }
 
     /// Distinct actions must NOT be merged — the coalescing is keyed on the

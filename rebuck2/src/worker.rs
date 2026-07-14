@@ -241,6 +241,18 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg, payload: Arc<dyn Payload>) -
         let (job, action) = match msg {
             D2W::Run { job, action } => (job, action),
             D2W::Ping => continue,
+            // Take a second copy so this blob does not live on one machine. In
+            // the background: nobody is waiting on it, and it must never delay a
+            // job. A failure costs durability, never correctness.
+            D2W::Replicate { digest } => {
+                let blobs = blobs.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = blobs.get_by_hash(&digest).await {
+                        eprintln!("[worker] replicate {digest} failed: {e:#}");
+                    }
+                });
+                continue;
+            }
             D2W::Exit => {
                 println!("[worker] driver said exit — done");
                 return Ok(());

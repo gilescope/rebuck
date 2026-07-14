@@ -29,7 +29,7 @@ use bazel_remote_apis::google::bytestream as bs;
 fn usage() -> ! {
     eprintln!(
         "usage: rebuck2 driver [--grpc-port N] [--registry-port N] [--store DIR] [--session S] [--locality] \
-         [--lease-ttl-secs N] [--min-workers N] [--no-local-exec] [--decentralized-cas] [--no-hardlinks] [--no-reflink] [--cache-failures]\n       \
+         [--lease-ttl-secs N] [--min-workers N] [--no-local-exec] [--centralized-cas] [--no-hardlinks] [--no-reflink] [--cache-failures]\n       \
          rebuck2 worker [--store DIR] [--session S] [--slots N] [--registry-port N] [--registry-bind IP] [--preloaded-shard N] [--connect-wait-secs N] [--no-hardlinks] [--no-reflink]\n       \
          rebuck2 registry [--store DIR] [--port N] [--bind IP]\n       \
          rebuck2 claim --key K [--session S]   (stdin = result to publish)\n       \
@@ -292,7 +292,16 @@ async fn run_driver(mut args: Args) -> Result<()> {
             .map(|s| s.parse().expect("--min-workers: number"))
             .unwrap_or(0),
         local_exec: !args.flag("--no-local-exec"),
-        decentralized: args.flag("--decentralized-cas"),
+        // Decentralized by DEFAULT. Outputs stay on the machine that produced
+        // them and peers fetch direct; the driver redirects instead of relaying,
+        // so it is never on the data path. Measured: a 150 MiB layer went from
+        // 0.97x amplification through the driver to ZERO bytes touching it.
+        //
+        // The old objection — "a dead worker takes its blobs with it" — is now
+        // answered by D2W::Replicate: the driver names a second holder the
+        // instant a blob is announced, off the critical path and off its own
+        // disk. --centralized-cas restores the old behaviour if you need it.
+        decentralized: !args.flag("--centralized-cas"),
         hardlinks: !args.flag("--no-hardlinks"),
         cache_failures: args.flag("--cache-failures"),
         locality: args.flag("--locality"),

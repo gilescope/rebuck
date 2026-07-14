@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Decentralized CAS e2e: driver --decentralized-cas + 2 workers. The rustc
+# Decentralized CAS e2e (now the DEFAULT): driver + 2 workers. The rustc
 # compile lands on one worker, the link needs its rlib — with outputs staying
 # local to producers, the consumer must fetch peer-to-peer (or the driver
 # read-through must kick in for buck2's own materialization). PASS requires
@@ -34,7 +34,7 @@ cargo build --release --manifest-path "$ROOT/rebuck2/Cargo.toml"
 BIN="$ROOT/rebuck2/target/release/rebuck2"
 
 echo "=== start driver (decentralized) + two workers"
-"$BIN" driver --grpc-port "$PORT" --session "$SESSION" --decentralized-cas \
+"$BIN" driver --grpc-port "$PORT" --session "$SESSION" \
     --store "$SCRATCH/driver-store" --min-workers 2 --no-local-exec \
     >"$DLOG" 2>&1 &
 DRIVER_PID=$!

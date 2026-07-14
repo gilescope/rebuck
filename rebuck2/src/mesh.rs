@@ -140,6 +140,21 @@ pub enum D2W {
         shard: u8,
         of: u8,
     },
+    /// "Go and fetch this, in the background."
+    ///
+    /// Closes decentralized mode's one real hole. A blob lives on exactly ONE
+    /// machine between the moment it is produced and the moment somebody first
+    /// wants it. If that worker dies in the window — a runner hits its 6h cap, an
+    /// eviction, an OOM — a downstream action's INPUT is gone, and unlike a
+    /// failed action you cannot re-run your way back to it.
+    ///
+    /// So the driver names a second holder on announce. It is off the critical
+    /// path (nobody waits for it) and it never touches the driver's disk, which
+    /// was the ceiling that made decentralized mode necessary in the first place.
+    Replicate {
+        digest: String,
+    },
+
     /// Liveness heartbeat (every 20s). Workers treat a long heartbeat gap
     /// as a dead driver and exit: a SIGTERM'd/crashed driver sends no QUIC
     /// close, and a worker blocked in recv_frame otherwise idles until its

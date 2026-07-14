@@ -48,11 +48,12 @@ echo "=== build rebuck"
 cargo build --release --manifest-path "$ROOT/rebuck2/Cargo.toml"
 BIN="$ROOT/rebuck2/target/release/rebuck2"
 
-# --decentralized-cas: the driver REDIRECTS a fetch to whoever holds the blob
-# instead of relaying the bytes through itself. Without it the driver would
-# read-through-cache every layer and we would be back where we started.
+# Decentralized is now the DEFAULT: the driver REDIRECTS a fetch to whoever holds
+# the blob rather than relaying the bytes through itself. (--centralized-cas
+# restores the old read-through behaviour, and would put us back where we
+# started.)
 echo "=== driver (coordinator only — it must never see a layer)"
-"$BIN" driver --grpc-port 9098 --session "$SESSION" --decentralized-cas \
+"$BIN" driver --grpc-port 9098 --session "$SESSION" \
     --store "$SCRATCH/driver-store" > "$SCRATCH/driver.log" 2>&1 &
 DRIVER=$!
 sleep 2
