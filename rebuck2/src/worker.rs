@@ -534,10 +534,20 @@ impl crate::registry::RegistryStore for Agent {
         up: crate::store::Upload,
         expected: Option<&str>,
     ) -> Result<String> {
-        // Lands in OUR store. The bloom gossip already running advertises it to
-        // the fleet within a beat, so a peer that wants it comes and takes it —
-        // nothing is uploaded anywhere.
-        self.store.finish_upload(up, expected).await
+        // Lands in OUR store — nothing is uploaded anywhere.
+        let hash = self.store.finish_upload(up, expected).await?;
+        // Tell the driver at once. Bloom gossip would get there in ~30s, but a
+        // follower blocked on the lease asks in ~0s, and until the driver knows
+        // who holds this it would RELAY the bytes through its own NIC — taking
+        // the centralised path at exactly the moment it costs most.
+        let announce = Dig {
+            hash: hash.clone(),
+            size: 0,
+        };
+        if let Err(e) = announce_blob(&self.conn, &announce).await {
+            eprintln!("[agent] announce {hash} failed ({e:#}); peers will find it by gossip");
+        }
+        Ok(hash)
     }
     async fn tag_get(&self, key: &str) -> Option<String> {
         self.store.tag_get(key).await
@@ -578,6 +588,16 @@ impl crate::registry::RegistryStore for Agent {
     async fn lease_abandon(&self, key: &str, _holder: &str) {
         let _ = release_lease(&self.conn, key, Err("leader abandoned".into())).await;
     }
+}
+
+/// Tell the driver we hold a blob, so it can redirect peers to us instead of
+/// relaying their bytes.
+async fn announce_blob(conn: &Connection, d: &Dig) -> Result<()> {
+    let (mut send, mut recv) = conn.open_bi().await?;
+    mesh::send_frame(&mut send, &BlobReq::Announce(vec![d.clone()])).await?;
+    send.finish()?;
+    let _ = mesh::recv_frame::<BlobResp>(&mut recv).await?;
+    Ok(())
 }
 
 /// Cross-machine single-flight, worker side.

@@ -171,6 +171,15 @@ pub enum BlobReq {
     /// pre-rustc stall on the big crate forests (run 29160244348).
     GetMany(Vec<Dig>),
 
+    /// "I now hold these." Seeds the driver's provider index the INSTANT a blob
+    /// lands, so a peer asking seconds later is redirected to us rather than
+    /// having the driver relay the bytes through its own NIC.
+    ///
+    /// Bloom gossip would get there eventually (30s), but a follower blocked on
+    /// a lease asks immediately — and "eventually" means the layer takes the
+    /// centralised path exactly when it matters most.
+    Announce(Vec<Dig>),
+
     /// Cross-machine single-flight (see [`crate::lease`]). A worker asks the
     /// driver — the fleet's single coordinator, so there is no consensus
     /// problem here, only a liveness one — whether it should build `key` or

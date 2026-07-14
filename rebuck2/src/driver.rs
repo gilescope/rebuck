@@ -1848,6 +1848,17 @@ async fn serve_blob_stream(
         // redirect in decentralized mode, read-through get_blob otherwise);
         // workers issue chunks on parallel streams, so the read-through
         // relaying fans out across streams even though each stream is serial.
+        BlobReq::Announce(digs) => {
+            // Record the producer. A follower's fetch is then a redirect to the
+            // machine that built it, not a relay through ours.
+            let mut providers = driver.providers.lock().await;
+            for d in digs {
+                providers.insert(d.hash, peer.clone());
+            }
+            drop(providers);
+            mesh::send_frame(&mut send, &BlobResp::PutOk).await?;
+        }
+
         // --- cross-machine single-flight (docs/buildkit-plan.md P2) ---
         BlobReq::Claim { key } => {
             match driver.leases.claim_peer(&key, &peer) {

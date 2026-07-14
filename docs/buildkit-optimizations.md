@@ -61,9 +61,34 @@ sufficient to share layers and why the snapshotter is not needed for it.
 Bonus: everything buildkit reads or writes becomes fleet-shared automatically —
 cache manifests, image configs, base layers — not just the single-flight path.
 
-## 1. Layers should travel P2P, not through the coordinator
+## 1. Layers should travel P2P, not through the coordinator — DONE
 
-**The one that matters — and now measured.** A leader PUSHES its layer to the
+**Shipped and measured.** `rebuck2 worker --registry-port` gives each worker its
+own agent; a buildkitd talks only to the agent on its own box.
+
+```text
+before (central registry)      after (agent per worker)
+  driver store: 150 MiB          driver store:   0 MiB   <- never sees the layer
+  amplification: 0.97x           worker 1 store: 154 MiB <- leader, loopback push
+  => (N-1)x through one NIC      worker 2 store: 151 MiB <- follower, from the LEADER
+```
+
+The driver's store holding **0 MiB** is the proof: its read-through path CACHES
+whatever it relays, so a single byte through the driver would be sitting on its
+disk. Verified by `tests/e2e-buildkit-p2p.sh`.
+
+Two things were needed beyond the agent itself:
+
+- `--decentralized-cas`, so the driver REDIRECTS a fetch to whoever holds the
+  blob instead of relaying (and caching) the bytes through itself.
+- `BlobReq::Announce` — the agent tells the driver the instant a blob lands.
+  Bloom gossip would get there in ~30s, but a follower blocked on a lease asks in
+  ~0s, and until the driver knows who holds it, it relays: the centralised path
+  at exactly the moment it costs most.
+
+The original analysis, which still explains WHY:
+
+**A leader PUSHES its layer to the
 coordinator's registry and every follower PULLS it back down, so the coordinator
 is on the critical path for every byte.
 
