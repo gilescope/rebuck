@@ -35,6 +35,13 @@ pub struct WorkerCfg {
     /// CI shard this worker restored before joining; finalize hands it
     /// the same shard back (see W2D::Hello::preloaded_shard).
     pub preloaded_shard: Option<u8>,
+    /// Serve an OCI registry on this port for a buildkitd sharing the box.
+    /// This is what keeps layers OFF the coordinator: the daemon pushes to
+    /// loopback and pulls from whichever peer built the thing.
+    pub registry_port: Option<u16>,
+    /// Bind address for that registry. Loopback by default and deliberately —
+    /// it has no auth.
+    pub registry_bind: std::net::IpAddr,
 }
 
 pub async fn run(store: Arc<Store>, cfg: WorkerCfg, payload: Arc<dyn Payload>) -> Result<()> {
@@ -138,6 +145,21 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg, payload: Arc<dyn Payload>) -
         hits_peer: std::sync::atomic::AtomicU64::new(0),
         hits_driver: std::sync::atomic::AtomicU64::new(0),
     });
+
+    // The local agent: a buildkitd on this box talks only to us.
+    if let Some(port) = cfg.registry_port {
+        let agent = Arc::new(Agent {
+            store: store.clone(),
+            blobs: blobs.clone(),
+            conn: conn.clone(),
+        });
+        let bind = cfg.registry_bind;
+        tokio::spawn(async move {
+            if let Err(e) = crate::registry::serve((bind, port).into(), agent).await {
+                eprintln!("[agent] registry died: {e:#}");
+            }
+        });
+    }
 
     // Fetch-source stats: one line a minute (when changed) makes peer-serving
     // measurable rather than a matter of faith.
@@ -387,7 +409,7 @@ impl crate::store::Blobs for TrackingBlobs {
 
 /// Blobs fetched from the driver (or, on redirect, straight from the
 /// producing worker), with the local store as cache.
-struct RemoteBlobs {
+pub struct RemoteBlobs {
     conn: Connection,
     ep: Endpoint,
     store: Arc<Store>,
@@ -462,6 +484,100 @@ pub enum Claimed {
     Failed(String),
     /// The leader vanished without publishing. Claim again.
     Retry,
+}
+
+/// A worker's local agent: an OCI registry backed by THIS worker's store and the
+/// mesh, with leases forwarded to the driver.
+///
+/// This is what puts the coordinator off the data path. A buildkitd talks only to
+/// its own agent on loopback:
+///
+/// ```text
+///   leader   pushes a layer -> its OWN agent (loopback, ~free)
+///   follower pulls  a layer -> its own agent -> mesh -> the LEADER's agent
+/// ```
+///
+/// So the bytes go straight from the machine that built them to the machine that
+/// needs them. Measured amplification through the central coordinator was ~1.0x
+/// per follower — i.e. (N-1)x at fleet scale, all through one NIC. Here it is
+/// zero: the driver never sees the layer at all.
+pub struct Agent {
+    pub store: Arc<Store>,
+    pub blobs: Arc<RemoteBlobs>,
+    pub conn: Connection,
+}
+
+#[async_trait::async_trait]
+impl crate::registry::RegistryStore for Agent {
+    async fn blob_size(&self, hash: &str) -> Option<u64> {
+        if let Some(n) = self.store.size_of(hash).await {
+            return Some(n);
+        }
+        // Be honest about FLEET-wide presence, not just our own disk, or the
+        // buildkitd re-pushes layers a peer already holds.
+        match self.blobs.get_by_hash(hash).await {
+            Ok(Some(b)) => Some(b.len() as u64),
+            _ => None,
+        }
+    }
+    async fn blob_get(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        self.blobs.get_by_hash(hash).await
+    }
+    async fn blob_put(&self, bytes: &[u8]) -> Result<String> {
+        Ok(self.store.put(None, bytes).await?.hash)
+    }
+    async fn upload_begin(&self) -> Result<crate::store::Upload> {
+        self.store.begin_upload().await
+    }
+    async fn upload_finish(
+        &self,
+        up: crate::store::Upload,
+        expected: Option<&str>,
+    ) -> Result<String> {
+        // Lands in OUR store. The bloom gossip already running advertises it to
+        // the fleet within a beat, so a peer that wants it comes and takes it —
+        // nothing is uploaded anywhere.
+        self.store.finish_upload(up, expected).await
+    }
+    async fn tag_get(&self, key: &str) -> Option<String> {
+        self.store.tag_get(key).await
+    }
+    async fn tag_put(&self, key: &str, manifest_hash: &str) -> Result<()> {
+        self.store.tag_put(key, manifest_hash).await
+    }
+
+    // The lease is the DRIVER's — it is the fleet's single coordinator. A worker
+    // agent only forwards. (Only the lease is centralised; the layers are not.)
+    async fn lease_claim(&self, key: &str) -> Option<crate::registry::Claimed> {
+        match claim(&self.conn, key).await {
+            // The mesh holder is US (this worker's endpoint): the driver already
+            // ties the lease to our connection, so our liveness IS the heartbeat
+            // and a dead worker is evicted the moment it disconnects.
+            Ok(Claimed::Leader) => Some(crate::registry::Claimed::Leader {
+                holder: String::new(),
+            }),
+            Ok(Claimed::Done(r)) => Some(crate::registry::Claimed::Done(r)),
+            Ok(Claimed::Failed(_)) | Ok(Claimed::Retry) => Some(crate::registry::Claimed::Retry),
+            // The driver is unreachable. Tell the buildkitd to build it: a fleet
+            // that loses its coordinator must degrade to plain BuildKit, never
+            // stall.
+            Err(e) => {
+                eprintln!("[agent] lease claim failed ({e:#}); telling buildkitd to build it");
+                Some(crate::registry::Claimed::Leader {
+                    holder: String::new(),
+                })
+            }
+        }
+    }
+    async fn lease_heartbeat(&self, key: &str, _holder: &str) -> bool {
+        heartbeat(&self.conn, key).await.unwrap_or(false)
+    }
+    async fn lease_release(&self, key: &str, _holder: &str, result: Vec<u8>) {
+        let _ = release_lease(&self.conn, key, Ok(result)).await;
+    }
+    async fn lease_abandon(&self, key: &str, _holder: &str) {
+        let _ = release_lease(&self.conn, key, Err("leader abandoned".into())).await;
+    }
 }
 
 /// Cross-machine single-flight, worker side.
@@ -544,6 +660,81 @@ pub async fn release_lease(
 }
 
 impl RemoteBlobs {
+    /// Blob by hash alone — the OCI path (a REAPI digest carries a size, an OCI
+    /// digest never does). Same chain as `get`: local store, then whichever peer
+    /// the blooms claim holds it, then the driver. That chain IS the P2P story —
+    /// a follower's layer comes from the machine that built it, not from the
+    /// coordinator's NIC.
+    ///
+    /// Verifies by hash: the size is learned from what came back, rather than
+    /// faked as zero, which would make `put(Some(d))` reject every non-empty blob.
+    pub async fn get_by_hash(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        if let Some(bytes) = self.store.get_by_hash(hash).await? {
+            return Ok(Some(bytes));
+        }
+        // The wire is hash-keyed (a peer reads cas/<hh>/<hash>), so a zero size
+        // is fine ON THE WIRE. It is the local cache-back that must not lie:
+        // put(Some(d)) verifies size, so a zero would reject every non-empty
+        // blob. Verify by hash and take the size from what actually arrived.
+        let probe = Dig {
+            hash: hash.to_string(),
+            size: 0,
+        };
+        let bytes = match self.fetch_over_mesh(&probe).await {
+            Ok(b) => b,
+            Err(_) => return Ok(None),
+        };
+        let landed = Dig {
+            hash: hash.to_string(),
+            size: bytes.len() as i64,
+        };
+        self.store.put(Some(&landed), &bytes).await?;
+        Ok(Some(bytes))
+    }
+
+    /// One pass of the peer/driver chain, WITHOUT the local cache-back — the
+    /// caller decides how to verify (REAPI knows the size; OCI does not).
+    async fn fetch_over_mesh(&self, d: &Dig) -> Result<Vec<u8>> {
+        let candidates: Vec<String> = {
+            let peers = self.peers.lock().await;
+            peers
+                .iter()
+                .filter(|(id, b)| **id != self.my_id && b.contains(&d.hash))
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        if !candidates.is_empty() {
+            let pick = usize::from_str_radix(&d.hash[..4], 16).unwrap_or(0) % candidates.len();
+            if let Ok(bytes) = self.fetch_from(&candidates[pick], d).await {
+                use std::sync::atomic::Ordering::Relaxed;
+                self.hits_peer.fetch_add(1, Relaxed);
+                return Ok(bytes);
+            }
+        }
+        let (mut send, mut recv) = self.conn.open_bi().await?;
+        mesh::send_frame(&mut send, &BlobReq::Get(d.clone())).await?;
+        send.finish()?;
+        match mesh::recv_frame::<BlobResp>(&mut recv)
+            .await?
+            .context("driver closed blob stream")?
+        {
+            BlobResp::Found { size } => {
+                use std::sync::atomic::Ordering::Relaxed;
+                self.hits_driver.fetch_add(1, Relaxed);
+                Ok(mesh::recv_raw(&mut recv, size).await?)
+            }
+            // The driver points at whoever built it: fetch direct, peer to peer.
+            BlobResp::Provider { endpoint } => {
+                use std::sync::atomic::Ordering::Relaxed;
+                let bytes = self.fetch_from(&endpoint, d).await?;
+                self.hits_peer.fetch_add(1, Relaxed);
+                Ok(bytes)
+            }
+            BlobResp::Missing => bail!("blob {} is nowhere on the mesh", d.hash),
+            other => bail!("unexpected blob response: {other:?}"),
+        }
+    }
+
     async fn upload_bytes(&self, d: &Dig, bytes: &[u8]) -> Result<()> {
         let (mut send, mut recv) = self.conn.open_bi().await?;
         mesh::send_frame(&mut send, &BlobReq::Put(d.clone())).await?;

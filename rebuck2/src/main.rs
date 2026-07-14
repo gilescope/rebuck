@@ -30,7 +30,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: rebuck2 driver [--grpc-port N] [--registry-port N] [--store DIR] [--session S] [--locality] \
          [--lease-ttl-secs N] [--min-workers N] [--no-local-exec] [--decentralized-cas] [--no-hardlinks] [--no-reflink] [--cache-failures]\n       \
-         rebuck2 worker [--store DIR] [--session S] [--slots N] [--preloaded-shard N] [--connect-wait-secs N] [--no-hardlinks] [--no-reflink]\n       \
+         rebuck2 worker [--store DIR] [--session S] [--slots N] [--registry-port N] [--registry-bind IP] [--preloaded-shard N] [--connect-wait-secs N] [--no-hardlinks] [--no-reflink]\n       \
          rebuck2 registry [--store DIR] [--port N] [--bind IP]\n       \
          rebuck2 claim --key K [--session S]   (stdin = result to publish)\n       \
          rebuck2 verify-store --store DIR\n       \
@@ -237,6 +237,14 @@ async fn main() -> Result<()> {
                         .unwrap_or(600),
                 ),
                 hardlinks: !args.flag("--no-hardlinks"),
+                registry_port: args
+                    .opt("--registry-port")
+                    .map(|s| s.parse().expect("--registry-port: port")),
+                registry_bind: args
+                    .opt("--registry-bind")
+                    .unwrap_or_else(|| "127.0.0.1".into())
+                    .parse()
+                    .expect("--registry-bind: an IP address"),
                 preloaded_shard: args
                     .opt("--preloaded-shard")
                     .map(|s| s.parse().expect("--preloaded-shard: number")),

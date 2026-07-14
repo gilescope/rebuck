@@ -2,9 +2,64 @@
 
 Found while building P1/P2, not yet done. Ordered by expected value.
 
+**(0) supersedes (1).** Both aim at the same thing — get the coordinator off the
+data path — but (0) does it by being buildkit's content store rather than a
+registry it pushes to, which makes the transfer step vanish instead of
+optimising it.
+
 Companion to [buildkit-plan.md](buildkit-plan.md) (the design) and
 [optimizations.md](optimizations.md) (the buck2 engine's perf journey, which is
 where several of these ideas were already proven).
+
+## 0. Be buildkit's CONTENT STORE, not a registry it pushes to
+
+**The architectural one.** Everything below (1) is a workaround for solving this
+at the wrong level.
+
+The problem with the HTTP-registry design: a layer lives inside buildkitd's
+containerd content store, which rebuck cannot reach — so the leader has to PUSH
+it out and every follower has to PULL it back, and the coordinator sits on the
+critical path for every byte.
+
+But buildkit's content store is an INTERFACE, and we fork buildkit:
+
+```text
+worker/runc/runc.go:95      local.NewStore(root/content)     <- a content.Store
+snapshot/containerd/content.go:14
+                            NewContentStore(store content.Store, ns string)
+```
+
+Substitute a mesh-backed `content.Store` and the push/pull disappears entirely:
+
+```text
+leader   commits a layer -> content store -> which IS the mesh    (no push)
+follower reads  a layer  <- content store <- nearest holder       (no pull)
+```
+
+P2P by construction, because rebuck's blob path already goes local store -> bloom
+peers -> driver. No explicit transfer step, no coordinator in the data path, and
+no double-storage (today a layer would live in BOTH buildkit's content store and
+rebuck's CAS).
+
+Scope, and what NOT to do:
+
+| layer | content-addressed? | distributable? |
+| ----- | ------------------ | -------------- |
+| **content store** (blobs) | yes | **yes — it IS a CAS.** Do this. |
+| snapshotter (overlayfs dirs) | no | No. The hard half — this is the `type=cache` problem (buildkit-plan P3). |
+| full containerd (images/containers/tasks/leases) | — | Unnecessary. A huge API, none of it needed. |
+
+**Do not pretend to be containerd.** The containerd *worker* wants images,
+containers, tasks and leases. We need one interface: `content.Store` — Info,
+Update, Walk, Delete, ReaderAt, Status, ListStatuses, Abort, Writer. ~200 lines
+of Go, in-process, no gRPC.
+
+The snapshotter stays local and DERIVES its snapshots by unpacking layers from
+the content store, which is precisely why a distributed content store is
+sufficient to share layers and why the snapshotter is not needed for it.
+
+Bonus: everything buildkit reads or writes becomes fleet-shared automatically —
+cache manifests, image configs, base layers — not just the single-flight path.
 
 ## 1. Layers should travel P2P, not through the coordinator
 

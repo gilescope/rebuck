@@ -99,11 +99,33 @@ pub trait RegistryStore: Send + Sync + 'static {
     async fn tag_get(&self, key: &str) -> Option<String>;
     async fn tag_put(&self, key: &str, manifest_hash: &str) -> Result<()>;
 
-    /// Cross-machine single-flight, if this backend has a fleet to coordinate.
-    /// A bare store does not (there is nobody to race); a driver does.
-    fn leases(&self) -> Option<&crate::lease::Leases> {
+    /// Cross-machine single-flight.
+    ///
+    /// Behaviour, not a field, because WHERE the lease lives depends on who is
+    /// serving: the driver owns the table; a worker's agent forwards to it over
+    /// the mesh; a bare store has no fleet to coordinate at all.
+    async fn lease_claim(&self, _key: &str) -> Option<Claimed> {
         None
     }
+    /// Keep an out-of-process leader's claim alive. A build can easily outrun the
+    /// TTL, and a leader reaped mid-build costs every follower a rebuild.
+    /// `false` = you no longer hold it; stop, and re-claim.
+    async fn lease_heartbeat(&self, _key: &str, _holder: &str) -> bool {
+        false
+    }
+    async fn lease_release(&self, _key: &str, _holder: &str, _result: Vec<u8>) {}
+    async fn lease_abandon(&self, _key: &str, _holder: &str) {}
+}
+
+/// What a claimant is told.
+pub enum Claimed {
+    /// You build it, then release (or abandon) quoting `holder`. Heartbeat until
+    /// you do, or a long build outruns the TTL and gets reaped mid-flight.
+    Leader { holder: String },
+    /// A peer built it. These are its result bytes.
+    Done(Vec<u8>),
+    /// The leader vanished. Claim again — never a hang.
+    Retry,
 }
 
 #[async_trait::async_trait]
@@ -173,8 +195,30 @@ impl RegistryStore for crate::driver::Driver {
     async fn tag_put(&self, key: &str, manifest_hash: &str) -> Result<()> {
         self.store.tag_put(key, manifest_hash).await
     }
-    fn leases(&self) -> Option<&crate::lease::Leases> {
-        Some(self.lease_table())
+    async fn lease_claim(&self, key: &str) -> Option<Claimed> {
+        // claim_http, NOT claim_local: an HTTP claim returns immediately and
+        // nothing holds it, so a drop-guarded local holder would wedge the key
+        // forever if the client died. See Leases::claim_http.
+        let (claim, holder) = self.lease_table().claim_http(key);
+        Some(match claim {
+            crate::lease::Claim::Leader => Claimed::Leader { holder },
+            crate::lease::Claim::Follower(rx) => match rx.await {
+                Ok(crate::lease::Outcome::Done(r)) => Claimed::Done(r),
+                // A failed leader and a vanished one look the same to a
+                // buildkitd: rebuild it. There is nothing else it could do.
+                _ => Claimed::Retry,
+            },
+        })
+    }
+    async fn lease_heartbeat(&self, key: &str, holder: &str) -> bool {
+        self.lease_table().heartbeat(key, holder)
+    }
+    async fn lease_release(&self, key: &str, holder: &str, result: Vec<u8>) {
+        self.lease_table()
+            .release(key, Some(holder), crate::lease::Outcome::Done(result));
+    }
+    async fn lease_abandon(&self, key: &str, holder: &str) {
+        self.lease_table().abandon_peer(key, holder);
     }
 }
 
@@ -547,60 +591,61 @@ async fn lease_handle<S: RegistryStore>(
     State(reg): State<Arc<Reg<S>>>,
     method: Method,
     Path(path): Path<String>,
+    headers: HeaderMap,
     body: Body,
 ) -> Response {
     if method != Method::POST {
         return err(StatusCode::METHOD_NOT_ALLOWED, "UNSUPPORTED", "POST only");
     }
-    let Some(leases) = reg.store.leases() else {
-        return err(
-            StatusCode::NOT_IMPLEMENTED,
-            "UNSUPPORTED",
-            "this registry has no fleet to coordinate",
-        );
-    };
     let Some((op, key)) = path.split_once('/') else {
         return err(StatusCode::NOT_FOUND, "UNSUPPORTED", &path);
     };
     if key.is_empty() {
         return err(StatusCode::BAD_REQUEST, "UNSUPPORTED", "empty lease key");
     }
+    // Who is speaking. Handed out with the grant; proves a release is the CURRENT
+    // leader's and not a zombie's.
+    let holder = headers
+        .get("X-Rebuck-Holder")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
 
     match op {
-        "claim" => match leases.claim_local(key) {
-            crate::lease::Claim::Leader => {
-                (StatusCode::OK, [("X-Rebuck-Lease", "leader")]).into_response()
+        "claim" => match reg.store.lease_claim(key).await {
+            None => err(
+                StatusCode::NOT_IMPLEMENTED,
+                "UNSUPPORTED",
+                "this registry has no fleet to coordinate",
+            ),
+            // The holder id goes back with the grant, and must be echoed on
+            // heartbeat/release/abandon. Without it a zombie leader could publish
+            // over its successor.
+            Some(Claimed::Leader { holder }) => (
+                StatusCode::OK,
+                [("X-Rebuck-Lease", "leader"), ("X-Rebuck-Holder", &holder)],
+            )
+                .into_response(),
+            Some(Claimed::Done(result)) => {
+                (StatusCode::OK, [("X-Rebuck-Lease", "follower")], result).into_response()
             }
-            crate::lease::Claim::Follower(rx) => match rx.await {
-                Ok(crate::lease::Outcome::Done(result)) => {
-                    (StatusCode::OK, [("X-Rebuck-Lease", "follower")], result).into_response()
-                }
-                Ok(crate::lease::Outcome::Failed(e)) => {
-                    err(StatusCode::BAD_GATEWAY, "LEASE_FAILED", &e)
-                }
-                // The leader died. Never a hang: the caller re-claims and one
-                // of the waiters becomes the new leader.
-                Ok(crate::lease::Outcome::Retry) | Err(_) => err(
-                    StatusCode::CONFLICT,
-                    "LEASE_RETRY",
-                    "leader vanished; re-claim",
-                ),
-            },
+            // The leader died or failed. 409 says "build it yourself" — never a
+            // hang, which would be the worse bug.
+            Some(Claimed::Retry) => err(
+                StatusCode::CONFLICT,
+                "LEASE_RETRY",
+                "leader vanished; build it yourself",
+            ),
         },
         "heartbeat" => {
-            // Local holders are drop-guarded and need no heartbeat; this exists
-            // for symmetry with the mesh path and always succeeds for a live key.
-            if leases.heartbeat_local(key) {
+            if reg.store.lease_heartbeat(key, &holder).await {
                 (StatusCode::OK, "alive").into_response()
             } else {
                 err(StatusCode::CONFLICT, "LEASE_RETRY", "you no longer hold it")
             }
         }
-        // A leader that FAILED must free its followers to rebuild, not hand them
-        // a bogus result. Without this they would wait out the whole TTL for a
-        // result that is never coming.
         "abandon" => {
-            leases.abandon_local(key);
+            reg.store.lease_abandon(key, &holder).await;
             (StatusCode::OK, "abandoned").into_response()
         }
         "release" => {
@@ -608,25 +653,22 @@ async fn lease_handle<S: RegistryStore>(
                 Ok(b) => b,
                 Err(e) => return err(StatusCode::PAYLOAD_TOO_LARGE, "UNSUPPORTED", &e.to_string()),
             };
-            leases.release(key, None, crate::lease::Outcome::Done(bytes.to_vec()));
+            reg.store.lease_release(key, &holder, bytes.to_vec()).await;
             (StatusCode::OK, "released").into_response()
         }
         _ => err(StatusCode::NOT_FOUND, "UNSUPPORTED", op),
     }
 }
 
-/// `GET /_rebuck/stats` — what crossed the coordinator, in JSON. The e2e reads
-/// this to answer "is the coordinator a bottleneck?" with a number.
+/// `GET /_rebuck/stats` — what crossed this endpoint, in JSON. The e2e reads it
+/// to answer "is the coordinator a bottleneck?" with a number rather than a
+/// hunch.
 async fn stats_handle<S: RegistryStore>(State(reg): State<Arc<Reg<S>>>) -> Response {
-    let leases = reg.store.leases();
     let body = serde_json::json!({
         "uploads":      reg.bw.uploaded.load(Ordering::Relaxed),
         "upload_bytes": reg.bw.upload_bytes.load(Ordering::Relaxed),
         "serves":       reg.bw.served.load(Ordering::Relaxed),
         "serve_bytes":  reg.bw.serve_bytes.load(Ordering::Relaxed),
-        "leases_led":       leases.map(|l| l.led.load(Ordering::Relaxed)),
-        "leases_merged":    leases.map(|l| l.merged.load(Ordering::Relaxed)),
-        "leases_abandoned": leases.map(|l| l.abandoned.load(Ordering::Relaxed)),
     });
     (StatusCode::OK, axum::Json(body)).into_response()
 }
@@ -1049,6 +1091,7 @@ mod tests {
             h["X-Rebuck-Lease"], "leader",
             "the first claimant must build it"
         );
+        let holder = h["X-Rebuck-Holder"].to_str().unwrap().to_string();
 
         // The second daemon blocks — it must not build the same thing.
         let r2 = r.clone();
@@ -1064,6 +1107,7 @@ mod tests {
         let (st, _, _) = call(
             &r,
             Request::post("/_rebuck/lease/release/sha256:abc")
+                .header("X-Rebuck-Holder", &holder)
                 .body(Body::from("the one true layer"))
                 .unwrap(),
         )
@@ -1084,15 +1128,16 @@ mod tests {
         let d = crate::driver::Driver::for_test();
         let r = router(d.clone());
 
-        let (st, _, _) = call(&r, post("/_rebuck/lease/claim/k")).await;
+        let (st, h, _) = call(&r, post("/_rebuck/lease/claim/k")).await;
         assert_eq!(st, StatusCode::OK);
+        let holder = h["X-Rebuck-Holder"].to_str().unwrap().to_string();
 
         let r2 = r.clone();
         let follower = tokio::spawn(async move { call(&r2, post("/_rebuck/lease/claim/k")).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // The leader vanishes without publishing.
-        d.lease_table().abandon_local("k");
+        d.lease_table().abandon_peer("k", &holder);
 
         let (st, _, _) = follower.await.unwrap();
         assert_eq!(
@@ -1115,12 +1160,20 @@ mod tests {
         let (st, h, _) = call(&r, post("/_rebuck/lease/claim/k")).await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(h["X-Rebuck-Lease"], "leader");
+        let holder = h["X-Rebuck-Holder"].to_str().unwrap().to_string();
 
         let r2 = r.clone();
         let follower = tokio::spawn(async move { call(&r2, post("/_rebuck/lease/claim/k")).await });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let (st, _, _) = call(&r, post("/_rebuck/lease/abandon/k")).await;
+        let (st, _, _) = call(
+            &r,
+            Request::post("/_rebuck/lease/abandon/k")
+                .header("X-Rebuck-Holder", &holder)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
         assert_eq!(st, StatusCode::OK);
 
         let (st, _, _) = follower.await.unwrap();
@@ -1129,6 +1182,49 @@ mod tests {
             StatusCode::CONFLICT,
             "the follower must be told to rebuild"
         );
+    }
+
+    /// A zombie must not publish over its successor. The holder id handed out
+    /// with the grant is what proves a release is the CURRENT leader's — without
+    /// it, an evicted leader that finally finishes would overwrite the result of
+    /// whoever took over, and two writers would race one entry.
+    #[tokio::test]
+    async fn a_release_without_the_holder_id_is_ignored() {
+        let r = router(crate::driver::Driver::for_test());
+        let (st, h, _) = call(&r, post("/_rebuck/lease/claim/k")).await;
+        assert_eq!(st, StatusCode::OK);
+        let holder = h["X-Rebuck-Holder"].to_str().unwrap().to_string();
+
+        let r2 = r.clone();
+        let follower = tokio::spawn(async move { call(&r2, post("/_rebuck/lease/claim/k")).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // An impostor (or a zombie quoting a stale id) publishes.
+        call(
+            &r,
+            Request::post("/_rebuck/lease/release/k")
+                .header("X-Rebuck-Holder", "http-999")
+                .body(Body::from("forged"))
+                .unwrap(),
+        )
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !follower.is_finished(),
+            "an impostor's result must not be served"
+        );
+
+        // The real leader publishes.
+        call(
+            &r,
+            Request::post("/_rebuck/lease/release/k")
+                .header("X-Rebuck-Holder", &holder)
+                .body(Body::from("genuine"))
+                .unwrap(),
+        )
+        .await;
+        let (_, _, body) = follower.await.unwrap();
+        assert_eq!(body, b"genuine");
     }
 
     /// A bare store has no fleet to coordinate, and must say so rather than

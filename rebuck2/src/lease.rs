@@ -112,6 +112,8 @@ pub struct Leases {
     /// Leaders that gave up (failed, cancelled, died). Their followers rebuilt,
     /// so this is the tax the mechanism levies when it goes wrong.
     pub abandoned: std::sync::atomic::AtomicU64,
+    /// Unique ids for out-of-process (HTTP) holders — see [`Leases::claim_http`].
+    next_http: std::sync::atomic::AtomicU64,
 }
 
 impl Default for Leases {
@@ -128,6 +130,7 @@ impl Leases {
             merged: std::sync::atomic::AtomicU64::new(0),
             led: std::sync::atomic::AtomicU64::new(0),
             abandoned: std::sync::atomic::AtomicU64::new(0),
+            next_http: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -216,15 +219,24 @@ impl Leases {
         }
     }
 
-    /// Whether a local claim is still ours. Local holders are drop-guarded and
-    /// so need no heartbeat to stay alive; this exists so an HTTP caller (which
-    /// has no Drop) can discover it was torn down rather than block forever.
-    pub fn heartbeat_local(&self, key: &str) -> bool {
-        self.inner
-            .lock()
-            .unwrap()
-            .get(key)
-            .is_some_and(|e| e.holder == Holder::Local)
+    /// Claim on behalf of an out-of-process client (a buildkitd over HTTP).
+    ///
+    /// NOT `claim_local`: a local holder is drop-guarded, which is only safe when
+    /// the holder is a future in THIS process. An HTTP claim returns immediately
+    /// and nothing holds it — so a client that crashes mid-build would wedge the
+    /// key FOREVER and block its followers forever. That is the exact hang this
+    /// module exists to prevent.
+    ///
+    /// So an HTTP holder is a peer like any other: it gets a TTL and a unique
+    /// id. It must heartbeat to keep the lease, and echo the id to release it —
+    /// otherwise a zombie could publish over its successor.
+    pub fn claim_http(&self, key: &str) -> (Claim, String) {
+        let id = format!(
+            "http-{}",
+            self.next_http
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        (self.claim(key, Holder::Peer(id.clone())), id)
     }
 
     /// Drop a local claim without a result — the leader was cancelled. Waiters
@@ -233,6 +245,24 @@ impl Leases {
     pub fn abandon_local(&self, key: &str) {
         let mut map = self.inner.lock().unwrap();
         if map.get(key).is_some_and(|e| e.holder == Holder::Local) {
+            self.abandoned
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let e = map.remove(key).expect("checked above");
+            for w in e.waiters {
+                let _ = w.send(Outcome::Retry);
+            }
+        }
+    }
+
+    /// Give up a peer's claim without a result: it failed, or was cancelled. The
+    /// followers are freed to rebuild rather than waiting out the TTL for a
+    /// result that is never coming.
+    pub fn abandon_peer(&self, key: &str, endpoint: &str) {
+        let mut map = self.inner.lock().unwrap();
+        if map
+            .get(key)
+            .is_some_and(|e| e.holder == Holder::Peer(endpoint.to_string()))
+        {
             self.abandoned
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let e = map.remove(key).expect("checked above");

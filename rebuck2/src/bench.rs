@@ -328,6 +328,8 @@ pub async fn fleet(cfg: FleetCfg) -> Result<FleetMetrics> {
             connect_wait: Duration::from_secs(30),
             driver_addr_file: Some(addr_file.clone()),
             hardlinks: true,
+            registry_port: None,
+            registry_bind: [127, 0, 0, 1].into(),
             preloaded_shard: None,
         };
         std::fs::create_dir_all(&cfgw.scratch)?;
