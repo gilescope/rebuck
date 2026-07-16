@@ -99,12 +99,20 @@ start_bk() { # start_bk <name> <agent-port> <host-port>
     # the STALE daemon -- so the run silently tests the old binary. Cost me two
     # runs and an "impossible" log before I spotted it.
     docker rm -f "$1" >/dev/null 2>&1 || true
+    # NETWORK_MODE=cni is NOT optional. Without it the worker falls back to host
+    # networking -- i.e. the container's docker bridge, which has no IPv6 route --
+    # so any `apt-get` whose mirror resolves to IPv6 dies with "Network is
+    # unreachable" and the example fails for reasons that have nothing to do with
+    # us. earthbuild sets it on its own daemon; match it, and the ulimit too.
     docker run -d --name "$1" --privileged \
+        -e NETWORK_MODE=cni \
         -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
         -e BUILDKIT_SINGLEFLIGHT_URL="http://host.docker.internal:$2" \
         -e BUILDKIT_SINGLEFLIGHT_REGISTRY=cache \
         -e CACHE_SIZE_MB=8000 \
         -e BUILDKIT_MAX_PARALLELISM=8 \
+        -e BUILDKIT_SETUP_CGROUPV2_ROOT=1 \
+        --ulimit nofile=1048576:1048576 \
         -p "127.0.0.1:$3:8372" \
         eb-load:test >/dev/null
 }

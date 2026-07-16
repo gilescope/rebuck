@@ -216,31 +216,70 @@ coordination; only the mutable tag namespace does. Small, but it blocks (1).
 
 ---
 
-## 10. Does single-flight even PAY? (the question the numbers raised)
+## 10. Does single-flight even PAY? — MEASURED, and the framing was wrong
 
-The one I did not think to ask until the instrumentation answered it.
+The one I did not think to ask until the instrumentation answered it. Then I
+answered it with a guess, and the numbers overturned that too.
 
-A follower avoided an 8-second build by downloading 150 MB. Whether that is a
-win depends entirely on the ratio:
+**The guess** was that the payoff is a ratio: expensive-to-build + small-output =
+win; cheap-to-build + large-output = lose. Same economics as the whole
+distribution question (compute >> data, or don't bother).
 
-| the vertex | single-flight |
-| ---------- | ------------- |
-| expensive to build, small output (a compiled binary, a linked rlib) | **big win** |
-| cheap to build, large output (unpacking an archive, generating assets) | **may LOSE** — the transfer costs more than the rebuild |
+**The measurement** (`rebuck2/tests/bench-singleflight-payoff.sh`) says the build
+cost is irrelevant. Two machines, the second arriving `stagger` seconds after the
+first; follower wall-clock:
 
-This is the same economics as the whole distribution question (compute >> data,
-or don't bother), and it means single-flight should probably not be
-unconditional. Options, none built:
+| build | stagger | SF on | SF off | delta |
+| ----- | ------- | ----- | ------ | ----- |
+| 20s | 0s | 24.0s | 22.1s | **+1.9s** — SF LOSES |
+| 20s | 10s | 14.1s | 21.0s | -6.9s |
+| 20s | 20s | 4.1s | 21.1s | -17.0s |
+| **40s** | 10s | 33.9s | 41.0s | **-7.1s** |
 
-- **Skip the lease for cheap vertices.** BuildKit does not know a vertex's cost
-  up front, but the coordinator sees every build: a `key -> duration` history is
-  free (the buck2 side already derives one from `ExecutedActionMetadata`).
-- **Skip the lease for huge outputs.** Harder — the size is not known until the
-  build finishes, and by then the followers are already waiting.
-- **Make the transfer cheap instead** — i.e. do (1), and the question mostly
-  goes away.
+The follower's SF-on time fits `max(0, build - stagger) + T_xfer` (T_xfer ~= 4s
+for a 50 MB layer). Subtract the control and **`build` cancels**:
 
-Which is another argument for (1) being first.
+```text
+delta = T_xfer - stagger
+```
+
+Doubling the build time moved the stagger=10 delta by 0.2s. The build cost — the
+thing the guess put at the centre — does not appear.
+
+### What that means
+
+**Single-flight is a THROUGHPUT optimisation, not a latency one.** A follower
+that arrives WITH the leader waits out the leader's whole build and then pays a
+transfer, where building in parallel on an idle core would have been free: it
+loses ~T_xfer, and the leader loses ~T_push on top. What the fleet gains is one
+build's worth of CPU. It pays iff `stagger > T_xfer`, i.e. iff the follower
+arrives late enough that it is really a cache hit — or iff the fleet is CONTENDED
+and the freed slot does other work.
+
+And no optimisation changes that. `T_xfer` is **irreducible**: the follower needs
+the layer's bytes to unpack them, and lazy fetch (8) does not help because a
+snapshot needs all of them. (0) removes the leader's push and the double-storage,
+which is real, but it cannot make a concurrent follower faster than just
+building.
+
+### The levers, re-aimed
+
+- ~~**Skip the lease for cheap vertices**~~ — **wrong lever, deleted.** Build
+  duration cancels out of the delta. A `key -> duration` history would optimise
+  the one variable measured to be irrelevant.
+- **Skip the lease for huge outputs** — right lever (`T_xfer` scales with size).
+  The old note dismissed this as "size is not known until the build finishes",
+  but a `key -> size` history is exactly as free as the `key -> duration` one it
+  was happy to propose.
+- **Gate on fleet contention** — the real lever, and the driver already tracks
+  slots. Busy fleet: single-flight. Idle fleet: just build it, parallelism is
+  free.
+
+### Still unmeasured
+
+Throughput itself. Every number above comes from a 2-worker IDLE fleet — the case
+where the feature looks worst. If its value is capacity, that is what to measure:
+saturate the workers with queued work and compare builds completed/sec.
 
 ## Measured, not guessed
 
@@ -248,19 +287,44 @@ Which is another argument for (1) being first.
 serves, bytes each way) and the lease outcomes (led / merged / abandoned). The
 e2e prints it.
 
-Two of the guesses above have already been overturned by looking:
+Three of the guesses above have been overturned by looking:
 
 - (1) **confirmed** at ~1.0x amplification per follower — but only once the
   workload produced a realistic layer. With a 32-byte output it measured `0.00x`
   and would have told me to skip it.
 - (7) **demoted**: the base image was 2.5% of a realistic push, not the win I
   assumed.
+- (10) **reframed**: build cost cancels; single-flight is a throughput
+  optimisation. Its "skip cheap vertices" lever aimed at the wrong variable.
+
+### The one that should have been caught first
+
+Single-flight was **INERT for every real build** from the day it was written, and
+four passing e2e tests said otherwise. A local source's cache key is
+session-scoped, so buildkit stamps its digest `random:` — and `LeaseKey` walked
+the dep chain and inherited it. Every vertex downstream of a `COPY` got a key no
+other machine could compute. Measured on `./examples/go+build`: two instances,
+four lease keys, **zero merges**.
+
+It hid because **not one test had a `COPY`**. Every rig used
+`RUN … /dev/urandom … sleep`, whose only input is a base image — the one shape
+where the bug cannot bite. The random-marker trick that made those tests
+"decisive" is exactly what kept local sources out of them: you cannot salt a
+build with random content AND feed it real source files.
+
+So the P2 "done when" bar was cleared by tests that could not fail. The fix is
+one clause in `LeaseKey` (drop `random:` keys, use the content key beside them,
+refuse when there is no content identity); the lesson is that a synthetic
+workload agrees with whatever design produced it.
+`rebuck2/tests/load-earthbuild-examples.sh` now runs earthbuild's own examples,
+which is what found it in a single run.
 
 Still unmeasured, and next:
 
-- time a follower spent BLOCKED vs what it would have spent building — the
-  numerator of (10)
+- **throughput on a CONTENDED fleet** — the actual value proposition of (10), and
+  the one thing an idle 2-worker rig cannot show
 - claim latency per vertex (is (3) real, or is a localhost round-trip free?)
 
 "Do not optimise this until a profile says so" applies to every line above,
-including the ones I was most confident about.
+including the ones I was most confident about. And: **prove it on a real graph,
+or you have proved nothing.**
