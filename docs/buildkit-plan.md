@@ -239,9 +239,47 @@ Two concurrent runs of the same target across two runners execute the shared
 vertices **once** (the second waits + imports), verified by an execution counter
 on the mesh, build green.
 
+**That bar was cleared by tests that could not fail.** Every e2e used a RUN whose
+only input was a base image (`RUN … /dev/urandom … sleep`), and single-flight was
+INERT for any vertex downstream of a `COPY` — the local source's session-scoped
+key is stamped `random:` by buildkit, and the lease key inherited it. Four green
+tests, zero merges on a real build. The counter now exists for real
+(`/_rebuck/stats` → `led`/`merged`/`abandoned`); before, nothing surfaced it and
+the e2e asserted on markers alone.
+
+Measured on earthbuild's own `+examples-1` (`rebuck2/tests/load-earthbuild-examples.sh`),
+two instances, both cold:
+
+| | |
+| ---------------------- | ------------------------------------------------ |
+| exec vertices claimed by both | 14 |
+| lease keys **agree** | **10** |
+| keys differ | 4 — and none is our bug |
+
+The 4: one content-hashes a **cache mount** (machine-local mutable state — that
+is P3 below); the rest content-hash a rootfs produced upstream by an unpinned
+`apt-get update`, i.e. genuinely different bytes.
+
+**So the real bar is: single-flight's merge rate is bounded by the build's
+REPRODUCIBILITY, not by our key derivation.** A byte-reproducible target merges
+everything (`./examples/go+build`: 2/2). A target with cache mounts or an
+unpinned apt cannot, and no amount of work here changes that — only P3, or the
+build becoming reproducible, does. Measure `merged/(led+merged)` against what the
+workload can actually achieve, not against 100%.
+
 ## P3 — mesh-backed cache mounts
 
 > The remaining Satellite warmth. Gate on P1/P2. ⚠︎ 0.75.
+>
+> **The gate has a number now.** A cache mount does not merely miss its own
+> warmth — it POISONS single-flight for the vertex that mounts it. Buildkit
+> content-hashes the mount (`selectors=[/cache]`) as an input, and a cache mount
+> is machine-local mutable state, so two machines hash different bytes and the
+> lease keys cannot match. Measured on `+examples-1`: of the 4 vertices (out of
+> 14) that still fail to merge, the `examples/cpp` one is exactly this — `RUN
+> --mount=type=cache,target=/code/CMakeFiles make`. So P3 buys P2's merge rate
+> too, not just cache warmth. It stays gated only because the other 3 are the
+> build's own non-determinism (unpinned `apt-get update`), which P3 cannot fix.
 
 `type=cache` mounts (cargo/npm/go registries) are `MutableRef` with
 `NoCommit: true` (`container.go:237`), never committed, unreachable by the
