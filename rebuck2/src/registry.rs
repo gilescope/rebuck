@@ -115,6 +115,20 @@ pub trait RegistryStore: Send + Sync + 'static {
     }
     async fn lease_release(&self, _key: &str, _holder: &str, _result: Vec<u8>) {}
     async fn lease_abandon(&self, _key: &str, _holder: &str) {}
+
+    /// `(led, merged, abandoned)` — did single-flight actually engage?
+    ///
+    /// `merged` is the only direct evidence the feature did anything: a vertex a
+    /// second machine adopted instead of rebuilding. Without it the e2e can only
+    /// infer engagement from identical markers, which a stray cache hit would
+    /// fake just as well.
+    ///
+    /// `None` for a store that owns no lease table (a bare store; an agent, which
+    /// forwards to the driver). Only the holder of the table can answer, so ask
+    /// the driver.
+    fn lease_stats(&self) -> Option<(u64, u64, u64)> {
+        None
+    }
 }
 
 /// What a claimant is told.
@@ -219,6 +233,11 @@ impl RegistryStore for crate::driver::Driver {
     }
     async fn lease_abandon(&self, key: &str, holder: &str) {
         self.lease_table().abandon_peer(key, holder);
+    }
+    fn lease_stats(&self) -> Option<(u64, u64, u64)> {
+        let l = self.lease_table();
+        let get = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
+        Some((get(&l.led), get(&l.merged), get(&l.abandoned)))
     }
 }
 
@@ -664,12 +683,19 @@ async fn lease_handle<S: RegistryStore>(
 /// to answer "is the coordinator a bottleneck?" with a number rather than a
 /// hunch.
 async fn stats_handle<S: RegistryStore>(State(reg): State<Arc<Reg<S>>>) -> Response {
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "uploads":      reg.bw.uploaded.load(Ordering::Relaxed),
         "upload_bytes": reg.bw.upload_bytes.load(Ordering::Relaxed),
         "serves":       reg.bw.served.load(Ordering::Relaxed),
         "serve_bytes":  reg.bw.serve_bytes.load(Ordering::Relaxed),
     });
+    // Only whoever owns the lease table can answer this; an agent forwards and
+    // would report zeroes, which is worse than saying nothing.
+    if let Some((led, merged, abandoned)) = reg.store.lease_stats() {
+        body["leases_led"] = led.into();
+        body["leases_merged"] = merged.into();
+        body["leases_abandoned"] = abandoned.into();
+    }
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
