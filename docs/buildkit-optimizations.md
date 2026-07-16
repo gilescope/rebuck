@@ -221,8 +221,8 @@ coordination; only the mutable tag namespace does. Small, but it blocks (1).
 The one I did not think to ask until the instrumentation answered it. Then I
 answered it with a guess, and the numbers overturned that too.
 
-**The guess** was that the payoff is a ratio: expensive-to-build + small-output =
-win; cheap-to-build + large-output = lose. Same economics as the whole
+**The guess** was that the payoff is a ratio: expensive-to-build + small-output
+= win; cheap-to-build + large-output = lose. Same economics as the whole
 distribution question (compute >> data, or don't bother).
 
 **The measurement** (`rebuck2/tests/bench-singleflight-payoff.sh`) says the build
@@ -328,3 +328,25 @@ Still unmeasured, and next:
 "Do not optimise this until a profile says so" applies to every line above,
 including the ones I was most confident about. And: **prove it on a real graph,
 or you have proved nothing.**
+
+### The rig lies more than the product
+
+Every one of these first presented as a product bug. Baseline-then-bisect
+against a known-good reference before believing any of it:
+
+- `merged=0` — a warm daemon cannot collide; the solo run had killed the race.
+- apt `Network is unreachable` — no `NETWORK_MODE=cni`, so the worker fell back
+  to host networking (no IPv6 route). Bisected by running the same rig with the
+  STOCK buildkitd, which failed identically.
+- an impossible log (one marker printed, another absent, same code path) —
+  `KEEP=1` left a container up, and the readiness probe passed against the STALE
+  daemon, so two runs silently tested the old binary.
+- `Could not open file … (5: Input/output error)` — the host disk was full and
+  the daemon died. The rigs now bin their CAS stores on exit; they were leaving
+  ~1.8 GB per run.
+
+And the instrumentation lesson: we could not SEE whether single-flight engaged —
+the lease counters existed and nothing surfaced them, so the e2e asserted on
+markers and passed while the feature did nothing. When two machines disagree the
+digest tells you nothing; `LeaseKeyDebugString` (the pre-hash string) is what
+names the diverging component. Both key bugs were found by diffing it.

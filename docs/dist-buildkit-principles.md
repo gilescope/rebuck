@@ -1,7 +1,13 @@
 # dist-buildkit — principles
 
-Why the design is the shape it is. Each of these was paid for: most arrived by
-being wrong first, and the cost is noted where it is instructive.
+Why the design is the shape it is: claims about what the PRODUCT must be, each
+paid for, most by being wrong first.
+
+Deliberately not here: how to test it, how to debug it, how to avoid fooling
+yourself. Those are working practice, equally true of any project, and live
+where they are used — the "Measured, not guessed" section of
+[buildkit-optimizations.md](buildkit-optimizations.md), and the header comments
+of the rigs in `rebuck2/tests/`, which record the specific ways each one lied.
 
 Companion to [buildkit-plan.md](buildkit-plan.md) (what we are building) and
 [buildkit-optimizations.md](buildkit-optimizations.md) (what we measured).
@@ -89,55 +95,20 @@ path, the layer is simply not there. (Measured: 0 MiB.)
 
 ## 7. Determinism is the ceiling
 
-A vertex's mergeability is bounded by its inputs' reproducibility. This is not a
-limitation we can engineer away:
+A vertex's mergeability is bounded by its inputs' reproducibility. This is a
+property of the system, not a limitation we can engineer away:
 
 - **cache mounts** are machine-local mutable state. Buildkit content-hashes the
   mount as an input, so two machines hash different bytes. They cannot merge
   until the mount itself is shared (plan P3).
 - **genuinely divergent inputs** cannot merge, by definition.
 
-So measure `merged / (led + merged)` against what the workload can ACHIEVE, not
-against 100%. A byte-reproducible target merges everything; a target with cache
-mounts cannot. This is the house rule showing up as an engineering ceiling:
-*same inputs -> same artifact*, or no dedup for you.
+A byte-reproducible target merges everything; a target with an unpinned
+`apt-get update` or a cache mount cannot, however good our key derivation gets.
+The house rule — *same inputs -> same artifact* — is therefore also the
+throughput and consistency ceiling, not just good hygiene.
 
-## 8. Prove it on a real graph, or you have proved nothing
-
-The rule that would have saved the most time. Single-flight was **inert for every
-real build** from the day it was written, and four green e2e tests said
-otherwise — because not one of them had a `COPY`. Every rig used
-`RUN … /dev/urandom … sleep`, whose only input is a base image: the one shape
-where the bug cannot bite. The random-marker trick that made those tests
-"decisive" is exactly what kept local sources out of them, because you cannot
-salt a build with random content AND feed it real source files.
-
-A synthetic workload agrees with whatever design produced it. Real graphs do not.
-`rebuck2/tests/load-earthbuild-examples.sh` runs earthbuild's own examples and
-found in one run what four tests had missed.
-
-## 9. Instrument first, or you are guessing
-
-We could not see whether single-flight engaged: the lease counters existed and
-nothing surfaced them, so the e2e asserted on markers and passed. The first
-honest look said `merged=0`.
-
-When two machines disagree, the DIGEST tells you nothing — the pre-hash string
-is what names the diverging component (`LeaseKeyDebugString`). Both bugs in (4)
-were found by diffing that string, not by reasoning.
-
-## 10. Baseline-then-bisect — the rig lies more than the product
-
-Four rig bugs, and every one first presented as a product bug:
-
-- `merged=0` — a warm daemon cannot collide; the solo run had killed the race.
-- apt: `Network is unreachable` — no `NETWORK_MODE=cni`. Bisected by running the
-  rig with the STOCK buildkitd, which failed identically.
-- an impossible log (one marker printed, another absent, same code path) —
-  `KEEP=1` left a container up, and the readiness probe passed against the STALE
-  daemon, so the run tested the old binary.
-- `Could not open file … (5: Input/output error)` — the host disk was full and
-  the daemon died.
-
-Before blaming the code, reproduce with a known-good reference (stock binary,
-stock daemon) and move ONE variable.
+Note the tension with (2): where a build is NOT reproducible, single-flight is
+what supplies the consistency it lacks, by making one machine's result canonical
+for the whole grid. The less reproducible the build, the more the lease is
+carrying.
