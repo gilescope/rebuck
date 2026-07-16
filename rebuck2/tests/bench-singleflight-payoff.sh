@@ -45,7 +45,11 @@ STAGGERS="${STAGGERS:-0 10 20}"   # 0 = together; ~BUILD_SECS = leader already d
 cleanup() {
     docker rm -f bench-bk-1 bench-bk-2 >/dev/null 2>&1 || true
     kill "${W1:-}" "${W2:-}" "${DRIVER:-}" 2>/dev/null || true
-    echo "logs kept in $SCRATCH"
+    # Bin the heavy artefacts, keep the logs -- the CAS stores hold every layer a
+    # leader pushed, so a few runs of this is gigabytes of scratch nobody reads.
+    rm -rf "$SCRATCH/driver-store" "$SCRATCH/w1" "$SCRATCH/w2" \
+           "$SCRATCH/buildkitd" 2>/dev/null || true
+    echo "logs kept in $SCRATCH ($(du -sm "$SCRATCH" 2>/dev/null | cut -f1) MB)"
 }
 trap cleanup EXIT
 

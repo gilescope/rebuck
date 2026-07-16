@@ -36,6 +36,18 @@ DP=5090            # the driver's registry port: it OWNS the lease table, so it
 TARGETS=("$@")
 [ ${#TARGETS[@]} -eq 0 ] && TARGETS=("./examples/go+build")
 
+# ISOLATE=1 gives each instance its OWN checkout.
+#
+# By default both run from $EB_SRC — the same directory, concurrently — and each
+# syncs it into its own daemon at a slightly different moment. earthbuild writes
+# into that tree as it goes (git plumbing touching .git/index, SAVE ARTIFACT AS
+# LOCAL), so the two contexts can genuinely differ, and buildkit's contenthash
+# correctly reports that as different content => different lease key => no merge.
+# Detached worktrees at the same commit isolate the tree while keeping
+# `git rev-parse HEAD` identical, so the two instances still agree on the commit.
+SRC1="$EB_SRC"; SRC2="$EB_SRC"
+WT1="$HOME/git/EarthBuild/.load-src-1"; WT2="$HOME/git/EarthBuild/.load-src-2"
+
 # shellcheck disable=SC2329  # invoked via trap
 cleanup() {
     # KEEP=1 leaves the daemons up so their logs can be read after the fact --
@@ -49,7 +61,19 @@ cleanup() {
         docker rm -f load-bk-1 load-bk-2 >/dev/null 2>&1 || true
     fi
     kill "${W1:-}" "${W2:-}" "${DRIVER:-}" 2>/dev/null || true
-    echo "logs kept in $SCRATCH"
+    if [ -n "${ISOLATE:-}" ]; then
+        git -C "$EB_SRC" worktree remove --force "$WT1" 2>/dev/null || true
+        git -C "$EB_SRC" worktree remove --force "$WT2" 2>/dev/null || true
+    fi
+    # Drop the heavy artefacts and keep only the logs. Each run otherwise leaves
+    # ~1.8 GB behind (two ~100 MB Go binaries + the driver/worker CAS stores,
+    # which hold every layer a leader pushed). A dozen runs filled the disk, took
+    # the docker daemon down with it, and the failure looked like a build bug:
+    # "Could not open file ... (5: Input/output error)". Logs are kilobytes; keep
+    # those, bin the rest.
+    rm -rf "$SCRATCH/driver-store" "$SCRATCH/w1" "$SCRATCH/w2" \
+           "$SCRATCH/buildkitd" "$SCRATCH/earthbuild" 2>/dev/null || true
+    echo "logs kept in $SCRATCH ($(du -sm "$SCRATCH" 2>/dev/null | cut -f1) MB)"
 }
 trap cleanup EXIT
 
@@ -60,6 +84,17 @@ fi
 echo "=== earthbuild CLI"
 ( cd "$EB_SRC" && GOFLAGS=-mod=mod GOPROXY=direct GOSUMDB=off \
     go build -o "$SCRATCH/earthbuild" ./cmd/earthly )
+
+if [ -n "${ISOLATE:-}" ]; then
+    echo "=== ISOLATE: a detached worktree per instance (same commit, own tree)"
+    COMMIT="$(git -C "$EB_SRC" rev-parse HEAD)"
+    git -C "$EB_SRC" worktree remove --force "$WT1" 2>/dev/null || true
+    git -C "$EB_SRC" worktree remove --force "$WT2" 2>/dev/null || true
+    git -C "$EB_SRC" worktree add --detach "$WT1" "$COMMIT" >/dev/null 2>&1
+    git -C "$EB_SRC" worktree add --detach "$WT2" "$COMMIT" >/dev/null 2>&1
+    SRC1="$WT1"; SRC2="$WT2"
+    echo "    both detached at ${COMMIT:0:12}"
+fi
 
 echo "=== our buildkitd, baked into earthbuild's buildkitd image"
 ARCH="$(docker info --format '{{.Architecture}}' | sed 's/aarch64/arm64/;s/x86_64/amd64/')"
@@ -142,8 +177,8 @@ global:
   tls_enabled: false
 EOF
 
-run_eb() { # run_eb <label> <bk-addr> <target>
-    ( cd "$EB_SRC" && EARTHLY_BUILDKIT_HOST="$2" \
+run_eb() { # run_eb <label> <bk-addr> <target> <srcdir>
+    ( cd "$4" && EARTHLY_BUILDKIT_HOST="$2" \
         "$SCRATCH/earthbuild" --no-output "$3" ) > "$SCRATCH/$1.log" 2>&1
 }
 
@@ -168,7 +203,7 @@ for T in "${TARGETS[@]}"; do
     echo "############ $T"
     echo "=== instance 1 alone (cold): does a real graph even build on our fork?"
     SECONDS=0
-    if run_eb "solo-1" "$BK1" "$T"; then
+    if run_eb "solo-1" "$BK1" "$T" "$SRC1"; then
         echo "PASS: $T built on dist-buildkit in ${SECONDS}s"
     else
         echo "FAIL: $T did not build. tail:"
@@ -192,8 +227,8 @@ for T in "${TARGETS[@]}"; do
     echo "=== now BOTH instances build $T at once, both COLD (the real load)"
     BEFORE="$(stats $DP)"
     SECONDS=0
-    run_eb "pair-1" "$BK1" "$T" & P1=$!
-    run_eb "pair-2" "$BK2" "$T" & P2=$!
+    run_eb "pair-1" "$BK1" "$T" "$SRC1" & P1=$!
+    run_eb "pair-2" "$BK2" "$T" "$SRC2" & P2=$!
     wait $P1 || { echo "FAIL: instance 1"; tail -25 "$SCRATCH/pair-1.log"; exit 1; }
     wait $P2 || { echo "FAIL: instance 2"; tail -25 "$SCRATCH/pair-2.log"; exit 1; }
     echo "both finished in ${SECONDS}s"
