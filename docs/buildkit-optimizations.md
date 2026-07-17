@@ -248,13 +248,26 @@ thing the guess put at the centre — does not appear.
 
 ### What that means
 
-**Single-flight is a THROUGHPUT optimisation, not a latency one.** A follower
-that arrives WITH the leader waits out the leader's whole build and then pays a
-transfer, where building in parallel on an idle core would have been free: it
-loses ~T_xfer, and the leader loses ~T_push on top. What the fleet gains is one
-build's worth of CPU. It pays iff `stagger > T_xfer`, i.e. iff the follower
-arrives late enough that it is really a cache hit — or iff the fleet is CONTENDED
-and the freed slot does other work.
+**Single-flight is not a latency optimisation.** A follower that arrives WITH the
+leader waits out the leader's whole build and then pays a transfer, where
+building in parallel on an idle core would have been free: it loses ~T_xfer, and
+the leader loses ~T_push on top. What the fleet gains is one build's worth of
+CPU, and it pays on latency only iff `stagger > T_xfer`.
+
+> **This section originally concluded "so it is a THROUGHPUT optimisation" and
+> proposed gating the lease on fleet contention — skip it when idle, since
+> parallel building is free. That is WRONG, and the numbers above cannot see why.**
+>
+> Single-flight is a **CONSISTENCY mechanism** (see
+> [dist-buildkit-principles.md](dist-buildkit-principles.md), principles 1-3).
+> On one machine `apt-get update` runs once and every downstream vertex sees the
+> same apt state. On a grid that does not merge, machine A takes the state from
+> 10:00 and machine B from 10:05, and the artifact is stitched from both — a
+> build no single machine would produce. Gate the lease on idleness and you
+> buy a little latency by making the grid non-deterministic.
+>
+> A correctness mechanism cannot be gated on load. The latency arithmetic below
+> is real; it is simply not what decides whether the feature runs.
 
 And no optimisation changes that. `T_xfer` is **irreducible**: the follower needs
 the layer's bytes to unpack them, and lazy fetch (8) does not help because a
@@ -262,18 +275,27 @@ snapshot needs all of them. (0) removes the leader's push and the double-storage
 which is real, but it cannot make a concurrent follower faster than just
 building.
 
-### The levers, re-aimed
+### The levers: there are none — do not skip the lease
 
-- ~~**Skip the lease for cheap vertices**~~ — **wrong lever, deleted.** Build
-  duration cancels out of the delta. A `key -> duration` history would optimise
-  the one variable measured to be irrelevant.
-- **Skip the lease for huge outputs** — right lever (`T_xfer` scales with size).
-  The old note dismissed this as "size is not known until the build finishes",
-  but a `key -> size` history is exactly as free as the `key -> duration` one it
-  was happy to propose.
-- **Gate on fleet contention** — the real lever, and the driver already tracks
-  slots. Busy fleet: single-flight. Idle fleet: just build it, parallelism is
-  free.
+Every "skip the lease when X" this section proposed is dead, and they all die the
+same death: skipping the lease means two machines build one key, and two builds
+of one key produce two answers. The trigger does not matter.
+
+- ~~**Skip for cheap vertices**~~ — build duration cancels out of the delta
+  anyway, so it optimised the one variable measured to be irrelevant. Wrong twice
+  over.
+- ~~**Skip for huge outputs**~~ — `T_xfer` does scale with size, so this looked
+  like the "right" lever. It is not: the big-output vertex is exactly the one you
+  least want two divergent copies of.
+- ~~**Gate on fleet contention**~~ — buys latency on an idle fleet by making the
+  grid non-deterministic. See the correction above.
+
+The lease is not an optimisation with a cost/benefit to tune. It is what makes
+the grid one machine. The only honest lever left is **making the transfer
+cheaper** — (0), which skips nothing and weakens no guarantee.
+
+That also settles the question this section opened with. "Should single-flight be
+unconditional?" Yes. Unconditionally.
 
 ### Still unmeasured
 
