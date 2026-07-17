@@ -224,6 +224,18 @@ for T in "${TARGETS[@]}"; do
     for _ in $(seq 1 60); do ready load-bk-1 && ready load-bk-2 && break; sleep 2; done
     ready load-bk-2 || { echo "FAIL: buildkitds did not come back"; exit 1; }
 
+    # The DRIVER keeps its lease table across that restart, so it still holds the
+    # solo run's canonical answers and the pair would adopt all of them --
+    # measuring RETENTION (a late claimant adopting an earlier answer) rather
+    # than the in-flight COLLISION this phase exists to test. They are different
+    # mechanisms and `merged` cannot tell them apart, so forget the answers.
+    # FRESH_TABLE=0 keeps them, which measures retention instead.
+    if [ "${FRESH_TABLE:-1}" = "1" ]; then
+        curl -sf -X POST "http://127.0.0.1:$DP/_rebuck/lease/forget-all" >/dev/null 2>&1 \
+            && echo "=== driver lease table cleared: the pair must collide, not adopt" \
+            || echo "⚠ could not clear the lease table; merged will include retention"
+    fi
+
     echo "=== now BOTH instances build $T at once, both COLD (the real load)"
     BEFORE="$(stats $DP)"
     SECONDS=0

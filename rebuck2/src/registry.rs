@@ -129,6 +129,16 @@ pub trait RegistryStore: Send + Sync + 'static {
     fn lease_stats(&self) -> Option<(u64, u64, u64)> {
         None
     }
+
+    /// Drop every canonical answer. Returns how many were forgotten.
+    ///
+    /// MEASUREMENT ONLY. `merged` cannot tell an in-flight collision from a late
+    /// claimant adopting an earlier answer, so a test that wants to measure only
+    /// the former must forget the latter first. In production this is never the
+    /// right thing: forgetting an answer is how a key acquires a second one.
+    fn lease_forget_all(&self) -> usize {
+        0
+    }
 }
 
 /// What a claimant is told.
@@ -241,6 +251,9 @@ impl RegistryStore for crate::driver::Driver {
         let l = self.lease_table();
         let get = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
         Some((get(&l.led), get(&l.merged), get(&l.abandoned)))
+    }
+    fn lease_forget_all(&self) -> usize {
+        self.lease_table().forget_all()
     }
 }
 
@@ -618,6 +631,16 @@ async fn lease_handle<S: RegistryStore>(
 ) -> Response {
     if method != Method::POST {
         return err(StatusCode::METHOD_NOT_ALLOWED, "UNSUPPORTED", "POST only");
+    }
+    // No key, and deliberately so: this drops every canonical answer the table
+    // holds. It exists for MEASUREMENT — `merged` cannot distinguish an
+    // in-flight collision from a late claimant adopting an earlier answer, and a
+    // test that wants to measure only the former has to forget the latter. It is
+    // never useful in production: forgetting an answer is how the grid ends up
+    // building a second one.
+    if path == "forget-all" {
+        let n = reg.store.lease_forget_all();
+        return (StatusCode::OK, format!("forgot {n}")).into_response();
     }
     let Some((op, key)) = path.split_once('/') else {
         return err(StatusCode::NOT_FOUND, "UNSUPPORTED", &path);

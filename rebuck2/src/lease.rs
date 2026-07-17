@@ -365,6 +365,20 @@ impl Leases {
         self.len() == 0
     }
 
+    /// Forget every canonical answer, keeping leases that are still held.
+    /// Returns how many answers were dropped.
+    ///
+    /// MEASUREMENT ONLY — see `RegistryStore::lease_forget_all`. Held leases are
+    /// spared because dropping one would strand its followers, which is the one
+    /// failure this module exists to prevent.
+    #[allow(dead_code)] // reached via the driver's RegistryStore impl
+    pub fn forget_all(&self) -> usize {
+        let mut map = self.inner.lock().unwrap();
+        let before = map.len();
+        map.retain(|_, e| e.done.is_none());
+        before - map.len()
+    }
+
     /// Leases actually HELD — entries someone is building right now.
     ///
     /// Not the same as [`len`], and the difference is the point: an entry that
