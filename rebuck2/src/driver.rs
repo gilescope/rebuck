@@ -1835,7 +1835,7 @@ impl Driver {
     /// Barrier: block until the agreed pool has formed once. A latch, not a
     /// level check — late joiners always add capacity, and a shrinking pool
     /// never re-blocks dispatch.
-    async fn await_pool_formed(&self) {
+    pub async fn await_pool_formed(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         if self.pool_formed.load(Relaxed) {
             return;

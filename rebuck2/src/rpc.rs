@@ -375,6 +375,12 @@ impl re::action_cache_server::ActionCache for Ac {
         req: Request<re::GetActionResultRequest>,
     ) -> Result<Response<re::ActionResult>, Status> {
         let d = req.get_ref().action_digest.as_ref().ok_or_else(no_digest)?;
+        // Coverage gate BEFORE validation: buck2 consults the AC before
+        // Execute, so gating only dispatch left lookups racing dark
+        // ranges during the join window - banked blobs read as
+        // unservable and the graph roots re-executed every lap
+        // (--require-shards' first lap, run 29602268246, missed this).
+        self.driver.await_pool_formed().await;
         // A hit is a promise the CAS can deliver every referenced blob.
         // Cache eviction breaks that silently (reader 28932994472) - the
         // validated gate reports a miss instead, so the client re-executes
