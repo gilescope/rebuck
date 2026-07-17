@@ -404,13 +404,23 @@ Bisected, one variable at a time:
 
 So it is not the rig, and not the buildkit version bump. It is our code.
 
-Prime suspect, unverified: single-flight adopts a **layer**. A non-constant ARG's
-value is its **stdout**, which no layer carries. A claim answered from the lease
-table (either a follower adopting, or — since first-writer-wins — a late claimant
-adopting a canonical result) returns a ref where a real exec was needed, and the
-ARG read finds nothing to read. If so, the fix is to not lease vertices whose
-result is consumed as stdout rather than as a filesystem, and the interesting
-question is how to know which those are.
+An earlier revision of this note blamed stdout: "single-flight adopts a layer,
+and a layer carries no stdout". **That mechanism does not exist.** The code
+(`earthfile2llb/converter.go:1015`) wraps the command so its output lands in a
+FILE inside the layer (`withShellAndEnvVarsOutput(outputFile)`), solves it as an
+ordinary vertex, and reads the file back with `ref.ReadFile`. An adopted layer
+carries that file like any other. So the cause is genuinely unknown. Candidates,
+all unverified, none to be trusted without an instrumented repro:
+
+- the leader's `publish` (GetRemotes + push) runs before execOp returns, and a
+  bazel-sized layer could hold the gateway request past the session deadline —
+  the error IS a deadline: `no active session ... context deadline exceeded`
+- the adopted ref is lazy, and `ReadFile` on it needs an unlazy path that our
+  blobFetcher does not serve
+- lease heartbeat/TTL interplay during the 11-minute bazel analysis
+
+The bisection table above is solid; the mechanism is not. Reproduce with
+logging before believing any of these.
 
 This violates the fork's own contract, stated in `singleflight_test.go`:
 "a fork that changes behaviour when you did not ask for it is a fork nobody will
