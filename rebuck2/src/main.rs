@@ -26,7 +26,7 @@ use bazel_remote_apis::google::bytestream as bs;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: rebuck2 driver [--grpc-port N] [--store DIR] [--session S] [--locality] \
+        "usage: rebuck2 driver [--grpc-port N] [--require-shards N] [--store DIR] [--session S] [--locality] \
          [--min-workers N] [--no-local-exec] [--decentralized-cas] [--no-hardlinks] [--no-reflink] [--cache-failures] [--no-name-independent]\n       \
          rebuck2 worker [--store DIR] [--session S] [--slots N] [--preloaded-shard N] [--connect-wait-secs N] [--no-hardlinks] [--no-reflink]\n       \
          rebuck2 verify-store --store DIR\n       \
@@ -224,6 +224,10 @@ async fn run_driver(mut args: Args) -> Result<()> {
         min_workers: args
             .opt("--min-workers")
             .map(|s| s.parse().expect("--min-workers: number"))
+            .unwrap_or(0),
+        require_shards: args
+            .opt("--require-shards")
+            .map(|s| s.parse().expect("--require-shards: number"))
             .unwrap_or(0),
         local_exec: !args.flag("--no-local-exec"),
         decentralized: args.flag("--decentralized-cas"),

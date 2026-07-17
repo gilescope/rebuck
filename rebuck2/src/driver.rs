@@ -24,6 +24,15 @@ use crate::store::Store;
 pub struct DriverCfg {
     pub session: String,
     pub min_workers: usize,
+    /// Quorum by RANGE, not head-count: wait until this many DISTINCT
+    /// preloaded shards are held by joined workers before dispatching.
+    /// 0 = off. Head-count quorum starts the build while the slowest
+    /// range owners are still seeding; the earliest-scheduled actions
+    /// (proc-macros, build scripts) then get their AC results refused
+    /// as unservable - the referenced blobs ARE banked, their range is
+    /// just dark during the join window - and re-execute every lap
+    /// (run 29596537112: 283 misses, all join-race).
+    pub require_shards: usize,
     pub local_exec: bool,
     /// Outputs stay on producing workers; the driver keeps digest -> worker
     /// index and redirects fetches. Trades worker-loss resilience for
@@ -1831,7 +1840,16 @@ impl Driver {
         if self.pool_formed.load(Relaxed) {
             return;
         }
-        while self.workers.lock().await.len() < self.cfg.min_workers {
+        loop {
+            let (n, shards) = {
+                let w = self.workers.lock().await;
+                let shards: std::collections::BTreeSet<u8> =
+                    w.iter().filter_map(|h| h.preloaded_shard).collect();
+                (w.len(), shards.len())
+            };
+            if n >= self.cfg.min_workers && shards >= self.cfg.require_shards {
+                break;
+            }
             self.worker_arrived.notified().await;
         }
         self.pool_formed.store(true, Relaxed);
@@ -2188,6 +2206,7 @@ mod tests {
         let mut cfg = DriverCfg {
             session: "test".into(),
             min_workers: 0,
+            require_shards: 0,
             local_exec: false,
             decentralized: false,
             hardlinks: true,
@@ -2210,6 +2229,7 @@ mod tests {
             DriverCfg {
                 session: "test".into(),
                 min_workers,
+                require_shards: 0,
                 local_exec,
                 decentralized: false,
                 hardlinks: true,

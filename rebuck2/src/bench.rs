@@ -249,6 +249,7 @@ pub async fn fleet(cfg: FleetCfg) -> Result<FleetMetrics> {
         DriverCfg {
             session: session.clone(),
             min_workers: cfg.workers,
+            require_shards: 0,
             local_exec: false,
             decentralized: false,
             hardlinks: true,

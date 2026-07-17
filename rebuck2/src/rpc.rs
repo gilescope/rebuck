@@ -545,6 +545,7 @@ mod tests {
             DriverCfg {
                 session: "test".into(),
                 min_workers: 0,
+                require_shards: 0,
                 local_exec: false,
                 decentralized: false,
                 hardlinks: true,
