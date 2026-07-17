@@ -844,6 +844,24 @@ impl Driver {
         // 3,650 stale hints into hard exec failures per lap (healing4/5).
         // Both sources get the same exact HasMany verification.
         let mut by_peer: HashMap<String, Vec<usize>> = HashMap::new();
+        // Deterministic range-owner fallback for hintless digests: bloom
+        // gossip lags joins, so freshly-seeded banked blobs can have no
+        // claimant at validation time - graph-root results then read as
+        // unservable and re-execute every lap (runs 29596537112..
+        // 29613987710: the persistent-108 class survived shard-coverage
+        // gating for exactly this reason). The shard map is not gossip:
+        // first hex nibble / 2 names the owner, and its store was seeded
+        // before it joined. Same exact HasMany verification either way.
+        let shard_owner: HashMap<u8, String> = {
+            let w = self.workers.lock().await;
+            let mut m = HashMap::new();
+            for h in w.iter() {
+                if let Some(p) = h.preloaded_shard {
+                    m.entry(p).or_insert_with(|| h.endpoint.clone());
+                }
+            }
+            m
+        };
         {
             let providers = self.providers.lock().await;
             let blooms = self.blooms.lock().await;
@@ -852,12 +870,19 @@ impl Driver {
                     have[i] = true;
                     continue;
                 }
-                let peer = providers.get(&d.hash).cloned().or_else(|| {
-                    blooms
-                        .iter()
-                        .find(|(_, b)| b.contains(&d.hash))
-                        .map(|(e, _)| e.clone())
-                });
+                let peer = providers
+                    .get(&d.hash)
+                    .cloned()
+                    .or_else(|| {
+                        blooms
+                            .iter()
+                            .find(|(_, b)| b.contains(&d.hash))
+                            .map(|(e, _)| e.clone())
+                    })
+                    .or_else(|| {
+                        let nib = u8::from_str_radix(d.hash.get(..1)?, 16).ok()?;
+                        shard_owner.get(&(nib / 2)).cloned()
+                    });
                 if let Some(p) = peer {
                     by_peer.entry(p).or_default().push(i);
                 }
