@@ -906,6 +906,20 @@ impl Driver {
         }))
         .await;
         for (peer, idxs, confirmed) in verdicts {
+            // Discriminate probe FAILURE (routing/transport - confirmed is
+            // None) from an honest "no": the hunt for the persistent-108
+            // died in this blind spot twice (banked + owner-held blobs
+            // still read unservable, runs 29613987710/29615666747).
+            if confirmed.is_none() {
+                let n = self.unservable_logged.fetch_add(1, Ordering::Relaxed);
+                if n < 20 {
+                    println!(
+                        "[driver] hasmany PROBE FAILED to {peer} ({} digs, first {})",
+                        idxs.len(),
+                        idxs.first().map(|&i| digs[i].hash.as_str()).unwrap_or("?")
+                    );
+                }
+            }
             let mut providers = self.providers.lock().await;
             for (k, &i) in idxs.iter().enumerate() {
                 let ok = confirmed
