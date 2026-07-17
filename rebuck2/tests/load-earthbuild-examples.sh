@@ -139,10 +139,17 @@ start_bk() { # start_bk <name> <agent-port> <host-port>
     # so any `apt-get` whose mirror resolves to IPv6 dies with "Network is
     # unreachable" and the example fails for reasons that have nothing to do with
     # us. earthbuild sets it on its own daemon; match it, and the ulimit too.
+    # CONTROL=1: single-flight off — two daemons each build everything, the
+    # no-coordination world. Same fork, same flags, same targets; only the
+    # coordination differs. Compare "both finished in Xs" between a CONTROL run
+    # and a normal run for the dist-vs-local wall-clock answer.
+    local sfurl="http://host.docker.internal:$2"
+    [ -n "${CONTROL:-}" ] && sfurl=""
     docker run -d --name "$1" --privileged \
         -e NETWORK_MODE=cni \
+        -e BUILDKIT_DEBUG="${BUILDKIT_DEBUG:-false}" \
         -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
-        -e BUILDKIT_SINGLEFLIGHT_URL="http://host.docker.internal:$2" \
+        -e BUILDKIT_SINGLEFLIGHT_URL="$sfurl" \
         -e BUILDKIT_SINGLEFLIGHT_REGISTRY=cache \
         -e CACHE_SIZE_MB=8000 \
         -e BUILDKIT_MAX_PARALLELISM=8 \

@@ -149,6 +149,27 @@ adopt       (follower side)       = 4-22ms
 healthy disk that is latency; on a sick one it is plausibly a session-deadline
 failure (see the bug note below).
 
+**Fixed twice over, unapportionably.** zstd replaced gzip in `refCfg`, AND the
+cache-mount gate now stops bazel's fat mounted layers leasing (so they are never
+published). Same workload after both: worst publishable **30.7ms**. The two
+mechanisms landed between measurements and cannot be separated from this run.
+
+Dist-vs-local, measured on real examples (two instances starting together,
+idle fleet — `CONTROL=1` runs the identical rig with single-flight off):
+
+| target | SF on | SF off | tax |
+| ------ | ----- | ------ | --- |
+| bazel+image | 94s | 76s | +18s |
+| react+docker | 23s | 20s | +3s |
+| cutoff-optimization+run | 10s | 9s | +1s |
+| import+build | 37s | 37s | 0 |
+
+The latency tax at stagger=0, exactly as the bench law predicts — while SF-on
+executed each shared vertex ONCE (28 led, 14 merged) and the control executed
+everything twice with divergent results. Latency bought consistency plus half
+the fleet CPU. The contended-fleet case, where that CPU becomes wall-clock,
+remains the open measurement.
+
 Ideas, cheapest first:
 
 - **zstd instead of gzip.** `compression.New(compression.Default)` is gzip.
