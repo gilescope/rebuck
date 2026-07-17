@@ -937,6 +937,50 @@ impl Driver {
                 }
             }
         }
+        // Second chance for denials: hints outrank the range owner, and a
+        // bloom FALSE POSITIVE is deterministic per digest - the same
+        // wrong worker gets asked every lap, honestly says no, and the
+        // owner is never consulted. That was the persistent-108 class
+        // (runs 29596537112..29617187131), immune to every join-window
+        // gate because it is not a race at all.
+        let denied: Vec<usize> = (0..digs.len()).filter(|&i| !have[i]).collect();
+        if !denied.is_empty() && !shard_owner.is_empty() {
+            let mut retry: HashMap<String, Vec<usize>> = HashMap::new();
+            for &i in &denied {
+                if let Some(owner) = u8::from_str_radix(&digs[i].hash[..1], 16)
+                    .ok()
+                    .and_then(|nib| shard_owner.get(&(nib / 2)))
+                {
+                    retry.entry(owner.clone()).or_default().push(i);
+                }
+            }
+            let verdicts = futures::future::join_all(retry.into_iter().map(|(peer, idxs)| {
+                let batch: Vec<Dig> = idxs.iter().map(|&i| digs[i].clone()).collect();
+                async move {
+                    let _permit = self.mesh_fetches.acquire().await;
+                    let confirmed = match self.peer_request(&peer, &BlobReq::HasMany(batch)).await {
+                        Ok(BlobResp::HaveMany(v)) => Some(v),
+                        _ => None,
+                    };
+                    (peer, idxs, confirmed)
+                }
+            }))
+            .await;
+            let mut providers = self.providers.lock().await;
+            for (peer, idxs, confirmed) in verdicts {
+                for (k, &i) in idxs.iter().enumerate() {
+                    if confirmed
+                        .as_ref()
+                        .and_then(|v| v.get(k))
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        have[i] = true;
+                        providers.insert(digs[i].hash.clone(), peer.clone());
+                    }
+                }
+            }
+        }
         have
     }
 
