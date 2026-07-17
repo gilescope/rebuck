@@ -198,17 +198,23 @@ else:
 ' || echo "(unavailable)"
 }
 
+# A survey wants EVERY failure, not the first. Bailing on target 1 means
+# targets 2..N are never tested, and the one that breaks is rarely the one you
+# most wanted to see. Collect and report at the end; exit non-zero if any failed.
+FAILED=()
 for T in "${TARGETS[@]}"; do
     echo
     echo "############ $T"
     echo "=== instance 1 alone (cold): does a real graph even build on our fork?"
     SECONDS=0
-    if run_eb "solo-1" "$BK1" "$T" "$SRC1"; then
+    LOG="solo-$(echo "$T" | tr -c 'a-zA-Z0-9' '_')"
+    if run_eb "$LOG" "$BK1" "$T" "$SRC1"; then
         echo "PASS: $T built on dist-buildkit in ${SECONDS}s"
     else
-        echo "FAIL: $T did not build. tail:"
-        tail -30 "$SCRATCH/solo-1.log"
-        exit 1
+        echo "FAIL: $T did not build after ${SECONDS}s. tail:"
+        tail -25 "$SCRATCH/$LOG.log"
+        FAILED+=("$T (solo)")
+        continue
     fi
 
     echo
@@ -241,8 +247,8 @@ for T in "${TARGETS[@]}"; do
     SECONDS=0
     run_eb "pair-1" "$BK1" "$T" "$SRC1" & P1=$!
     run_eb "pair-2" "$BK2" "$T" "$SRC2" & P2=$!
-    wait $P1 || { echo "FAIL: instance 1"; tail -25 "$SCRATCH/pair-1.log"; exit 1; }
-    wait $P2 || { echo "FAIL: instance 2"; tail -25 "$SCRATCH/pair-2.log"; exit 1; }
+    if ! wait $P1; then echo "FAIL: $T instance 1"; tail -20 "$SCRATCH/pair-1.log"; FAILED+=("$T (pair-1)"); fi
+    if ! wait $P2; then echo "FAIL: $T instance 2"; tail -20 "$SCRATCH/pair-2.log"; FAILED+=("$T (pair-2)"); fi
     echo "both finished in ${SECONDS}s"
     echo "  driver before: $BEFORE"
     echo "  driver after:  $(stats $DP)"
@@ -257,3 +263,11 @@ du -sm "$SCRATCH/driver-store" 2>/dev/null | cut -f1 | sed 's/$/ MiB/'
 echo
 echo "DONE. 'merged' is the headline: vertices a second instance adopted"
 echo "rather than rebuilt, on a graph nobody hand-crafted for us."
+echo
+if [ ${#FAILED[@]} -eq 0 ]; then
+    echo "ALL TARGETS PASSED (${#TARGETS[@]})"
+else
+    echo "FAILED (${#FAILED[@]} of ${#TARGETS[@]}):"
+    printf '  - %s\n' "${FAILED[@]}"
+    exit 1
+fi

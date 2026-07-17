@@ -372,3 +372,51 @@ the lease counters existed and nothing surfaced them, so the e2e asserted on
 markers and passed while the feature did nothing. When two machines disagree the
 digest tells you nothing; `LeaseKeyDebugString` (the pre-hash string) is what
 names the diverging component. Both key bugs were found by diffing it.
+
+---
+
+## BUG: single-flight breaks earthbuild's `$(...)` ARG expansion
+
+**Open. Found by widening the load to earthbuild's `examples-3`.**
+
+`examples/bazel+image` does:
+
+```text
+ARG jar = $(bazel cquery //:ProjectRunner_deploy.jar --output starlark ...)
+```
+
+A *non-constant* ARG: earthbuild RUNS the command and reads its **stdout** back
+through the gateway session. With single-flight on, it fails:
+
+```text
+failed to expand ARG $(bazel cquery ...): non constant build arg read request:
+DeadlineExceeded: no active session for jgxv7...: context deadline exceeded
+```
+
+Bisected, one variable at a time:
+
+| setup | result |
+| ----- | ------ |
+| stock earthbuild, its own daemon | PASS |
+| our rig's flags + STOCK buildkitd | PASS |
+| **our binary, `BUILDKIT_SINGLEFLIGHT_URL` unset** | **PASS** |
+| **our binary, single-flight ON** | **FAIL** |
+
+So it is not the rig, and not the buildkit version bump. It is our code.
+
+Prime suspect, unverified: single-flight adopts a **layer**. A non-constant ARG's
+value is its **stdout**, which no layer carries. A claim answered from the lease
+table (either a follower adopting, or — since first-writer-wins — a late claimant
+adopting a canonical result) returns a ref where a real exec was needed, and the
+ARG read finds nothing to read. If so, the fix is to not lease vertices whose
+result is consumed as stdout rather than as a filesystem, and the interesting
+question is how to know which those are.
+
+This violates the fork's own contract, stated in `singleflight_test.go`:
+"a fork that changes behaviour when you did not ask for it is a fork nobody will
+merge". Here the behaviour changes when you DID ask for it, in a way that has
+nothing to do with what you asked.
+
+`examples-1` never used `$(...)`, which is why nothing caught this until the load
+widened. Principle 8 again, one level up: a real graph is not one workload, it is
+a distribution of them.
