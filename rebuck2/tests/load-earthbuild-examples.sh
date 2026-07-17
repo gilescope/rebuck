@@ -146,6 +146,7 @@ start_bk() { # start_bk <name> <agent-port> <host-port>
     local sfurl="http://host.docker.internal:$2"
     [ -n "${CONTROL:-}" ] && sfurl=""
     docker run -d --name "$1" --privileged \
+        --add-host host.docker.internal:host-gateway \
         -e NETWORK_MODE=cni \
         -e BUILDKIT_DEBUG="${BUILDKIT_DEBUG:-false}" \
         -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
@@ -216,16 +217,27 @@ FAILED=()
 for T in "${TARGETS[@]}"; do
     echo
     echo "############ $T"
-    echo "=== instance 1 alone (cold): does a real graph even build on our fork?"
-    SECONDS=0
-    LOG="solo-$(echo "$T" | tr -c 'a-zA-Z0-9' '_')"
-    if run_eb "$LOG" "$BK1" "$T" "$SRC1"; then
-        echo "PASS: $T built on dist-buildkit in ${SECONDS}s"
+    # "t1,t2" runs DIFFERENT targets on the two instances — the shared-prefix
+    # experiment. Two CI shards of one repo share their whole base chain
+    # (+code/+deps) and differ only in the leaves, so every merge is a genuine
+    # cross-target win, none of the same-target-twice flattery. Solo phase is
+    # skipped: this shape is a measurement, not a does-it-build check.
+    TA="$T"; TB="$T"
+    if [[ "$T" == *,* ]]; then
+        TA="${T%%,*}"; TB="${T#*,}"
+        echo "=== PAIR MODE: instance 1 -> $TA, instance 2 -> $TB (no solo)"
     else
-        echo "FAIL: $T did not build after ${SECONDS}s. tail:"
-        tail -25 "$SCRATCH/$LOG.log"
-        FAILED+=("$T (solo)")
-        continue
+        echo "=== instance 1 alone (cold): does a real graph even build on our fork?"
+        SECONDS=0
+        LOG="solo-$(echo "$T" | tr -c 'a-zA-Z0-9' '_')"
+        if run_eb "$LOG" "$BK1" "$T" "$SRC1"; then
+            echo "PASS: $T built on dist-buildkit in ${SECONDS}s"
+        else
+            echo "FAIL: $T did not build after ${SECONDS}s. tail:"
+            tail -25 "$SCRATCH/$LOG.log"
+            FAILED+=("$T (solo)")
+            continue
+        fi
     fi
 
     echo
@@ -256,8 +268,8 @@ for T in "${TARGETS[@]}"; do
     echo "=== now BOTH instances build $T at once, both COLD (the real load)"
     BEFORE="$(stats $DP)"
     SECONDS=0
-    run_eb "pair-1" "$BK1" "$T" "$SRC1" & P1=$!
-    run_eb "pair-2" "$BK2" "$T" "$SRC2" & P2=$!
+    run_eb "pair-1" "$BK1" "$TA" "$SRC1" & P1=$!
+    run_eb "pair-2" "$BK2" "$TB" "$SRC2" & P2=$!
     if ! wait $P1; then echo "FAIL: $T instance 1"; tail -20 "$SCRATCH/pair-1.log"; FAILED+=("$T (pair-1)"); fi
     if ! wait $P2; then echo "FAIL: $T instance 2"; tail -20 "$SCRATCH/pair-2.log"; FAILED+=("$T (pair-2)"); fi
     echo "both finished in ${SECONDS}s"
