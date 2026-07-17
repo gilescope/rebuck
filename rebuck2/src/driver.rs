@@ -901,7 +901,8 @@ impl Driver {
         // Fast path: a validated-servable entry is served from memory -
         // no disk read, no revalidation, concurrent readers.
         if let Some(cached) = self.memo_servable.read().await.get(hash).cloned() {
-            if let Ok(result) = re::ActionResult::decode(cached.as_slice()) {
+            if let Ok(mut result) = re::ActionResult::decode(cached.as_slice()) {
+                crate::norm::ensure_execution_metadata(&mut result);
                 return AcLookup::Hit(Box::new(result));
             }
         }
@@ -913,10 +914,15 @@ impl Driver {
                 return AcLookup::Unservable;
             }
         }
-        let Ok(result) = re::ActionResult::decode(bytes.as_slice()) else {
+        let Ok(mut result) = re::ActionResult::decode(bytes.as_slice()) else {
             // Corrupt entry: re-execution overwrites it. Safer than serving.
             return AcLookup::Miss;
         };
+        // Serve-time heal: pre-fix canon-hits were re-cached under the
+        // requesting digest WITHOUT execution_metadata (rewrite_result
+        // used to strip it) and then banked - buck2's client hard-rejects
+        // such rows. Every digest-keyed serve flows through here.
+        crate::norm::ensure_execution_metadata(&mut result);
         let mut digs = result_digests(&result);
         // Top-level digests prove a directory output's Tree PROTO exists,
         // not its contents: reader 29010597531 lost 5,390 actions to

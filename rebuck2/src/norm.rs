@@ -225,18 +225,25 @@ pub fn normalize_result(r: &re::ActionResult) -> re::ActionResult {
     n
 }
 
+/// buck2's OSS RE client hard-rejects any ActionResult without
+/// execution_metadata ("The execution metadata are not defined.").
+/// Call at every serve boundary; rows banked by pre-fix code lack it.
+pub fn ensure_execution_metadata(r: &mut re::ActionResult) {
+    if r.execution_metadata.is_none() {
+        r.execution_metadata = Some(re::ExecutedActionMetadata {
+            worker: "rebuck2-cached".into(),
+            ..Default::default()
+        });
+    }
+}
+
 /// Serve a canonical result under the requesting action's paths.
 /// Positional: normalization preserves order, and both sides of a canonical
 /// match declared the same output shape (same normalized Command).
 pub fn rewrite_result(mut canonical: re::ActionResult, cmd: &re::Command) -> re::ActionResult {
-    // Presence is contractual: buck2's OSS RE client rejects any
-    // ActionResult without execution_metadata ("The execution metadata
-    // are not defined."). The store form strips it so one requester's
-    // timing never leaks to another; serve a neutral one instead.
-    canonical.execution_metadata = Some(re::ExecutedActionMetadata {
-        worker: "rebuck2-canonical".into(),
-        ..Default::default()
-    });
+    // Presence is contractual (see ensure_execution_metadata): the store
+    // form strips it so one requester's timing never leaks to another.
+    ensure_execution_metadata(&mut canonical);
     #[allow(deprecated)]
     let declared: Vec<String> = if cmd.output_paths.is_empty() {
         cmd.output_files
