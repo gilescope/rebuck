@@ -271,18 +271,23 @@ workload can actually achieve, not against 100%.
 
 > The remaining Satellite warmth. Gate on P1/P2. ⚠︎ 0.75.
 >
-> **Correction — an earlier revision of this note was wrong.** It claimed a cache
-> mount POISONS single-flight for the vertex that mounts it, because buildkit
-> content-hashes the mount (`selectors=[/cache]`) and two machines hold different
-> bytes. That was true only of a bug in our own key derivation: `LeaseKey` was
-> unioning the slow (content) key in beside the fast key. Once the slow key is
-> treated as a FALLBACK (principle 4), the mount's bytes never reach the lease
-> key, and the `examples/cpp` vertex — `RUN --mount=type=cache,target=/code/CMakeFiles
-> make` — merges like any other. Measured on `+examples-1`: **14 of 14 keys agree,
-> zero divergence.**
+> **This note has now been wrong in both directions; the third version is
+> grounded in a failure.** v1 said cache mounts POISON single-flight (keys
+> diverge). False — that was our own slow-key union bug; with the slow key as a
+> fallback, 14/14 keys agree. v2 then said cache-mounted vertices "merge like
+> any other". ALSO false, and dangerously so: the keys agree but the ADOPTION is
+> unsound. A cache-mounted vertex's published layer is not its whole result —
+> `examples/bazel+build` (`CACHE /root/.cache/bazel`) keeps bazel's real output
+> tree in the mount and leaves only a symlink in the layer. A follower adopting
+> that layer gets a dangling symlink: measured, instance 2's
+> `readlink -f ./bazel-out` returned nothing and the build failed. `cpp` merging
+> happily was luck — its mount held only intermediates.
 >
-> So P3 buys cache WARMTH, which is what it always claimed. It does not buy P2's
-> merge rate — P2 needed no help. Gate it on the warmth numbers alone.
+> So cache-mounted execs are now EXCLUDED from single-flight entirely
+> (`ExecOp.hasCacheMount`, fail open, build locally): fail open, never fail
+> wrong. Which restores P3's claim on the merge rate after all, by the third
+> route: until mounts are fleet-shared, cache-mounted vertices cannot merge
+> SOUNDLY, so P3 buys their warmth AND their mergeability.
 
 `type=cache` mounts (cargo/npm/go registries) are `MutableRef` with
 `NoCommit: true` (`container.go:237`), never committed, unreachable by the

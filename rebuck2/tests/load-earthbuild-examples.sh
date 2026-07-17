@@ -178,8 +178,12 @@ global:
 EOF
 
 run_eb() { # run_eb <label> <bk-addr> <target> <srcdir>
+    # --allow-privileged: the CLIENT half of the security.insecure entitlement.
+    # The daemon already grants it (buildkitd.toml.template: insecure-entitlements),
+    # but WITH DOCKER targets (examples-5's integration-test) fail with
+    # "security.insecure is not allowed" unless the client requests it too.
     ( cd "$4" && EARTHLY_BUILDKIT_HOST="$2" \
-        "$SCRATCH/earthbuild" --no-output "$3" ) > "$SCRATCH/$1.log" 2>&1
+        "$SCRATCH/earthbuild" --allow-privileged --no-output "$3" ) > "$SCRATCH/$1.log" 2>&1
 }
 
 stats() { # stats <port> — bandwidth; plus leases iff this endpoint owns the table

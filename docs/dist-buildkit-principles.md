@@ -48,8 +48,11 @@ is exactly (1) violated.
 
 Liveness never requires keeping *your own* bytes — only *some* bytes.
 
-> Status: not yet implemented. Today we fail open and keep our own result, which
-> protects liveness and quietly abandons consistency in the one case that matters.
+> Implemented: a released success becomes the key's canonical answer, and every
+> later claimant adopts it (`Claim::Done`). Only a success is canonical — a
+> failure drops the entry, or one machine's transient OOM would be cached for
+> the fleet. Measured on `+examples-1`: led 15, merged 30 across a solo run plus
+> two concurrent instances — each vertex built exactly once, grid-wide.
 
 ## 4. Identity is what BUILDKIT matches on — not what we can compute
 
@@ -98,16 +101,25 @@ path, the layer is simply not there. (Measured: 0 MiB.)
 A vertex's mergeability is bounded by its inputs' reproducibility — but the bound
 is far looser than it first appears, and we twice mistook our own bugs for it.
 
-What actually blocks a merge is the KEY not agreeing. And the key is
-`f(op, deps)`; it does not hash the output (principle 4). So a vertex is
-mergeable whenever buildkit itself would call it a cache hit — including
-`RUN apt-get update`, whose output is wildly non-deterministic and whose key is
-perfectly stable. Measured on `+examples-1`: **14 of 14 keys agree**, cache
-mounts and unpinned apt included.
+Merging needs two things, and we learned them one failure apart:
 
-The real bound is narrower: an input whose IDENTITY differs across machines
-cannot merge. In practice that means a local source with no content key at all —
-we refuse the lease there (principle 5) rather than invent one.
+1. **The KEY must agree.** It is `f(op, deps)` and does not hash the output
+   (principle 4), so a vertex is key-mergeable whenever buildkit itself would
+   call it a cache hit — including `RUN apt-get update`, whose output is wildly
+   non-deterministic and whose key is perfectly stable. Measured on
+   `+examples-1`: **14 of 14 keys agree**, cache mounts and unpinned apt
+   included.
+2. **The ADOPTION must be sound**: the published layer must BE the whole
+   result. A cache-mounted vertex fails this — bazel keeps its real output tree
+   in the mount and leaves only a symlink in the layer, so a follower adopting
+   it gets a dangling result (measured: `readlink -f ./bazel-out` -> nothing).
+   Key agreement is necessary, not sufficient. Such vertices are excluded from
+   the lease (`hasCacheMount`) until mounts are fleet-shared (P3).
+
+The identity bound proper is narrower still: an input whose IDENTITY differs
+across machines cannot merge. In practice that means a local source with no
+content key at all — we refuse the lease there (principle 5) rather than invent
+one.
 
 Twice we blamed reproducibility for what was our own key derivation:
 `random:` inheritance, then unioning the slow key in. Both times the vertices
@@ -117,9 +129,5 @@ diverging** — the pre-hash string says which, in one run.
 
 Where a build IS non-reproducible, note the tension with (2): the lease is then
 carrying MORE, not less. It is what makes one machine's result canonical for the
-whole grid, and so supplies the consistency the build itself lacks.
-
-Note the tension with (2): where a build is NOT reproducible, single-flight is
-what supplies the consistency it lacks, by making one machine's result canonical
-for the whole grid. The less reproducible the build, the more the lease is
-carrying.
+whole grid, and so supplies the consistency the build itself lacks. The less
+reproducible the build, the more the lease is carrying.
