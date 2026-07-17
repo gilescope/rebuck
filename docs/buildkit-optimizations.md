@@ -129,11 +129,25 @@ should be served by N/2 of them, not by one.
 Cost: `blobFetcher` learns to follow a redirect; the coordinator's OCI GET
 answers `BlobResp::Provider` instead of bytes. Both already exist in the fleet.
 
-## 2. The leader compresses on the critical path
+## 2. The leader compresses on the critical path — MEASURED, it is real
 
 `GetRemotes(createIfNeeded=true)` is what turns a freshly-executed snapshot into
 a layer blob — i.e. it gzips the whole diff while the followers sit and wait. It
-is on the leader's critical path *and* on every follower's.
+is on the leader's critical path *and* on every follower's — and worse than
+either: `publish` runs in a defer inside `ExecOp.Exec`, so it blocks the
+leader's OWN solve from seeing its own result.
+
+Measured on `examples/bazel+image` (SFTIME, debug level):
+
+```text
+publishable (GetRemotes/compress) = 19.1s and 30.8s   on the two bazel layers
+publish     (lease release+push)  < 1ms
+adopt       (follower side)       = 4-22ms
+```
+
+30 seconds of compression before the solver learns the exec finished. On a
+healthy disk that is latency; on a sick one it is plausibly a session-deadline
+failure (see the bug note below).
 
 Ideas, cheapest first:
 
@@ -375,9 +389,21 @@ names the diverging component. Both key bugs were found by diffing it.
 
 ---
 
-## BUG: single-flight breaks earthbuild's `$(...)` ARG expansion
+## BUG (downgraded): the `$(...)` ARG-expansion failure does not reproduce
 
-**Open. Found by widening the load to earthbuild's `examples-3`.**
+**Status: NOT currently reproducible.** After clearing the docker VM's disk
+(it had been filling all day and later hit 100%), the identical run passes:
+solo in 148s, pair merging 6/6. The bisection below was CONFOUNDED — each run
+added ~8 GB to the VM, so "single-flight on" vs "off" was never the only
+variable. The original 11-minute analyze phase, and the session deadline that
+killed it, are both consistent with a starved disk.
+
+Kept because the bisection METHOD was right and the table is honest data — it
+just measured two variables while believing it measured one. The remaining
+suspect with a number attached: `publishable` blocks the leader's own solve for
+up to 30.8s on bazel-sized layers (see (2) above), which under disk pressure
+could stretch past the gateway session deadline. If this failure returns, look
+there first, and control the disk this time.
 
 `examples/bazel+image` does:
 
