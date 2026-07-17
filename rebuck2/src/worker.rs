@@ -639,12 +639,10 @@ impl exec::Blobs for RemoteBlobs {
             // Pulls into the local store as a side effect.
             let _ = self.get(d).await?;
         }
-        // Linked = shared 0o555 inode, exec included; Private = ours to chmod.
-        if self.store.link_out(d, dest).await? == crate::store::Materialized::Private
-            && is_executable
-        {
-            exec::set_exec(dest).await?;
-        }
+        // link_out_exec guarantees the exec bit on BOTH paths - including
+        // normalizing a mode-stripped shared store inode (bank-seeded
+        // blobs staged 0o100644 and died with EACCES, run 29524645875).
+        self.store.link_out_exec(d, dest, is_executable).await?;
         Ok(())
     }
 

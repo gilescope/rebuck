@@ -2027,11 +2027,10 @@ impl exec::Blobs for StoreBlobs {
             }
             return Ok(());
         }
-        if self.store.link_out(d, dest).await? == crate::store::Materialized::Private
-            && is_executable
-        {
-            exec::set_exec(dest).await?;
-        }
+        // link_out_exec guarantees the exec bit on BOTH paths - including
+        // normalizing a mode-stripped shared store inode (bank-seeded
+        // blobs staged 0o100644 and died with EACCES, run 29524645875).
+        self.store.link_out_exec(d, dest, is_executable).await?;
         Ok(())
     }
 }

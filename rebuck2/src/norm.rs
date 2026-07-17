@@ -229,6 +229,14 @@ pub fn normalize_result(r: &re::ActionResult) -> re::ActionResult {
 /// Positional: normalization preserves order, and both sides of a canonical
 /// match declared the same output shape (same normalized Command).
 pub fn rewrite_result(mut canonical: re::ActionResult, cmd: &re::Command) -> re::ActionResult {
+    // Presence is contractual: buck2's OSS RE client rejects any
+    // ActionResult without execution_metadata ("The execution metadata
+    // are not defined."). The store form strips it so one requester's
+    // timing never leaks to another; serve a neutral one instead.
+    canonical.execution_metadata = Some(re::ExecutedActionMetadata {
+        worker: "rebuck2-canonical".into(),
+        ..Default::default()
+    });
     #[allow(deprecated)]
     let declared: Vec<String> = if cmd.output_paths.is_empty() {
         cmd.output_files
@@ -335,6 +343,17 @@ mod tests {
             &[8u8; 32],
         );
         assert_ne!(k1, k3);
+    }
+
+    #[test]
+    fn rewrite_result_restores_execution_metadata() {
+        // The canonical store form strips execution_metadata (timing must
+        // not leak between requesters), but buck2's OSS RE client REJECTS
+        // any ActionResult without it ("The execution metadata are not
+        // defined.") - every canonical hit served bare was converted into
+        // an internal error (run 29524645875, atk-sys rustc diag).
+        let out = rewrite_result(re::ActionResult::default(), &re::Command::default());
+        assert!(out.execution_metadata.is_some());
     }
 
     #[test]

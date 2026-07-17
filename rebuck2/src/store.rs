@@ -218,6 +218,37 @@ impl Store {
         })
     }
 
+    /// `link_out` plus the exec guarantee: when `is_executable`, the
+    /// materialized file carries the exec bit. A blob that entered the
+    /// store via a mode-less path (CI bank seed, external tar) violates
+    /// the 0o555 invariant; on the Linked path this normalizes the SHARED
+    /// inode - adding exec to immutable content is safe, write stays off,
+    /// and every past and future link of the blob heals with it (run
+    /// 29524645875: bank-era build scripts staged 0o100644, EACCES).
+    pub async fn link_out_exec(
+        &self,
+        d: &Dig,
+        dest: &std::path::Path,
+        is_executable: bool,
+    ) -> Result<Materialized> {
+        let m = self.link_out(d, dest).await?;
+        #[cfg(unix)]
+        if is_executable {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = tokio::fs::metadata(dest).await?;
+            if meta.permissions().mode() & 0o111 == 0 {
+                let mode = match m {
+                    Materialized::Private => 0o755,
+                    Materialized::Linked => 0o555,
+                };
+                tokio::fs::set_permissions(dest, std::fs::Permissions::from_mode(mode)).await?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = is_executable;
+        Ok(m)
+    }
+
     /// Materialize a blob at `dest` for near-zero cost. Chain: block clone
     /// (ReFS/btrfs — private inode) -> hardlink (shared inode, 0o555-defended)
     /// -> copy on the two honest link refusals. macOS: fs::copy = APFS clone.
@@ -619,6 +650,42 @@ mod tests {
         std::fs::write(&dest, b"stale case-colliding twin").unwrap();
         store.link_out(&d, &dest).await.unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"new contents");
+    }
+
+    /// A blob that entered the store via a mode-less path (CI bank seed,
+    /// external tar) violates the 0o555 invariant; the Linked
+    /// materialization shares that inode, so an executable input stages
+    /// as 0644 and the action dies with EACCES (run 29524645875:
+    /// build_script_build mode=0o100644). link_out must normalize the
+    /// shared inode when the caller demands exec.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn link_out_heals_mode_stripped_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::new(dir.path().join("store")).unwrap();
+        let d = store.put(None, b"#!/bin/sh\ntrue\n").await.unwrap();
+        // Simulate the mode-less arrival: strip the store inode to 0644.
+        let src = store.cas_path_for_test(&d.hash);
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let dest = dir.path().join("exec/build_script_build");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        store.link_out_exec(&d, &dest, true).await.unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(&dest).unwrap();
+        let mode = meta.permissions().mode();
+        assert!(
+            mode & 0o111 != 0,
+            "materialized executable lacks exec: {mode:o}"
+        );
+        // Only a SHARED inode (hardlink path) must stay unwritable; a
+        // private clone/copy is the caller's to chmod (0o755 is fine).
+        if meta.nlink() > 1 {
+            assert!(
+                mode & 0o222 == 0,
+                "shared CAS inode must stay unwritable: {mode:o}"
+            );
+        }
     }
 
     #[test]
