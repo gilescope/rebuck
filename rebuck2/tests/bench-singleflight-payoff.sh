@@ -14,18 +14,27 @@
 #           => t ~= build_secs
 #
 # So single-flight costs the follower ~T_xfer of LATENCY and saves the fleet one
-# whole build of CPU. It is a THROUGHPUT optimisation, not a latency one. The
-# "big win" #10 imagines is really the LATE arrival: a follower that shows up
-# after the leader finished gets a cache hit (T_xfer) instead of a build
-# (build_secs).
-#
-# If that is right, the payoff is governed by ARRIVAL STAGGER -- a variable #10
+# whole build of CPU. The payoff is governed by ARRIVAL STAGGER -- a variable #10
 # does not mention -- and not by the cost/size ratio alone. This measures it:
 # sweep the stagger from "together" to "leader already done" and print the sign.
 #
+# WHAT THIS BENCH CANNOT SEE, and why its numbers must not decide anything:
+#
+# An earlier version of this header concluded "so it is a THROUGHPUT
+# optimisation, not a latency one", and #10 went on to propose gating the lease
+# on fleet contention -- skip it when idle, since parallel building is free. The
+# arithmetic is right and the conclusion is wrong. Single-flight is a CONSISTENCY
+# mechanism (docs/dist-buildkit-principles.md, 1-3): without it, machine A takes
+# its apt state from 10:00 and B from 10:05 and the artifact is stitched from
+# both -- a build no single machine would produce. Gating on idleness buys a
+# little latency by making the grid non-deterministic.
+#
+# So read this as: what does consistency COST, and where does it also happen to
+# pay? Never as: should the lease run? It runs unconditionally.
+#
 # Prints a table. Asserts nothing about the sign: this is a MEASUREMENT, and the
-# point is to find out, not to confirm. (Two of #10's neighbours were already
-# overturned by looking.)
+# point is to find out, not to confirm. (Three of #10's claims were overturned by
+# looking, including one this bench produced.)
 #
 # Usage: rebuck2/tests/bench-singleflight-payoff.sh
 set -euo pipefail
@@ -36,6 +45,9 @@ SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/rebuck2-bench.XXXXXX")"
 SESSION="rebuck2-bench-$$"
 A1=5081   # worker 1's agent
 A2=5082   # worker 2's agent
+DP=5080   # the driver's registry: it OWNS the lease table, so it is the only
+          # endpoint that can report led/merged/abandoned. An agent forwards, and
+          # would report nothing.
 
 BUILD_SECS="${BUILD_SECS:-20}"
 LAYER_MB="${LAYER_MB:-50}"
@@ -71,7 +83,7 @@ cargo build --release --manifest-path "$ROOT/rebuck2/Cargo.toml"
 BIN="$ROOT/rebuck2/target/release/rebuck2"
 
 echo "=== driver + two workers, each with its own agent (the P2P topology)"
-"$BIN" driver --grpc-port 9096 --session "$SESSION" \
+"$BIN" driver --grpc-port 9096 --session "$SESSION" --registry-port $DP \
     --store "$SCRATCH/driver-store" > "$SCRATCH/driver.log" 2>&1 &
 DRIVER=$!
 sleep 2
@@ -178,11 +190,11 @@ done
 
 echo
 echo "=== what the fleet spent (leases: led = built, merged = adopted)"
-curl -s "http://127.0.0.1:$A1/_rebuck/stats" 2>/dev/null | python3 -c '
+curl -s "http://127.0.0.1:$DP/_rebuck/stats" 2>/dev/null | python3 -c '
 import json,sys
 try: s = json.load(sys.stdin)
-except Exception: print("  (agent 1 stats unavailable)"); sys.exit()
-print("  agent1  led={} merged={} abandoned={}".format(
+except Exception: print("  (driver stats unavailable)"); sys.exit()
+print("  driver  led={} merged={} abandoned={}".format(
     s.get("leases_led"), s.get("leases_merged"), s.get("leases_abandoned")))
 ' || true
 
