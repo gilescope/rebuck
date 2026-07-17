@@ -216,6 +216,9 @@ impl RegistryStore for crate::driver::Driver {
         let (claim, holder) = self.lease_table().claim_http(key);
         Some(match claim {
             crate::lease::Claim::Leader => Claimed::Leader { holder },
+            // Already answered by whoever got here first: adopt it, do not build
+            // a second one (principle 3).
+            crate::lease::Claim::Done(r) => Claimed::Done(r),
             crate::lease::Claim::Follower(rx) => match rx.await {
                 Ok(crate::lease::Outcome::Done(r)) => Claimed::Done(r),
                 // A failed leader and a vanished one look the same to a

@@ -86,9 +86,21 @@ enum Holder {
 struct Entry {
     holder: Holder,
     /// `None` for a local holder: its guard reaps it. `Some` for a peer, whose
-    /// death we can only infer from silence.
+    /// death we can only infer from silence. Also `None` once `done` is set —
+    /// a result is not a lease and cannot expire out from under a claimant.
     expires: Option<Instant>,
     waiters: Vec<oneshot::Sender<Outcome>>,
+    /// The key's canonical result, once a leader has published one.
+    ///
+    /// Set => this entry is no longer a lease but an ANSWER, and every later
+    /// claimant adopts it instead of building. Only a SUCCESS becomes canonical:
+    /// a failure leaves the key open, or one machine's transient OOM would be
+    /// cached for the whole grid.
+    ///
+    /// This is bounded and cheap: what is retained is the published descriptor
+    /// chain (a few hundred bytes), never the layer. It is the same
+    /// one-answer-per-key table a single buildkitd keeps for a single build.
+    done: Option<Vec<u8>>,
 }
 
 /// The result of asking for a key.
@@ -98,6 +110,13 @@ pub enum Claim {
     Leader,
     /// A peer owns it. Await this for their result.
     Follower(oneshot::Receiver<Outcome>),
+    /// Already built, and here it is. Adopt it — do NOT build your own.
+    ///
+    /// The key's canonical answer: whoever got here first. Building it again
+    /// would produce a SECOND answer (an `apt-get update` alone guarantees the
+    /// bytes differ), leaving the grid with two results for one key and an
+    /// artifact stitched from both. First writer wins.
+    Done(Vec<u8>),
 }
 
 /// The lease table. One per driver — it is the fleet's single coordinator, so
@@ -148,6 +167,14 @@ impl Leases {
         let mut map = self.inner.lock().unwrap();
         match map.get_mut(key) {
             Some(e) => {
+                // Already answered. Adopt it — first writer wins. Checked BEFORE
+                // expiry: a result never expires, and re-leading a key that has
+                // an answer is precisely how the grid ends up with two.
+                if let Some(bytes) = &e.done {
+                    self.merged
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Claim::Done(bytes.clone());
+                }
                 // A peer's lease that has gone quiet is not a lease. Take it —
                 // the old holder's late Release is ignored (see `release`).
                 if e.expires.is_some_and(|t| t <= Instant::now()) {
@@ -173,6 +200,7 @@ impl Leases {
                         expires,
                         holder,
                         waiters: Vec::new(),
+                        done: None,
                     },
                 );
                 self.led.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -213,8 +241,23 @@ impl Leases {
         if !mine {
             return;
         }
-        let e = map.remove(key).expect("checked above");
-        for w in e.waiters {
+        let waiters = match &outcome {
+            // A success is the key's ANSWER. Keep it: the next claimant adopts it
+            // rather than building a second, different one (principle 3).
+            Outcome::Done(bytes) => {
+                let e = map.get_mut(key).expect("checked above");
+                e.done = Some(bytes.clone());
+                e.expires = None; // a result is not a lease; it cannot expire
+                e.holder = Holder::Local; // nobody holds it now; it is just an answer
+                std::mem::take(&mut e.waiters)
+            }
+            // A failure answers nothing. Drop the entry so the next claimant
+            // leads and builds it — otherwise one machine's transient OOM is
+            // cached for the whole fleet.
+            _ => map.remove(key).expect("checked above").waiters,
+        };
+        drop(map);
+        for w in waiters {
             let _ = w.send(outcome.clone());
         }
     }
@@ -322,6 +365,23 @@ impl Leases {
         self.len() == 0
     }
 
+    /// Leases actually HELD — entries someone is building right now.
+    ///
+    /// Not the same as [`len`], and the difference is the point: an entry that
+    /// has published its result is no longer a lease but the key's canonical
+    /// answer, retained so a late claimant adopts it instead of building a
+    /// second one. A leak is a lease nobody will ever release; a retained
+    /// answer is the feature.
+    #[allow(dead_code)] // assertions
+    pub fn held(&self) -> usize {
+        self.inner
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|e| e.done.is_none())
+            .count()
+    }
+
     fn deadline(&self, h: &Holder) -> Option<Instant> {
         match h {
             // A local holder is drop-guarded: its death is observable, so it
@@ -351,7 +411,48 @@ mod tests {
         };
         l.release("k", None, Outcome::Done(b"built".to_vec()));
         assert_eq!(rx.await.unwrap(), Outcome::Done(b"built".to_vec()));
-        assert!(l.is_empty(), "a released lease must not linger");
+    }
+
+    /// Principle 3: ONE canonical result per key, first writer wins.
+    ///
+    /// A claimant that turns up after the leader has already released must NOT
+    /// be handed a fresh lease and told to build. It built the same key, so it
+    /// would produce a SECOND, different result -- `apt-get update` alone
+    /// guarantees the bytes differ -- and the grid would hold two answers to one
+    /// question. Half the artifact built against one, half the other: exactly
+    /// what the grid exists to prevent.
+    ///
+    /// Measured on +examples-1 before this: 14 of 14 keys agreed and only 7
+    /// merged. The other 7 were BOTH leaders -- they never overlapped in time,
+    /// so both built, and both kept their own bytes.
+    #[tokio::test]
+    async fn a_late_claimant_adopts_the_canonical_result_rather_than_rebuilding() {
+        let l = Leases::default();
+        assert!(leader(l.claim_local("k")));
+        l.release("k", None, Outcome::Done(b"the-one-true-layer".to_vec()));
+
+        // The leader is long gone. This claimant is not racing anyone.
+        match l.claim_local("k") {
+            Claim::Done(bytes) => assert_eq!(bytes, b"the-one-true-layer".to_vec()),
+            Claim::Leader => {
+                panic!("a late claimant must ADOPT the canonical result, not build a second one")
+            }
+            Claim::Follower(_) => panic!("nobody is building it; there is nothing to wait for"),
+        }
+    }
+
+    /// A FAILED build must not become canonical. The key has no answer, so the
+    /// next claimant has to build it -- otherwise one machine's transient
+    /// failure is cached for the whole grid.
+    #[tokio::test]
+    async fn a_failure_is_not_canonical() {
+        let l = Leases::default();
+        assert!(leader(l.claim_local("k")));
+        l.release("k", None, Outcome::Failed("oom".into()));
+        assert!(
+            leader(l.claim_local("k")),
+            "a failure must leave the key open for the next claimant to build"
+        );
     }
 
     /// A failure is the same failure for every waiter — it is the same job.

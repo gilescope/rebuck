@@ -1892,6 +1892,14 @@ async fn serve_blob_stream(
                 lease::Claim::Leader => {
                     mesh::send_frame(&mut send, &BlobResp::LeaseGranted).await?;
                 }
+                // Already answered. Same two frames a follower gets, minus the
+                // wait: the worker cannot tell (or care) whether it waited for
+                // the leader or arrived after it — only that it must NOT build a
+                // second answer to a question already answered.
+                lease::Claim::Done(bytes) => {
+                    mesh::send_frame(&mut send, &BlobResp::LeaseHeld).await?;
+                    mesh::send_frame(&mut send, &BlobResp::LeaseDone(Ok(bytes))).await?;
+                }
                 lease::Claim::Follower(rx) => {
                     // Hold the stream open and PUSH the outcome. The worker
                     // does not poll, and a leader's death reaches it as a
@@ -2187,7 +2195,11 @@ mod tests {
             .expect("follower stranded by an abandoned leader");
         got.unwrap().expect("re-elected follower must complete");
         assert!(runs.load(Ordering::Relaxed) >= 1);
-        assert!(d.leases.is_empty(), "the abandoned lease leaked");
+        // `held`, not `is_empty`: the re-elected follower SUCCEEDED, so the key
+        // now holds its canonical result (principle 3) and the table is
+        // deliberately not empty. A leak is a lease nobody will release; a
+        // retained answer is the feature.
+        assert_eq!(d.leases.held(), 0, "the abandoned lease leaked");
     }
 
     /// `do_not_cache` actions must never merge — REAPI is explicit that

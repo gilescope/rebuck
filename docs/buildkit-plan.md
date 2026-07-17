@@ -271,15 +271,18 @@ workload can actually achieve, not against 100%.
 
 > The remaining Satellite warmth. Gate on P1/P2. ⚠︎ 0.75.
 >
-> **The gate has a number now.** A cache mount does not merely miss its own
-> warmth — it POISONS single-flight for the vertex that mounts it. Buildkit
-> content-hashes the mount (`selectors=[/cache]`) as an input, and a cache mount
-> is machine-local mutable state, so two machines hash different bytes and the
-> lease keys cannot match. Measured on `+examples-1`: of the 4 vertices (out of
-> 14) that still fail to merge, the `examples/cpp` one is exactly this — `RUN
-> --mount=type=cache,target=/code/CMakeFiles make`. So P3 buys P2's merge rate
-> too, not just cache warmth. It stays gated only because the other 3 are the
-> build's own non-determinism (unpinned `apt-get update`), which P3 cannot fix.
+> **Correction — an earlier revision of this note was wrong.** It claimed a cache
+> mount POISONS single-flight for the vertex that mounts it, because buildkit
+> content-hashes the mount (`selectors=[/cache]`) and two machines hold different
+> bytes. That was true only of a bug in our own key derivation: `LeaseKey` was
+> unioning the slow (content) key in beside the fast key. Once the slow key is
+> treated as a FALLBACK (principle 4), the mount's bytes never reach the lease
+> key, and the `examples/cpp` vertex — `RUN --mount=type=cache,target=/code/CMakeFiles
+> make` — merges like any other. Measured on `+examples-1`: **14 of 14 keys agree,
+> zero divergence.**
+>
+> So P3 buys cache WARMTH, which is what it always claimed. It does not buy P2's
+> merge rate — P2 needed no help. Gate it on the warmth numbers alone.
 
 `type=cache` mounts (cargo/npm/go registries) are `MutableRef` with
 `NoCommit: true` (`container.go:237`), never committed, unreachable by the

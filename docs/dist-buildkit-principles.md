@@ -95,18 +95,29 @@ path, the layer is simply not there. (Measured: 0 MiB.)
 
 ## 7. Determinism is the ceiling
 
-A vertex's mergeability is bounded by its inputs' reproducibility. This is a
-property of the system, not a limitation we can engineer away:
+A vertex's mergeability is bounded by its inputs' reproducibility — but the bound
+is far looser than it first appears, and we twice mistook our own bugs for it.
 
-- **cache mounts** are machine-local mutable state. Buildkit content-hashes the
-  mount as an input, so two machines hash different bytes. They cannot merge
-  until the mount itself is shared (plan P3).
-- **genuinely divergent inputs** cannot merge, by definition.
+What actually blocks a merge is the KEY not agreeing. And the key is
+`f(op, deps)`; it does not hash the output (principle 4). So a vertex is
+mergeable whenever buildkit itself would call it a cache hit — including
+`RUN apt-get update`, whose output is wildly non-deterministic and whose key is
+perfectly stable. Measured on `+examples-1`: **14 of 14 keys agree**, cache
+mounts and unpinned apt included.
 
-A byte-reproducible target merges everything; a target with an unpinned
-`apt-get update` or a cache mount cannot, however good our key derivation gets.
-The house rule — *same inputs -> same artifact* — is therefore also the
-throughput and consistency ceiling, not just good hygiene.
+The real bound is narrower: an input whose IDENTITY differs across machines
+cannot merge. In practice that means a local source with no content key at all —
+we refuse the lease there (principle 5) rather than invent one.
+
+Twice we blamed reproducibility for what was our own key derivation:
+`random:` inheritance, then unioning the slow key in. Both times the vertices
+were mergeable all along. **Before concluding "this build is too
+non-deterministic to merge", check that the key derivation is not the thing
+diverging** — the pre-hash string says which, in one run.
+
+Where a build IS non-reproducible, note the tension with (2): the lease is then
+carrying MORE, not less. It is what makes one machine's result canonical for the
+whole grid, and so supplies the consistency the build itself lacks.
 
 Note the tension with (2): where a build is NOT reproducible, single-flight is
 what supplies the consistency it lacks, by making one machine's result canonical
