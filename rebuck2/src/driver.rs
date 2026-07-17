@@ -952,8 +952,28 @@ impl Driver {
                 }),
         )
         .await;
-        for fetched in tree_blobs {
+        for (ti, fetched) in tree_blobs.into_iter().enumerate() {
             let Ok(Some(tree_bytes)) = fetched else {
+                // The tree arms were a sampling blind spot: run
+                // 29611514770 refused 484 lookups with ZERO samples -
+                // every one came through here. Name the missing tree.
+                let n = self.unservable_logged.fetch_add(1, Ordering::Relaxed);
+                if n < 20 {
+                    let td = result
+                        .output_directories
+                        .get(ti)
+                        .and_then(|od| od.tree_digest.as_ref())
+                        .map(|d| format!("{}/{}", d.hash, d.size_bytes))
+                        .unwrap_or_default();
+                    println!(
+                        "[driver] unservable sample {n}: action {hash} TREE blob missing {td} (dir {})",
+                        result
+                            .output_directories
+                            .get(ti)
+                            .map(|od| od.path.as_str())
+                            .unwrap_or("?")
+                    );
+                }
                 self.memo_unservable
                     .lock()
                     .await
@@ -961,6 +981,10 @@ impl Driver {
                 return AcLookup::Unservable;
             };
             let Ok(tree) = re::Tree::decode(tree_bytes.as_slice()) else {
+                let n = self.unservable_logged.fetch_add(1, Ordering::Relaxed);
+                if n < 20 {
+                    println!("[driver] unservable sample {n}: action {hash} TREE decode failed");
+                }
                 self.memo_unservable
                     .lock()
                     .await
