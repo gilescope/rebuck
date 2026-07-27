@@ -133,23 +133,44 @@ a docker-in-docker theory that was about to cause a NixOS rebuild for nothing.
 
 Target `+test-no-qemu-group1`, cold daemons, 32-core box, 62 GB RAM.
 
-| run | wall | led | MERGED | result |
-| ------------------------------- | ---- | --- | ------ | ------ |
-| solo, 1 instance | 361s | 270 | - | PASS |
-| pair, 2 instances, single-flight | 373s | +270 | **270** | PASS |
-| pair, 2 instances, `CONTROL=1` | TBD | TBD | 0 | not yet run to completion |
+All runs `ISOLATE=1`, all PASS.
+
+| config              | solo | pair | MERGED |
+| ------------------- | ---- | ---- | ------ |
+| single-flight on    | 361s | 373s | 270    |
+| `CONTROL=1` (no SF) | 328s | 342s | 0      |
 
 The second instance led 270 vertices and adopted 270: it rebuilt **nothing**,
-`abandoned=0`. Doubling the work cost +12s (3.3%).
+`abandoned=0`. Single-flight works exactly as designed.
 
-Caveats, stated because the number flatters us:
+**And it is not faster.** The pair costs 373s coordinated against 342s
+uncoordinated. Both configs scale almost perfectly (2x the work for +12s and
++14s respectively) because a 32-core, 62 GB box running two jobs is nowhere near
+contended. Coordination adds a roughly constant ~31s on top and buys no
+throughput back, because there was no throughput to reclaim.
+
+This is [dist-buildkit-principles.md](dist-buildkit-principles.md) §2 measured
+rather than argued: latency loses ~`T_xfer`, throughput wins only on a contended
+fleet, consistency is the actual product. It is also the trap
+[buildkit-optimizations.md](buildkit-optimizations.md) already named - "the one
+thing an idle 2-worker rig cannot show" - so this rig cannot answer the
+throughput question by construction.
+
+**Do not quote the 9% as a result.** SF-ON solo measured 329s and 361s on two
+runs: a 10% spread, the same size as the effect. With n=1 per cell the only
+defensible statement is *no detectable difference*. Three to five repeats per
+cell are needed before either number means anything.
+
+Further caveats, stated because the merge count flatters us:
 
 - same-target is single-flight's **best case**. Real CI runs different shards
   where the shared prefix is a fraction. That measurement is still outstanding.
 - green integration tests on the adopting instance is good evidence the adopted
   vertices were correct, but it is not a byte-comparison of artifacts.
-- one box, two instances. Shared cores, disk and NIC is not a fleet. A win here
-  is evidence, not proof, for two physical machines.
+- one box, two instances. Shared cores, disk and NIC is not a fleet.
+- the `CONTROL=1` pair failed on its first run (both instances cancelled, no
+  failing target) and passed on retry. Bare `Canceled` with nothing failing is
+  flake on this rig, not signal - do not build a story on a single failure.
 
 ## Recipe that works
 
@@ -165,9 +186,23 @@ to reproduce the shared-tree failure deliberately.
 
 ## Open questions
 
+- **repeats.** Every cell above is n=1 against ~10% run-to-run variance. Nothing
+  here supports a speed claim in either direction until that is fixed. Cheapest
+  useful next step.
+- **a contended fleet.** Single-flight's only wall-clock case is when the box
+  cannot absorb the duplicated work. Two jobs on 32 idle cores is the opposite
+  of that. Either raise the job count well past capacity, or cap parallelism.
 - disjoint shards (`group1` vs `group2`) with `ISOLATE=1` - the case that
   actually resembles CI, and the one that answers "does my CI get faster"
 - two physical machines rather than two instances on one box
 - artifact-level proof that adopted vertices are byte-identical to built ones
 - `run-groups.sh` does not set `ISOLATE=1`, so every group experiment run
   through it so far has been measuring the shared-tree failure
+
+## If the goal is "faster"
+
+Single-flight is not the lever, and this rig now shows why. Reach for cache
+reuse and for putting **disjoint** work on more machines; keep single-flight
+because it is what makes the second of those safe, not because it pays back on
+wall clock. Sell it internally as consistency, or it will keep looking like a
+regression to anyone holding a stopwatch.
