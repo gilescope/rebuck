@@ -179,6 +179,34 @@ ready load-bk-2 || { echo "FAIL: buildkitds not ready"; docker logs load-bk-1 2>
 BK1="$(bk_addr load-bk-1 8395)"; BK2="$(bk_addr load-bk-2 8396)"
 echo "both up ($BK1, $BK2)"
 
+# PREFLIGHT: prove, from INSIDE each daemon, that it can actually reach its agent.
+# An unreachable BUILDKIT_SINGLEFLIGHT_URL does not fail the build. The daemon
+# starts, builds correctly, and coordinates with nobody -- the run reports
+# led=0 MERGED=0 and is indistinguishable from CONTROL, so an SF-ON run silently
+# measures nothing. That is not hypothetical: the 2026-07-17 x86 pair run burned
+# 2349s producing exactly that, and the zeros were read as a real result.
+# --add-host above fixes the NAME; it does not fix the ROUTE. On a host with a
+# firewall (NixOS default) docker0 -> host is still dropped and the agent stays
+# unreachable. Only an end-to-end fetch proves both. Assert it.
+if [ -z "${CONTROL:-}" ]; then
+    reach() { docker exec "$1" wget -q -T 5 -O /dev/null "http://host.docker.internal:$2/v2/" 2>/dev/null; }
+    for pair in "load-bk-1:$A1" "load-bk-2:$A2"; do
+        c="${pair%%:*}"; p="${pair##*:}"
+        reach "$c" "$p" || {
+            echo "FAIL: $c cannot reach its single-flight agent at host.docker.internal:$p"
+            echo "  expected: a response from the agent's registry endpoint /v2/"
+            echo "  found:    unreachable (name did not resolve, or the route is blocked)"
+            echo "  fix:      name  -> --add-host host.docker.internal:host-gateway (already set)"
+            echo "            route -> allow docker0 to reach the host; on NixOS set"
+            echo "                     networking.firewall.trustedInterfaces = [ \"docker0\" ];"
+            echo "  why it matters: single-flight would no-op in silence and this run would"
+            echo "                  measure nothing -- SF-ON would be a second CONTROL."
+            exit 1
+        }
+    done
+    echo "single-flight agents reachable from both daemons"
+fi
+
 export EARTHLY_CONFIG="$SCRATCH/earthbuild.yml"
 cat > "$EARTHLY_CONFIG" <<'EOF'
 global:
