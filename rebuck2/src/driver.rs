@@ -844,6 +844,9 @@ impl Driver {
         // 3,650 stale hints into hard exec failures per lap (healing4/5).
         // Both sources get the same exact HasMany verification.
         let mut by_peer: HashMap<String, Vec<usize>> = HashMap::new();
+        // Who was asked in round one, so the second chance never re-asks
+        // the same worker for the same digest.
+        let mut asked: HashMap<usize, String> = HashMap::new();
         // Deterministic range-owner fallback for hintless digests: bloom
         // gossip lags joins, so freshly-seeded banked blobs can have no
         // claimant at validation time - graph-root results then read as
@@ -884,6 +887,7 @@ impl Driver {
                         shard_owner.get(&(nib / 2)).cloned()
                     });
                 if let Some(p) = peer {
+                    asked.insert(i, p.clone());
                     by_peer.entry(p).or_default().push(i);
                 }
             }
@@ -951,6 +955,12 @@ impl Driver {
                     .ok()
                     .and_then(|nib| shard_owner.get(&(nib / 2)))
                 {
+                    // Round one already asked the owner (hintless
+                    // fallback): a second identical probe gets the
+                    // same answer.
+                    if asked.get(&i) == Some(owner) {
+                        continue;
+                    }
                     retry.entry(owner.clone()).or_default().push(i);
                 }
             }
