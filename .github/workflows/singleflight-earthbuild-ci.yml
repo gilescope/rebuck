@@ -1,0 +1,262 @@
+name: singleflight-earthbuild-ci
+
+# earthbuild's real CI shape, over the iroh mesh.
+#
+# Today each +test-no-qemu-groupN runs on its own runner and shares NOTHING, so
+# every one of them rebuilds the shared stem. Measured: the stem is exactly
+# +earthly-integration-test-base, 32 vertices, and it is the ENTIRE intersection
+# between group1 and group2 (two independent cross-shard runs each merged
+# exactly 32). At 100 jobs that stem is built 100 times and could be built once.
+#
+# Topology differs from the buck2 actions. There the driver owns the build and
+# workers lend CPU. Here every job owns its OWN earthly build; the driver is
+# only the lease coordinator, so each builder job runs a worker (for its agent)
+# AND a buildkitd AND earthly. Layers move builder-to-builder over the mesh --
+# the driver never carries them (measured on the box: 368 MiB served
+# peer-to-peer while the driver store stayed at 1 MiB).
+#
+# Deliberately 2 groups, not 12. This is a measurement, not a migration: two
+# disjoint shards are enough to show whether the follower adopts the stem
+# instead of rebuilding it, and cheap enough to iterate on.
+#
+# UNTESTED on a real runner as written -- expect a round or two of CI iteration
+# before the first honest number. The assertions below are built to fail loudly
+# rather than produce a plausible-looking zero.
+
+on:
+  workflow_dispatch:
+    inputs:
+      control:
+        description: "1 = single-flight OFF (the A/B control arm)"
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  SESSION: eb-mesh-${{ github.run_id }}
+  DRIVER_PORT: "9095"
+  AGENT_PORT: "5091"
+
+jobs:
+  driver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: rebuck2bin
+        with:
+          path: rebuck2/target/release/rebuck2
+          key: rebuck2-bin-${{ runner.os }}-${{ hashFiles('rebuck2/src/**', 'rebuck2/Cargo.toml', 'rebuck2/Cargo.lock') }}
+      - name: build rebuck2 (cache miss only)
+        if: steps.rebuck2bin.outputs.cache-hit != 'true'
+        run: cargo build --release --manifest-path rebuck2/Cargo.toml
+
+      # The driver coordinates leases and nothing else: --no-local-exec, and it
+      # never receives a build. min-workers 2 makes it wait for both builders
+      # rather than racing ahead and publishing an empty lease table.
+      - name: start driver
+        run: |
+          ./rebuck2/target/release/rebuck2 driver \
+            --grpc-port "$DRIVER_PORT" --session "$SESSION" \
+            --registry-port 5090 --min-workers 2 --no-local-exec \
+            --store "$HOME/.cache/rebuck2/driver" > driver.log 2>&1 &
+          echo $! > driver.pid
+
+      - name: wait for both builders to join the mesh
+        run: |
+          for _ in $(seq 1 180); do
+            grep -q "worker 2 joined" driver.log && exit 0
+            kill -0 "$(cat driver.pid)" 2>/dev/null || { cat driver.log; echo "::error::driver died"; exit 1; }
+            sleep 5
+          done
+          cat driver.log; echo "::error::builders never joined the mesh"; exit 1
+
+      # The builders own the verdict; the driver just has to outlive them and
+      # then report what crossed it. Poll its own stats rather than guessing a
+      # duration -- when leases stop moving for a while, the fleet is done.
+      - name: hold open while the builders work, then report
+        run: |
+          stats() { curl -s "http://127.0.0.1:5090/_rebuck/stats" 2>/dev/null; }
+          last=""; still=0
+          for _ in $(seq 1 300); do
+            cur="$(stats)"
+            [ "$cur" = "$last" ] && still=$((still + 1)) || still=0
+            last="$cur"
+            [ "$still" -ge 12 ] && break   # ~60s with no lease movement
+            sleep 5
+          done
+          echo "$last" | tee driver-stats.json
+          {
+            echo "### driver"
+            echo '```'
+            echo "$last"
+            echo '```'
+            echo '```'
+            grep -E "sf_merged|worker .* joined" driver.log | tail -5
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # An unreachable or idle coordinator reports zeros, and zeros are
+      # byte-identical to a deliberate control run. Ten days were lost reading
+      # exactly that as a result, so a coordinated run that merged nothing is a
+      # broken rig and must go red.
+      - name: assert the mesh actually coordinated
+        if: ${{ inputs.control == '' }}
+        run: |
+          merged="$(grep -oE '"leases_merged":[0-9]+' driver-stats.json | cut -d: -f2)"
+          echo "leases_merged=$merged"
+          [ "${merged:-0}" -gt 0 ] \
+            || { echo "::error::coordinated run merged nothing -- rig broken, not a result"; exit 1; }
+
+      - name: stop driver
+        if: always()
+        run: kill "$(cat driver.pid)" 2>/dev/null || true
+
+  # Runs concurrently with `driver` -- deliberately no `needs:`. The builders
+  # must be up while the driver is, or there is nothing to coordinate.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [1, 2]
+    name: group${{ matrix.group }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: rebuck2src
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: EarthBuild/buildkit
+          ref: giles-rebuck-single-flight
+          path: buildkit
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: EarthBuild/earthbuild
+          path: earthbuild
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+
+      # A cold group pulls ~18 base images and leaves ~1.8 GB of CAS behind. On
+      # the x86 box a full disk killed the docker daemon and presented as
+      # "Could not open file ... (5: Input/output error)" -- a build bug, it was
+      # not. Reclaim first rather than rediscover that here.
+      - name: reclaim disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: build the pieces
+        run: |
+          cargo build --release --manifest-path rebuck2src/rebuck2/Cargo.toml
+          ( cd buildkit && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+              go build -o "$RUNNER_TEMP/buildkitd" ./cmd/buildkitd )
+          ( cd earthbuild && GOFLAGS=-mod=mod GOPROXY=direct GOSUMDB=off \
+              go build -o "$RUNNER_TEMP/earthly" ./cmd/earthly )
+
+      # The agent must bind 0.0.0.0, not loopback: buildkitd reaches it from
+      # inside a container, via the docker bridge.
+      - name: start worker (its agent is this runner's layer server)
+        env:
+          IROH_SESSION: ${{ env.SESSION }}
+        run: |
+          ./rebuck2src/rebuck2/target/release/rebuck2 worker \
+            --session "$IROH_SESSION" --slots 4 \
+            --store "$HOME/.cache/rebuck2/worker" \
+            --registry-port "$AGENT_PORT" --registry-bind 0.0.0.0 \
+            > worker.log 2>&1 &
+          echo $! > worker.pid
+          for _ in $(seq 1 60); do
+            curl -sf -o /dev/null "http://127.0.0.1:$AGENT_PORT/v2/" && exit 0
+            sleep 2
+          done
+          cat worker.log; echo "::error::agent never came up"; exit 1
+
+      # host.docker.internal is auto-provided only by Docker Desktop; on Linux
+      # it must be mapped. Getting this wrong does not fail anything -- the
+      # daemon builds correctly and coordinates with nobody, reporting zeros.
+      - name: start buildkitd wired to this runner's agent
+        env:
+          CONTROL: ${{ inputs.control }}
+        run: |
+          docker build -q -t eb-ci:test -f - "$RUNNER_TEMP" <<EOF
+          FROM earthbuild/buildkitd:v0.8.17
+          COPY buildkitd /usr/bin/buildkitd
+          EOF
+          SFURL="http://host.docker.internal:$AGENT_PORT"
+          [ -n "$CONTROL" ] && SFURL=""
+          docker run -d --name eb-bk --privileged \
+            --add-host host.docker.internal:host-gateway \
+            -e NETWORK_MODE=cni \
+            -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
+            -e BUILDKIT_SINGLEFLIGHT_URL="$SFURL" \
+            -e BUILDKIT_SINGLEFLIGHT_REGISTRY=cache \
+            -e CACHE_SIZE_MB=8000 -e BUILDKIT_MAX_PARALLELISM=4 \
+            -e BUILDKIT_SETUP_CGROUPV2_ROOT=1 \
+            --ulimit nofile=1048576:1048576 \
+            -p 127.0.0.1:8395:8372 eb-ci:test
+          for _ in $(seq 1 60); do
+            docker exec eb-bk buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 && break
+            sleep 2
+          done
+
+      # Prove reachability from INSIDE the daemon before trusting any number.
+      # --add-host fixes the NAME; it does not fix the ROUTE. Only an
+      # end-to-end fetch proves both.
+      - name: preflight - the daemon can reach its agent
+        if: ${{ inputs.control == '' }}
+        run: |
+          docker exec eb-bk wget -q -T 5 -O /dev/null \
+            "http://host.docker.internal:$AGENT_PORT/v2/" \
+            || { echo "::error::buildkitd cannot reach its agent; single-flight would no-op in silence"; exit 1; }
+
+      # 127.0.0.1 would make earthbuild think it MANAGES the daemon and start
+      # its own (containerutil.IsLocal). On Linux the container IP is routable
+      # directly -- ask docker for it rather than assuming 172.17.0.2, which is
+      # only the first container on the default bridge.
+      - name: build this group
+        env:
+          GROUP: ${{ matrix.group }}
+        run: |
+          BK="tcp://$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' eb-bk):8372"
+          echo "buildkit at $BK"
+          cat > "$RUNNER_TEMP/eb.yml" <<'EOF'
+          global:
+            tls_enabled: false
+          EOF
+          start=$SECONDS
+          ( cd earthbuild && EARTHLY_CONFIG="$RUNNER_TEMP/eb.yml" \
+              EARTHLY_BUILDKIT_HOST="$BK" \
+              "$RUNNER_TEMP/earthly" --allow-privileged --no-output \
+              "+test-no-qemu-group$GROUP" ) 2>&1 | tee build.log
+          echo "WALL=$((SECONDS - start))" | tee -a "$GITHUB_ENV"
+
+      - name: summarise
+        if: always()
+        run: |
+          {
+            echo "### group${{ matrix.group }} on $(nproc) cores - ${WALL:-?}s"
+            echo '```'
+            curl -s "http://127.0.0.1:$AGENT_PORT/_rebuck/stats" || echo "(agent gone)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: stop
+        if: always()
+        run: |
+          docker rm -f eb-bk >/dev/null 2>&1 || true
+          kill "$(cat worker.pid)" 2>/dev/null || true
