@@ -1,0 +1,149 @@
+name: singleflight-weak-runner
+
+# Does single-flight pay on a WEAK machine?
+#
+# Measured on a 32-core / 62 GB box, adopting the shared stem cost the same as
+# rebuilding it: solo 94s, retention pair 96s, with zero vertices rebuilt. That
+# box is single-flight's worst case -- 32 cores make `apk add` and `go build`
+# cheap, and both daemons share a kernel so the 368 MiB transfer is free. The
+# execution single-flight removes was never the expensive part there.
+#
+# A GitHub runner inverts that ratio: few slow cores make execution dominate,
+# while the transfer stays roughly constant. If adoption wins anywhere, it wins
+# here -- and here is also what earthbuild's real CI actually runs on.
+#
+# Everything is in ONE job on ONE runner: driver, both agents, both buildkitds.
+# That deliberately does NOT test cross-machine transfer (see docs/
+# use-x86-as-fast-build-runners-notes.md, open questions). It tests only the
+# CPU-vs-IO ratio, which is the thing a fast box cannot tell us and the thing
+# that decides whether cross-runner plumbing is worth building at all.
+#
+# Target is +earthly-integration-test-base: measured to be EXACTLY the shared
+# stem between test-no-qemu-group1 and group2 (32 vertices, confirmed by two
+# independent cross-shard runs merging exactly 32).
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: earthbuild target to build
+        default: "+earthly-integration-test-base"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Same rig, same target, same isolation. ONLY coordination differs --
+          # that is the whole A/B. FRESH_TABLE=0 keeps the solo run's published
+          # answers, so the pair ADOPTS rather than races: the retention path,
+          # which is what 80 of earthbuild's 100 CI jobs actually do (they start
+          # after the stem exists, they never collide for it).
+          - mode: coordinated
+            control: ""
+          - mode: control
+            control: "1"
+    name: ${{ matrix.mode }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: rebuck2
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: EarthBuild/buildkit
+          ref: giles-rebuck-single-flight
+          path: buildkit
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: EarthBuild/earthbuild
+          path: earthbuild
+
+      # A cold run pulls ~18 base images and leaves ~1.8 GB of CAS behind. The
+      # runner ships with ~25 GB of toolchains we do not use; reclaim them
+      # rather than discover the limit as an I/O error mid-build (which is how
+      # this failed on the x86 box, and it looked like a build bug).
+      - name: reclaim disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: record the machine we are measuring
+        run: |
+          echo "cores:  $(nproc)"
+          free -g | head -2
+          go version
+          cargo --version
+
+      # No pinned setup-* actions: ubuntu-24.04 ships Go and Rust, and an
+      # unpinned action is worse than the preinstalled toolchain. Versions are
+      # printed above so a result can always be tied to what produced it.
+      - name: run the pair
+        working-directory: rebuck2
+        env:
+          BUILDKIT_FORK: ${{ github.workspace }}/buildkit
+          EARTHBUILD_SRC: ${{ github.workspace }}/earthbuild
+          ISOLATE: "1"        # two instances sharing one worktree corrupt each
+                              # other's context: bare "Canceled", and drifting
+                              # contexts suppress merges. Never run without it.
+          FRESH_TABLE: "0"    # retention, not collision -- see matrix comment
+          CONTROL: ${{ matrix.control }}
+          # Via env, never interpolated into the run: body -- a workflow_dispatch
+          # input is attacker-controlled text and `"${{ inputs.target }}"` would
+          # be a shell injection.
+          TARGET: ${{ inputs.target }}
+        run: |
+          ./rebuck2/tests/load-earthbuild-examples.sh "$TARGET" \
+            2>&1 | tee "$RUNNER_TEMP/run.log"
+
+      # The failure this guards against: an unreachable coordinator does not
+      # fail the build. buildkitd starts, builds everything correctly, and
+      # coordinates with nobody -- reporting led=0 MERGED=0, byte-identical to a
+      # deliberate CONTROL run. Ten days were spent believing exactly that
+      # output. A coordinated run that merged nothing is a broken rig, not a
+      # result, and must go red.
+      - name: assert coordination actually engaged
+        if: matrix.mode == 'coordinated'
+        run: |
+          grep -q "single-flight agents reachable from both daemons" "$RUNNER_TEMP/run.log" \
+            || { echo "::error::preflight never confirmed agent reachability"; exit 1; }
+          merged="$(grep -oE 'MERGED=[0-9]+' "$RUNNER_TEMP/run.log" | tail -1 | cut -d= -f2)"
+          echo "MERGED=$merged"
+          [ -n "$merged" ] && [ "$merged" -gt 0 ] \
+            || { echo "::error::coordinated run merged nothing -- rig broken, not a result"; exit 1; }
+
+      # The control arm must NOT coordinate, or it is not a control.
+      - name: assert control did not coordinate
+        if: matrix.mode == 'control'
+        run: |
+          merged="$(grep -oE 'MERGED=[0-9]+' "$RUNNER_TEMP/run.log" | tail -1 | cut -d= -f2)"
+          [ "${merged:-0}" -eq 0 ] \
+            || { echo "::error::control arm merged $merged -- CONTROL=1 did not disable single-flight"; exit 1; }
+
+      - name: summarise
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.mode }} on $(nproc) cores"
+            echo '```'
+            grep -E "PASS:|FAIL:|both finished|led=|MERGED|agent[12]:|ALL TARGETS|FAILED" \
+              "$RUNNER_TEMP/run.log" || echo "(no result lines -- run did not reach the pair)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Deliberately no upload-artifact: it would need a pinned SHA I do not have
+      # to hand, and a guessed pin is worse than no artifact. The step summary
+      # above carries every number this experiment produces. Add it with a real
+      # pin (`upaction`) if the full logs turn out to be wanted.
