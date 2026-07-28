@@ -22,7 +22,15 @@ name: singleflight-weak-runner
 # stem between test-no-qemu-group1 and group2 (32 vertices, confirmed by two
 # independent cross-shard runs merging exactly 32).
 
+# See the sibling workflow: workflow_dispatch only resolves on the DEFAULT
+# branch, so a branch-scoped push trigger is what actually runs this during
+# iteration.
 on:
+  push:
+    branches: [giles-dist-buildkit]
+    paths:
+      - ".github/workflows/singleflight-weak-runner.yml"
+      - "rebuck2/tests/load-earthbuild-examples.sh"
   workflow_dispatch:
     inputs:
       target:
@@ -103,7 +111,10 @@ jobs:
           # Via env, never interpolated into the run: body -- a workflow_dispatch
           # input is attacker-controlled text and `"${{ inputs.target }}"` would
           # be a shell injection.
-          TARGET: ${{ inputs.target }}
+          # inputs.* are empty on a push trigger, so the default lives here too
+          # -- otherwise the script silently falls back to ./examples/go+build
+          # and measures the wrong graph.
+          TARGET: ${{ inputs.target || '+earthly-integration-test-base' }}
         run: |
           ./rebuck2/tests/load-earthbuild-examples.sh "$TARGET" \
             2>&1 | tee "$RUNNER_TEMP/run.log"

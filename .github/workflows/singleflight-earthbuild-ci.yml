@@ -23,7 +23,16 @@ name: singleflight-earthbuild-ci
 # before the first honest number. The assertions below are built to fail loudly
 # rather than produce a plausible-looking zero.
 
+# workflow_dispatch alone is not dispatchable until the workflow reaches the
+# DEFAULT branch -- the API resolves it there, not on the ref you pass. Rather
+# than land an untested experiment on main, trigger on pushes to the working
+# branch, narrowed to the files that change what is measured.
 on:
+  push:
+    branches: [giles-dist-buildkit]
+    paths:
+      - ".github/workflows/singleflight-earthbuild-ci.yml"
+      - "rebuck2/src/**"
   workflow_dispatch:
     inputs:
       control:
