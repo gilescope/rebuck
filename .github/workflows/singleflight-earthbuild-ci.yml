@@ -33,12 +33,9 @@ on:
     paths:
       - ".github/workflows/singleflight-earthbuild-ci.yml"
       - "rebuck2/src/**"
+  # No inputs: the control arm is a matrix dimension now, because dispatch
+  # inputs are unreachable on a non-default branch.
   workflow_dispatch:
-    inputs:
-      control:
-        description: "1 = single-flight OFF (the A/B control arm)"
-        default: ""
-        type: string
 
 permissions:
   contents: read
@@ -117,8 +114,8 @@ jobs:
       # byte-identical to a deliberate control run. Ten days were lost reading
       # exactly that as a result, so a coordinated run that merged nothing is a
       # broken rig and must go red.
+      # The driver only ever serves the coordinated arm, so this is unconditional.
       - name: assert the mesh actually coordinated
-        if: ${{ inputs.control == '' }}
         run: |
           merged="$(grep -oE '"leases_merged":[0-9]+' driver-stats.json | cut -d: -f2)"
           echo "leases_merged=$merged"
@@ -135,8 +132,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # The A/B, as a matrix rather than a workflow_dispatch input: an input is
+        # unreachable here because dispatch only resolves on the DEFAULT branch,
+        # so the control arm could never actually be run. Both arms build the
+        # same groups, cold, in the same run -- only coordination differs.
+        # The control arm ignores the driver entirely, so the two do not
+        # interfere despite sharing a session name.
+        arm: [coordinated, control]
         group: [1, 2]
-    name: group${{ matrix.group }}
+    name: ${{ matrix.arm }}-group${{ matrix.group }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -193,6 +197,7 @@ jobs:
       # The agent must bind 0.0.0.0, not loopback: buildkitd reaches it from
       # inside a container, via the docker bridge.
       - name: start worker (its agent is this runner's layer server)
+        if: matrix.arm == 'coordinated'
         env:
           IROH_SESSION: ${{ env.SESSION }}
         run: |
@@ -213,7 +218,10 @@ jobs:
       # daemon builds correctly and coordinates with nobody, reporting zeros.
       - name: start buildkitd wired to this runner's agent
         env:
-          CONTROL: ${{ inputs.control }}
+          # Empty on the coordinated arm, "1" on the control arm. The control
+          # daemon gets no BUILDKIT_SINGLEFLIGHT_URL at all, so it cannot
+          # coordinate even by accident.
+          CONTROL: ${{ matrix.arm == 'control' && '1' || '' }}
         run: |
           docker build -q -t eb-ci:test -f - "$RUNNER_TEMP" <<EOF
           FROM earthbuild/buildkitd:v0.8.17
@@ -240,7 +248,7 @@ jobs:
       # --add-host fixes the NAME; it does not fix the ROUTE. Only an
       # end-to-end fetch proves both.
       - name: preflight - the daemon can reach its agent
-        if: ${{ inputs.control == '' }}
+        if: matrix.arm == 'coordinated'
         run: |
           docker exec eb-bk wget -q -T 5 -O /dev/null \
             "http://host.docker.internal:$AGENT_PORT/v2/" \
@@ -271,7 +279,7 @@ jobs:
         if: always()
         run: |
           {
-            echo "### group${{ matrix.group }} on $(nproc) cores - ${WALL:-?}s"
+            echo "### ${{ matrix.arm }} group${{ matrix.group }} on $(nproc) cores - ${WALL:-?}s"
             echo '```'
             curl -s "http://127.0.0.1:$AGENT_PORT/_rebuck/stats" || echo "(agent gone)"
             echo '```'
