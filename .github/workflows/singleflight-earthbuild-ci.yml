@@ -165,8 +165,12 @@ jobs:
       - name: reclaim disk
         run: |
           df -h /
+          # NOT $AGENT_TOOLSDIRECTORY: that is /opt/hostedtoolcache, where the
+          # runner keeps Go and Rust. Deleting it frees ~1 GB and costs you the
+          # toolchain -- "go: command not found" on the very next step. dotnet
+          # and android are ~30 GB between them and are genuinely unused here.
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+                      /usr/local/share/boost || true
           df -h /
 
       - name: build the pieces

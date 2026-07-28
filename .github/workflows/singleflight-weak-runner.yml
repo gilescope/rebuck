@@ -77,15 +77,19 @@ jobs:
           repository: EarthBuild/earthbuild
           path: earthbuild
 
-      # A cold run pulls ~18 base images and leaves ~1.8 GB of CAS behind. The
-      # runner ships with ~25 GB of toolchains we do not use; reclaim them
-      # rather than discover the limit as an I/O error mid-build (which is how
-      # this failed on the x86 box, and it looked like a build bug).
+      # A cold run pulls ~18 base images and leaves ~1.8 GB of CAS behind.
+      # Reclaim the unused SDKs rather than discover the limit as an I/O error
+      # mid-build (which is how this failed on the x86 box, and it looked like a
+      # build bug).
       - name: reclaim disk
         run: |
           df -h /
+          # NOT $AGENT_TOOLSDIRECTORY: that is /opt/hostedtoolcache, where the
+          # runner keeps Go and Rust. Deleting it frees ~1 GB and costs you the
+          # toolchain -- "go: command not found" on the very next step. dotnet
+          # and android are ~30 GB between them and are genuinely unused here.
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+                      /usr/local/share/boost || true
           df -h /
 
       - name: record the machine we are measuring
