@@ -261,6 +261,7 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
         let ctrl = ctrl_send.clone();
         let scratch = cfg.scratch.clone();
         let slots = slots.clone();
+        let ac_store = store.clone();
         tokio::spawn(async move {
             let _permit = slots.acquire_owned().await.expect("semaphore open");
             let tracking = TrackingBlobs {
@@ -268,11 +269,14 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                 stored: Mutex::new(Vec::new()),
             };
             let reply = match exec::run_action(&tracking, &action, &scratch).await {
-                Ok(outcome) => W2D::Done {
-                    job,
-                    action_result: outcome.action_result.encode_to_vec(),
-                    stored: tracking.stored.into_inner(),
-                },
+                Ok(outcome) => {
+                    record_local_ac(&ac_store, &action.hash, &outcome).await;
+                    W2D::Done {
+                        job,
+                        action_result: outcome.action_result.encode_to_vec(),
+                        stored: tracking.stored.into_inner(),
+                    }
+                }
                 Err(e) => W2D::Failed {
                     job,
                     msg: format!("{e:#}"),
@@ -350,6 +354,30 @@ async fn serve_get(
     }
     send.finish()?;
     Ok(())
+}
+
+/// Keep a local AC row for an action this worker just executed.
+///
+/// The worker never READS the AC — the driver is the only consumer — but
+/// it is the node that authored the result, so it is the node that banks
+/// it (`ci/ac-bank-plan.md`). Row and referenced blobs are then born AND
+/// banked on the same box in the same lap: a torn publish loses both
+/// together (honest miss) instead of banking a row whose outputs never
+/// landed — the unservable class of writer 28935304124.
+///
+/// Cacheability is the strict subset of the driver's rule (rpc.rs): exit
+/// 0 and not do_not_cache. `--cache-failures` dedupes failures WITHIN a
+/// lap on the driver; a banked failure row replays forever.
+async fn record_local_ac(store: &Store, action_hash: &str, outcome: &exec::Outcome) {
+    if outcome.do_not_cache || outcome.action_result.exit_code != 0 {
+        return;
+    }
+    if let Err(e) = store
+        .ac_put(action_hash, &outcome.action_result.encode_to_vec())
+        .await
+    {
+        eprintln!("[worker] local AC row for {action_hash} not written: {e:#}");
+    }
 }
 
 /// Records which blobs an action persisted — the driver's provider index.
@@ -739,4 +767,46 @@ async fn sync_shard(
         })
         .await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bazel_remote_apis::build::bazel::remote::execution::v2 as re;
+
+    fn outcome(exit_code: i32, do_not_cache: bool) -> exec::Outcome {
+        exec::Outcome {
+            action_result: re::ActionResult {
+                exit_code,
+                stdout_raw: b"hello".to_vec(),
+                ..Default::default()
+            },
+            do_not_cache,
+        }
+    }
+
+    #[tokio::test]
+    async fn banks_only_cacheable_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+
+        record_local_ac(&store, &"a".repeat(64), &outcome(0, false)).await;
+        record_local_ac(&store, &"b".repeat(64), &outcome(1, false)).await;
+        record_local_ac(&store, &"c".repeat(64), &outcome(0, true)).await;
+
+        let banked = store.ac_get(&"a".repeat(64)).await.expect("row banked");
+        assert_eq!(
+            banked,
+            outcome(0, false).action_result.encode_to_vec(),
+            "banked bytes must be the encoded ActionResult"
+        );
+        assert!(
+            store.ac_get(&"b".repeat(64)).await.is_none(),
+            "failure rows must not reach the bank - the poison class"
+        );
+        assert!(
+            store.ac_get(&"c".repeat(64)).await.is_none(),
+            "do_not_cache rows must not reach the bank"
+        );
+    }
 }
