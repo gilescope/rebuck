@@ -69,12 +69,17 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: EarthBuild/buildkit
-          ref: giles-rebuck-single-flight
+          ref: 86a419fabb82aa3932b0ce673069281d483a73e0 # giles-rebuck-single-flight
           path: buildkit
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: EarthBuild/earthbuild
+          # Pinned to what the x86 box measured. Unpinned, CI silently drifts as
+          # upstream moves and the numbers stop being comparable -- the target
+          # was renamed earthly- to earthbuild- mid-experiment and the run died
+          # on "target not found".
+          ref: 32308f78acd5b57ba2f54e78894c5457cf20fb8f # main, 2026-07-17
           path: earthbuild
 
       # A cold run pulls ~18 base images and leaves ~1.8 GB of CAS behind.
