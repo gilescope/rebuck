@@ -18,7 +18,7 @@ name: singleflight-weak-runner
 # CPU-vs-IO ratio, which is the thing a fast box cannot tell us and the thing
 # that decides whether cross-runner plumbing is worth building at all.
 #
-# Target is +earthly-integration-test-base: measured to be EXACTLY the shared
+# Target is +earthbuild-integration-test-base: measured to be EXACTLY the shared
 # stem between test-no-qemu-group1 and group2 (32 vertices, confirmed by two
 # independent cross-shard runs merging exactly 32).
 
@@ -35,7 +35,7 @@ on:
     inputs:
       target:
         description: earthbuild target to build
-        default: "+earthly-integration-test-base"
+        default: "+earthbuild-integration-test-base"
         type: string
 
 permissions:
@@ -79,7 +79,7 @@ jobs:
           # upstream moves and the numbers stop being comparable -- the target
           # was renamed earthly- to earthbuild- mid-experiment and the run died
           # on "target not found".
-          ref: 32308f78acd5b57ba2f54e78894c5457cf20fb8f # main, 2026-07-17
+          ref: 202cf3206afc76d95ea14a06f9b1acea3638c4a5 # main, 2026-07-27
           path: earthbuild
 
       # A cold run pulls ~18 base images and leaves ~1.8 GB of CAS behind.
@@ -123,7 +123,7 @@ jobs:
           # inputs.* are empty on a push trigger, so the default lives here too
           # -- otherwise the script silently falls back to ./examples/go+build
           # and measures the wrong graph.
-          TARGET: ${{ inputs.target || '+earthly-integration-test-base' }}
+          TARGET: ${{ inputs.target || '+earthbuild-integration-test-base' }}
         run: |
           # pipefail is NOT the default in GitHub's `bash -e {0}`, so `script |
           # tee` reports tee's exit code and a failed run looks green. That is

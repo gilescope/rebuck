@@ -161,7 +161,7 @@ jobs:
           # upstream moves and the numbers stop being comparable -- the target
           # was renamed earthly- to earthbuild- mid-experiment and the run died
           # on "target not found".
-          ref: 32308f78acd5b57ba2f54e78894c5457cf20fb8f # main, 2026-07-17
+          ref: 202cf3206afc76d95ea14a06f9b1acea3638c4a5 # main, 2026-07-27
           path: earthbuild
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
@@ -262,6 +262,7 @@ jobs:
         env:
           GROUP: ${{ matrix.group }}
         run: |
+          set -o pipefail
           BK="tcp://$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' eb-bk):8372"
           echo "buildkit at $BK"
           cat > "$RUNNER_TEMP/eb.yml" <<'EOF'
@@ -274,6 +275,10 @@ jobs:
               "$RUNNER_TEMP/earthly" --allow-privileged --no-output \
               "+test-no-qemu-group$GROUP" ) 2>&1 | tee build.log
           echo "WALL=$((SECONDS - start))" | tee -a "$GITHUB_ENV"
+          # Without pipefail this step reports TEE's status, so a build that died
+          # in 26s went green and published a WALL that looked like a result. The
+          # whole point of this run is a wall-clock A/B; a failed build that
+          # reports a number is worse than no run at all.
 
       - name: summarise
         if: always()
