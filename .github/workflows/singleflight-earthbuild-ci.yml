@@ -90,13 +90,21 @@ jobs:
       # duration -- when leases stop moving for a while, the fleet is done.
       - name: hold open while the builders work, then report
         run: |
+          # Stillness is a BAD done-signal on a short fuse. Leases only move when
+          # vertices start; a single long apk/compile phase claims nothing for
+          # minutes while the build is very much alive. At 60s this loop decided
+          # the fleet had finished mid-build, the step below killed the driver,
+          # and both builders died "Canceled" exactly 60s later.
+          #
+          # A builder takes ~8-10 min here, so require 10 min of true silence and
+          # a 12 min floor. The job timeout is the real backstop.
           stats() { curl -s "http://127.0.0.1:5090/_rebuck/stats" 2>/dev/null; }
           last=""; still=0
-          for _ in $(seq 1 300); do
+          for i in $(seq 1 480); do
             cur="$(stats)"
             [ "$cur" = "$last" ] && still=$((still + 1)) || still=0
             last="$cur"
-            [ "$still" -ge 12 ] && break   # ~60s with no lease movement
+            [ "$i" -ge 144 ] && [ "$still" -ge 120 ] && break  # 12 min floor, 10 min still
             sleep 5
           done
           echo "$last" | tee driver-stats.json
