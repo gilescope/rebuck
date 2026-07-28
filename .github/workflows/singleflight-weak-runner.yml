@@ -120,6 +120,11 @@ jobs:
           # and measures the wrong graph.
           TARGET: ${{ inputs.target || '+earthly-integration-test-base' }}
         run: |
+          # pipefail is NOT the default in GitHub's `bash -e {0}`, so `script |
+          # tee` reports tee's exit code and a failed run looks green. That is
+          # how a script which died building the CLI still reached the assertion
+          # step below and failed there instead, pointing at the wrong thing.
+          set -o pipefail
           ./rebuck2/tests/load-earthbuild-examples.sh "$TARGET" \
             2>&1 | tee "$RUNNER_TEMP/run.log"
 

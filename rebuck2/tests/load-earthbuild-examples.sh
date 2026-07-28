@@ -82,7 +82,16 @@ if ! command -v docker >/dev/null || ! docker info >/dev/null 2>&1; then
 fi
 
 echo "=== earthbuild CLI"
-( cd "$EB_SRC" && GOFLAGS=-mod=mod GOPROXY=direct GOSUMDB=off \
+# NOT GOSUMDB=off / GOPROXY=direct. earthbuild's go.mod asks for a newer Go than
+# the host may have, so the go command downloads a toolchain -- and it verifies
+# that download against the checksum database. Disabling the sumdb makes the
+# download fail outright:
+#   go: download go1.26.0: golang.org/toolchain@...: verifying module:
+#   checksum database disabled by GOSUMDB=off
+# which only ever showed up on a machine WITHOUT the required Go preinstalled
+# (i.e. every CI runner, and no dev box). Defaults verify the toolchain, which
+# is also the behaviour you want for a build claiming to be reproducible.
+( cd "$EB_SRC" && GOFLAGS=-mod=mod \
     go build -o "$SCRATCH/earthbuild" ./cmd/earthly )
 
 if [ -n "${ISOLATE:-}" ]; then

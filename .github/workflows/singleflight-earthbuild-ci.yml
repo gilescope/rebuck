@@ -178,7 +178,11 @@ jobs:
           cargo build --release --manifest-path rebuck2src/rebuck2/Cargo.toml
           ( cd buildkit && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
               go build -o "$RUNNER_TEMP/buildkitd" ./cmd/buildkitd )
-          ( cd earthbuild && GOFLAGS=-mod=mod GOPROXY=direct GOSUMDB=off \
+          # No GOSUMDB=off: earthbuild's go.mod wants a newer Go than the runner
+          # ships, so the go command downloads a toolchain and verifies it
+          # against the checksum database. Disabling the sumdb fails that
+          # download rather than skipping it.
+          ( cd earthbuild && GOFLAGS=-mod=mod \
               go build -o "$RUNNER_TEMP/earthly" ./cmd/earthly )
 
       # The agent must bind 0.0.0.0, not loopback: buildkitd reaches it from
