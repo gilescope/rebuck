@@ -1416,6 +1416,16 @@ impl Driver {
             .map(|w| w.endpoint.clone())
             .filter(|e| !e.is_empty())
             .collect();
+        // Log on ENTRY, not just on completion: the census below is 8
+        // sequential ListShard rounds with a 30s per-peer timeout, so the
+        // old first-print could be minutes in - and on a 12-minute warm
+        // lap the driver stopped first, leaving run 30241746804 with no
+        // evidence the flag had plumbed at all. An unobservable feature
+        // is an unverifiable one.
+        println!(
+            "[driver] eager prefetch: census over {} peers ({OF} shard rounds)",
+            peers.len()
+        );
         for shard in 0..OF {
             let lists = futures::future::join_all(peers.iter().map(|ep| {
                 let this = self.clone();
