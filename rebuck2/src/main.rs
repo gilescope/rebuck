@@ -195,6 +195,7 @@ async fn main() -> Result<()> {
                 preloaded_shard: args
                     .opt("--preloaded-shard")
                     .map(|s| s.parse().expect("--preloaded-shard: number")),
+                give_up_file: args.opt("--give-up-file").map(Into::into),
             };
             args.done();
             std::fs::create_dir_all(&cfg.scratch)?;

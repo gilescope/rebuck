@@ -331,6 +331,7 @@ pub async fn fleet(cfg: FleetCfg) -> Result<FleetMetrics> {
             driver_addr_file: Some(addr_file.clone()),
             hardlinks: true,
             preloaded_shard: None,
+            give_up_file: None,
         };
         std::fs::create_dir_all(&cfgw.scratch)?;
         tokio::spawn(async move { worker::run(wstore, cfgw).await });

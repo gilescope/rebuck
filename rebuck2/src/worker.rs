@@ -36,6 +36,34 @@ pub struct WorkerCfg {
     /// CI shard this worker restored before joining; finalize hands it
     /// the same shard back (see W2D::Hello::preloaded_shard).
     pub preloaded_shard: Option<u8>,
+    /// "The party is over": if this path appears while we are still
+    /// dialling, the driver has finished and there is nothing left to
+    /// join. Something outside the process creates it (in CI, a poller
+    /// watching for the driver's end-of-lap marker) — a worker that
+    /// arrives late otherwise burns its whole `connect_wait` on a driver
+    /// that exited half an hour ago, and reds its job doing it.
+    pub give_up_file: Option<std::path::PathBuf>,
+}
+
+/// What the connect-retry loop should do after a failed dial.
+#[derive(Debug, PartialEq, Eq)]
+enum Retry {
+    Again,
+    PartyOver,
+    Fatal,
+}
+
+/// The note beats the clock in BOTH directions: arriving after the lap
+/// ended is not a failure, so it must not surface as one even once the
+/// connect deadline has also passed.
+fn retry_verdict(give_up: Option<&std::path::Path>, deadline_passed: bool) -> Retry {
+    if give_up.is_some_and(std::path::Path::exists) {
+        Retry::PartyOver
+    } else if deadline_passed {
+        Retry::Fatal
+    } else {
+        Retry::Again
+    }
 }
 
 pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
@@ -92,11 +120,21 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
             };
             match attempt {
                 Ok(c) => break c,
-                Err(e) if Instant::now() < deadline => {
-                    println!("[worker] connect retry: {e}");
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                Err(e) => {
+                    match retry_verdict(cfg.give_up_file.as_deref(), Instant::now() >= deadline) {
+                        Retry::PartyOver => {
+                            println!(
+                                "[worker] driver finished before we joined — nothing to serve"
+                            );
+                            return Ok(());
+                        }
+                        Retry::Fatal => return Err(e).context("driver never became reachable"),
+                        Retry::Again => {
+                            println!("[worker] connect retry: {e}");
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                        }
+                    }
                 }
-                Err(e) => return Err(e).context("driver never became reachable"),
             }
         }
     };
@@ -783,6 +821,29 @@ mod tests {
             },
             do_not_cache,
         }
+    }
+
+    #[test]
+    fn party_over_beats_the_connect_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let note = dir.path().join("party-over");
+
+        // Nothing to say yet: keep dialling until the deadline.
+        assert!(matches!(retry_verdict(Some(&note), false), Retry::Again));
+        // Deadline with no note is the old behaviour: a hard error.
+        assert!(matches!(retry_verdict(Some(&note), true), Retry::Fatal));
+
+        std::fs::write(&note, b"").unwrap();
+        // The note wins in BOTH directions - arriving after the lap ended
+        // is not a failure, so it must not surface as one even when the
+        // connect deadline has also passed.
+        assert!(matches!(
+            retry_verdict(Some(&note), false),
+            Retry::PartyOver
+        ));
+        assert!(matches!(retry_verdict(Some(&note), true), Retry::PartyOver));
+        // No note configured at all: deadline decides.
+        assert!(matches!(retry_verdict(None, true), Retry::Fatal));
     }
 
     #[tokio::test]
