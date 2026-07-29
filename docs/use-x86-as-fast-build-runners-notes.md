@@ -191,9 +191,9 @@ to reproduce the shared-tree failure deliberately.
 
 | target (solo, cold)                 | led |
 | ----------------------------------- | --- |
-| `+earthbuild-integration-test-base`  | 32  |
-| `./tests+base`                       | 32  |
-| `+test-no-qemu-group1`               | 270 |
+| `+earthbuild-integration-test-base` | 32  |
+| `./tests+base`                      | 32  |
+| `+test-no-qemu-group1`              | 270 |
 
 `./tests+base` is what BOTH groups derive from, so its vertex count IS the
 shared prefix - and it adds nothing above the stem. So 32 is the complete
