@@ -82,9 +82,18 @@ mesh. Intra-build multi-host routing is an optional future earthbuild change at
 | P1 | mesh OCI registry facade | none | ~3 |
 | P2 | **distributed single-flight** | buildkit ~60 LoC | 3-5 |
 | P3 | mesh-backed cache mounts | buildkit (plugin) | 4-8 |
+| P2.1 | buildkit identity in the lease key | buildkit ~2 LoC | days |
+| P4 | **source-op coordination (resolve + pull)** | buildkit | 3-5 |
 
 P1 + P2 are the headline (warm cache + build-once). P3 is the remaining
 Satellite warmth (`type=cache` mounts); gate on P1/P2 numbers.
+
+**P2 is built and measured, and the wall-clock case did not land** -- see
+[use-x86-as-fast-build-runners-notes.md](use-x86-as-fast-build-runners-notes.md).
+It coordinates correctly across real machines and adopts the entire shared
+prefix, but on earthbuild's test suite that prefix is I/O-bound, so adopting it
+costs about what building it costs. P2.1 and P4 come out of that measurement and
+are now the live work.
 
 ## P0 — payload/fleet split
 
@@ -338,3 +347,77 @@ protos on bump.
   rebuck), output paths unknowable, non-hermetic caching wrong for `apt-get`.
 - **Windows/macOS buildkit workers.** No pool overlap with the MSVC-buck2 sweep;
   no macOS buildkitd.
+
+## P2.1 — the lease key must name the buildkit that built it
+
+`LeaseKey` is a function of graph content alone: op digest, dep chain, selector,
+output index. It carries no builder identity, so two daemons at different
+commits compute the SAME key and adopt each other's results silently.
+
+Harmless on a homogeneous fleet, and earthbuild is homogeneous *today* only by
+accident: `earthly-entrypoint.sh` starts a buildkitd inside every test container
+(~480 per CI run), and its image is built from `./buildkitd+buildkitd`, so inner
+and outer are the same commit. Pin a released buildkitd for the inner daemon —
+the obvious thing to do — and two versions share one keyspace with no error.
+
+Do the cheap half first: mix the buildkit commit into the key, so versions
+partition into cohorts and never merge across. The ambitious half (carry version
+as lease metadata, let adoption decide compatibility) needs a policy for what
+"compatible" means when LLB semantics change, and is unsound without the cheap
+half in place first.
+
+**Fail loudly.** A version-partitioned refusal must be visible. A fleet whose
+merge rate is zero because two daemons disagree looks exactly like a fleet whose
+coordinator is unreachable, and that ambiguity has already cost ten days once.
+
+### Done when — P2.1
+
+Two daemons at different commits, same graph, produce different lease keys and
+merge nothing; the refusal appears in `/_rebuck/stats` rather than only as an
+absence of merges.
+
+## P4 — source-op coordination (resolve + pull)
+
+The lever P2's measurements point at. `SingleFlightKey` is consumed in exactly
+one place — `solver/llbsolver/ops/exec.go:420` — so **ExecOps are coordinated
+and source ops are not**. Every machine resolves and pulls every base image
+independently.
+
+That is where the duplicated I/O actually is:
+
+- ~18 registry pulls per earthbuild CI job, uncoordinated
+- ~480 inner buildkitds per run, each pulling independently. earthbuild already
+  papers over this with Docker Hub mirror credentials — `Earthfile:564` says so
+  outright: "The inner buildkit requires Docker hub creds to prevent
+  rate-limiting issues"
+- the 32 ExecOps we *do* coordinate are cheap by comparison
+
+It is also a correctness fix, not only a performance one. Docker Official Images
+are republished under the same tag for CVE rebuilds, so a tag that moves
+mid-run leaves half a fleet on the old base and half on the new — section 1 of
+[dist-buildkit-principles.md](dist-buildkit-principles.md) violated, silently.
+Worse, the differing digests produce differing lease keys, so the merge rate
+collapses to zero and looks like a broken coordinator.
+
+Two mechanisms, and the first is most of the value:
+
+1. **Lease the RESOLUTION.** First machine to resolve a reference publishes the
+   digest; the rest adopt it. Makes the fleet single-valued about what it built
+   on, independently of whether the tag moves. Cheap, and it fixes the
+   consistency hole whether or not the pull is ever shared.
+2. **Lease the PULL.** One machine fetches the layers and serves them to peers
+   over the mesh, as it already does for ExecOp outputs. The transfer path
+   exists and is proven — 368 MiB moved peer-to-peer with the driver store flat
+   at 1 MiB.
+
+### Done when — P4
+
+Two runners building targets that share a base image resolve it to the same
+digest via the coordinator, and the layers cross the mesh once rather than being
+pulled twice from the registry. Measured, not asserted: registry egress drops,
+`serves` rises, and a tag republished mid-run does not split the fleet.
+
+**Do not accept "merges went up" as evidence.** P2's history is a catalogue of
+plausible numbers from broken rigs: an unreachable agent, a shared working tree,
+a stale pin, a masked pipeline. Every claim here needs the arms distinguishable
+and the failure mode loud.
