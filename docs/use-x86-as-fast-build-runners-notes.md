@@ -184,6 +184,36 @@ EARTHBUILD_SRC=$HOME/git/EarthBuild/earthbuild \
 Prepend `CONTROL=1` for the uncoordinated arm. Omit `ISOLATE=1` only if you want
 to reproduce the shared-tree failure deliberately.
 
+## The merge count is already optimal - the graph is the limit
+
+`merged=32` looked low against `led=352`, so the obvious question is how many
+*ought* to merge. Measured directly rather than inferred:
+
+| target (solo, cold)                 | led |
+| ----------------------------------- | --- |
+| `+earthbuild-integration-test-base`  | 32  |
+| `./tests+base`                       | 32  |
+| `+test-no-qemu-group1`               | 270 |
+
+`./tests+base` is what BOTH groups derive from, so its vertex count IS the
+shared prefix - and it adds nothing above the stem. So 32 is the complete
+intersection, and single-flight adopts all 32. There is no bug above the stem
+and no divergent lease key; the merge logic is doing everything available to it.
+
+Do not repeat the mistake of estimating the intersection as
+`led(g1) + led(g2) - led(pair)`. Both group builds are ~50% flaky (bare
+`Canceled`), so the subtraction is noise-dominated, and an early estimate of
+"~188 ought to merge" was wrong by 6x. Measure the shared target directly.
+
+The ceiling is therefore structural: two shards share ~12% of their vertices
+(32 of ~270) because every test target is its own `FROM`/`RUN`. Merging more
+requires earthbuild's graph to share more - an architecture question, not a
+coordinator one.
+
+Combined with the wall-clock finding above, that is the honest verdict for this
+workload: a small shareable fraction, adopted perfectly, in a form whose
+adoption costs about what building costs.
+
 ## Open questions
 
 - **repeats.** Every cell above is n=1 against ~10% run-to-run variance. Nothing
