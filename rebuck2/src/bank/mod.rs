@@ -28,6 +28,8 @@ use prost::Message;
 
 use crate::store::sha256_hex;
 
+pub mod manifest;
+
 /// Dispatch for `rebuck2 bank <verb> [args...]`.
 pub fn run(args: &[String]) -> Result<()> {
     let strs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -37,14 +39,58 @@ pub fn run(args: &[String]) -> Result<()> {
         ["tar", store, batch, out] => tar(Path::new(store), Path::new(batch), Path::new(out)),
         ["link", store, paths, dst] => link(Path::new(store), Path::new(paths), Path::new(dst)),
         ["purge-failures", dir] => purge_failures(Path::new(dir)),
+        ["fetch-list", m, owned] => {
+            let m = manifest::Manifest::read(Path::new(m))?;
+            for s in m.segments_to_fetch(owned) {
+                println!("{}", s.name);
+            }
+            Ok(())
+        }
+        // AC row lists union line-wise, so a mutated row leaves both its
+        // old and new (path, hash) pairs behind; collapse to newest-per-
+        // path so the list tracks the row set, not its history.
+        ["collapse-rows", file] => {
+            let lines: Vec<String> = std::fs::read_to_string(file)?
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect();
+            for l in manifest::collapse_rows(&lines) {
+                println!("{l}");
+            }
+            Ok(())
+        }
+        ["needs-compaction", m] => {
+            let m = manifest::Manifest::read(Path::new(m))?;
+            println!(
+                "{}",
+                manifest::needs_compaction(&m, &manifest::CompactCfg::from_env())
+            );
+            Ok(())
+        }
+        ["write-manifest", lineage, gen, parent, parent_gen, run, head, segs, out] => {
+            manifest::write_manifest(
+                lineage,
+                gen,
+                Some(parent),
+                Some(parent_gen),
+                run.parse().unwrap_or(0),
+                (*head != "-").then(|| Path::new(*head)),
+                Path::new(segs),
+                Path::new(out),
+            )
+        }
         ["gen-store", dir, n] => gen_store(Path::new(dir), n.parse()?),
         ["gen-ac", dir, n] => gen_ac(Path::new(dir), n.parse()?),
         ["gen-segments", dir, n] => gen_segments(Path::new(dir), n.parse()?),
         _ => bail!(
             "usage: rebuck2 bank index <store> | ac-index <store> \
              | tar <store> <batch> <out> | link <store> <paths> <dst> \
-             | purge-failures <dir> | gen-store <dir> <n> | gen-ac <dir> <n> \
-             | gen-segments <dir> <n>"
+             | purge-failures <dir> | fetch-list <manifest> <prefixes> \
+             | needs-compaction <manifest> \
+             | write-manifest <lineage> <gen> <parent|-> <parent-gen|-> <run> \
+                              <head|-> <segs-dir> <out-dir> \
+             | gen-store <dir> <n> | gen-ac <dir> <n> | gen-segments <dir> <n>"
         ),
     }
 }
@@ -432,5 +478,55 @@ mod tests {
         );
         assert!(ac.join("okrow").exists(), "success row was eaten");
         assert!(ac.join("garbage").exists(), "undecodable row was eaten");
+    }
+}
+
+/// zstd via the CLI, deliberately.
+///
+/// The `zstd` crate would drag in a C build (zstd-sys) for something every
+/// runner already has on PATH and the shell layer already uses for the same
+/// files - and the segment name is sha256 of the RAW tar precisely so the
+/// compressor's version cannot fork it. Shelling out keeps the bytes
+/// identical to what the previous generation wrote.
+pub mod zstd {
+    use std::io::Write;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    use anyhow::{bail, Result};
+
+    pub fn read_lines(path: &Path) -> Result<Vec<String>> {
+        let out = Command::new("zstd").arg("-dqc").arg(path).output()?;
+        if !out.status.success() {
+            bail!(
+                "zstd -dqc {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect())
+    }
+
+    pub fn write_lines(path: &Path, lines: &[String]) -> Result<()> {
+        let mut child = Command::new("zstd")
+            .args(["-q", "-f", "-o"])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()?;
+        {
+            let mut si = child.stdin.take().expect("piped");
+            for l in lines {
+                writeln!(si, "{l}")?;
+            }
+        }
+        let st = child.wait()?;
+        if !st.success() {
+            bail!("zstd -o {}: exit {st}", path.display());
+        }
+        Ok(())
     }
 }
