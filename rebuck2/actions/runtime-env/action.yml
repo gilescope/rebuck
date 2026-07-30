@@ -1,0 +1,17 @@
+name: rebuck2 runtime env
+description: >-
+  Export the Actions runtime credentials (ACTIONS_RUNTIME_TOKEN,
+  ACTIONS_RESULTS_URL) into the job env so ordinary steps - and rebuck2's
+  own bank commands - can speak the artifact API directly.
+
+inputs:
+  required:
+    description: >-
+      Fail the step when no runtime credentials are found, instead of
+      warning. Set this when the job's upload path depends on them.
+    required: false
+    default: "false"
+
+runs:
+  using: node24
+  main: index.js

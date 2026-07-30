@@ -12,6 +12,7 @@ so a workflow only declares fleet shape and build targets.
 | `worker`        | Install, restore shard, serve, publish shard          |
 | `setup`         | Standalone `rebuck2` install (driver/worker embed it) |
 | `buck2`         | Standalone pinned buck2 install (driver embeds it)    |
+| `runtime-env`   | Export ACTIONS_RUNTIME_TOKEN + RESULTS_URL to the job |
 
 A distributed build is two `uses:` lines: `driver` and `worker` install
 buck2 + the engine themselves. Pin everything to the **same full sha**:
