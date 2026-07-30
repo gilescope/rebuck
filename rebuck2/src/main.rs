@@ -8,6 +8,7 @@
 //! Rendezvous needs no service: both sides derive the driver's iroh key from
 //! `--session` (default $GITHUB_RUN_ID), see mesh.rs.
 
+mod bank;
 mod bench;
 mod driver;
 mod exec;
@@ -88,6 +89,10 @@ async fn main() -> Result<()> {
     let role = argv.remove(0);
     let mut args = Args(argv);
     match role.as_str() {
+        // Deterministic file munging for the CI store bank - no engine, no
+        // mesh, no store handle. Takes its own argv so the bank verbs keep
+        // the flat shape their callers already use.
+        "bank" => bank::run(&args.0),
         "driver" => run_driver(args).await,
         "bench" => {
             let cfg = bench::BenchCfg {
