@@ -131,3 +131,60 @@ Where a build IS non-reproducible, note the tension with (2): the lease is then
 carrying MORE, not less. It is what makes one machine's result canonical for the
 whole grid, and so supplies the consistency the build itself lacks. The less
 reproducible the build, the more the lease is carrying.
+
+## 8. Resolution happens ONCE — the grid must agree what it built ON
+
+Principle 1 says the grid must produce what one machine would. Single-flight
+only ever delivered half of that: it makes each vertex build once, and says
+nothing about the base it built on.
+
+Every machine resolved every tag for itself. Measured on the stem, per daemon,
+per run: **7 resolutions**, of references like `alpine:3.22`, `alpine:3.13`,
+`alpine:3.19`, `golang:1.21-alpine3.19` — all MUTABLE. Docker Official Images
+are republished under the same tag for CVE rebuilds, so a tag that moves
+mid-run leaves part of the fleet on the old base and part on the new. That is
+principle 1 violated, by exactly the mechanism its own apt example describes.
+
+It degrades doubly, and the second half is nastier than the first: differing
+digests yield differing lease keys, so the merge rate collapses to zero —
+indistinguishable from an unreachable coordinator, which is a failure we have
+already spent ten days misreading once.
+
+So resolution is coordinated like execution: first machine to ask publishes the
+digest, the rest adopt it. Measured: `resolve_merged=6` — six times a machine
+took the fleet's answer instead of asking the registry.
+
+Two corollaries, both learned the hard way:
+
+- **Coordinate the seam that FIRES.** We wired `ResolveImageConfig`, which for
+  this workload is called **0 times**; the live seam is `resolveSourceMetadata`
+  at 7. Instrumentation settled in one run what inference had got wrong.
+- **Adopt without reconstructing.** A follower resolves the PINNED reference
+  down the ordinary path rather than rebuilding a serialised response.
+  Correctness stays with code that already works; only the digest travels.
+
+## 9. The origin registry is a fallback, not a data path
+
+The sibling of principle 6. The coordinator is off the layer path; the upstream
+registry should be too.
+
+Agreeing a digest still leaves N machines fetching the same bytes from Docker
+Hub. earthbuild already pays for this and says so in its own Earthfile: *"The
+inner buildkit requires Docker hub creds to prevent rate-limiting issues"* — and
+because `earthly-entrypoint.sh` starts a buildkitd inside every test container,
+a CI run makes those requests from ~480 daemons rather than 12.
+
+Buying credentials is a workaround for the symptom. The fix is to fetch once
+into the fleet and serve peer to peer, which the mesh is already equipped for:
+the driver keeps a bloom per peer, `HasMany` confirms what blooms only route.
+
+The bound is honest: **blooms may only ever lie in the safe direction**. A
+claimed holder must still be confirmed before anyone waits on it — an
+unconfirmed false positive is a stall, and a stall on a hot path is worse than
+the request it was avoiding.
+
+And it is a rate-limit and determinism argument, NOT a speed one. Whether a peer
+beats a CDN is unmeasured; every speed prediction this project has made from
+first principles has been wrong. Fetch-once is worth doing because the fleet
+should not be N customers of someone else's quota — if it is also faster, that
+is a result to measure, not a premise to assume.
