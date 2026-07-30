@@ -161,6 +161,7 @@ start_bk() { # start_bk <name> <agent-port> <host-port>
         -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
         -e BUILDKIT_SINGLEFLIGHT_URL="$sfurl" \
         -e BUILDKIT_SINGLEFLIGHT_REGISTRY=cache \
+        -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG="${EARTHLY_ADDITIONAL_BUILDKIT_CONFIG:-}" \
         -e CACHE_SIZE_MB=8000 \
         -e BUILDKIT_MAX_PARALLELISM=8 \
         -e BUILDKIT_SETUP_CGROUPV2_ROOT=1 \
