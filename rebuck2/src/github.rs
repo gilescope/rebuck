@@ -55,9 +55,17 @@ impl Artifact {
     /// `head_repository_id == repository_id` also drops fork PRs, which
     /// have no write token and must not be able to publish under any
     /// lineage.
+    /// `lineage == "-"` means "any": CONTAINERS are looked up that way,
+    /// because the trust anchor is the manifest that names them, not the
+    /// container artifact itself. That is the pre-existing behaviour and
+    /// this port keeps it deliberately - see the nits file for why it is
+    /// nonetheless worth tightening.
     pub fn provenance_ok(&self, lineage: &str) -> bool {
         if self.expired {
             return false;
+        }
+        if lineage == "-" {
+            return true;
         }
         let Some(run) = &self.workflow_run else {
             return false;
@@ -235,6 +243,16 @@ mod tests {
         let mut orphan = art("m", Some("main"), true, false, "t");
         orphan.workflow_run = None;
         assert!(!orphan.provenance_ok("main"), "no run, no provenance");
+    }
+
+    #[test]
+    fn a_dash_lineage_skips_provenance_but_not_expiry() {
+        // Containers are named by a manifest that IS provenance-checked.
+        assert!(art("c", Some("other"), false, false, "t").provenance_ok("-"));
+        assert!(
+            !art("c", Some("other"), true, true, "t").provenance_ok("-"),
+            "expired is still expired"
+        );
     }
 
     #[test]
