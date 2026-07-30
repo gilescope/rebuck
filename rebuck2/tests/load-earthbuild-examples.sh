@@ -240,8 +240,17 @@ bw = "uploads={} ({:.1f} MiB)  serves={} ({:.1f} MiB)".format(
     s.get("uploads",0), s.get("upload_bytes",0)/1048576,
     s.get("serves",0), s.get("serve_bytes",0)/1048576)
 if "leases_merged" in s:
-    print("led={} MERGED={} abandoned={}  {}".format(
-        s["leases_led"], s["leases_merged"], s["leases_abandoned"], bw))
+    # resolve_* splits image RESOLUTIONS out of the totals. A bare MERGED cannot
+    # say whether a machine skipped a BUILD or a REGISTRY ROUND TRIP, and that
+    # ambiguity was read as evidence more than once before the driver reported
+    # it. Printed here so the number survives the run -- the driver exits with
+    # it, so a live curl is otherwise the only way to see it.
+    res = ""
+    if "resolve_merged" in s:
+        res = "  resolve_led={} resolve_MERGED={}".format(
+            s.get("resolve_led", 0), s.get("resolve_merged", 0))
+    print("led={} MERGED={} abandoned={}{}  {}".format(
+        s["leases_led"], s["leases_merged"], s["leases_abandoned"], res, bw))
 else:
     print(bw)
 ' || echo "(unavailable)"
