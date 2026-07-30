@@ -1339,3 +1339,95 @@ mod tests {
         out
     }
 }
+
+/// Pull-through mirror: where an image blob comes from when nobody in the fleet
+/// holds it.
+///
+/// Principle 9 -- the origin registry is a fallback, not a data path. Without
+/// this the agent 404s on a blob no peer has, buildkit fetches it upstream
+/// itself, and the bytes never enter the fleet: every machine then pays the same
+/// request, which is what earthbuild currently buys Docker Hub credentials to
+/// survive. Fetching once THROUGH the agent puts it in a store the blooms
+/// advertise, so the next machine gets it peer to peer.
+pub mod upstream {
+    /// The registry an unqualified repo belongs to. Docker Hub is the default
+    /// because it is what rate-limits; anything else is already explicit in the
+    /// reference.
+    pub const DEFAULT_HOST: &str = "registry-1.docker.io";
+
+    /// Blob URL for a repo and digest.
+    ///
+    /// The repo arrives from the mirror request path, so an official image
+    /// reaches us as "library/alpine" -- already normalised by the client. We do
+    /// not re-normalise: guessing at a namespace is how a mirror silently serves
+    /// the wrong image.
+    pub fn blob_url(host: &str, repo: &str, digest: &str) -> String {
+        format!("https://{host}/v2/{repo}/blobs/{digest}")
+    }
+
+    /// Docker Hub answers an anonymous blob request with 401 and a token
+    /// challenge. The token is per-repo and pull-scoped: asking for more is how
+    /// an anonymous client gets refused outright.
+    pub fn token_url(repo: &str) -> String {
+        format!(
+            "https://auth.docker.io/token?service=registry.docker.io&scope=repository:{repo}:pull"
+        )
+    }
+
+    /// Enabled by pointing at a host. Off by default: a mirror that starts
+    /// reaching the internet because a binary was upgraded is not a change
+    /// anyone asked for.
+    pub fn host_from_env() -> Option<String> {
+        match std::env::var("REBUCK_UPSTREAM_REGISTRY") {
+            Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod upstream_tests {
+    use super::upstream::*;
+
+    #[test]
+    fn blob_url_is_the_oci_v2_path() {
+        assert_eq!(
+            blob_url("registry-1.docker.io", "library/alpine", "sha256:abc"),
+            "https://registry-1.docker.io/v2/library/alpine/blobs/sha256:abc"
+        );
+    }
+
+    /// A non-Hub registry is reached directly; nothing about the path is
+    /// Hub-specific.
+    #[test]
+    fn blob_url_works_for_any_host() {
+        assert_eq!(
+            blob_url("ghcr.io", "earthbuild/earthbuild", "sha256:d"),
+            "https://ghcr.io/v2/earthbuild/earthbuild/blobs/sha256:d"
+        );
+    }
+
+    /// Pull-scoped and repo-scoped. A broader scope is refused for anonymous
+    /// clients, so asking for one turns every miss into a hard failure.
+    #[test]
+    fn token_is_scoped_to_pull_on_one_repo() {
+        let u = token_url("library/alpine");
+        assert!(u.contains("scope=repository:library/alpine:pull"), "{u}");
+        assert!(u.contains("service=registry.docker.io"), "{u}");
+    }
+
+    /// Off unless asked for: a mirror must not start reaching the internet
+    /// because someone upgraded a binary.
+    #[test]
+    fn upstream_is_opt_in() {
+        // SAFETY-free: single-threaded test, and we restore nothing because the
+        // absence of the var IS the default under test.
+        unsafe { std::env::remove_var("REBUCK_UPSTREAM_REGISTRY") };
+        assert_eq!(host_from_env(), None);
+        unsafe { std::env::set_var("REBUCK_UPSTREAM_REGISTRY", "  ") };
+        assert_eq!(host_from_env(), None, "blank is not a host");
+        unsafe { std::env::set_var("REBUCK_UPSTREAM_REGISTRY", " ghcr.io ") };
+        assert_eq!(host_from_env().as_deref(), Some("ghcr.io"));
+        unsafe { std::env::remove_var("REBUCK_UPSTREAM_REGISTRY") };
+    }
+}
