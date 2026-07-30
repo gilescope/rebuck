@@ -1,0 +1,87 @@
+name: rebuck2 bank restore
+description: >-
+  Seed a rebuck2 store from the CI bank - action-cache rows and, when a
+  shard is given, that range's CAS blobs. A cold bank is a normal outcome,
+  not a failure.
+
+inputs:
+  store:
+    description: >-
+      Store root. Defaults to the same place the driver/worker actions use,
+      resolved per-OS by the action rather than by the caller - which is
+      the point: no cygpath in your workflow.
+    required: false
+    default: ""
+  role:
+    description: >-
+      This node's identity in the bank. Every node banks the rows it
+      AUTHORED under its own role, so this decides which manifest is
+      "ours" and therefore what the matching publish may overwrite.
+    required: true
+  mode:
+    description: >-
+      "all" lays down every role's rows and is for the node that READS the
+      AC (the driver). "own" lays down only this role's history, which is
+      all a worker needs to re-pack, and stops it re-banking rows it never
+      authored.
+    required: false
+    default: own
+  lineage:
+    description: 'Bank lineage. Defaults to the branch (PR: the source branch).'
+    required: false
+    default: ""
+  parent-lineage:
+    description: >-
+      Trunk to inherit from, read-only. Its rows seed the store and join
+      the diff base so they are never re-banked, while every publish still
+      goes to this lineage's own manifest. Defaults to the PR base branch.
+    required: false
+    default: ""
+  shard:
+    description: >-
+      CAS range this node is primary for (0-7), or empty for AC only.
+    required: false
+    default: ""
+
+outputs:
+  cold:
+    description: '"1" when there was no bank to restore from.'
+    value: ${{ steps.ac.outputs.cold }}
+
+runs:
+  using: composite
+  steps:
+    # The credentials for LISTING and DOWNLOAD are GITHUB_TOKEN, which the
+    # caller passes as GH_TOKEN. Upload needs the runtime token instead -
+    # that is the bank-publish action's problem, via runtime-env.
+    - id: ac
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        CAS_LINEAGE: ${{ inputs.lineage || github.head_ref || github.ref_name }}
+        CAS_PARENT_LINEAGE: ${{ inputs.parent-lineage || github.base_ref }}
+      run: |
+        set -euo pipefail
+        STORE='${{ inputs.store }}'
+        # Path resolution belongs here, once, not in every consumer: a
+        # windows runner gets a native path and rebuck2 handles it, so
+        # there is no cygpath dance and no $DEV_DRIVE special case for
+        # the caller to remember.
+        if [ -z "$STORE" ]; then
+          if [ -n "${DEV_DRIVE:-}" ]; then STORE="$DEV_DRIVE/rebuck2"
+          else STORE="$HOME/.cache/rebuck2"; fi
+        fi
+        BANK_WORK="${BANK_WORK:-$RUNNER_TEMP/rebuck2-bank}"
+        export BANK_WORK
+        echo "store=$STORE" >> "$GITHUB_OUTPUT"
+        echo "bank-work=$BANK_WORK" >> "$GITHUB_OUTPUT"
+
+        rc=0
+        rebuck2 bank ac-restore "$STORE" '${{ inputs.role }}' \
+          '${{ inputs.mode }}' "$CAS_LINEAGE" "${CAS_PARENT_LINEAGE:--}" || rc=$?
+        # 3 = cold bank. A first lap on a new lineage is not a failure.
+        if [ "$rc" -eq 3 ]; then
+          echo "cold=1" >> "$GITHUB_OUTPUT"
+        elif [ "$rc" -ne 0 ]; then
+          exit "$rc"
+        fi

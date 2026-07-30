@@ -13,6 +13,7 @@ so a workflow only declares fleet shape and build targets.
 | `setup`         | Standalone `rebuck2` install (driver/worker embed it) |
 | `buck2`         | Standalone pinned buck2 install (driver embeds it)    |
 | `runtime-env`   | Export ACTIONS_RUNTIME_TOKEN + RESULTS_URL to the job |
+| `bank-restore`  | Seed the store from the CI bank (AC rows, CAS range)  |
 
 A distributed build is two `uses:` lines: `driver` and `worker` install
 buck2 + the engine themselves. Pin everything to the **same full sha**:
@@ -132,3 +133,29 @@ long-lived workers can instead use `finalize:` + the worker action's
   the same compiler. Pin the toolchain in the calling workflow.
 - `driver-finish` reads state from `$GITHUB_ENV` exported by `driver`;
   they must run in the same job.
+
+## The bank
+
+Cache persistence is `rebuck2 bank` plus one action, not a directory of
+shell. A consumer's restore is:
+
+```yaml
+      - uses: gilescope/rebuck/rebuck2/actions/bank-restore@<sha>
+        with:
+          role: ${{ runner.os }}-w${{ matrix.n }}
+          mode: own          # 'all' on the node that reads the AC
+          shard: ${{ matrix.owns }}
+```
+
+`lineage` defaults to the branch (on a PR, the source branch) and
+`parent-lineage` to the PR base, so a branch inherits the trunk's bank
+read-only: its rows seed the store and join the diff base, while every
+publish still goes to the branch's own manifest. A cold bank sets the
+`cold` output rather than failing - a first lap on a new lineage is a
+normal outcome.
+
+Store paths are resolved inside the action, per OS. That is deliberate:
+the shell this replaces needed `cygpath` on windows, a
+`timeout`/`gtimeout` fork on macOS, and `tr -d '\r'` after every
+`jq.exe` call. A windows driver mostly just works now, and the caller
+never learns why it wouldn't have.
