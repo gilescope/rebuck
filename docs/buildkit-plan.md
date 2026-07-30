@@ -421,3 +421,57 @@ pulled twice from the registry. Measured, not asserted: registry egress drops,
 plausible numbers from broken rigs: an unreachable agent, a shared working tree,
 a stale pin, a masked pipeline. Every claim here needs the arms distinguishable
 and the failure mode loud.
+
+## P4b — serve image layers from the mesh, not the registry
+
+P4a agrees a digest per reference. Every machine still *fetches* it, so N
+machines make N registry requests for the same bytes. earthbuild already pays
+for that: `Earthfile:564` -- "The inner buildkit requires Docker hub creds to
+prevent rate-limiting issues" -- and every test container starts its own
+buildkitd, so a CI run makes those requests hundreds of times over.
+
+The parts already exist and were built for a different reason:
+
+| piece              | where             | what it does today                |
+| ------------------ | ----------------- | --------------------------------- |
+| per-peer holdings  | `driver.rs:227`   | `blooms: HashMap<String, Bloom>`  |
+| locality dispatch  | `driver.rs:43`    | prefers the worker holding inputs |
+| exact confirmation | `mesh.rs:172`     | `HasMany` confirms what blooms route |
+| OCI registry       | `registry.rs:753` | agent serves `/v2/{*path}`        |
+
+So the fleet can already answer "who holds this digest?" It simply never asks on
+behalf of an image pull, and the agent has no upstream path: a blob it does not
+hold is a plain miss.
+
+Shape: make the agent a **pull-through mirror**, and point buildkitd's registry
+mirror at it.
+
+1. blob requested; agent holds it -> serve
+2. not held -> ask the driver whose bloom claims it, confirm with `HasMany`,
+   fetch peer-to-peer
+3. nobody holds it -> fetch upstream ONCE, store, serve
+
+Turns N x M registry requests into 1 x M, which is the rate-limit fix rather
+than a workaround for it.
+
+Two properties are load-bearing:
+
+- **Blooms are probabilistic and must never be trusted alone.** They lie only in
+  the safe direction (false positives, never false negatives -- see
+  `bloom_no_false_negatives_and_sane_fp`), so a claimed holder must still be
+  confirmed with `HasMany` before anyone waits on it. A false positive that is
+  not confirmed is a stall, not a wrong answer.
+- **Fail open to upstream, always.** A mirror that fails a pull when the mesh is
+  unavailable is strictly worse than no mirror. Same rule as every other part of
+  this system, and the one it has broken before.
+
+### Done when — P4b
+
+Two machines building from the same base image produce ONE upstream registry
+request between them, measured at the agent rather than inferred: `serves` rises,
+upstream fetches do not. And with the mesh killed mid-run, both still build.
+
+**Not a throughput claim yet.** Whether serving a layer from a peer beats
+fetching it from a CDN is unmeasured and not obvious -- Docker Hub is fast and
+close. The case for P4b is rate limits and determinism first; speed is a
+hypothesis to test, not a premise.
