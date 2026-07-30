@@ -248,6 +248,178 @@ pub async fn restore(r: Restore<'_>, work: &Work) -> Result<Option<u64>> {
     Ok(Some(seeded))
 }
 
+/// Stage this node's new/changed rows for upload.
+///
+/// The counterpart to [`restore`]: same `BANK_WORK`, same role. Every node
+/// banks the rows it AUTHORED under its own manifest, so publishing is
+/// never a merge - it can only add to, or fully re-pack, this role's own
+/// history.
+pub struct Publish<'a> {
+    pub store: &'a Path,
+    pub role: &'a str,
+    pub lineage: &'a str,
+    pub parent: Option<&'a str>,
+    pub run: &'a str,
+}
+
+/// What a publish staged, for a caller that wants to report it. The CLI
+/// only needs to know that something WAS staged, so the fields are
+/// informational.
+#[derive(Debug)]
+pub struct Staged {
+    pub segments: usize,
+}
+
+pub fn publish(p: Publish<'_>, work: &Work) -> Result<Option<Staged>> {
+    use super::publish as policy;
+
+    let container = format!("cas-ac-segs-{}-{}-{}", p.lineage, p.run, p.role);
+    let run_num: u64 = p.run.parse().unwrap_or(0);
+    let segs_dir = work.dir.join("ac-segs");
+    let container_dir = work.dir.join("ac-container");
+    let manifest_dir = work.dir.join("ac-manifest-out");
+    for d in [&segs_dir, &container_dir, &manifest_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    // A failed own-manifest lookup leaves this role's banked state
+    // unknown; staging anything now risks newest-wins putting a thin
+    // manifest over the fat one.
+    if work.own_unknown().is_file() {
+        println!(
+            "[ac-bank] {}: own manifest state unknown - not staging",
+            p.role
+        );
+        return Ok(None);
+    }
+
+    // Never bank poison: --cache-failures rows are useful WITHIN a lap and
+    // fatal across laps, so they are purged here as well as at seed.
+    for sub in ["ac", "acn"] {
+        let d = p.store.join(sub);
+        if d.is_dir() {
+            super::purge_failures(&d)?;
+        }
+    }
+
+    let banked = super::read_list(&work.banked_rows())?;
+    let head_dir = work.own_head();
+    let head = head_dir
+        .join("manifest.json")
+        .is_file()
+        .then(|| Manifest::read(&head_dir.join("manifest.json")))
+        .transpose()?;
+
+    // The AC's row set is bounded by the action graph (~22MB fleet-wide),
+    // so the blob bank's 256MB floor would never fire.
+    let mut pol = policy::CompactPolicy::from_env();
+    pol.cfg.min_mb = std::env::var("AC_COMPACT_MIN_MB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    pol.cfg.max_segments = std::env::var("AC_COMPACT_MAX_SEGMENTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
+    let evidence = policy::RestoreEvidence {
+        delta_restore_secs: None,
+        oldest_container: std::fs::read_to_string(work.oldest_container())
+            .ok()
+            .map(|s| s.trim().to_owned()),
+    };
+    let mut compacting = pol.decide(head.as_ref(), &evidence, policy::now_secs()?);
+    if let Some(c) = &compacting {
+        println!("[ac-bank] {}: COMPACTING ({})", p.role, c.reason());
+    }
+
+    let diff_base: &[String] = if compacting.is_some() { &[] } else { &banked };
+    let mut names = pack::ac_pack(p.store, diff_base, &segs_dir, compacting.is_some())?;
+
+    // Monotonicity gate: a full re-pack that would SHED rows (a referenced
+    // container failed to restore) falls back to a delta, which can only
+    // add - newest-wins must never lose history.
+    if compacting.is_some() && !names.is_empty() {
+        let old_list = head_dir.join("blobs.txt.zst");
+        if old_list.is_file() {
+            let old = super::zstd::read_lines(&old_list)?.len();
+            let new: usize = names
+                .iter()
+                .map(|n| {
+                    super::zstd::read_lines(&segs_dir.join(n).join("blobs.txt.zst"))
+                        .map(|v| v.len())
+                        .unwrap_or(0)
+                })
+                .sum();
+            if policy::would_shed(old, new) {
+                println!(
+                    "[ac-bank] {}: compact would shed rows ({old} -> {new}) - delta instead",
+                    p.role
+                );
+                compacting = None;
+                let _ = std::fs::remove_dir_all(&segs_dir);
+                names = pack::ac_pack(p.store, &banked, &segs_dir, false)?;
+            }
+        }
+    }
+
+    if names.is_empty() {
+        println!("[ac-bank] {}: no new or changed rows", p.role);
+        let _ = std::fs::remove_dir_all(&segs_dir);
+        return Ok(None);
+    }
+
+    // Move the payload into the container dir and stamp each meta with the
+    // container, run and role - the restore's fetch map and sort key.
+    std::fs::create_dir_all(&container_dir)?;
+    let mut fresh_rows: Vec<String> = Vec::new();
+    for name in &names {
+        let from = segs_dir.join(name);
+        let to = container_dir.join(name);
+        std::fs::create_dir_all(&to)?;
+        std::fs::rename(from.join("bulk.tar.zst"), to.join("bulk.tar.zst"))?;
+        let mut seg: super::manifest::Segment =
+            serde_json::from_str(&std::fs::read_to_string(from.join("meta.json"))?)?;
+        seg.artifact = Some(container.clone());
+        seg.run = Some(run_num);
+        seg.role = Some(p.role.to_owned());
+        seg.full = compacting.is_some().then_some(true);
+        std::fs::write(from.join("meta.json"), serde_json::to_string(&seg)? + "\n")?;
+        fresh_rows.extend(super::zstd::read_lines(&from.join("blobs.txt.zst"))?);
+    }
+
+    let prev_gen = head.as_ref().map(|h| h.generation.clone());
+    super::manifest::write_manifest(
+        p.lineage,
+        &format!("{}-1", p.run),
+        p.parent,
+        prev_gen.as_deref(),
+        run_num,
+        // A compacting manifest references ONLY its fresh full packs.
+        (compacting.is_none() && head.is_some()).then_some(head_dir.as_path()),
+        &segs_dir,
+        &manifest_dir,
+    )?;
+
+    // The union is line-wise, so a mutated row leaves both its old and new
+    // (path, hash) pairs behind; collapse to newest-per-path with this
+    // lap's rows last so the list tracks the row set, not its history.
+    let list = manifest_dir.join("blobs.txt.zst");
+    let mut all = super::zstd::read_lines(&list)?;
+    all.extend(fresh_rows);
+    super::zstd::write_lines(&list, &super::manifest::collapse_rows(&all))?;
+
+    println!(
+        "[ac-bank] {}: {} segments in {container}; manifest gen {}-1 staged",
+        p.role,
+        names.len(),
+        p.run
+    );
+    let _ = std::fs::remove_dir_all(&segs_dir);
+    Ok(Some(Staged {
+        segments: names.len(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

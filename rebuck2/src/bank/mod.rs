@@ -31,6 +31,7 @@ use crate::store::sha256_hex;
 pub mod ac;
 pub mod manifest;
 pub mod pack;
+pub mod publish;
 
 /// A diff base: one id per line, or nothing at all. `/dev/null` and a
 /// missing file both mean "cold bank" - the callers pass either.
@@ -125,6 +126,36 @@ pub async fn run(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
+        ["ac-publish", store, role, lineage, run, rest @ ..] => {
+            let work = ac::Work::new(
+                std::env::var("BANK_WORK")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| std::env::temp_dir().join("bank")),
+            )?;
+            let staged = ac::publish(
+                ac::Publish {
+                    store: Path::new(store),
+                    role,
+                    lineage,
+                    parent: rest.first().copied().filter(|p| !p.is_empty() && *p != "-"),
+                    run,
+                },
+                &work,
+            )?;
+            if let Some(s) = staged {
+                // The upload steps are gated on this: no container, no
+                // manifest, and a lap with nothing new stages neither.
+                if let Ok(out) = std::env::var("GITHUB_OUTPUT") {
+                    use std::io::Write;
+                    writeln!(
+                        fs::OpenOptions::new().append(true).open(out)?,
+                        "have=1\nsegments={}",
+                        s.segments
+                    )?;
+                }
+            }
+            Ok(())
+        }
         ["gh-list", name, lineage] => {
             let c = crate::github::Client::from_env()?;
             for a in c.by_name(name, lineage).await? {
@@ -185,6 +216,7 @@ pub async fn run(args: &[String]) -> Result<()> {
              | write-manifest <lineage> <gen> <parent|-> <parent-gen|-> <run> \
                               <head|-> <segs-dir> <out-dir> \
              | ac-restore <store> <role> <all|own> <lineage> [parent] \
+             | ac-publish <store> <role> <lineage> <run> [parent] \
              | gh-list <name> <lineage> | gh-list-prefix <prefix> <lineage> \
              | gh-download <id> <dest> \
              | gen-store <dir> <n> | gen-ac <dir> <n> | gen-segments <dir> <n>"
