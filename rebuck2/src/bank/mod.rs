@@ -29,6 +29,18 @@ use prost::Message;
 use crate::store::sha256_hex;
 
 pub mod manifest;
+pub mod pack;
+
+/// A diff base: one id per line, or nothing at all. `/dev/null` and a
+/// missing file both mean "cold bank" - the callers pass either.
+fn read_list(path: &Path) -> Result<Vec<String>> {
+    Ok(fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
 
 /// Dispatch for `rebuck2 bank <verb> [args...]`.
 pub fn run(args: &[String]) -> Result<()> {
@@ -49,6 +61,42 @@ pub fn run(args: &[String]) -> Result<()> {
         // AC row lists union line-wise, so a mutated row leaves both its
         // old and new (path, hash) pairs behind; collapse to newest-per-
         // path so the list tracks the row set, not its history.
+        ["pack", store, banked, out, rest @ ..] => {
+            let only = rest.first().copied().unwrap_or("*");
+            let full = rest.contains(&"--full");
+            for n in pack::pack_segments(
+                Path::new(store),
+                &read_list(Path::new(banked))?,
+                Path::new(out),
+                only,
+                full,
+            )? {
+                println!("{n}");
+            }
+            Ok(())
+        }
+        ["ac-pack", store, banked, out, rest @ ..] => {
+            for n in pack::ac_pack(
+                Path::new(store),
+                &read_list(Path::new(banked))?,
+                Path::new(out),
+                rest.contains(&"--full"),
+            )? {
+                println!("{n}");
+            }
+            Ok(())
+        }
+        ["compact", store, out] => {
+            for n in pack::compact(Path::new(store), Path::new(out))? {
+                println!("{n}");
+            }
+            Ok(())
+        }
+        ["seed", store, segs @ ..] => {
+            let dirs: Vec<std::path::PathBuf> = segs.iter().map(Into::into).collect();
+            pack::seed_store(Path::new(store), &dirs)?;
+            Ok(())
+        }
         ["collapse-rows", file] => {
             let lines: Vec<String> = std::fs::read_to_string(file)?
                 .lines()
@@ -133,6 +181,16 @@ fn index(store: &Path) -> Result<()> {
 /// key: AC rows are name-stable but content-MUTABLE, so the name alone
 /// cannot tell a re-executed action's new result from its old one.
 fn ac_index(store: &Path) -> Result<()> {
+    let mut w = BufWriter::new(std::io::stdout().lock());
+    for (path, hash, size) in ac_rows(store)? {
+        writeln!(w, "{path}\t{hash}\t{size}")?;
+    }
+    Ok(w.flush()?)
+}
+
+/// Every AC row as `(store-relative path, sha256(content), bytes)`,
+/// path-sorted. See [`ac_index`] for why both layouts are walked.
+pub fn ac_rows(store: &Path) -> Result<Vec<(String, String, u64)>> {
     let mut rows: BTreeMap<String, (String, u64)> = BTreeMap::new();
     for (sub, depth) in [("ac", 0u32), ("acn", 1)] {
         let dir = store.join(sub);
@@ -165,11 +223,7 @@ fn ac_index(store: &Path) -> Result<()> {
             }
         }
     }
-    let mut w = BufWriter::new(std::io::stdout().lock());
-    for (path, (hash, size)) in rows {
-        writeln!(w, "{path}\t{hash}\t{size}")?;
-    }
-    Ok(w.flush()?)
+    Ok(rows.into_iter().map(|(p, (h, n))| (p, h, n)).collect())
 }
 
 /// Write one octal field: zero-padded to `width - 1`, NUL-terminated.
@@ -191,12 +245,18 @@ fn octal(field: &mut [u8], val: u64) {
 /// targets). The byte layout is pinned by test against the shipped tool's
 /// output - changing it is a bank-wide re-upload.
 fn tar(store: &Path, batch: &Path, out: &Path) -> Result<()> {
-    let mut paths: Vec<String> = BufReader::new(fs::File::open(batch)?)
+    let paths: Vec<String> = BufReader::new(fs::File::open(batch)?)
         .lines()
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
         .filter(|l| !l.trim().is_empty())
         .collect();
+    tar_to(store, &paths, out)
+}
+
+/// [`tar`] over an in-memory path list.
+pub fn tar_to(store: &Path, paths: &[String], out: &Path) -> Result<()> {
+    let mut paths = paths.to_vec();
     paths.sort();
     paths.dedup();
 
@@ -509,6 +569,39 @@ pub mod zstd {
             .filter(|l| !l.is_empty())
             .map(str::to_owned)
             .collect())
+    }
+
+    /// Compress a file in place-adjacent form (source kept).
+    pub fn compress_file(src: &Path, dst: &Path, level: u8) -> Result<()> {
+        let st = Command::new("zstd")
+            .args(["-q", "-f", &format!("-{level}")])
+            .arg(src)
+            .arg("-o")
+            .arg(dst)
+            .status()?;
+        if !st.success() {
+            bail!("zstd {}: exit {st}", src.display());
+        }
+        Ok(())
+    }
+
+    /// `zstd -dc <tarball> | tar -x -C <dest>`.
+    pub fn extract_tar(tarball: &Path, dest: &Path) -> Result<()> {
+        let z = Command::new("zstd")
+            .args(["-dqc"])
+            .arg(tarball)
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let st = Command::new("tar")
+            .arg("-x")
+            .arg("-C")
+            .arg(dest)
+            .stdin(Stdio::from(z.stdout.expect("piped")))
+            .status()?;
+        if !st.success() {
+            bail!("tar -x {}: exit {st}", tarball.display());
+        }
+        Ok(())
     }
 
     pub fn write_lines(path: &Path, lines: &[String]) -> Result<()> {
