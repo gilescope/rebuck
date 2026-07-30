@@ -12,6 +12,7 @@ mod bank;
 mod bench;
 mod driver;
 mod exec;
+mod github;
 mod mesh;
 mod norm;
 mod rpc;
@@ -92,7 +93,7 @@ async fn main() -> Result<()> {
         // Deterministic file munging for the CI store bank - no engine, no
         // mesh, no store handle. Takes its own argv so the bank verbs keep
         // the flat shape their callers already use.
-        "bank" => bank::run(&args.0),
+        "bank" => bank::run(&args.0).await,
         "driver" => run_driver(args).await,
         "bench" => {
             let cfg = bench::BenchCfg {

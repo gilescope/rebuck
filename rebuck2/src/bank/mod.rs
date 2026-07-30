@@ -43,7 +43,7 @@ fn read_list(path: &Path) -> Result<Vec<String>> {
 }
 
 /// Dispatch for `rebuck2 bank <verb> [args...]`.
-pub fn run(args: &[String]) -> Result<()> {
+pub async fn run(args: &[String]) -> Result<()> {
     let strs: Vec<&str> = args.iter().map(String::as_str).collect();
     match strs.as_slice() {
         ["index", store] => index(Path::new(store)),
@@ -97,6 +97,26 @@ pub fn run(args: &[String]) -> Result<()> {
             pack::seed_store(Path::new(store), &dirs)?;
             Ok(())
         }
+        // Artifact lookups: GITHUB_TOKEN over the REST API, the same
+        // calls the workflow made with `gh api`. Prints "id<TAB>name".
+        ["gh-list", name, lineage] => {
+            let c = crate::github::Client::from_env()?;
+            for a in c.by_name(name, lineage).await? {
+                println!("{}\t{}\t{}", a.id, a.name, a.created_at);
+            }
+            Ok(())
+        }
+        ["gh-list-prefix", prefix, lineage] => {
+            let c = crate::github::Client::from_env()?;
+            for a in c.by_prefix(prefix, lineage).await? {
+                println!("{}\t{}\t{}", a.id, a.name, a.created_at);
+            }
+            Ok(())
+        }
+        ["gh-download", id, dest] => {
+            let c = crate::github::Client::from_env()?;
+            c.download_to(id.parse()?, Path::new(dest)).await
+        }
         ["collapse-rows", file] => {
             let lines: Vec<String> = std::fs::read_to_string(file)?
                 .lines()
@@ -138,6 +158,8 @@ pub fn run(args: &[String]) -> Result<()> {
              | needs-compaction <manifest> \
              | write-manifest <lineage> <gen> <parent|-> <parent-gen|-> <run> \
                               <head|-> <segs-dir> <out-dir> \
+             | gh-list <name> <lineage> | gh-list-prefix <prefix> <lineage> \
+             | gh-download <id> <dest> \
              | gen-store <dir> <n> | gen-ac <dir> <n> | gen-segments <dir> <n>"
         ),
     }
