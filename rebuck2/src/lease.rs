@@ -131,6 +131,12 @@ pub struct Leases {
     /// Leaders that gave up (failed, cancelled, died). Their followers rebuilt,
     /// so this is the tax the mechanism levies when it goes wrong.
     pub abandoned: std::sync::atomic::AtomicU64,
+    /// Of the above, those coordinating an image RESOLUTION rather than an
+    /// execution. Both kinds share this table, so a bare `merged` cannot say
+    /// which moved — and "merged went up" has been mistaken for evidence here
+    /// more than once. Split them.
+    pub resolve_led: std::sync::atomic::AtomicU64,
+    pub resolve_merged: std::sync::atomic::AtomicU64,
     /// Unique ids for out-of-process (HTTP) holders — see [`Leases::claim_http`].
     next_http: std::sync::atomic::AtomicU64,
 }
@@ -149,6 +155,8 @@ impl Leases {
             merged: std::sync::atomic::AtomicU64::new(0),
             led: std::sync::atomic::AtomicU64::new(0),
             abandoned: std::sync::atomic::AtomicU64::new(0),
+            resolve_led: std::sync::atomic::AtomicU64::new(0),
+            resolve_merged: std::sync::atomic::AtomicU64::new(0),
             next_http: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -171,8 +179,7 @@ impl Leases {
                 // expiry: a result never expires, and re-leading a key that has
                 // an answer is precisely how the grid ends up with two.
                 if let Some(bytes) = &e.done {
-                    self.merged
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.count_merged(key);
                     return Claim::Done(bytes.clone());
                 }
                 // A peer's lease that has gone quiet is not a lease. Take it —
@@ -183,13 +190,12 @@ impl Leases {
                     }
                     e.holder = holder.clone();
                     e.expires = self.deadline(&holder);
-                    self.led.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.count_led(key);
                     return Claim::Leader;
                 }
                 let (tx, rx) = oneshot::channel();
                 e.waiters.push(tx);
-                self.merged
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.count_merged(key);
                 Claim::Follower(rx)
             }
             None => {
@@ -203,10 +209,45 @@ impl Leases {
                         done: None,
                     },
                 );
-                self.led.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.count_led(key);
                 Claim::Leader
             }
         }
+    }
+
+    /// Resolution leases are namespaced by the client (buildkit's
+    /// ResolveLeaseKey); classifying here keeps the wire format unchanged and
+    /// costs one prefix comparison.
+    fn is_resolve(key: &str) -> bool {
+        key.starts_with("resolve-")
+    }
+
+    fn count_led(&self, key: &str) {
+        self.led.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if Self::is_resolve(key) {
+            self.resolve_led
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn count_merged(&self, key: &str) {
+        self.merged
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if Self::is_resolve(key) {
+            self.resolve_merged
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// (led, merged) restricted to image resolutions. The number that says a
+    /// machine skipped a registry round trip, rather than merely that some
+    /// lease somewhere was adopted.
+    pub fn resolve_stats(&self) -> (u64, u64) {
+        (
+            self.resolve_led.load(std::sync::atomic::Ordering::Relaxed),
+            self.resolve_merged
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Extend a peer's claim. Ignored if the peer no longer holds the key —
@@ -598,5 +639,41 @@ mod tests {
         assert!(leader(l.claim_local("a")));
         assert!(leader(l.claim_local("b")));
         assert_eq!(l.len(), 2);
+    }
+    /// Resolutions and executions share one table, and "merged went up" cannot
+    /// say which. That ambiguity has repeatedly been mistaken for evidence here,
+    /// so the counters are split by kind.
+    #[test]
+    fn resolve_leases_are_counted_separately() {
+        let l = Leases::default();
+        assert!(leader(l.claim_local("resolve-abc")));
+        assert!(leader(l.claim_local("deadbeef")));
+
+        let led = l.led.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(led, 2, "both kinds still count toward the total");
+
+        let (rled, rmerged) = l.resolve_stats();
+        assert_eq!(rled, 1, "only the resolve- key counts as a resolution");
+        assert_eq!(rmerged, 0);
+    }
+
+    /// A follower adopting a resolution must show up as a resolution merge --
+    /// that is the number that proves a machine skipped a registry round trip
+    /// rather than merely claiming a lease.
+    #[test]
+    fn adopting_a_resolution_counts_as_a_resolve_merge() {
+        let l = Leases::default();
+        assert!(leader(l.claim_local("resolve-abc")));
+        l.release("resolve-abc", None, Outcome::Done(b"answer".to_vec()));
+
+        // A second claimant finds the published answer.
+        matches!(l.claim_local("resolve-abc"), Claim::Done(_));
+
+        let (rled, rmerged) = l.resolve_stats();
+        assert_eq!(rled, 1);
+        assert_eq!(
+            rmerged, 1,
+            "the adoption must be attributable to a resolution"
+        );
     }
 }

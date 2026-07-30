@@ -130,6 +130,12 @@ pub trait RegistryStore: Send + Sync + 'static {
         None
     }
 
+    /// (led, merged) restricted to image resolutions. Split out because both
+    /// kinds share one table, so a bare `merged` cannot say which moved.
+    fn resolve_stats(&self) -> Option<(u64, u64)> {
+        None
+    }
+
     /// Drop every canonical answer. Returns how many were forgotten.
     ///
     /// MEASUREMENT ONLY. `merged` cannot tell an in-flight collision from a late
@@ -251,6 +257,9 @@ impl RegistryStore for crate::driver::Driver {
         let l = self.lease_table();
         let get = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
         Some((get(&l.led), get(&l.merged), get(&l.abandoned)))
+    }
+    fn resolve_stats(&self) -> Option<(u64, u64)> {
+        Some(self.lease_table().resolve_stats())
     }
     fn lease_forget_all(&self) -> usize {
         self.lease_table().forget_all()
@@ -721,6 +730,12 @@ async fn stats_handle<S: RegistryStore>(State(reg): State<Arc<Reg<S>>>) -> Respo
         body["leases_led"] = led.into();
         body["leases_merged"] = merged.into();
         body["leases_abandoned"] = abandoned.into();
+    }
+    // Of the above, the image resolutions. "merged went up" cannot say whether a
+    // machine skipped a BUILD or a REGISTRY ROUND TRIP; this can.
+    if let Some((led, merged)) = reg.store.resolve_stats() {
+        body["resolve_led"] = led.into();
+        body["resolve_merged"] = merged.into();
     }
     (StatusCode::OK, axum::Json(body)).into_response()
 }
