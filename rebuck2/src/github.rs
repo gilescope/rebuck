@@ -88,6 +88,10 @@ pub struct Client {
     http: reqwest::Client,
     repo: String,
     token: String,
+    /// API root. GitHub sets `GITHUB_API_URL` on every runner and it is
+    /// not `api.github.com` on GHES - so honouring it is correctness, not
+    /// just the seam that lets tests point at a stub.
+    api: String,
 }
 
 impl Client {
@@ -105,6 +109,10 @@ impl Client {
                 .build()?,
             repo,
             token,
+            api: std::env::var("GITHUB_API_URL")
+                .unwrap_or_else(|_| "https://api.github.com".into())
+                .trim_end_matches('/')
+                .to_owned(),
         })
     }
 
@@ -126,8 +134,8 @@ impl Client {
     /// Artifacts with this exact name, newest first, provenance-checked.
     pub async fn by_name(&self, name: &str, lineage: &str) -> Result<Vec<Artifact>> {
         let url = format!(
-            "https://api.github.com/repos/{}/actions/artifacts?name={name}&per_page=100",
-            self.repo
+            "{}/repos/{}/actions/artifacts?name={name}&per_page=100",
+            self.api, self.repo
         );
         let page: ArtifactPage = self.get(&url).await?.json().await?;
         Ok(newest_first(
@@ -144,8 +152,8 @@ impl Client {
     /// enumeration, so a matrix change cannot silently drop a slice.
     pub async fn by_prefix(&self, prefix: &str, lineage: &str) -> Result<Vec<Artifact>> {
         let url = format!(
-            "https://api.github.com/repos/{}/actions/artifacts?per_page=100",
-            self.repo
+            "{}/repos/{}/actions/artifacts?per_page=100",
+            self.api, self.repo
         );
         let page: ArtifactPage = self.get(&url).await?.json().await?;
         let mut newest: std::collections::BTreeMap<String, Artifact> = Default::default();
@@ -171,8 +179,8 @@ impl Client {
     /// is why the uploads set `compression-level: 0`.
     pub async fn download_to(&self, id: u64, dest: &Path) -> Result<()> {
         let url = format!(
-            "https://api.github.com/repos/{}/actions/artifacts/{id}/zip",
-            self.repo
+            "{}/repos/{}/actions/artifacts/{id}/zip",
+            self.api, self.repo
         );
         let bytes = self.get(&url).await?.bytes().await?;
         if dest.exists() {

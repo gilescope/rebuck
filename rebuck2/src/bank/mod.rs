@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use bazel_remote_apis::build::bazel::remote::execution::v2 as re;
@@ -28,6 +28,7 @@ use prost::Message;
 
 use crate::store::sha256_hex;
 
+pub mod ac;
 pub mod manifest;
 pub mod pack;
 
@@ -99,6 +100,31 @@ pub async fn run(args: &[String]) -> Result<()> {
         }
         // Artifact lookups: GITHUB_TOKEN over the REST API, the same
         // calls the workflow made with `gh api`. Prints "id<TAB>name".
+        // The whole AC restore: lookup, order, seed, purge, banked list.
+        // Exit 3 = cold bank, which callers treat as "nothing to inherit".
+        ["ac-restore", store, role, mode, lineage, rest @ ..] => {
+            let work = ac::Work::new(
+                std::env::var("BANK_WORK")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| std::env::temp_dir().join("bank")),
+            )?;
+            let parent = rest.first().copied().filter(|p| !p.is_empty() && *p != "-");
+            let seeded = ac::restore(
+                ac::Restore {
+                    store: Path::new(store),
+                    role,
+                    all_roles: *mode == "all",
+                    lineage,
+                    parent,
+                },
+                &work,
+            )
+            .await?;
+            if seeded.is_none() {
+                std::process::exit(3);
+            }
+            Ok(())
+        }
         ["gh-list", name, lineage] => {
             let c = crate::github::Client::from_env()?;
             for a in c.by_name(name, lineage).await? {
@@ -158,6 +184,7 @@ pub async fn run(args: &[String]) -> Result<()> {
              | needs-compaction <manifest> \
              | write-manifest <lineage> <gen> <parent|-> <parent-gen|-> <run> \
                               <head|-> <segs-dir> <out-dir> \
+             | ac-restore <store> <role> <all|own> <lineage> [parent] \
              | gh-list <name> <lineage> | gh-list-prefix <prefix> <lineage> \
              | gh-download <id> <dest> \
              | gen-store <dir> <n> | gen-ac <dir> <n> | gen-segments <dir> <n>"
