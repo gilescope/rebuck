@@ -147,6 +147,14 @@ shell. A consumer's restore is:
           shard: ${{ matrix.owns }}
 ```
 
+The store is hash-verified before the build sees it: a CAS filename IS
+the sha256 of its content, and artifacts cross GitHub's branch-scoping
+wall - any run, any branch, including fork PRs, shares one namespace.
+That degrades a planted blob to a cold cache rather than code execution,
+and it is why the container artifact's own provenance does not have to
+be trusted. Set `verify: false` only when the hashing cost outweighs a
+source you already trust.
+
 `lineage` defaults to the branch (on a PR, the source branch) and
 `parent-lineage` to the PR base, so a branch inherits the trunk's bank
 read-only: its rows seed the store and join the diff base, while every

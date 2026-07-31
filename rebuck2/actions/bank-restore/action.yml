@@ -42,6 +42,17 @@ inputs:
       CAS range this node is primary for (0-7), or empty for AC only.
     required: false
     default: ""
+  verify:
+    description: >-
+      Hash-verify the seeded store before use. A CAS filename IS the
+      sha256 of its content, and artifacts cross GitHub's branch-scoping
+      wall - any run, any branch, including fork PRs, shares one
+      namespace. Verifying degrades a planted blob to a cold cache
+      instead of code execution, and makes the container artifact's own
+      provenance irrelevant. Off only if you are seeding from a source
+      you already trust and the hashing cost is not worth it.
+    required: false
+    default: "true"
 
 outputs:
   cold:
@@ -85,3 +96,14 @@ runs:
         elif [ "$rc" -ne 0 ]; then
           exit "$rc"
         fi
+
+    # Anything that crossed the artifact wall proves itself before the
+    # build can use it. This is the engine's own verifier: portable,
+    # parallel, and immune to the failure the shell version had - two
+    # hashers writing one pipe interleave past PIPE_BUF and the parser
+    # deleted GOOD files, which cost a whole mac fleet (run 29082052036).
+    - if: inputs.verify == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        rebuck2 verify-store --store '${{ steps.ac.outputs.store }}'
