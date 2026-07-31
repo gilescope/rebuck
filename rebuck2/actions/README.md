@@ -14,7 +14,7 @@ so a workflow only declares fleet shape and build targets.
 | `buck2`         | Standalone pinned buck2 install (driver embeds it)    |
 | `runtime-env`   | Export ACTIONS_RUNTIME_TOKEN + RESULTS_URL to the job |
 | `bank-restore`  | Seed the store from the CI bank (AC rows, CAS range)  |
-| `bank-publish`  | Bank + upload this node's new blobs, rows and spill    |
+| `bank-publish`  | Bank + upload this node's new blobs, rows and spill   |
 
 A distributed build is two `uses:` lines: `driver` and `worker` install
 buck2 + the engine themselves. Pin everything to the **same full sha**:
