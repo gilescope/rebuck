@@ -10,6 +10,14 @@ inputs:
     description: Store root. Defaults to the same resolution bank-restore uses.
     required: false
     default: ""
+  subdir:
+    description: >-
+      Sub-store under the resolved root, e.g. "worker" or "driver". One
+      runner can host several roles (the driver box also runs a
+      co-worker), and each needs its own store - but the ROOT is the
+      action's business, not the caller's.
+    required: false
+    default: ""
   role:
     description: >-
       This node's identity in the bank. Names its own AC manifest and its
@@ -54,6 +62,8 @@ runs:
           if [ -n "${DEV_DRIVE:-}" ]; then STORE="$DEV_DRIVE/rebuck2"
           else STORE="$HOME/.cache/rebuck2"; fi
         fi
+        SUB='${{ inputs.subdir }}'
+        [ -z "$SUB" ] || STORE="$STORE/$SUB"
         BANK_WORK="${BANK_WORK:-$RUNNER_TEMP/rebuck2-bank}"
         export BANK_WORK
         echo "bank-work=$BANK_WORK" >> "$GITHUB_OUTPUT"
