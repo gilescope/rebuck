@@ -157,7 +157,7 @@ pub async fn run(args: &[String]) -> Result<()> {
                     use std::io::Write;
                     writeln!(
                         fs::OpenOptions::new().append(true).open(out)?,
-                        "have=1\nsegments={}",
+                        "ac-have=1\nac-segments={}",
                         s.segments
                     )?;
                 }
