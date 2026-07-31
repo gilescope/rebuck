@@ -88,6 +88,7 @@ runs:
         IN_SUBDIR: ${{ inputs.subdir }}
         IN_ROLE: ${{ inputs.role }}
         IN_SHARD: ${{ inputs.shard }}
+        IN_MODE: ${{ inputs.mode }}
       run: |
         set -euo pipefail
         STORE="$IN_STORE"
