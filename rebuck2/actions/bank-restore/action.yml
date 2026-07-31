@@ -77,11 +77,20 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ github.token }}
+        # Inputs reach the script through the environment, never through
+        # ${{ }} interpolation into the body: a git ref may contain a
+        # quote, and `lineage` defaults to github.head_ref, which a fork
+        # PR author chooses. Interpolated, that is shell injection into
+        # the runner; as an env var it is just a string.
         CAS_LINEAGE: ${{ inputs.lineage || github.head_ref || github.ref_name }}
         CAS_PARENT_LINEAGE: ${{ inputs.parent-lineage || github.base_ref }}
+        IN_STORE: ${{ inputs.store }}
+        IN_SUBDIR: ${{ inputs.subdir }}
+        IN_ROLE: ${{ inputs.role }}
+        IN_SHARD: ${{ inputs.shard }}
       run: |
         set -euo pipefail
-        STORE='${{ inputs.store }}'
+        STORE="$IN_STORE"
         # Path resolution belongs here, once, not in every consumer: a
         # windows runner gets a native path and rebuck2 handles it, so
         # there is no cygpath dance and no $DEV_DRIVE special case for
@@ -90,9 +99,9 @@ runs:
           if [ -n "${DEV_DRIVE:-}" ]; then STORE="$DEV_DRIVE/rebuck2"
           else STORE="$HOME/.cache/rebuck2"; fi
         fi
-        SUB='${{ inputs.subdir }}'
+        SUB="$IN_SUBDIR"
         [ -z "$SUB" ] || STORE="$STORE/$SUB"
-        SHARD='${{ inputs.shard }}'
+        SHARD="$IN_SHARD"
         BANK_WORK="${BANK_WORK:-$RUNNER_TEMP/rebuck2-bank}"
         export BANK_WORK
         # ABSORB_SPILLS is the range owner's job: seed recent spills so the
@@ -112,8 +121,7 @@ runs:
           "${CAS_PARENT_LINEAGE:--}" || rc=$?
         if [ "$rc" -eq 3 ]; then cold=1; elif [ "$rc" -ne 0 ]; then exit "$rc"; fi
         rc=0
-        rebuck2 bank ac-restore "$STORE" '${{ inputs.role }}' \
-          '${{ inputs.mode }}' "$CAS_LINEAGE" "${CAS_PARENT_LINEAGE:--}" || rc=$?
+        rebuck2 bank ac-restore "$STORE" "$IN_ROLE" "$IN_MODE" "$CAS_LINEAGE" "${CAS_PARENT_LINEAGE:--}" || rc=$?
         if [ "$rc" -eq 3 ]; then cold=1; elif [ "$rc" -ne 0 ]; then exit "$rc"; fi
         [ "$cold" -eq 0 ] || echo "cold=1" >> "$GITHUB_OUTPUT"
 
@@ -124,6 +132,8 @@ runs:
     # deleted GOOD files, which cost a whole mac fleet (run 29082052036).
     - if: inputs.verify == 'true'
       shell: bash
+      env:
+        STORE: ${{ steps.ac.outputs.store }}
       run: |
         set -euo pipefail
-        rebuck2 verify-store --store '${{ steps.ac.outputs.store }}'
+        rebuck2 verify-store --store "$STORE"

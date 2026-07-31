@@ -53,27 +53,37 @@ runs:
     - id: pack
       shell: bash
       env:
+        # Inputs reach the script through the environment, never through
+        # ${{ }} interpolation into the body: a git ref may contain a
+        # quote, and `lineage` defaults to github.head_ref, which a fork
+        # PR author chooses. Interpolated, that is shell injection into
+        # the runner; as an env var it is just a string.
         CAS_LINEAGE: ${{ inputs.lineage || github.head_ref || github.ref_name }}
         CAS_PARENT_LINEAGE: ${{ inputs.parent-lineage || github.base_ref }}
+        IN_STORE: ${{ inputs.store }}
+        IN_SUBDIR: ${{ inputs.subdir }}
+        IN_ROLE: ${{ inputs.role }}
+        IN_SHARD: ${{ inputs.shard }}
+        IN_MODE: ${{ inputs.mode }}
+        IN_AC: ${{ inputs.ac }}
       run: |
         set -euo pipefail
-        STORE='${{ inputs.store }}'
+        STORE="$IN_STORE"
         if [ -z "$STORE" ]; then
           if [ -n "${DEV_DRIVE:-}" ]; then STORE="$DEV_DRIVE/rebuck2"
           else STORE="$HOME/.cache/rebuck2"; fi
         fi
-        SUB='${{ inputs.subdir }}'
+        SUB="$IN_SUBDIR"
         [ -z "$SUB" ] || STORE="$STORE/$SUB"
         BANK_WORK="${BANK_WORK:-$RUNNER_TEMP/rebuck2-bank}"
         export BANK_WORK
         echo "bank-work=$BANK_WORK" >> "$GITHUB_OUTPUT"
         echo "lineage=$CAS_LINEAGE" >> "$GITHUB_OUTPUT"
 
-        rebuck2 bank cas-publish "$STORE" '${{ inputs.role }}' \
-          '${{ inputs.shard }}' "$CAS_LINEAGE" "$GITHUB_RUN_ID" \
+        rebuck2 bank cas-publish "$STORE" "$IN_ROLE" "$IN_SHARD" "$CAS_LINEAGE" "$GITHUB_RUN_ID" \
           "${CAS_PARENT_LINEAGE:--}"
-        if [ '${{ inputs.ac }}' = 'true' ]; then
-          rebuck2 bank ac-publish "$STORE" '${{ inputs.role }}' \
+        if [ "$IN_AC" = "true" ]; then
+          rebuck2 bank ac-publish "$STORE" "$IN_ROLE" \
             "$CAS_LINEAGE" "$GITHUB_RUN_ID" "${CAS_PARENT_LINEAGE:--}"
         fi
 
