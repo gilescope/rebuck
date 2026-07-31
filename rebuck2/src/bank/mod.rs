@@ -29,6 +29,7 @@ use prost::Message;
 use crate::store::sha256_hex;
 
 pub mod ac;
+pub mod cas;
 pub mod manifest;
 pub mod pack;
 pub mod publish;
@@ -42,6 +43,13 @@ fn read_list(path: &Path) -> Result<Vec<String>> {
         .filter(|l| !l.is_empty())
         .map(str::to_owned)
         .collect())
+}
+
+/// Staging dir shared by a restore and the publish that follows it.
+fn bank_work() -> PathBuf {
+    std::env::var("BANK_WORK")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("bank"))
 }
 
 /// Dispatch for `rebuck2 bank <verb> [args...]`.
@@ -156,6 +164,52 @@ pub async fn run(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
+        ["cas-restore", store, shard, lineage, rest @ ..] => {
+            let work = cas::Work::new(bank_work())?;
+            let seeded = cas::restore(
+                cas::Restore {
+                    store: Path::new(store),
+                    shard: shard.parse().ok(),
+                    lineage,
+                    parent: rest.first().copied().filter(|p| !p.is_empty() && *p != "-"),
+                    absorb_spills: std::env::var("ABSORB_SPILLS").as_deref() == Ok("1"),
+                },
+                &work,
+            )
+            .await?;
+            if seeded.is_none() {
+                std::process::exit(3);
+            }
+            Ok(())
+        }
+        ["cas-publish", store, role, shard, lineage, run, rest @ ..] => {
+            let work = cas::Work::new(bank_work())?;
+            let staged = cas::publish(
+                cas::Publish {
+                    store: Path::new(store),
+                    role,
+                    shard: shard.parse().ok(),
+                    lineage,
+                    parent: rest.first().copied().filter(|p| !p.is_empty() && *p != "-"),
+                    run,
+                },
+                &work,
+            )?;
+            if let Ok(out) = std::env::var("GITHUB_OUTPUT") {
+                use std::io::Write;
+                let mut f = fs::OpenOptions::new().append(true).open(out)?;
+                for (k, v) in [
+                    ("have", staged.container),
+                    ("manifest", staged.manifest),
+                    ("spill", staged.spill),
+                ] {
+                    if v {
+                        writeln!(f, "{k}=1")?;
+                    }
+                }
+            }
+            Ok(())
+        }
         ["gh-list", name, lineage] => {
             let c = crate::github::Client::from_env()?;
             for a in c.by_name(name, lineage).await? {
@@ -217,6 +271,8 @@ pub async fn run(args: &[String]) -> Result<()> {
                               <head|-> <segs-dir> <out-dir> \
              | ac-restore <store> <role> <all|own> <lineage> [parent] \
              | ac-publish <store> <role> <lineage> <run> [parent] \
+             | cas-restore <store> <shard|-> <lineage> [parent] \
+             | cas-publish <store> <role> <shard|-> <lineage> <run> [parent] \
              | gh-list <name> <lineage> | gh-list-prefix <prefix> <lineage> \
              | gh-download <id> <dest> \
              | gen-store <dir> <n> | gen-ac <dir> <n> | gen-segments <dir> <n>"
