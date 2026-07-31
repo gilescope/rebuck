@@ -92,20 +92,30 @@ runs:
         fi
         SUB='${{ inputs.subdir }}'
         [ -z "$SUB" ] || STORE="$STORE/$SUB"
+        SHARD='${{ inputs.shard }}'
         BANK_WORK="${BANK_WORK:-$RUNNER_TEMP/rebuck2-bank}"
         export BANK_WORK
+        # ABSORB_SPILLS is the range owner's job: seed recent spills so the
+        # next publish banks them properly. Secondaries must not, or the
+        # blobs ping-pong between spill artifacts.
+        [ -z "$SHARD" ] || [ "$SHARD" = "-" ] || export ABSORB_SPILLS=1
         echo "store=$STORE" >> "$GITHUB_OUTPUT"
         echo "bank-work=$BANK_WORK" >> "$GITHUB_OUTPUT"
 
+        # BOTH banks. shard '-' means blob-list only: the driver needs
+        # the union to diff its spill against but seeds no range, while a
+        # worker seeds the range it owns. 3 = cold bank, which is a normal
+        # first lap on a new lineage, not a failure.
+        cold=0
+        rc=0
+        rebuck2 bank cas-restore "$STORE" "${SHARD:--}" "$CAS_LINEAGE" \
+          "${CAS_PARENT_LINEAGE:--}" || rc=$?
+        if [ "$rc" -eq 3 ]; then cold=1; elif [ "$rc" -ne 0 ]; then exit "$rc"; fi
         rc=0
         rebuck2 bank ac-restore "$STORE" '${{ inputs.role }}' \
           '${{ inputs.mode }}' "$CAS_LINEAGE" "${CAS_PARENT_LINEAGE:--}" || rc=$?
-        # 3 = cold bank. A first lap on a new lineage is not a failure.
-        if [ "$rc" -eq 3 ]; then
-          echo "cold=1" >> "$GITHUB_OUTPUT"
-        elif [ "$rc" -ne 0 ]; then
-          exit "$rc"
-        fi
+        if [ "$rc" -eq 3 ]; then cold=1; elif [ "$rc" -ne 0 ]; then exit "$rc"; fi
+        [ "$cold" -eq 0 ] || echo "cold=1" >> "$GITHUB_OUTPUT"
 
     # Anything that crossed the artifact wall proves itself before the
     # build can use it. This is the engine's own verifier: portable,
