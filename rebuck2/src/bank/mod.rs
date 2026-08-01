@@ -164,6 +164,50 @@ pub async fn run(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
+        // The composite verbs: one call for the whole warm path, so the
+        // actions stay one line and cannot drift from each other.
+        ["restore", store, role, mode, shard, lineage, rest @ ..] => {
+            let warm = restore_all(
+                Path::new(store),
+                role,
+                *mode == "all",
+                shard.parse().ok(),
+                lineage,
+                rest.first().copied().filter(|p| !p.is_empty() && *p != "-"),
+                rest.get(1).copied() != Some("--no-verify"),
+            )
+            .await?;
+            if !warm {
+                std::process::exit(3);
+            }
+            Ok(())
+        }
+        ["publish", store, role, shard, lineage, run, rest @ ..] => {
+            let (cas_staged, ac_staged) = publish_all(
+                Path::new(store),
+                role,
+                shard.parse().ok(),
+                lineage,
+                rest.first().copied().filter(|p| !p.is_empty() && *p != "-"),
+                run,
+                rest.get(1).copied() != Some("--no-ac"),
+            )?;
+            if let Ok(out) = std::env::var("GITHUB_OUTPUT") {
+                use std::io::Write;
+                let mut f = fs::OpenOptions::new().append(true).open(out)?;
+                for (k, v) in [
+                    ("have", cas_staged.container),
+                    ("manifest", cas_staged.manifest),
+                    ("spill", cas_staged.spill),
+                    ("ac-have", ac_staged),
+                ] {
+                    if v {
+                        writeln!(f, "{k}=1")?;
+                    }
+                }
+            }
+            Ok(())
+        }
         ["cas-restore", store, shard, lineage, rest @ ..] => {
             let work = cas::Work::new(bank_work())?;
             let seeded = cas::restore(
@@ -271,6 +315,8 @@ pub async fn run(args: &[String]) -> Result<()> {
                               <head|-> <segs-dir> <out-dir> \
              | ac-restore <store> <role> <all|own> <lineage> [parent] \
              | ac-publish <store> <role> <lineage> <run> [parent] \
+             | restore <store> <role> <all|own> <shard|-> <lineage> [parent] \
+             | publish <store> <role> <shard|-> <lineage> <run> [parent] \
              | cas-restore <store> <shard|-> <lineage> [parent] \
              | cas-publish <store> <role> <shard|-> <lineage> <run> [parent] \
              | gh-list <name> <lineage> | gh-list-prefix <prefix> <lineage> \
@@ -759,4 +805,110 @@ pub mod zstd {
         }
         Ok(())
     }
+}
+
+/// The whole warm path, as one call.
+///
+/// Composition lives here rather than in YAML so there is exactly one
+/// definition of "restore the bank": the actions, the workflow and a
+/// developer running it by hand all get the same sequence. Returns false
+/// for a cold bank, which is a normal first lap on a new lineage.
+pub async fn restore_all(
+    store: &Path,
+    role: &str,
+    all_roles: bool,
+    shard: Option<u8>,
+    lineage: &str,
+    parent: Option<&str>,
+    verify: bool,
+) -> Result<bool> {
+    let work_dir = bank_work();
+    let mut warm = false;
+
+    let cas_work = cas::Work::new(work_dir.clone())?;
+    if cas::restore(
+        cas::Restore {
+            store,
+            shard,
+            lineage,
+            parent,
+            absorb_spills: shard.is_some(),
+        },
+        &cas_work,
+    )
+    .await?
+    .is_some()
+    {
+        warm = true;
+    }
+
+    let ac_work = ac::Work::new(work_dir)?;
+    if ac::restore(
+        ac::Restore {
+            store,
+            role,
+            all_roles,
+            lineage,
+            parent,
+        },
+        &ac_work,
+    )
+    .await?
+    .is_some()
+    {
+        warm = true;
+    }
+
+    // Anything that crossed the artifact wall proves itself before the
+    // build can use it: a CAS filename IS the sha256 of its content, and
+    // the artifact namespace is shared by every run and branch in the
+    // repo, fork PRs included.
+    if verify && warm {
+        let (ok, bad) = crate::store::verify_cas(store)?;
+        println!("[bank] verified {ok} blobs, rejected {bad}");
+        if bad > 0 {
+            eprintln!("[bank] WARNING - rejected blobs suggest a poisoned or corrupt artifact");
+        }
+    }
+    Ok(warm)
+}
+
+/// Bank everything this node has to bank, in one call.
+pub fn publish_all(
+    store: &Path,
+    role: &str,
+    shard: Option<u8>,
+    lineage: &str,
+    parent: Option<&str>,
+    run: &str,
+    with_ac: bool,
+) -> Result<(cas::Staged, bool)> {
+    let work_dir = bank_work();
+    let cas_staged = cas::publish(
+        cas::Publish {
+            store,
+            role,
+            shard,
+            lineage,
+            parent,
+            run,
+        },
+        &cas::Work::new(work_dir.clone())?,
+    )?;
+    let ac_staged = if with_ac {
+        ac::publish(
+            ac::Publish {
+                store,
+                role,
+                lineage,
+                parent,
+                run,
+            },
+            &ac::Work::new(work_dir)?,
+        )?
+        .is_some()
+    } else {
+        false
+    };
+    Ok((cas_staged, ac_staged))
 }
