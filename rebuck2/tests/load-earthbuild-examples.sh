@@ -228,7 +228,14 @@ run_eb() { # run_eb <label> <bk-addr> <target> <srcdir>
     # The daemon already grants it (buildkitd.toml.template: insecure-entitlements),
     # but WITH DOCKER targets (examples-5's integration-test) fail with
     # "security.insecure is not allowed" unless the client requests it too.
-    ( cd "$4" && EARTHLY_BUILDKIT_HOST="$2" \
+    # TLS as an ENV var as well as in $EARTHLY_CONFIG, because only the env var
+    # travels. earthbuild forwards its buildkit settings into every RUN so a
+    # nested build can reach the same daemon, and it collects them from the
+    # ENVIRONMENT -- a config file lives in one container and cannot reach a
+    # build running in another. Set the address without the TLS setting and the
+    # nested earthly dials the daemon, defaults to TLS, and dies on a CA nobody
+    # gave it (measured: exit code 6).
+    ( cd "$4" && EARTHLY_BUILDKIT_HOST="$2" EARTHLY_TLS_ENABLED=false \
         "$SCRATCH/earthbuild" --allow-privileged --no-output "$3" ) > "$SCRATCH/$1.log" 2>&1
 }
 
