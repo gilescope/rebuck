@@ -75,7 +75,12 @@ runs:
         fi
         SUB="$IN_SUBDIR"
         [ -z "$SUB" ] || STORE="$STORE/$SUB"
-        BANK_WORK="${BANK_WORK:-$RUNNER_TEMP/rebuck2-bank}"
+        # Per-ROLE staging. One runner hosts several roles (the driver box
+        # also runs a co-worker), and the restore leaves this role's own
+        # manifest head here for its publish to chain from. Sharing one
+        # dir would let the second restore overwrite the first's head and
+        # publish a manifest chained from the wrong role's generation.
+        BANK_WORK="${BANK_WORK:-$RUNNER_TEMP/rebuck2-bank-$IN_ROLE}"
         export BANK_WORK
         echo "bank-work=$BANK_WORK" >> "$GITHUB_OUTPUT"
         echo "lineage=$CAS_LINEAGE" >> "$GITHUB_OUTPUT"
