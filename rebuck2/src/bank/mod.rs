@@ -30,6 +30,7 @@ use crate::store::sha256_hex;
 
 pub mod ac;
 pub mod cas;
+pub mod dice;
 pub mod manifest;
 pub mod pack;
 pub mod publish;
@@ -254,6 +255,44 @@ pub async fn run(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
+        ["dice-restore", dice_dir, lineage, seed, rest @ ..] => {
+            let work = bank_work();
+            let merged = dice::restore(
+                dice::Restore {
+                    dice_dir: Path::new(dice_dir),
+                    lineage,
+                    parent: rest.first().copied().filter(|p| !p.is_empty() && *p != "-"),
+                    seed,
+                },
+                &work,
+            )
+            .await?;
+            if merged.is_none() {
+                std::process::exit(3);
+            }
+            Ok(())
+        }
+        ["dice-keys", db] => {
+            for k in dice::keys(Path::new(db))? {
+                println!("{k}");
+            }
+            Ok(())
+        }
+        ["dice-pack", db, banked, out] => {
+            for n in dice::pack(
+                Path::new(db),
+                &read_list(Path::new(banked))?,
+                Path::new(out),
+            )? {
+                println!("{n}");
+            }
+            Ok(())
+        }
+        ["dice-merge", db, segs @ ..] => {
+            let dirs: Vec<PathBuf> = segs.iter().map(Into::into).collect();
+            dice::merge(Path::new(db), &dirs)?;
+            Ok(())
+        }
         ["gh-list", name, lineage] => {
             let c = crate::github::Client::from_env()?;
             for a in c.by_name(name, lineage).await? {
@@ -317,6 +356,9 @@ pub async fn run(args: &[String]) -> Result<()> {
              | ac-publish <store> <role> <lineage> <run> [parent] \
              | restore <store> <role> <all|own> <shard|-> <lineage> [parent] \
              | publish <store> <role> <shard|-> <lineage> <run> [parent] \
+             | dice-restore <dice-dir> <lineage> <seed> [parent] \
+             | dice-pack <db> <banked> <out> | dice-merge <db> <seg>... \
+             | dice-keys <db> \
              | cas-restore <store> <shard|-> <lineage> [parent] \
              | cas-publish <store> <role> <shard|-> <lineage> <run> [parent] \
              | gh-list <name> <lineage> | gh-list-prefix <prefix> <lineage> \
