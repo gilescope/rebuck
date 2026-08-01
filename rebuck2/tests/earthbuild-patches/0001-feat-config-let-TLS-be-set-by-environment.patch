@@ -1,0 +1,196 @@
+From 544a8242e6e5823ba212a3ede08656e21e90bdc6 Mon Sep 17 00:00:00 2001
+From: Giles Cope <gilescope@gmail.com>
+Date: Fri, 31 Jul 2026 05:53:37 +0100
+Subject: [PATCH 1/5] feat(config): let TLS be set by environment
+
+Every other buildkit setting already has an env binding via EarthEnvVars. TLS
+alone was config-file only, which made a nested earthly impossible to configure:
+it inherits the daemon address (EARTHLY_BUILDKIT_HOST does have a binding),
+dials it, defaults to TLS, and dies on a CA nobody gave it --
+
+  could not connect to buildkit: could not read ca certificate
+
+A config FILE cannot help: a file lives in one container and a nested build runs
+in another. Env is the only carrier that crosses. So a caller could point a
+callee at a daemon but never tell it how to speak to one.
+
+Uses env.Lookup rather than restating the prefixes. internal/env owns the pair
+(EARTH_ preferred, EARTHLY_ as the migration shim), so the next rename lands
+there and not here.
+
+Verified end to end on a two-level earthly-in-earthly rig with no config file
+anywhere: the error moves from a certificate failure to a plain TCP refusal --
+the inner earthly honoured the setting two levels down.
+
+Unparseable values are IGNORED rather than read as false. A typo must not
+silently disable TLS, and failing to the safe direction beats reporting it on a
+path that runs at every config load.
+
+Six tests cover both prefixes, their precedence, the preserved default, and the
+junk case -- the deprecated prefix alone would have passed even with the current
+one wired up wrong.
+
+SECURITY NOTE for review: this lets any environment turn TLS off for an earthly
+that would otherwise require it. Consistent with how every other setting already
+behaves, but a real trade -- argue it, do not assume it.
+
+Assisted-by: Claude:claude-opus-4.8 claude-code
+---
+ config/config.go       | 33 +++++++++++++++
+ config/tls_env_test.go | 92 ++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 125 insertions(+)
+ create mode 100644 config/tls_env_test.go
+
+diff --git a/config/config.go b/config/config.go
+index 4fc9f4ef..12f7c2c0 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -9,6 +9,9 @@ import (
+ 	"path/filepath"
+ 	"reflect"
+ 	"regexp"
++	"strconv"
++
++	"github.com/EarthBuild/earthbuild/internal/env"
+ 	"strings"
+ 	"time"
+ 
+@@ -164,6 +167,8 @@ func ParseYAML(yamlData []byte, installationName string) (Config, error) {
+ 		return Config{}, errors.Wrap(err, "failed to parse YAML config")
+ 	}
+ 
++	applyTLSEnabledEnvOverride(&config)
++
+ 	if config.Git == nil {
+ 		config.Git = make(map[string]GitConfig)
+ 	}
+@@ -588,3 +593,31 @@ func cfgPath(instName, path string) (string, error) {
+ 
+ 	return filepath.Join(cfgDir, path), nil
+ }
++
++// applyTLSEnabledEnvOverride lets TLS be set by environment, which is the only
++// carrier that reaches a NESTED earthly.
++//
++// Every other buildkit setting already has an env binding via EarthEnvVars. TLS
++// alone was config-file only, and a config file lives in one container while a
++// nested build runs in another. So a caller could point a callee at a daemon
++// (EARTHLY_BUILDKIT_HOST does have a binding) but never tell it how to speak to
++// one -- the callee defaulted to TLS and died on a CA nobody gave it.
++//
++// env.Lookup owns the prefix pair (EARTH_ preferred, EARTHLY_ as the migration
++// shim), so this does not restate them. When the next rename comes, it lands in
++// internal/env and not here.
++//
++// Unparseable values are IGNORED rather than read as false: a typo must not
++// silently disable TLS. Failing to the safe direction matters more than
++// reporting the typo, on a path that runs at every config load.
++func applyTLSEnabledEnvOverride(config *Config) {
++	v, ok := env.Lookup("TLS_ENABLED")
++	if !ok || v == "" {
++		return
++	}
++	b, err := strconv.ParseBool(v)
++	if err != nil {
++		return
++	}
++	config.Global.TLSEnabled = b
++}
+diff --git a/config/tls_env_test.go b/config/tls_env_test.go
+new file mode 100644
+index 00000000..c3dbcbc2
+--- /dev/null
++++ b/config/tls_env_test.go
+@@ -0,0 +1,92 @@
++package config
++
++import "testing"
++
++// TLS is the one buildkit setting with no env binding, and that makes nested
++// earthly invocations impossible to configure.
++//
++// Measured: env does not cross into a RUN step, and a config FILE lives in one
++// container only -- so a nested earthly inherits neither. It receives
++// EARTHLY_BUILDKIT_HOST (which does have an env binding), dials the daemon,
++// defaults to TLS, and dies looking for a CA nobody gave it:
++//
++//	could not connect to buildkit: could not read ca certificate
++//
++// An env binding is the only carrier that a caller can set for a callee it does
++// not build the image for.
++func TestTLSEnabledHonoursEnvOverride(t *testing.T) {
++	t.Setenv("EARTHLY_TLS_ENABLED", "false")
++	cfg, err := ParseYAML([]byte("global:\n  tls_enabled: true\n"), "earthly")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if cfg.Global.TLSEnabled {
++		t.Fatal("env override must win over the config file, or a nested earthly cannot be told to skip TLS")
++	}
++}
++
++// The default must not move: TLS stays on unless someone asks for it off.
++// Getting this backwards would silently drop TLS for every user.
++func TestTLSEnabledDefaultsOnWithoutEnv(t *testing.T) {
++	cfg, err := ParseYAML([]byte("global: {}\n"), "earthly")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !cfg.Global.TLSEnabled {
++		t.Fatal("TLS must default to enabled")
++	}
++}
++
++// An explicit "true" in the env is honoured too -- the override is a setting,
++// not a one-way off switch.
++func TestTLSEnabledEnvCanEnable(t *testing.T) {
++	t.Setenv("EARTHLY_TLS_ENABLED", "true")
++	cfg, err := ParseYAML([]byte("global:\n  tls_enabled: false\n"), "earthly")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !cfg.Global.TLSEnabled {
++		t.Fatal("env override must be able to turn TLS on as well as off")
++	}
++}
++
++// Junk must not silently disable TLS. Anything unparseable leaves the config
++// value alone -- failing open to the SAFE direction.
++func TestTLSEnabledIgnoresUnparseableEnv(t *testing.T) {
++	t.Setenv("EARTHLY_TLS_ENABLED", "yes-please")
++	cfg, err := ParseYAML([]byte("global:\n  tls_enabled: true\n"), "earthly")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !cfg.Global.TLSEnabled {
++		t.Fatal("unparseable env must not disable TLS")
++	}
++}
++
++// The CURRENT prefix. The tests above use EARTHLY_, which env.Lookup treats as
++// the migration shim -- so on their own they would still pass if the current
++// prefix were wired up wrong.
++func TestTLSEnabledHonoursCurrentPrefix(t *testing.T) {
++	t.Setenv("EARTH_TLS_ENABLED", "false")
++	cfg, err := ParseYAML([]byte("global:\n  tls_enabled: true\n"), "earthly")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if cfg.Global.TLSEnabled {
++		t.Fatal("EARTH_ prefix must be honoured")
++	}
++}
++
++// Precedence: current wins over deprecated, so a half-migrated environment
++// behaves predictably rather than depending on lookup order.
++func TestTLSEnabledCurrentPrefixWinsOverDeprecated(t *testing.T) {
++	t.Setenv("EARTH_TLS_ENABLED", "false")
++	t.Setenv("EARTHLY_TLS_ENABLED", "true")
++	cfg, err := ParseYAML([]byte("global: {}\n"), "earthly")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if cfg.Global.TLSEnabled {
++		t.Fatal("EARTH_ must win over EARTHLY_ when both are set")
++	}
++}

@@ -1,0 +1,276 @@
+From dfee4f9f3717b83fd8cc40f0f0d78576e068ba1c Mon Sep 17 00:00:00 2001
+From: Giles Cope <gilescope@gmail.com>
+Date: Fri, 31 Jul 2026 08:14:54 +0100
+Subject: [PATCH 2/5] feat(earthfile2llb): forward buildkit settings into RUN,
+ so nesting works at depth
+
+A nested earthly could not be configured. Nothing crosses into a RUN step: a
+caller's environment does not reach it (measured), and a config file lives in one
+container while the nested build runs in another. So level 2 inherited nothing,
+started its own daemon, and a CI run ended up with one cold buildkitd per test --
+each pulling its own base images, which is what earthbuild currently buys Docker
+Hub credentials to survive.
+
+Forwarding composes: level 1 puts the settings in the RUN environment, an earthly
+invoked there finds them and forwards them again. Any depth, nothing baked into
+images.
+
+Four decisions, each of which cost a wrong attempt:
+
+- Collected CLI-SIDE and threaded through ConvertOpt. The converter runs inside
+  buildkitd's gateway, so os.LookupEnv there returns the daemon's environment --
+  a debug print from that package never reached the CLI's stderr.
+- Forwards the SANDBOX address, not this CLI's. Ours names the daemon from the
+  host (a container IP, a socket) and neither resolves inside an exec.
+- tcp://buildkitsandbox:8372 is a buildkit constant written into every exec's
+  /etc/hosts, so the string is identical on every machine while resolving
+  locally. A machine-specific address would make every forwarded RUN unmergeable
+  and quietly undo cross-machine single-flight.
+- Keys sorted: map order would vary the LLB, and a vertex that differs run to run
+  cannot merge.
+
+The list is EXPLICIT, not a prefix match. EARTH_*/EARTHLY_* on a build host
+carries credentials -- earthbuild's own tests use DOCKERHUB_AUTH and
+DOCKERHUB_MIRROR_PASS -- and a prefix rule would copy them into every container
+and into cache keys shared across a fleet. The bar for adding an entry is not
+"not secret" but SAFE TO PUBLISH: forwarded values land in the image config and
+are visible in docker inspect and the lease-key debug string. Three tests enforce
+that the list stays short, carries nothing credential-shaped, and names suffixes
+rather than full variables.
+
+Verified: a RUN with no ENV line reports
+EARTH_BUILDKIT_HOST=tcp://buildkitsandbox:8372.
+
+Assisted-by: Claude:claude-opus-4.8 claude-code
+---
+ builder/builder.go                |  4 ++
+ earthfile2llb/converter.go        | 90 +++++++++++++++++++++++++++++++
+ earthfile2llb/earthfile2llb.go    | 10 ++++
+ earthfile2llb/forward_env_test.go | 63 ++++++++++++++++++++++
+ 4 files changed, 167 insertions(+)
+ create mode 100644 earthfile2llb/forward_env_test.go
+
+diff --git a/builder/builder.go b/builder/builder.go
+index 403b38fa..5f39431f 100644
+--- a/builder/builder.go
++++ b/builder/builder.go
+@@ -338,6 +338,10 @@ func (b *Builder) convertAndBuild(
+ 				FilesWithCommandRenameWarning:        make(map[string]bool),
+ 				BuildkitSkipper:                      b.opt.BuildkitSkipper,
+ 				NoAutoSkip:                           b.opt.NoAutoSkip,
++				// Collected HERE, CLI-side. The converter runs inside
++				// buildkitd's gateway, so reading the environment there would
++				// return the daemon's, not ours.
++				ForwardedBuildkitEnv: earthfile2llb.CollectForwardedBuildkitEnv(),
+ 			}
+ 
+ 			mts, err = earthfile2llb.Earthfile2LLB(childCtx, target, opt, true)
+diff --git a/earthfile2llb/converter.go b/earthfile2llb/converter.go
+index 65bc1d30..3af20dfc 100644
+--- a/earthfile2llb/converter.go
++++ b/earthfile2llb/converter.go
+@@ -15,6 +15,7 @@ import (
+ 	"os"
+ 	"path"
+ 	"path/filepath"
++	"sort"
+ 	"strconv"
+ 	"strings"
+ 	"time"
+@@ -27,6 +28,7 @@ import (
+ 	"github.com/EarthBuild/earthbuild/features"
+ 	"github.com/EarthBuild/earthbuild/inputgraph"
+ 	"github.com/EarthBuild/earthbuild/internal/earthfile"
++	"github.com/EarthBuild/earthbuild/internal/env"
+ 	"github.com/EarthBuild/earthbuild/logbus"
+ 	"github.com/EarthBuild/earthbuild/logstream"
+ 	"github.com/EarthBuild/earthbuild/states"
+@@ -2862,6 +2864,8 @@ func (c *Converter) internalRun(ctx context.Context, opts ConvertRunOpts) (pllb.
+ 		}
+ 	}
+ 
++	state = forwardBuildkitEnv(state, c.opt.ForwardedBuildkitEnv)
++
+ 	if isInteractive {
+ 		c.mts.Final.RanInteractive = true
+ 
+@@ -3572,3 +3576,89 @@ func strIf(condition bool, str string) string {
+ 
+ 	return ""
+ }
++
++// forwardedEnvSuffixes are the settings earthly hands down to a nested earthly,
++// as suffixes for env.Lookup (which owns the EARTH_/EARTHLY_ prefix pair).
++//
++// EXPLICIT, not a prefix match. EARTH_*/EARTHLY_* on a build host includes
++// credentials -- earthbuild's own tests carry DOCKERHUB_AUTH and
++// DOCKERHUB_MIRROR_PASS -- and a prefix rule would copy them into every
++// container AND into cache keys that are then shared across the fleet.
++//
++// The bar for adding an entry is not "not secret" but SAFE TO PUBLISH: a
++// forwarded value lands in the image config, so it shows up in docker inspect of
++// any exported image and in the lease-key debug string.
++var forwardedEnvSuffixes = []string{
++	// Where the daemon is. Value is tcp://buildkitsandbox:8372 --
++	// buildkitsandbox is a buildkit constant (executor/oci/hosts.go), written
++	// into every exec's /etc/hosts, so the STRING is identical on every machine
++	// while resolving locally. That is what keeps forwarding from poisoning
++	// cache keys: a machine-specific address would make every forwarded RUN
++	// unmergeable and quietly undo cross-machine single-flight.
++	"BUILDKIT_HOST",
++	// How to speak to it. Without this a nested earthly dials the daemon,
++	// defaults to TLS, and dies on a CA nobody gave it.
++	"TLS_ENABLED",
++}
++
++// CollectForwardedBuildkitEnv reads the settings to hand down, and must be
++// called CLI-side.
++//
++// The converter cannot do this itself: it runs inside buildkitd's gateway, so
++// os.LookupEnv there returns the daemon's environment. That was measured, not
++// assumed -- a debug print from the converter never reached the CLI's stderr.
++func CollectForwardedBuildkitEnv() map[string]string {
++	out := map[string]string{}
++	for _, suffix := range forwardedEnvSuffixes {
++		if suffix == "BUILDKIT_HOST" {
++			// NOT this CLI's address. Ours names the daemon from the HOST --
++			// a container IP, or a socket -- and neither means anything inside
++			// an exec. sandboxBuildkitHost is how the same daemon is reached
++			// from in there, and it is a constant, which is also what keeps
++			// forwarding from poisoning cache keys.
++			//
++			// Only forwarded when this earthly is itself using a daemon: if it
++			// is not, there is nothing for a nested build to share.
++			if _, ok := env.Lookup(suffix); ok {
++				out[env.Prefix+suffix] = sandboxBuildkitHost
++			}
++			continue
++		}
++		if v, ok := env.Lookup(suffix); ok && v != "" {
++			out[env.Prefix+suffix] = v
++		}
++	}
++	return out
++}
++
++// sandboxBuildkitHost is how a nested build reaches the daemon running this
++// build. buildkitsandbox is a buildkit constant (executor/oci/hosts.go) written
++// into every exec's /etc/hosts, so this string is identical on every machine
++// while resolving locally -- and identical strings are what let forwarded RUNs
++// still merge across a fleet.
++const sandboxBuildkitHost = "tcp://buildkitsandbox:8372"
++
++// forwardBuildkitEnv puts the caller-supplied settings into the RUN
++// environment, so an earthly invoked inside that RUN finds them.
++//
++// This is the only mechanism that works at depth. A caller's environment does
++// NOT reach a RUN step (measured), and a config file lives in one container --
++// so without forwarding, level 2 inherits nothing and starts its own daemon,
++// which is how a CI run ends up with one cold buildkitd per test.
++func forwardBuildkitEnv(state pllb.State, fwd map[string]string) pllb.State {
++	for _, k := range sortedKeys(fwd) {
++		state = state.AddEnv(k, fwd[k])
++	}
++	return state
++}
++
++// sortedKeys keeps the env deterministic: map order would otherwise vary the
++// LLB, and a vertex that differs run to run cannot merge across machines.
++func sortedKeys(m map[string]string) []string {
++	out := make([]string, 0, len(m))
++	for k := range m {
++		out = append(out, k)
++	}
++	sort.Strings(out)
++	return out
++}
+diff --git a/earthfile2llb/earthfile2llb.go b/earthfile2llb/earthfile2llb.go
+index ee0f68c9..b2d2897a 100644
+--- a/earthfile2llb/earthfile2llb.go
++++ b/earthfile2llb/earthfile2llb.go
+@@ -177,6 +177,16 @@ type ConvertOpt struct {
+ 	UseFakeDep bool
+ 	// NoAutoSkip disables auto-skip usages.
+ 	NoAutoSkip bool
++
++	// ForwardedBuildkitEnv is this earthly's own buildkit settings, to be placed
++	// in every RUN environment so an earthly invoked inside that RUN finds them.
++	//
++	// Supplied by the CALLER, never read from the environment here: the
++	// converter runs inside buildkitd's gateway, so os.LookupEnv would see the
++	// daemon's environment rather than the CLI's. Measured -- a debug print from
++	// this package never reached the CLI's stderr, and no forwarded variable
++	// reached a RUN.
++	ForwardedBuildkitEnv map[string]string
+ 	// UseInlineCache enables the inline caching feature (use any SAVE IMAGE --push declaration as
+ 	// cache import).
+ 	UseInlineCache bool
+diff --git a/earthfile2llb/forward_env_test.go b/earthfile2llb/forward_env_test.go
+new file mode 100644
+index 00000000..377dff6d
+--- /dev/null
++++ b/earthfile2llb/forward_env_test.go
+@@ -0,0 +1,63 @@
++package earthfile2llb
++
++import "testing"
++
++// Forwarding earthly's own buildkit settings into RUN environments is what makes
++// a NESTED earthly work at any depth: level 1 sets them, level 2 inherits and
++// re-forwards, and so on. Nothing else crosses -- measured, a caller's env does
++// not reach a RUN step, and a config file lives in one container.
++//
++// The list is EXPLICIT, not a prefix match. EARTH_*/EARTHLY_* on a build host
++// includes credentials (DOCKERHUB_AUTH, DOCKERHUB_MIRROR_PASS, tokens), and a
++// prefix rule would copy them into every container AND into cache keys that are
++// then shared across the fleet. That is secret exfiltration wearing a nesting
++// fix's clothes.
++//
++// The bar for adding an entry is not "not secret" but SAFE TO PUBLISH: a
++// forwarded value lands in the image config, so it is visible in docker inspect
++// of any exported image and in the lease-key debug string.
++
++func TestForwardedEnvIsAnExplicitShortList(t *testing.T) {
++	if len(forwardedEnvSuffixes) == 0 {
++		t.Fatal("nothing forwarded means nesting cannot work at all")
++	}
++	// A short list is the invariant. If this fails, someone has started using it
++	// as a general-purpose env channel -- which is exactly what the explicit
++	// list exists to prevent.
++	if len(forwardedEnvSuffixes) > 4 {
++		t.Fatalf("forwarding %d vars: keep the list short and justified", len(forwardedEnvSuffixes))
++	}
++}
++
++// Guard the actual danger. These names, or anything shaped like them, must never
++// be forwarded -- they are the ones a build host really does carry.
++func TestForwardedEnvCarriesNoCredentials(t *testing.T) {
++	banned := []string{"TOKEN", "SECRET", "PASS", "AUTH", "KEY", "CREDENTIAL"}
++	for _, suffix := range forwardedEnvSuffixes {
++		for _, b := range banned {
++			if contains(suffix, b) {
++				t.Fatalf("%q looks credential-shaped and must not be forwarded: it lands in the image config", suffix)
++			}
++		}
++	}
++}
++
++// Suffixes, not full names: internal/env owns the EARTH_/EARTHLY_ pair and its
++// own comment says the deprecated one is a migration shim to be dropped. Naming
++// full variables here would make that removal a hunt.
++func TestForwardedEnvUsesSuffixesNotFullNames(t *testing.T) {
++	for _, suffix := range forwardedEnvSuffixes {
++		if contains(suffix, "EARTH_") || contains(suffix, "EARTHLY_") {
++			t.Fatalf("%q carries a prefix; env.Lookup owns those", suffix)
++		}
++	}
++}
++
++func contains(s, sub string) bool {
++	for i := 0; i+len(sub) <= len(s); i++ {
++		if s[i:i+len(sub)] == sub {
++			return true
++		}
++	}
++	return false
++}

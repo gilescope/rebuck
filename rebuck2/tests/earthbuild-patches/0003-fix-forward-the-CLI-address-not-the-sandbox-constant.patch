@@ -1,0 +1,27 @@
+From cb8bed76b49f012db12f625f7879040b8a7a32c3 Mon Sep 17 00:00:00 2001
+From: Giles Cope <gilescope@gmail.com>
+Date: Sat, 1 Aug 2026 06:36:21 +0100
+Subject: [PATCH 3/5] fix: forward the CLI address, not the sandbox constant
+
+---
+ earthfile2llb/converter.go | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/earthfile2llb/converter.go b/earthfile2llb/converter.go
+index 3af20dfc..57ae870c 100644
+--- a/earthfile2llb/converter.go
++++ b/earthfile2llb/converter.go
+@@ -3610,7 +3610,12 @@ var forwardedEnvSuffixes = []string{
+ func CollectForwardedBuildkitEnv() map[string]string {
+ 	out := map[string]string{}
+ 	for _, suffix := range forwardedEnvSuffixes {
+-		if suffix == "BUILDKIT_HOST" {
++		// The sandbox constant is only reachable when an exec shares the
++		// daemon's network namespace. Under NETWORK_MODE=cni it does not --
++		// buildkitsandbox then resolves to the exec itself and the dial is
++		// refused (measured). Forward this CLI's own address, which an exec
++		// CAN reach.
++		if false {
+ 			// NOT this CLI's address. Ours names the daemon from the HOST --
+ 			// a container IP, or a socket -- and neither means anything inside
+ 			// an exec. sandboxBuildkitHost is how the same daemon is reached
