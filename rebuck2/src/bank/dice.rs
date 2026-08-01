@@ -42,14 +42,28 @@ struct Row {
 }
 
 impl Row {
+    /// Rows arrive from a DOWNLOADED artifact, so every field is remote
+    /// input. The keys are parsed as i64 and cannot be anything else; the
+    /// value is the one free-text field, and it goes on to be
+    /// concatenated into a `X'..'` blob literal - so it is validated
+    /// HERE, at the trust boundary, rather than trusted because sqlite's
+    /// own hex() produced it on some other machine.
     fn parse(line: &str) -> Option<Self> {
         let mut it = line.splitn(4, ' ');
-        Some(Row {
+        let row = Row {
             shard: it.next()?.parse().ok()?,
             key_hi: it.next()?.parse().ok()?,
             key_lo: it.next()?.parse().ok()?,
             value_hex: it.next()?.to_owned(),
-        })
+        };
+        // Even-length ASCII hex, or it is not a blob literal and has no
+        // business reaching the replay.
+        if !row.value_hex.len().is_multiple_of(2)
+            || !row.value_hex.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        Some(row)
     }
     fn key(&self) -> String {
         format!("{} {}", self.key_hi, self.key_lo)
@@ -192,8 +206,8 @@ pub fn merge(db: &Path, segments: &[PathBuf]) -> Result<u64> {
         }
         for line in zstd::read_lines(&rows)? {
             if let Some(r) = Row::parse(&line) {
-                // The value is hex from sqlite's own hex(), so it cannot
-                // carry a quote - but bind it as a blob literal anyway.
+                // Safe to interpolate ONLY because Row::parse rejects
+                // anything but even-length ASCII hex - see there.
                 by_shard[(r.shard & 15) as usize].push(format!(
                     "INSERT OR IGNORE INTO pagable_data VALUES({},{},X'{}');",
                     r.key_lo, r.key_hi, r.value_hex
@@ -358,5 +372,37 @@ mod tests {
         // A negative key_hi is real: sqlite stores these as signed i64 and
         // awk's arithmetic could not be trusted with them.
         assert!(Row::parse("bad").is_none());
+    }
+
+    #[test]
+    fn a_crafted_value_cannot_reach_the_replay() {
+        // The value is concatenated into X'..' for sqlite3, and rows come
+        // from a downloaded artifact in a namespace shared with every run
+        // and branch in the repo. Rejecting at parse is what makes the
+        // interpolation safe.
+        for evil in [
+            "3 1 2 ');DROP TABLE pagable_data;--",
+            "3 1 2 AA'",
+            "3 1 2 zz",
+            "3 1 2 ABC",   // odd length is not a blob
+            "3 1 2 AA BB", // splitn(4) keeps the space - still not hex
+        ] {
+            assert!(
+                Row::parse(evil).is_none(),
+                "{evil:?} must not parse into a replayable row"
+            );
+        }
+        // An empty value is X'' - a valid empty blob, and not injectable.
+        // Rejecting it would silently drop legitimate rows, so the rule
+        // is "hex or nothing", not "non-empty".
+        assert!(
+            Row::parse("3 1 2 ").is_some(),
+            "an empty blob is legitimate"
+        );
+        assert!(Row::parse("3 1 2 deadbeef").is_some(), "lowercase hex too");
+        assert!(
+            Row::parse("3 1 2 DEADBEEF").is_some(),
+            "real hex still parses"
+        );
     }
 }
