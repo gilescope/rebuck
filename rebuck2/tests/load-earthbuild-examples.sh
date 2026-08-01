@@ -20,6 +20,7 @@
 #
 # Usage: rebuck2/tests/load-earthbuild-examples.sh [target ...]
 #   e.g. rebuck2/tests/load-earthbuild-examples.sh ./examples/go+build
+#   SOLO=1 skips the pair phase — breadth over many targets, ~390s a target cheaper.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -280,6 +281,7 @@ for T in "${TARGETS[@]}"; do
     if [[ "$T" == *,* ]]; then
         TA="${T%%,*}"; TB="${T#*,}"
         echo "=== PAIR MODE: instance 1 -> $TA, instance 2 -> $TB (no solo)"
+        [ -n "${SOLO:-}" ] && echo "⚠ SOLO=1 ignored for '$T': this shape has no solo phase."
     else
         echo "=== instance 1 alone (cold): does a real graph even build on our fork?"
         SECONDS=0
@@ -292,6 +294,14 @@ for T in "${TARGETS[@]}"; do
             FAILED+=("$T (solo)")
             continue
         fi
+        # SOLO=1: does-it-build across many targets, without paying for the pair.
+        # The pair phase answers "do two instances collide and merge", which is a
+        # property of the COORDINATOR and does not change per target -- so a
+        # breadth sweep pays ~390s a target for an answer it already has. Solo
+        # alone is what says whether a target survives consolidation, and that
+        # DOES differ per target: LOCALLY inside a nested build needs its own
+        # daemon, and only running the target finds out.
+        if [ -n "${SOLO:-}" ]; then continue; fi
     fi
 
     echo
@@ -322,10 +332,14 @@ for T in "${TARGETS[@]}"; do
     echo "=== now BOTH instances build $T at once, both COLD (the real load)"
     BEFORE="$(stats $DP)"
     SECONDS=0
-    run_eb "pair-1" "$BK1" "$TA" "$SRC1" & P1=$!
-    run_eb "pair-2" "$BK2" "$TB" "$SRC2" & P2=$!
-    if ! wait $P1; then echo "FAIL: $T instance 1"; tail -20 "$SCRATCH/pair-1.log"; FAILED+=("$T (pair-1)"); fi
-    if ! wait $P2; then echo "FAIL: $T instance 2"; tail -20 "$SCRATCH/pair-2.log"; FAILED+=("$T (pair-2)"); fi
+    # Per-target log names. A survey over 12 groups otherwise ends with one
+    # pair-1.log -- the last target's -- and the evidence for whichever one
+    # actually failed has been overwritten by the ones that passed after it.
+    PLOG="pair-$(echo "$T" | tr -c 'a-zA-Z0-9' '_')"
+    run_eb "$PLOG-1" "$BK1" "$TA" "$SRC1" & P1=$!
+    run_eb "$PLOG-2" "$BK2" "$TB" "$SRC2" & P2=$!
+    if ! wait $P1; then echo "FAIL: $T instance 1"; tail -20 "$SCRATCH/$PLOG-1.log"; FAILED+=("$T (pair-1)"); fi
+    if ! wait $P2; then echo "FAIL: $T instance 2"; tail -20 "$SCRATCH/$PLOG-2.log"; FAILED+=("$T (pair-2)"); fi
     echo "both finished in ${SECONDS}s"
     echo "  driver before: $BEFORE"
     echo "  driver after:  $(stats $DP)"
