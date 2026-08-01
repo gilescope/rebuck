@@ -85,7 +85,11 @@ jobs:
         if: matrix.arm == 'consolidated'
         run: |
           cd earthbuild
-          git -c user.name=ci -c user.email=ci@local am \
+          # gpgsign explicitly off: a runner has no signing config so this is
+          # inert here, but the same command run on a developer box with a
+          # yubikey dies on "gpg: signing failed: Inappropriate ioctl for
+          # device", which reads as a broken patch and is not one.
+          git -c user.name=ci -c user.email=ci@local -c commit.gpgsign=false am \
             ../rebuck2src/rebuck2/tests/earthbuild-patches/*.patch
           git log --oneline "${EARTHBUILD_BASE}..HEAD"
 
