@@ -175,6 +175,12 @@ runs:
             "$CAS_LINEAGE" "${CAS_PARENT_LINEAGE:--}" || rc=$?
         [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || exit "$rc"
 
+        # How many AC entries the seed actually laid down. driver-finish
+        # warns when a lap restored an AC yet served ZERO hits - a silent
+        # cache regression that hid behind three green laps once, because
+        # a cold cache and a working one look identical from the outside.
+        echo "REBUCK2_SEEDED_AC_COUNT=$(find "$STORE/driver/ac" -type f 2>/dev/null | wc -l | tr -d ' ')" >> "$GITHUB_ENV"
+
         # The co-worker executes actions too, so it authors rows and needs
         # its own history to re-pack from - and its own staging dir, or
         # its restore would overwrite the driver's manifest head.

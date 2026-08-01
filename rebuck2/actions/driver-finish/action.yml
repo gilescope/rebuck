@@ -1,123 +1,124 @@
-name: rebuck2 driver-finish
+name: rebuck2 driver finish
 description: >-
-  Teardown for the `driver` action - call it with `if: always()` after the
-  build steps. Finalizes CAS shards across the fleet (when the driver was
-  started with finalize), re-snapshots the store unless unchanged since
-  seed, prints dispatch stats, uploads the driver log, and stops the
-  driver. Reads its state from the env the `driver` action exported.
+  Close the lap: stop the driver so the fleet packs in parallel, tell any
+  worker still dialling that the party is over, bank what this box
+  authored, and collect the logs. Pair with `driver` around your build.
 
 inputs:
   log-artifact:
-    description: Artifact name for the driver + co-worker logs. Empty = skip.
-    default: "driver-log"
-  finalize-wait-secs:
-    description: How long to wait for the fleet to acknowledge shard finalize.
-    default: "1000"
+    description: Artifact name for the driver + co-worker logs.
+    default: "rebuck2-logs"
 
 runs:
   using: composite
   steps:
-    # Hand CAS persistence to the fleet: driver assigns shards, workers
-    # sync + save them in their own teardown (parallel, off our path).
-    - name: Finalize shards across the fleet
+    # Stopping first is deliberate: it broadcasts exit to the fleet, so
+    # every worker starts its own pack while this box does the same. The
+    # driver's teardown is then off the critical path.
+    - name: Stop the driver
       if: always()
       shell: bash
-      env:
-        IN_WAIT: ${{ inputs.finalize-wait-secs }}
       run: |
-        [ -n "${REBUCK2_FINALIZE_FILE:-}" ] || { echo "finalize not enabled - skipping"; exit 0; }
-        touch "$REBUCK2_FINALIZE_FILE"
-        for _ in $(seq 1 $((IN_WAIT / 5))); do
-          [ -f "$REBUCK2_FINALIZE_FILE.done" ] && { echo "finalized: $(cat "$REBUCK2_FINALIZE_FILE.done") workers"; exit 0; }
-          kill -0 "$(cat "$REBUCK2_DRIVER_PID_FILE")" 2>/dev/null || { echo "driver gone before finalize"; exit 0; }
+        kill "$(cat "$REBUCK2_DRIVER_PID_FILE")" 2>/dev/null || true
+        for _ in $(seq 1 24); do
+          pgrep -f "rebuck2 worker" > /dev/null 2>&1 || break
           sleep 5
         done
-        echo "finalize timed out (workers save what they synced)"
 
-    - name: Pack store snapshot (skip when unchanged)
-      id: pack
+    # A 0-byte marker keyed to this run. A worker that arrives after the
+    # driver has gone reads it and exits clean, instead of burning its
+    # whole connect budget dialling a corpse (run 30517451940: 1h34m).
+    # always(): a FAILED driver ends the party too.
+    - name: Mark the lap finished
       if: always()
       shell: bash
       run: |
-        [ -n "${REBUCK2_SNAPSHOT_KEY_PREFIX:-}" ] || { echo "skip=1" >> "$GITHUB_OUTPUT"; echo "snapshots disabled"; exit 0; }
-        if bash "$GITHUB_ACTION_PATH/../store-snapshot.sh" unchanged \
-             "$REBUCK2_STORE/driver" "$REBUCK2_SEEDED_MANIFEST" "$REBUCK2_SNAPSHOT_SUBDIRS"; then
-          echo "[snapshot] store unchanged since seed - skipping pack + upload"
-          echo "skip=1" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-        mkdir -p "$REBUCK2_SNAPSHOT_DIR"
-        # shellcheck disable=SC2086 # subdirs intentionally word-splits
-        tar -c -C "$REBUCK2_STORE/driver" $REBUCK2_SNAPSHOT_SUBDIRS \
-          | zstd -T0 --long=27 -8 > "$REBUCK2_SNAPSHOT_DIR/bulk.tar.zst"
-        ls -lh "$REBUCK2_SNAPSHOT_DIR/"
+        mkdir -p "$REBUCK2_WORK/lapdone"
+        : > "$REBUCK2_WORK/lapdone/done"
 
-    - name: Save store snapshot
-      if: always() && steps.pack.outputs.skip != '1'
+    - if: always()
       uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
       with:
-        path: ${{ runner.temp }}/rebuck2-driver/snapshot
-        key: ${{ env.REBUCK2_SNAPSHOT_KEY_PREFIX }}${{ github.run_id }}
+        path: ${{ runner.temp }}/rebuck2-driver/lapdone
+        key: rebuck2-done-${{ github.run_id }}
 
-    - name: Pack CAS shards (skip unchanged ones)
-      id: shards
+    - name: Bank what the driver authored
+      id: pack-driver
       if: always()
       shell: bash
-      env:
-        GH_TOKEN: ${{ github.token }}
       run: |
-        [ "${REBUCK2_CAS_SHARDS:-false}" = "true" ] || { echo "cas shards disabled"; exit 0; }
-        mkdir -p "$REBUCK2_WORK/shard-out"
-        for i in 0 1 2 3; do
-          p=$(printf 'cas/%x* cas/%x* cas/%x* cas/%x*' $((i*4)) $((i*4+1)) $((i*4+2)) $((i*4+3)))
-          # Skip only when BOTH unchanged since seed AND already published -
-          # a warm first lap is unchanged by definition and the pool would
-          # never bootstrap on unchanged-alone.
-          published=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$REBUCK2_SHARD_PREFIX$i&per_page=1" \
-            --jq '[.artifacts[] | select(.expired==false)] | length' 2>/dev/null || echo 0)
-          if [ "${published:-0}" -gt 0 ] \
-             && bash "$GITHUB_ACTION_PATH/../store-snapshot.sh" unchanged \
-               "$REBUCK2_STORE/driver" "$REBUCK2_SEEDED_MANIFEST.shard$i" "$p"; then
-            echo "[shard] $i unchanged since seed and published - skipping"
-            continue
-          fi
-          mkdir -p "$REBUCK2_WORK/shard-out/$i"
-          # shellcheck disable=SC2086 # prefix list intentionally word-splits
-          (cd "$REBUCK2_STORE/driver" && find $p -mindepth 1 -maxdepth 1 -type f 2>/dev/null) \
-            | tar -c -C "$REBUCK2_STORE/driver" -T - \
-            | zstd -T0 --long=27 -8 > "$REBUCK2_WORK/shard-out/$i/bulk.tar.zst"
-          echo "up$i=1" >> "$GITHUB_OUTPUT"
-        done
-        ls -lhR "$REBUCK2_WORK/shard-out/" 2>/dev/null || true
+        set -euo pipefail
+        BANK_WORK="$REBUCK2_WORK/bank-driver" \
+          rebuck2 bank publish "$REBUCK2_STORE/driver" driver - \
+            "$REBUCK2_LINEAGE" "$GITHUB_RUN_ID" "$REBUCK2_PARENT_LINEAGE"
 
-    - name: Publish CAS shard 0
-      if: always() && steps.shards.outputs.up0 == '1'
+    - id: cas-container-driver
+      if: always() && steps.pack-driver.outputs.have == '1'
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
-        name: ${{ env.REBUCK2_SHARD_PREFIX }}0
-        path: ${{ runner.temp }}/rebuck2-driver/shard-out/0/bulk.tar.zst
+        name: cas-segs-${{ env.REBUCK2_LINEAGE }}-${{ github.run_id }}-driver
+        path: ${{ runner.temp }}/rebuck2-driver/bank-driver/bank-container
         compression-level: 0
-    - name: Publish CAS shard 1
-      if: always() && steps.shards.outputs.up1 == '1'
+
+    - if: always() && steps.pack-driver.outputs.spill == '1'
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
-        name: ${{ env.REBUCK2_SHARD_PREFIX }}1
-        path: ${{ runner.temp }}/rebuck2-driver/shard-out/1/bulk.tar.zst
+        name: cas-spill-${{ env.REBUCK2_LINEAGE }}-${{ github.run_id }}-driver
+        path: ${{ runner.temp }}/rebuck2-driver/bank-driver/bank-spill
         compression-level: 0
-    - name: Publish CAS shard 2
-      if: always() && steps.shards.outputs.up2 == '1'
+
+    - id: ac-container-driver
+      if: always() && steps.pack-driver.outputs.ac-have == '1'
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
-        name: ${{ env.REBUCK2_SHARD_PREFIX }}2
-        path: ${{ runner.temp }}/rebuck2-driver/shard-out/2/bulk.tar.zst
+        name: cas-ac-segs-${{ env.REBUCK2_LINEAGE }}-${{ github.run_id }}-driver
+        path: ${{ runner.temp }}/rebuck2-driver/bank-driver/ac-container
         compression-level: 0
-    - name: Publish CAS shard 3
-      if: always() && steps.shards.outputs.up3 == '1'
+
+    - if: always() && steps.pack-driver.outputs.ac-have == '1' && steps.ac-container-driver.outcome == 'success'
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
-        name: ${{ env.REBUCK2_SHARD_PREFIX }}3
-        path: ${{ runner.temp }}/rebuck2-driver/shard-out/3/bulk.tar.zst
+        name: cas-manifest-${{ env.REBUCK2_LINEAGE }}-ac-driver
+        path: ${{ runner.temp }}/rebuck2-driver/bank-driver/ac-manifest-out
+
+    - name: Bank what the co-worker authored
+      id: pack-coworker
+      if: always() && env.REBUCK2_COWORKER == '1'
+      shell: bash
+      run: |
+        set -euo pipefail
+        BANK_WORK="$REBUCK2_WORK/bank-co-worker" \
+          rebuck2 bank publish "$REBUCK2_STORE/co-worker" co-worker - \
+            "$REBUCK2_LINEAGE" "$GITHUB_RUN_ID" "$REBUCK2_PARENT_LINEAGE"
+
+    - id: cas-container-coworker
+      if: always() && steps.pack-coworker.outputs.have == '1'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: cas-segs-${{ env.REBUCK2_LINEAGE }}-${{ github.run_id }}-co-worker
+        path: ${{ runner.temp }}/rebuck2-driver/bank-co-worker/bank-container
         compression-level: 0
+
+    - if: always() && steps.pack-coworker.outputs.spill == '1'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: cas-spill-${{ env.REBUCK2_LINEAGE }}-${{ github.run_id }}-co-worker
+        path: ${{ runner.temp }}/rebuck2-driver/bank-co-worker/bank-spill
+        compression-level: 0
+
+    - id: ac-container-coworker
+      if: always() && steps.pack-coworker.outputs.ac-have == '1'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: cas-ac-segs-${{ env.REBUCK2_LINEAGE }}-${{ github.run_id }}-co-worker
+        path: ${{ runner.temp }}/rebuck2-driver/bank-co-worker/ac-container
+        compression-level: 0
+
+    - if: always() && steps.pack-coworker.outputs.ac-have == '1' && steps.ac-container-coworker.outcome == 'success'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: cas-manifest-${{ env.REBUCK2_LINEAGE }}-ac-co-worker
+        path: ${{ runner.temp }}/rebuck2-driver/bank-co-worker/ac-manifest-out
 
     - name: Dispatch stats
       if: always()
@@ -141,6 +142,7 @@ runs:
         grep -a "\[stats\]" "$REBUCK2_DRIVER_LOG" | tail -2 || true
         tail -5 "$REBUCK2_DRIVER_LOG"
 
+
     - name: Upload driver log
       if: always() && inputs.log-artifact != ''
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -150,8 +152,3 @@ runs:
           ${{ runner.temp }}/rebuck2-driver/driver.log
           ${{ runner.temp }}/rebuck2-driver/co-worker.log
         if-no-files-found: ignore
-
-    - name: Stop driver
-      if: always()
-      shell: bash
-      run: kill "$(cat "$REBUCK2_DRIVER_PID_FILE")" 2>/dev/null || true
