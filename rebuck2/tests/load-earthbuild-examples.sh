@@ -265,6 +265,13 @@ else:
 ' || echo "(unavailable)"
 }
 
+# A target becomes a filename, and a target can be arbitrarily long -- a
+# mis-quoted argument list arrives as ONE target and the derived name then
+# exceeds NAME_MAX, so the run dies on "File name too long" after 0s with the
+# real mistake nowhere in the message. Truncate; collisions are cosmetic here
+# and a readable failure is not.
+slug() { echo "$1" | tr -c 'a-zA-Z0-9' '_' | cut -c1-80; }
+
 # A survey wants EVERY failure, not the first. Bailing on target 1 means
 # targets 2..N are never tested, and the one that breaks is rarely the one you
 # most wanted to see. Collect and report at the end; exit non-zero if any failed.
@@ -285,7 +292,7 @@ for T in "${TARGETS[@]}"; do
     else
         echo "=== instance 1 alone (cold): does a real graph even build on our fork?"
         SECONDS=0
-        LOG="solo-$(echo "$T" | tr -c 'a-zA-Z0-9' '_')"
+        LOG="solo-$(slug "$T")"
         if run_eb "$LOG" "$BK1" "$T" "$SRC1"; then
             echo "PASS: $T built on dist-buildkit in ${SECONDS}s"
         else
@@ -335,7 +342,7 @@ for T in "${TARGETS[@]}"; do
     # Per-target log names. A survey over 12 groups otherwise ends with one
     # pair-1.log -- the last target's -- and the evidence for whichever one
     # actually failed has been overwritten by the ones that passed after it.
-    PLOG="pair-$(echo "$T" | tr -c 'a-zA-Z0-9' '_')"
+    PLOG="pair-$(slug "$T")"
     run_eb "$PLOG-1" "$BK1" "$TA" "$SRC1" & P1=$!
     run_eb "$PLOG-2" "$BK2" "$TB" "$SRC2" & P2=$!
     if ! wait $P1; then echo "FAIL: $T instance 1"; tail -20 "$SCRATCH/$PLOG-1.log"; FAILED+=("$T (pair-1)"); fi
