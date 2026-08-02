@@ -347,6 +347,87 @@ pub async fn restore(r: Restore<'_>, work: &Path) -> Result<Option<u64>> {
     Ok(Some(merged))
 }
 
+pub struct Publish<'a> {
+    pub dice_dir: &'a Path,
+    pub lineage: &'a str,
+    pub parent: Option<&'a str>,
+    pub seed: &'a str,
+    pub run: &'a str,
+}
+
+/// Stage this lap's dice delta. Returns false when there is nothing new.
+pub fn publish(p: Publish<'_>, work: &Path) -> Result<bool> {
+    let db = p.dice_dir.join("db");
+    let skeleton = graph_meta(p.dice_dir);
+    if !db.is_dir() || !skeleton.is_file() {
+        println!(
+            "[dice-bank] no db/graph.meta under {} - nothing to publish",
+            p.dice_dir.display()
+        );
+        return Ok(false);
+    }
+
+    let container = format!("cas-dice-segs-{}-{}", p.lineage, p.run);
+    let segs = work.join("dice-segs");
+    let container_dir = work.join("dice-container");
+    let manifest_dir = work.join("dice-manifest-out");
+    for d in [&segs, &container_dir, &manifest_dir] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    let banked = super::read_list(&work.join("dice-banked-keys.txt"))?;
+    let names = pack(&db, &banked, &segs)?;
+    if names.is_empty() {
+        println!("[dice-bank] no new dice rows");
+        let _ = std::fs::remove_dir_all(&segs);
+        return Ok(false);
+    }
+
+    std::fs::create_dir_all(&container_dir)?;
+    for name in &names {
+        let from = segs.join(name);
+        let to = container_dir.join(name);
+        std::fs::create_dir_all(&to)?;
+        std::fs::rename(from.join("rows.txt.zst"), to.join("rows.txt.zst"))?;
+        let mut seg: Segment =
+            serde_json::from_str(&std::fs::read_to_string(from.join("meta.json"))?)?;
+        seg.artifact = Some(container.clone());
+        std::fs::write(from.join("meta.json"), serde_json::to_string(&seg)? + "\n")?;
+    }
+
+    let head = work.join("dice-head");
+    let head_manifest = head.join("manifest.json");
+    let prev_gen = head_manifest
+        .is_file()
+        .then(|| Manifest::read(&head_manifest))
+        .transpose()?
+        .map(|m| m.generation);
+    super::manifest::write_manifest(
+        p.lineage,
+        &format!("{}-1", p.run),
+        p.parent,
+        prev_gen.as_deref(),
+        p.run.parse().unwrap_or(0),
+        head_manifest.is_file().then_some(head.as_path()),
+        &segs,
+        &manifest_dir,
+    )?;
+
+    // The skeleton rides the manifest whole: it is byte-stable, and it
+    // must be ATOMIC with the row index that references it - a manifest
+    // pointing at rows from a different graph shape is unhydratable.
+    zstd::compress_file(&skeleton, &manifest_dir.join("graph.meta.zst"), 8)?;
+
+    println!(
+        "[dice-bank] {} segments in {container}; manifest dice-{} gen {}-1 staged",
+        names.len(),
+        seed8(p.seed),
+        p.run
+    );
+    let _ = std::fs::remove_dir_all(&segs);
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

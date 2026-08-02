@@ -42,6 +42,33 @@ runs:
         path: ${{ runner.temp }}/rebuck2-driver/lapdone
         key: rebuck2-done-${{ github.run_id }}
 
+    # The skeleton rides the manifest whole and must be atomic with the
+    # row index that references it, so the container uploads first and
+    # the manifest is gated on it - same rule as every other bank.
+    - name: Bank the dice delta
+      id: pack-dice
+      if: always() && env.REBUCK2_DICE_SEED != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+        BANK_WORK="$REBUCK2_WORK/bank-dice" \
+          rebuck2 bank dice-publish "$REBUCK2_DICE_DIR" "$REBUCK2_LINEAGE" \
+            "$REBUCK2_DICE_SEED" "$GITHUB_RUN_ID" "$REBUCK2_PARENT_LINEAGE"
+
+    - id: dice-container
+      if: always() && steps.pack-dice.outputs.have == '1'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: cas-dice-segs-${{ env.REBUCK2_LINEAGE }}-${{ github.run_id }}
+        path: ${{ runner.temp }}/rebuck2-driver/bank-dice/dice-container
+        compression-level: 0
+
+    - if: always() && steps.pack-dice.outputs.have == '1' && steps.dice-container.outcome == 'success'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: cas-manifest-${{ env.REBUCK2_LINEAGE }}-dice-${{ env.REBUCK2_DICE_SEED8 }}
+        path: ${{ runner.temp }}/rebuck2-driver/bank-dice/dice-manifest-out
+
     - name: Bank what the driver authored
       id: pack-driver
       if: always()

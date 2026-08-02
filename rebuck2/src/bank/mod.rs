@@ -272,6 +272,33 @@ pub async fn run(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
+        ["dice-publish", dice_dir, lineage, seed, run, rest @ ..] => {
+            let work = bank_work();
+            let staged = dice::publish(
+                dice::Publish {
+                    dice_dir: Path::new(dice_dir),
+                    lineage,
+                    parent: rest.first().copied().filter(|p| !p.is_empty() && *p != "-"),
+                    seed,
+                    run,
+                },
+                &work,
+            )?;
+            if staged {
+                if let Ok(out) = std::env::var("GITHUB_OUTPUT") {
+                    use std::io::Write;
+                    writeln!(fs::OpenOptions::new().append(true).open(out)?, "have=1")?;
+                }
+            }
+            Ok(())
+        }
+        // The manifest artifact name embeds the seed hash, and the
+        // workflow needs it to name an upload - so the engine is the one
+        // place that computes it.
+        ["dice-seed8", seed] => {
+            println!("{}", dice::seed8(seed));
+            Ok(())
+        }
         ["dice-keys", db] => {
             for k in dice::keys(Path::new(db))? {
                 println!("{k}");
@@ -357,6 +384,7 @@ pub async fn run(args: &[String]) -> Result<()> {
              | restore <store> <role> <all|own> <shard|-> <lineage> [parent] \
              | publish <store> <role> <shard|-> <lineage> <run> [parent] \
              | dice-restore <dice-dir> <lineage> <seed> [parent] \
+             | dice-publish <dice-dir> <lineage> <seed> <run> [parent] \
              | dice-pack <db> <banked> <out> | dice-merge <db> <seg>... \
              | dice-keys <db> \
              | cas-restore <store> <shard|-> <lineage> [parent] \

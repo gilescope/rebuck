@@ -35,6 +35,16 @@ inputs:
       joins the diff base, while every publish still goes to this
       lineage's own manifest. Defaults to the PR base branch.
     default: ""
+  dice-seed:
+    description: >-
+      Reuse gate for the dice bank - must equal BUCK2_DICE_SNAPSHOT_SEED.
+      Banked rows are only valid within one fork-rev + seed, so a rev bump
+      orphans them by name rather than serving a stale graph. Empty = no
+      dice bank.
+    default: ""
+  dice-dir:
+    description: Directory holding db/ and graph.meta for the dice bank.
+    default: "dice-snap/sweep"
   grpc-port:
     description: Local port buck2 talks REAPI to.
     default: "9092"
@@ -143,6 +153,8 @@ runs:
         GH_TOKEN: ${{ github.token }}
         IN_STORE: ${{ inputs.store }}
         IN_SLOTS: ${{ inputs.co-worker-slots }}
+        IN_DICE_SEED: ${{ inputs.dice-seed }}
+        IN_DICE_DIR: ${{ inputs.dice-dir }}
         CAS_LINEAGE: ${{ inputs.lineage || github.head_ref || github.ref_name }}
         CAS_PARENT_LINEAGE: ${{ inputs.parent-lineage || github.base_ref }}
       run: |
@@ -174,6 +186,22 @@ runs:
           rebuck2 bank restore "$STORE/driver" driver all - \
             "$CAS_LINEAGE" "${CAS_PARENT_LINEAGE:--}" || rc=$?
         [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || exit "$rc"
+
+        # The dice value store is a CAS in sqlite clothing and banks like
+        # one. Its manifest name carries the seed hash, so an inherited
+        # bank is only ever read when it is the SAME graph.
+        if [ -n "$IN_DICE_SEED" ]; then
+          rc=0
+          BANK_WORK="$WORK/bank-dice" \
+            rebuck2 bank dice-restore "$IN_DICE_DIR" "$CAS_LINEAGE" \
+              "$IN_DICE_SEED" "${CAS_PARENT_LINEAGE:--}" || rc=$?
+          [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || exit "$rc"
+          {
+            echo "REBUCK2_DICE_SEED=$IN_DICE_SEED"
+            echo "REBUCK2_DICE_DIR=$IN_DICE_DIR"
+            echo "REBUCK2_DICE_SEED8=$(rebuck2 bank dice-seed8 "$IN_DICE_SEED")"
+          } >> "$GITHUB_ENV"
+        fi
 
         # How many AC entries the seed actually laid down. driver-finish
         # warns when a lap restored an AC yet served ZERO hits - a silent
