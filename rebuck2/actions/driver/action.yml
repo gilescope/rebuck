@@ -45,6 +45,15 @@ inputs:
   dice-dir:
     description: Directory holding db/ and graph.meta for the dice bank.
     default: "dice-snap/sweep"
+  hot-cas:
+    description: >-
+      Seed the driver's small CAS blobs (<=256KB: rmetas, dirs argsfiles)
+      from the previous lap. These are what buck2 clients download to
+      compute pipelined keys, so having them driver-local turns those
+      reads from cross-mesh relays into local disk. Unlike the banks this
+      is an actions-CACHE pair, not artifacts - it is a warm-start
+      optimisation whose loss costs latency, not correctness.
+    default: "true"
   grpc-port:
     description: Local port buck2 talks REAPI to.
     default: "9092"
@@ -146,6 +155,14 @@ runs:
       run: cargo install --locked --git "$IN_GIT" --rev "$REV" rebuck2
 
 
+    - id: hotcas-restore
+      if: inputs.hot-cas == 'true'
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ${{ runner.temp }}/rebuck2-driver/hotcas
+        key: rebuck2-hotcas-${{ github.run_id }}
+        restore-keys: rebuck2-hotcas-
+
     - name: Resolve paths and restore the bank
       id: paths
       shell: bash
@@ -155,6 +172,7 @@ runs:
         IN_SLOTS: ${{ inputs.co-worker-slots }}
         IN_DICE_SEED: ${{ inputs.dice-seed }}
         IN_DICE_DIR: ${{ inputs.dice-dir }}
+        IN_HOT_CAS: ${{ inputs.hot-cas }}
         CAS_LINEAGE: ${{ inputs.lineage || github.head_ref || github.ref_name }}
         CAS_PARENT_LINEAGE: ${{ inputs.parent-lineage || github.base_ref }}
       run: |
@@ -174,6 +192,7 @@ runs:
           echo "REBUCK2_DRIVER_PID_FILE=$WORK/driver.pid"
           echo "REBUCK2_LINEAGE=$CAS_LINEAGE"
           echo "REBUCK2_PARENT_LINEAGE=${CAS_PARENT_LINEAGE:--}"
+          echo "REBUCK2_HOT_CAS=$IN_HOT_CAS"
         } >> "$GITHUB_ENV"
         echo "addr-file=$WORK/driver-addr.json" >> "$GITHUB_OUTPUT"
 
@@ -186,6 +205,21 @@ runs:
           rebuck2 bank restore "$STORE/driver" driver all - \
             "$CAS_LINEAGE" "${CAS_PARENT_LINEAGE:--}" || rc=$?
         [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ] || exit "$rc"
+
+        # Unpack the hot-CAS BEFORE the bank: the bank is authoritative
+        # and its content should land on top. A corrupt tarball is a cold
+        # start for this piece, never a dead job - a failed lap's
+        # always()-pack once banked a truncated file (run 29280964336
+        # died seeding a 312-BYTE snapshot).
+        HOT="$WORK/hotcas/hotcas.tar.zst"
+        if [ -f "$HOT" ]; then
+          mkdir -p "$STORE/driver"
+          if zstd -dq --long=27 < "$HOT" | tar -x -C "$STORE/driver"; then
+            echo "hot-CAS seeded ($(du -h "$HOT" | cut -f1))"
+          else
+            echo "WARNING: corrupt hot-CAS snapshot - cold start for it"
+          fi
+        fi
 
         # The dice value store is a CAS in sqlite clothing and banks like
         # one. Its manifest name carries the seed hash, so an inherited

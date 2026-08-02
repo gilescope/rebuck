@@ -147,6 +147,30 @@ runs:
         name: cas-manifest-${{ env.REBUCK2_LINEAGE }}-ac-co-worker
         path: ${{ runner.temp }}/rebuck2-driver/bank-co-worker/ac-manifest-out
 
+    # The driver's accumulated hot metadata: CAS blobs <= 256KB, which is
+    # rmetas and dirs argsfiles, never the MB-scale rlibs that live on
+    # worker shards. -4 and no --long deliberately: this ran 435s at
+    # -8/--long=27 every lap (run 29564589011) for a marginal ratio gain
+    # on tiny files, and the seed side reads both formats.
+    - name: Pack the driver hot-CAS
+      id: hotpack
+      if: always() && env.REBUCK2_HOT_CAS == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        [ -d "$REBUCK2_STORE/driver/cas" ] || { echo "skip=1" >> "$GITHUB_OUTPUT"; exit 0; }
+        mkdir -p "$REBUCK2_WORK/hotcas"
+        ( cd "$REBUCK2_STORE/driver" \
+          && find cas -type f -size -262144c -print0 | tar --null -c -T - ) \
+          | zstd -T0 -4 > "$REBUCK2_WORK/hotcas/hotcas.tar.zst"
+        ls -lh "$REBUCK2_WORK/hotcas/" || true
+
+    - if: always() && env.REBUCK2_HOT_CAS == 'true' && steps.hotpack.outputs.skip != '1'
+      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ${{ runner.temp }}/rebuck2-driver/hotcas
+        key: rebuck2-hotcas-${{ github.run_id }}
+
     - name: Dispatch stats
       if: always()
       shell: bash
