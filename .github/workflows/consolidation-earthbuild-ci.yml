@@ -1,24 +1,35 @@
 name: consolidation-earthbuild-ci
 
-# Does daemon consolidation hold, and pay, on the hardware CI actually runs on?
+# Three arms x twelve groups, on the hardware CI actually runs on.
 #
-# earthbuild's integration tests invoke earthly inside a RUN, and today each of
-# those nested invocations stands up its OWN buildkitd -- one cold daemon per
-# test, each pulling its own base images. That is what earthbuild currently buys
-# Docker Hub credentials to survive (its Earthfile:564). Consolidation makes the
-# nested earthly reach the daemon that started it instead.
+#   stock         earthbuild at EARTHBUILD_BASE, unpatched. One nested buildkitd
+#                 per nested earthly -- 342 across the suite, measured.
+#   consolidated  + the patches. Nested builds share the caller's daemon.
+#   coordinated   + cross-machine single-flight, so twelve runners stop
+#                 rebuilding each other's shared stem.
 #
-# Measured on the x86 box, one group: 311s consolidated against a 329s control,
-# with ZERO nested daemons against one per test. n=1, on a 32-core box that is
-# nowhere near contended. A 2-core GitHub runner is a different machine and the
-# whole point of a per-test daemon -- memory, image pulls, parallelism -- bites
-# harder there, so the box number does not transfer. Run it here.
+# All three run the SAME daemon binary (our fork) so exactly one thing changes
+# per step: the earthbuild tree for stock->consolidated, the coordinator URL for
+# consolidated->coordinated. An A/B that moves two variables measures neither.
 #
-# Twelve groups on twelve runners answers in ~15 minutes what the box answers
-# sequentially in an hour, which is also the shape the product is aiming at.
+# WHY THIS SHAPE ANSWERS THE SINGLE-FLIGHT QUESTION AND THE X86 BOX CANNOT.
+# Single-flight removes DUPLICATED work; it does not shorten a job that is not
+# waiting for anything. The shared stem is 32 vertices / 94s (measured), so a
+# follower saves at most that. On an idle 32-core box there is nothing else to
+# reclaim, and the box duly measured 373s coordinated against 342s
+# uncoordinated -- buildkit-optimizations.md calls that "the one thing an idle
+# 2-worker rig cannot show". A runner pool differs: past the account's
+# concurrency cap jobs QUEUE, and a shorter job frees a runner sooner, so the
+# saving compounds into queue time. 36 jobs is past a cap of 20, which is the
+# point of running 36.
 #
-# COST: 24 jobs x ~12 min ~= 290 runner-minutes per run. Trim the group list
-# before iterating on the workflow itself.
+# Durations come from the Actions API in the report job, not from a variable the
+# build job echoed. The previous version wrote WALL into $GITHUB_ENV, which sets
+# it without printing it, and produced a complete run with every timing cell
+# empty. The API also yields queue time, which is the number this exists to get.
+#
+# COST: 36 jobs, ~450 runner-minutes a run. Trim the group list before iterating
+# on the workflow itself, rather than on the result.
 
 on:
   push:
@@ -26,33 +37,97 @@ on:
     paths:
       - ".github/workflows/consolidation-earthbuild-ci.yml"
       - "rebuck2/tests/earthbuild-patches/**"
-  # Unreachable until this file lands on the default branch -- the dispatch API
-  # resolves the workflow there, not on the ref you pass. Kept so it works once
-  # this graduates.
+  # Unreachable until this file reaches the default branch -- dispatch resolves
+  # the workflow there, not on the ref passed. Kept for when it graduates.
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# EARTHBUILD_BASE is the commit the x86 box measured, and the patches in
-# rebuck2/tests/earthbuild-patches apply to exactly it. Moving one without the
-# other makes `git am` fail loudly, which is the intended behaviour: a silently
-# rebased experiment produces numbers that look fine and compare nothing.
 env:
-  # Full SHA, not the short form: actions/checkout resolves `ref` as a real
-  # git ref and an abbreviated SHA is not one.
+  # The commit the x86 box measured, and the commit the patches apply to. Moving
+  # one without the other makes `git am` fail loudly, which is intended: a
+  # silently rebased experiment produces numbers that look fine and compare
+  # nothing.
   EARTHBUILD_BASE: "32308f78acd5b57ba2f54e78894c5457cf20fb8f"
+  BUILDKIT_REF: "86a419fabb82aa3932b0ce673069281d483a73e0" # giles-rebuck-single-flight
+  SESSION: eb-consolidation-${{ github.run_id }}
+  AGENT_PORT: "5091"
+  DRIVER_PORT: "9095"
 
 jobs:
+  # Runs concurrently with the builders -- deliberately no `needs:`. The
+  # coordinated arm has nothing to coordinate with unless this is already up.
+  driver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+      - run: cargo build --release --manifest-path rebuck2/Cargo.toml
+
+      # --min-workers 2, not 12. The driver does not need every builder, and
+      # waiting for all of them turns one queued or failed runner into a
+      # two-hour hang for the whole arm.
+      - name: start driver
+        run: |
+          ./rebuck2/target/release/rebuck2 driver \
+            --grpc-port "$DRIVER_PORT" --session "$SESSION" \
+            --registry-port 5090 --min-workers 2 --no-local-exec \
+            --store "$HOME/.cache/rebuck2/driver" > driver.log 2>&1 &
+          echo $! > driver.pid
+
+      # Stillness is a bad done-signal on a short fuse: leases only move when
+      # vertices start, and a long compile claims nothing for minutes while very
+      # much alive. At 60s an earlier version of this loop decided the fleet had
+      # finished mid-build and killed the driver under it. Require real silence
+      # and a floor; the job timeout is the backstop.
+      - name: hold open while the builders work, then report
+        run: |
+          stats() { curl -s "http://127.0.0.1:5090/_rebuck/stats" 2>/dev/null; }
+          last=""; still=0
+          for i in $(seq 1 960); do
+            cur="$(stats)"
+            [ "$cur" = "$last" ] && still=$((still + 1)) || still=0
+            last="$cur"
+            [ "$i" -ge 240 ] && [ "$still" -ge 120 ] && break   # 20 min floor, 10 min still
+            sleep 5
+          done
+          echo "$last" | tee driver-stats.json
+          {
+            echo "### driver"
+            echo '```'
+            echo "$last"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Zeros are byte-identical to a deliberate control run, and reading them as
+      # a result is the most expensive mistake this project has made. A
+      # coordinated run that merged nothing is a broken rig, not a finding.
+      - name: assert the mesh coordinated at all
+        run: |
+          merged="$(grep -oE '"leases_merged":[0-9]+' driver-stats.json | cut -d: -f2)"
+          echo "leases_merged=${merged:-0}"
+          [ "${merged:-0}" -gt 0 ] \
+            || { echo "::error::coordinated arm merged nothing -- rig broken, not a result"; exit 1; }
+
+      - name: stop driver
+        if: always()
+        run: kill "$(cat driver.pid)" 2>/dev/null || true
+
   build:
     strategy:
       fail-fast: false
       matrix:
-        arm: [consolidated, stock]
+        arm: [stock, consolidated, coordinated]
         group: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     name: ${{ matrix.arm }}-group${{ matrix.group }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
       contents: read
     steps:
@@ -64,55 +139,90 @@ jobs:
           repository: EarthBuild/earthbuild
           ref: ${{ env.EARTHBUILD_BASE }}
           path: earthbuild
-          # git am needs real history to apply onto and to report against.
-          fetch-depth: 0
+          fetch-depth: 0 # git am needs history to apply onto
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: EarthBuild/buildkit
+          ref: ${{ env.BUILDKIT_REF }}
+          path: buildkit
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        if: matrix.arm == 'coordinated'
+        with:
+          toolchain: "1.92.0"
 
       # A cold group pulls ~18 base images and leaves ~1.8 GB of CAS behind. On
       # the x86 box a full disk killed the docker daemon and presented as
       # "Could not open file ... (5: Input/output error)" -- which reads as a
-      # build bug and is not one. Reclaim first rather than rediscover it here.
+      # build bug and is not one.
       - name: reclaim disk
         run: |
           df -h /
           # NOT /opt/hostedtoolcache: that is where the runner keeps Go, and
-          # deleting it costs the toolchain on the very next step. dotnet and
-          # android are ~30 GB between them and are genuinely unused here.
+          # deleting it costs the toolchain on the very next step.
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /usr/local/share/boost || true
           df -h /
 
       - name: apply the consolidation patches
-        if: matrix.arm == 'consolidated'
+        if: matrix.arm != 'stock'
         run: |
           cd earthbuild
-          # gpgsign explicitly off: a runner has no signing config so this is
-          # inert here, but the same command run on a developer box with a
-          # yubikey dies on "gpg: signing failed: Inappropriate ioctl for
-          # device", which reads as a broken patch and is not one.
+          # gpgsign off explicitly: inert on a runner, but the same command on a
+          # signing dev box dies with "gpg: signing failed: Inappropriate ioctl
+          # for device", which reads as a broken patch and is not one.
           git -c user.name=ci -c user.email=ci@local -c commit.gpgsign=false am \
             ../rebuck2src/rebuck2/tests/earthbuild-patches/*.patch
           git log --oneline "${EARTHBUILD_BASE}..HEAD"
 
-      - name: build earthly
+      - name: build earthly and buildkitd
         run: |
           # No GOSUMDB=off: earthbuild's go.mod wants a newer Go than the runner
           # ships, so the go command downloads a toolchain and verifies it
           # against the checksum database. Disabling the sumdb fails that
           # download outright rather than skipping the check.
-          cd earthbuild && GOFLAGS=-mod=mod go build -o "$RUNNER_TEMP/earthly" ./cmd/earthly
+          ( cd earthbuild && GOFLAGS=-mod=mod go build -o "$RUNNER_TEMP/earthly" ./cmd/earthly )
+          ( cd buildkit && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+              go build -o "$RUNNER_TEMP/buildkitd" ./cmd/buildkitd )
 
-      # One daemon, stock image. This workflow measures CONSOLIDATION, which is
-      # a property of the earthly CLI -- no mesh, no fork, no coordinator. Keep
-      # single-flight out of it so a failure here has one possible cause.
-      - name: start the one buildkitd
+      # Only the coordinated arm has anything to coordinate with. The agent must
+      # bind 0.0.0.0, not loopback: buildkitd reaches it from inside a container
+      # over the docker bridge.
+      - name: start worker
+        if: matrix.arm == 'coordinated'
         run: |
+          cargo build --release --manifest-path rebuck2src/rebuck2/Cargo.toml
+          ./rebuck2src/rebuck2/target/release/rebuck2 worker \
+            --session "$SESSION" --slots 4 \
+            --store "$HOME/.cache/rebuck2/worker" \
+            --registry-port "$AGENT_PORT" --registry-bind 0.0.0.0 > worker.log 2>&1 &
+          echo $! > worker.pid
+          for _ in $(seq 1 60); do
+            curl -sf -o /dev/null "http://127.0.0.1:$AGENT_PORT/v2/" && exit 0
+            sleep 2
+          done
+          cat worker.log; echo "::error::agent never came up"; exit 1
+
+      # Same daemon binary on every arm. Only BUILDKIT_SINGLEFLIGHT_URL differs,
+      # and it is empty unless this is the coordinated arm -- so the other two
+      # cannot coordinate even by accident.
+      - name: start buildkitd
+        env:
+          SFURL: ${{ matrix.arm == 'coordinated' && 'http://host.docker.internal:5091' || '' }}
+        run: |
+          docker build -q -t eb-ci:test -f - "$RUNNER_TEMP" <<'EOF'
+          FROM earthbuild/buildkitd:v0.8.17
+          COPY buildkitd /usr/bin/buildkitd
+          EOF
           docker run -d --name eb-bk --privileged \
+            --add-host host.docker.internal:host-gateway \
             -e NETWORK_MODE=cni \
             -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
+            -e BUILDKIT_SINGLEFLIGHT_URL="$SFURL" \
+            -e BUILDKIT_SINGLEFLIGHT_REGISTRY=cache \
             -e CACHE_SIZE_MB=8000 -e BUILDKIT_MAX_PARALLELISM=4 \
             -e BUILDKIT_SETUP_CGROUPV2_ROOT=1 \
             --ulimit nofile=1048576:1048576 \
-            earthbuild/buildkitd:v0.8.17
+            eb-ci:test
           for _ in $(seq 1 60); do
             docker exec eb-bk buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 && exit 0
             sleep 2
@@ -120,78 +230,170 @@ jobs:
           docker logs eb-bk 2>&1 | tail -20
           echo "::error::buildkitd never came ready"; exit 1
 
+      # --add-host fixes the NAME; it does not fix the ROUTE. An unreachable
+      # coordinator does not fail the build -- the daemon builds correctly,
+      # coordinates with nobody, and reports zeros. Only an end-to-end fetch
+      # proves both halves.
+      - name: preflight - the daemon can reach its agent
+        if: matrix.arm == 'coordinated'
+        run: |
+          docker exec eb-bk wget -q -T 5 -O /dev/null \
+            "http://host.docker.internal:$AGENT_PORT/v2/" \
+            || { echo "::error::buildkitd cannot reach its agent; single-flight would no-op in silence"; exit 1; }
+
       - name: build group ${{ matrix.group }}
         id: build
         env:
           GROUP: ${{ matrix.group }}
         run: |
-          # Without pipefail this step reports TEE's status, so a build that died
-          # in 26s goes green carrying a plausible WALL. The point of the run is
-          # a wall-clock A/B; a failed build that reports a number is worse than
-          # no run at all.
+          # Without pipefail this reports TEE's status, so a build that died in
+          # 26s goes green carrying a plausible duration.
           set -o pipefail
           # 127.0.0.1 would make earthly think it MANAGES the daemon and start
-          # its own (containerutil.IsLocal). On Linux the container IP is
-          # routable directly -- ask docker rather than assuming 172.17.0.2,
-          # which is only the first container on the default bridge.
+          # its own (containerutil.IsLocal). Ask docker for the container IP
+          # rather than assuming 172.17.0.2, which is only the first container.
           BK="tcp://$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' eb-bk):8372"
           cat > "$RUNNER_TEMP/eb.yml" <<'EOF'
           global:
             tls_enabled: false
           EOF
           # TLS as an ENV var as well as in the config file, because only the env
-          # var travels: earthly collects the settings it forwards into RUN from
-          # the ENVIRONMENT, and a config file lives in one container while the
-          # nested build runs in another. Set the address without this and the
-          # nested earthly dials a plaintext daemon over TLS and dies on a CA
-          # nobody gave it (measured: exit code 6). Inert on the stock arm.
-          start=$SECONDS
+          # var travels: earthly collects what it forwards into RUN from the
+          # ENVIRONMENT, and a config file lives in one container while the
+          # nested build runs in another. Without it a nested earthly dials a
+          # plaintext daemon over TLS and dies on a CA nobody gave it (exit 6).
+          # Inert on the stock arm, which forwards nothing.
           ( cd earthbuild && EARTHLY_CONFIG="$RUNNER_TEMP/eb.yml" \
               EARTHLY_BUILDKIT_HOST="$BK" EARTHLY_TLS_ENABLED=false \
               "$RUNNER_TEMP/earthly" --allow-privileged --no-output \
               "+test-no-qemu-group$GROUP" ) 2>&1 | tee build.log
-          echo "WALL=$((SECONDS - start))" >> "$GITHUB_ENV"
 
-      # The instrument that settled this on the box, and the only one that
-      # distinguishes "consolidation worked" from "the build happened to pass".
+      # The instrument that settled consolidation on the box, and the only one
+      # separating "it worked" from "the build happened to pass".
       # earthly-entrypoint.sh prints "running under pid=" ONLY on its
-      # internal-buildkit branch, so the count is exact rather than inferred.
+      # internal-buildkit branch, so this count is exact rather than inferred.
       #
-      # Asserted, not merely reported: forwarding the settings without the
-      # entrypoint fix leaves the container starting a daemon that earthly then
-      # ignores -- strictly worse than not forwarding, and green on wall-clock
-      # alone. A consolidated arm with nested daemons is a broken rig, not a
-      # result.
+      # NOT asserted here. The patched arms legitimately start a few --
+      # force_internal_buildkit exists for the tests a shared daemon would
+      # change -- so the honest check is consolidated < stock per group, which
+      # needs both arms and therefore belongs in the report job. An absolute
+      # "== 0" was asserted in the previous version and failed a green build.
       - name: count nested daemons
         if: always()
         run: |
+          mkdir -p out
           NESTED="$(grep -c 'earthly-entrypoint.sh running under pid' build.log 2>/dev/null || true)"
-          echo "NESTED=${NESTED:-0}" >> "$GITHUB_ENV"
           echo "nested daemons: ${NESTED:-0}"
-          # Only assert on a build that finished. A build that died in the first
-          # minute has no nested daemons for reasons that have nothing to do with
-          # consolidation, and "the control is not a control" stacked on top of
-          # the real failure sends the next reader to the wrong place.
-          if [ "${{ steps.build.outcome }}" != "success" ]; then
-            echo "build did not succeed; skipping the daemon-count assertions"
-            exit 0
-          fi
-          if [ "${{ matrix.arm }}" = "consolidated" ] && [ "$NESTED" -gt 0 ]; then
-            echo "::error::consolidated arm started $NESTED nested daemon(s); consolidation did not take"
-            exit 1
-          fi
-          if [ "${{ matrix.arm }}" = "stock" ] && [ "$NESTED" -eq 0 ]; then
-            echo "::error::stock arm started no nested daemons -- the control is not a control"
-            exit 1
-          fi
+          printf '%s %s %s %s\n' "${{ matrix.arm }}" "${{ matrix.group }}" \
+            "${NESTED:-0}" "${{ steps.build.outcome }}" > "out/${{ matrix.arm }}-${{ matrix.group }}.txt"
 
-      # A step summary is per-JOB, so a bare table row would render as loose
-      # text. Emit a whole small table each time; the run page stacks them.
-      - name: summarise
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: nested-${{ matrix.arm }}-${{ matrix.group }}
+          path: out/
+          retention-days: 7
+
+      - name: stop
         if: always()
         run: |
-          {
-            echo "| arm | group | wall | nested daemons |"
-            echo "| ------------ | ----- | ---- | -------------- |"
-            echo "| ${{ matrix.arm }} | ${{ matrix.group }} | ${WALL:-fail}s | ${NESTED:-?} |"
-          } >> "$GITHUB_STEP_SUMMARY"
+          docker rm -f eb-bk >/dev/null 2>&1 || true
+          kill "$(cat worker.pid)" 2>/dev/null || true
+
+  report:
+    needs: [build]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read # to read this run's job timings
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: nested
+          merge-multiple: true
+
+      # Durations from the API, not from a variable the build job echoed.
+      # started_at minus the run's creation is QUEUE, which is where
+      # single-flight should show up once 36 jobs exceed a cap of 20 -- a
+      # shorter job frees a runner sooner. Run time alone cannot see that.
+      - name: table
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/jobs" \
+            --jq '.jobs[] | [.name, .started_at, .completed_at] | @tsv' > jobs.tsv
+          RUN_CREATED="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq .created_at)"
+          export RUN_CREATED
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import os, datetime, pathlib, collections
+          t = lambda s: datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+          created = t(os.environ["RUN_CREATED"])
+          times = {}
+          for line in open("jobs.tsv"):
+              parts = line.rstrip("\n").split("\t")
+              if len(parts) < 3 or not parts[1] or not parts[2]:
+                  continue
+              name, st, en = parts
+              times[name] = (int((t(st) - created).total_seconds()),
+                             int((t(en) - t(st)).total_seconds()))
+          nested, outcome = {}, {}
+          for f in pathlib.Path("nested").rglob("*.txt"):
+              arm, grp, n, oc = f.read_text().split()
+              nested[(arm, int(grp))] = int(n)
+              outcome[(arm, int(grp))] = oc
+          arms = ["stock", "consolidated", "coordinated"]
+          print("| group | " + " | ".join(f"{a} q/run/daemons" for a in arms) + " |")
+          print("| ----- | " + " | ".join("-" * 22 for _ in arms) + " |")
+          tot = collections.defaultdict(lambda: [0, 0, 0])
+          for g in range(1, 13):
+              row = [str(g)]
+              for a in arms:
+                  q, r = times.get(f"{a}-group{g}", (None, None))
+                  n = nested.get((a, g))
+                  if q is None:
+                      row.append("-")
+                      continue
+                  tot[a][0] += q
+                  tot[a][1] += r
+                  tot[a][2] += n or 0
+                  bad = "" if outcome.get((a, g)) == "success" else " x"
+                  row.append(f"{q}s / {r}s / {n if n is not None else '?'}{bad}")
+              print("| " + " | ".join(row) + " |")
+          print("| **total** | " + " | ".join(
+              f"**{tot[a][0]}s / {tot[a][1]}s / {tot[a][2]}**" for a in arms) + " |")
+          print()
+          print("q = queue (job start minus run creation); run = job duration; "
+                "daemons = nested buildkitd; x = the build step did not succeed.")
+          PY
+
+      # The honest consolidation check: fewer nested daemons than stock, per
+      # group. The patched arms legitimately start a few, because
+      # force_internal_buildkit exists for the tests a shared daemon would
+      # change -- so an absolute zero is the wrong bar, and failed a green build
+      # last time.
+      - name: assert consolidation reduced daemons
+        run: |
+          python3 - <<'PY'
+          import pathlib, sys
+          n = {}
+          for f in pathlib.Path("nested").rglob("*.txt"):
+              arm, grp, cnt, _ = f.read_text().split()
+              n[(arm, int(grp))] = int(cnt)
+          bad = []
+          for g in range(1, 13):
+              s = n.get(("stock", g))
+              for a in ("consolidated", "coordinated"):
+                  c = n.get((a, g))
+                  if s is None or c is None:
+                      continue
+                  if c >= s:
+                      bad.append(f"group{g}: {a}={c} not fewer than stock={s}")
+          if bad:
+              print("::error::consolidation did not reduce nested daemons")
+              print("\n".join(bad))
+              sys.exit(1)
+          print("consolidation reduced nested daemons in every comparable group")
+          PY
