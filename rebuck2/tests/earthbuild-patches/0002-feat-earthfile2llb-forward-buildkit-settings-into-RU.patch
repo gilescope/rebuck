@@ -1,8 +1,8 @@
 From dfee4f9f3717b83fd8cc40f0f0d78576e068ba1c Mon Sep 17 00:00:00 2001
 From: Giles Cope <gilescope@gmail.com>
 Date: Fri, 31 Jul 2026 08:14:54 +0100
-Subject: [PATCH 2/5] feat(earthfile2llb): forward buildkit settings into RUN,
- so nesting works at depth
+Subject: [PATCH 02/12] feat(earthfile2llb): forward buildkit settings into
+ RUN, so nesting works at depth
 
 A nested earthly could not be configured. Nothing crosses into a RUN step: a
 caller's environment does not reach it (measured), and a config file lives in one

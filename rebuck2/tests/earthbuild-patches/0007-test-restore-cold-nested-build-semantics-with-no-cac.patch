@@ -1,0 +1,94 @@
+From b7c850ae16215013ceef53f879d6fb631bce7655 Mon Sep 17 00:00:00 2001
+From: Giles Cope <gilescope@gmail.com>
+Date: Sun, 2 Aug 2026 06:58:03 +0100
+Subject: [PATCH 07/12] test: restore cold-nested-build semantics with
+ --no-cache, not a daemon each
+
+The opt-out list was about to become the whole file. ~193 of this suite's 525
+RUN_EARTHLY call sites assert with --output_contains, and the failure is always
+the same shape: the inner build reports SUCCESS, the step was a cache hit, so it
+printed nothing and the grep fails. Three targeted opt-outs bought exactly one
+group out of seven, and every failure behind them was another instance of it --
+wildcard-build-pwd, propagate-args-to-base, config+test, logbus+test-manifest,
+test-visited-upfront-hash-collection.
+
+The reason those greps ever worked is that a daemon per test made every nested
+build COLD. That is the property the suite depends on, not the daemon. So say it
+directly: --no-cache on the inner build. Same observable behaviour, one place
+instead of every call site, and consolidation keeps what it is actually for --
+not paying for a daemon start and a set of base image pulls per test.
+
+Caching the step's stdout and replaying it was considered and rejected. These
+tests are not asserting on text; they use text as a proxy for "the work
+happened". Replay makes the assertion unconditionally true, which is worse than
+red -- and two of them could not be satisfied honestly at all, since
+test-visited-upfront-hash-collection infers PARALLELISM from interleaving and
+logbus+test-manifest counts events rather than lines. Replayed logs would also
+have to be stored and, under single-flight, shipped between machines, which is a
+poor thing to do to anything scrub-https-credentials exists to keep out of them.
+
+Depends on buildkit b8f3a4e97: before single-flight honoured IgnoreCache, a
+follower would adopt a --no-cache vertex and this would fail in precisely the
+way it is meant to prevent.
+
+Tests that are ABOUT the cache take allow_shared_cache=true and a fresh daemon
+instead, since --no-cache would invalidate what they measure.
+
+Assisted-by: Claude:claude-opus-5 claude-code
+---
+ tests/Earthfile | 27 ++++++++++++++++++++++++++-
+ 1 file changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/tests/Earthfile b/tests/Earthfile
+index 13e570f1..c269000e 100644
+--- a/tests/Earthfile
++++ b/tests/Earthfile
+@@ -1739,14 +1739,39 @@ RUN_EARTHLY:
+     #
+     # Tests with any of those set this, and declare themselves by doing so.
+     ARG force_internal_buildkit=false
++    # A nested build on a SHARED daemon is no longer cold, and this suite was
++    # written against a cold one. Under a daemon per test every inner build
++    # started with an empty cache, so every step ran -- which is exactly what
++    # ~193 of this file's assertions rely on. They grep earthly.output for what a
++    # step PRINTS, or count log-bus events, or infer parallelism from interleaved
++    # markers. All of that is silence when the step is a cache hit, and the inner
++    # build reports SUCCESS while the assertion fails.
++    #
++    # --no-cache says the same thing the old daemon said, directly: run every
++    # step. It restores the previous semantics rather than approximating them,
++    # and it does so in ONE place instead of at every call site -- while keeping
++    # what consolidation is actually for, which is not paying for a daemon start
++    # and a set of base image pulls per test.
++    #
++    # It relies on single-flight honouring IgnoreCache. Before
++    # buildkit b8f3a4e97 a follower would adopt a --no-cache vertex and this
++    # would fail in exactly the way it was meant to prevent.
++    #
++    # Tests that are ABOUT the cache set allow_shared_cache=true and take a
++    # fresh daemon instead (force_internal_buildkit), since --no-cache would
++    # invalidate the very thing they measure.
++    ARG allow_shared_cache=false
+     IF [ ! -z "$earthfile" ]
+         COPY "$earthfile" "$earthfile_dest"
+     END
+     RUN echo "
+         set -ex
++        nocache=
+         if $force_internal_buildkit; then
+             unset EARTH_BUILDKIT_HOST EARTHLY_BUILDKIT_HOST BUILDKIT_HOST
+             unset EARTH_TLS_ENABLED EARTHLY_TLS_ENABLED
++        elif ! $allow_shared_cache; then
++            nocache=--no-cache
+         fi
+         export EARTHLY_VERBOSE=$verbose
+         if $use_tmpfs; then
+@@ -1772,7 +1797,7 @@ RUN_EARTHLY:
+         else
+             echo running earthly with $extra_args $target $post_command
+             set +e
+-            (eval \"/usr/bin/earthly-entrypoint.sh $extra_args $target $post_command\"; echo exit_code=\$?) 2>&1 | tee earthly.output
++            (eval \"/usr/bin/earthly-entrypoint.sh \$nocache $extra_args $target $post_command\"; echo exit_code=\$?) 2>&1 | tee earthly.output
+             set -e
+         fi
+ 

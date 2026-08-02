@@ -1,0 +1,235 @@
+From 1a476954401d9d866d28a2c4a17862acb70b734c Mon Sep 17 00:00:00 2001
+From: Giles Cope <gilescope@gmail.com>
+Date: Sun, 2 Aug 2026 07:12:03 +0100
+Subject: [PATCH 08/12] test: mark in the fixtures the steps whose execution is
+ asserted
+
+Replaces the blanket --no-cache with per-step marks, which is where the
+requirement belongs. A fixture that says
+
+    RUN --no-cache echo "hello world 1"
+
+documents that this step must EXECUTE; the same effect achieved by a flag in
+RUN_EARTHLY says only that someone, somewhere, needed something. The blanket
+version was also wrong in the other direction: tests that deliberately run twice
+to assert a cache HIT -- run-no-cache, run-no-cache-save-artifact, the
+cached_lines counter -- would have gone green while measuring nothing, which is
+the failure mode this branch already rejected for replayed stdout.
+
+Marked, each because a test greps earthly.output for what the step prints:
+
+    wildcard/{foo,baz,bar}     "hello world N"
+    propagate-args-to-base     the four "the global is <base64>" lines
+    config/hello.earth         "greetings"
+    logbus/manifest.earth      the log-bus manifest command count and their
+                               RUN_STATUS_SUCCESS -- a cached step moves it
+
+test-visited-upfront-hash-collection is the odd one out and takes a daemon
+instead. Its fixture already marks every step --no-cache, so the steps do run;
+what it asserts is that they run CONCURRENTLY, inferred from interleaved "### N"
+markers. That is the daemon's SCHEDULER, and on a shared one the executors queue
+behind the outer suite: measured "order: 222555111444333", five clean blocks,
+"no parallelization observed". No amount of cache-invariance reaches that.
+
+Assisted-by: Claude:claude-opus-5 claude-code
+---
+ tests/Earthfile                              | 37 ++++++--------------
+ tests/config/hello.earth                     |  3 +-
+ tests/logbus/manifest.earth                  |  9 +++--
+ tests/propagate-args-to-base/propagate.earth | 10 +++---
+ tests/wildcard/bar/Earthfile                 |  4 ++-
+ tests/wildcard/baz/Earthfile                 |  4 ++-
+ tests/wildcard/foo/Earthfile                 |  4 ++-
+ 7 files changed, 34 insertions(+), 37 deletions(-)
+
+diff --git a/tests/Earthfile b/tests/Earthfile
+index c269000e..e3196e29 100644
+--- a/tests/Earthfile
++++ b/tests/Earthfile
+@@ -1609,16 +1609,26 @@ test-cache-persist:
+       --target=+test-persisted \
+       --output_contains="| test persisted ok"
+ 
++# The odd one out. Its fixture already marks every step RUN --no-cache, so the
++# steps DO run -- what this asserts is that they run CONCURRENTLY, inferred from
++# interleaved "### N" markers. That is a property of the DAEMON's scheduler, and
++# on a shared daemon the executors queue behind the outer suite's own work:
++# measured "order: 222555111444333", i.e. five clean blocks and "no
++# parallelization observed". Cache-invariance cannot help; it needs a daemon
++# whose queue is its own.
+ test-visited-upfront-hash-collection:
+   DO +RUN_EARTHLY \
++      --force_internal_buildkit=true \
+       --earthfile=visited-upfront-hash-collection.earth \
+       --target=+parallel
+   DO +TEST_PARALLELIZATION
+   DO +RUN_EARTHLY \
++      --force_internal_buildkit=true \
+       --earthfile=visited-upfront-hash-collection.earth \
+       --target=+parallel-dynamic-arg
+   DO +TEST_PARALLELIZATION
+   DO +RUN_EARTHLY \
++      --force_internal_buildkit=true \
+       --earthfile=visited-upfront-hash-collection.earth \
+       --target=+parallel-dynamic-let
+   DO +TEST_PARALLELIZATION
+@@ -1739,39 +1749,14 @@ RUN_EARTHLY:
+     #
+     # Tests with any of those set this, and declare themselves by doing so.
+     ARG force_internal_buildkit=false
+-    # A nested build on a SHARED daemon is no longer cold, and this suite was
+-    # written against a cold one. Under a daemon per test every inner build
+-    # started with an empty cache, so every step ran -- which is exactly what
+-    # ~193 of this file's assertions rely on. They grep earthly.output for what a
+-    # step PRINTS, or count log-bus events, or infer parallelism from interleaved
+-    # markers. All of that is silence when the step is a cache hit, and the inner
+-    # build reports SUCCESS while the assertion fails.
+-    #
+-    # --no-cache says the same thing the old daemon said, directly: run every
+-    # step. It restores the previous semantics rather than approximating them,
+-    # and it does so in ONE place instead of at every call site -- while keeping
+-    # what consolidation is actually for, which is not paying for a daemon start
+-    # and a set of base image pulls per test.
+-    #
+-    # It relies on single-flight honouring IgnoreCache. Before
+-    # buildkit b8f3a4e97 a follower would adopt a --no-cache vertex and this
+-    # would fail in exactly the way it was meant to prevent.
+-    #
+-    # Tests that are ABOUT the cache set allow_shared_cache=true and take a
+-    # fresh daemon instead (force_internal_buildkit), since --no-cache would
+-    # invalidate the very thing they measure.
+-    ARG allow_shared_cache=false
+     IF [ ! -z "$earthfile" ]
+         COPY "$earthfile" "$earthfile_dest"
+     END
+     RUN echo "
+         set -ex
+-        nocache=
+         if $force_internal_buildkit; then
+             unset EARTH_BUILDKIT_HOST EARTHLY_BUILDKIT_HOST BUILDKIT_HOST
+             unset EARTH_TLS_ENABLED EARTHLY_TLS_ENABLED
+-        elif ! $allow_shared_cache; then
+-            nocache=--no-cache
+         fi
+         export EARTHLY_VERBOSE=$verbose
+         if $use_tmpfs; then
+@@ -1797,7 +1782,7 @@ RUN_EARTHLY:
+         else
+             echo running earthly with $extra_args $target $post_command
+             set +e
+-            (eval \"/usr/bin/earthly-entrypoint.sh \$nocache $extra_args $target $post_command\"; echo exit_code=\$?) 2>&1 | tee earthly.output
++            (eval \"/usr/bin/earthly-entrypoint.sh $extra_args $target $post_command\"; echo exit_code=\$?) 2>&1 | tee earthly.output
+             set -e
+         fi
+ 
+diff --git a/tests/config/hello.earth b/tests/config/hello.earth
+index 42276c38..0da546cb 100644
+--- a/tests/config/hello.earth
++++ b/tests/config/hello.earth
+@@ -2,4 +2,5 @@ VERSION 0.8
+ FROM alpine:3.24.1
+ 
+ hello:
+-    RUN echo "Z3JlZXRpbmdzCg==" | base64 -d
++    # tests/config+test asserts this reaches earthly.output, so it has to run.
++    RUN --no-cache echo "Z3JlZXRpbmdzCg==" | base64 -d
+diff --git a/tests/logbus/manifest.earth b/tests/logbus/manifest.earth
+index 34433e85..cf1e1ffa 100644
+--- a/tests/logbus/manifest.earth
++++ b/tests/logbus/manifest.earth
+@@ -2,15 +2,18 @@ VERSION 0.8
+ 
+ FROM alpine:3.24.1
+ 
++# +test-manifest counts these commands in the log-bus manifest and asserts
++# RUN_STATUS_SUCCESS on them, so they have to execute rather than come from the
++# caller's cache -- a cached step moves the count.
+ all:
+     COPY +src/x .
+-    RUN cat x
++    RUN --no-cache cat x
+     BUILD +foo
+ 
+ src:
+-    RUN echo foo > x
++    RUN --no-cache echo foo > x
+     SAVE ARTIFACT x
+ 
+ foo:
+-    RUN echo foo > x
++    RUN --no-cache echo foo > x
+     SAVE IMAGE foo
+diff --git a/tests/propagate-args-to-base/propagate.earth b/tests/propagate-args-to-base/propagate.earth
+index 5ac3d89d..cca7be17 100644
+--- a/tests/propagate-args-to-base/propagate.earth
++++ b/tests/propagate-args-to-base/propagate.earth
+@@ -4,18 +4,20 @@ ARG a="set in base"
+ ARG --global g="$(echo $a | base64)"
+ 
+ test:
+-    RUN echo "under test, the global is $g"
++    # +CHECK_OUTPUT greps earthly.output for each of these four lines, so each
++    # step has to run rather than be served from the caller's cache.
++    RUN --no-cache echo "under test, the global is $g"
+     DO +FUNC1 --some_arg="val1" --a="set when calling FUNC1"
+     BUILD +target --a="set when calling target"
+ 
+ FUNC1:
+     FUNCTION
+-    RUN echo "under FUNC1, the global is $g"
++    RUN --no-cache echo "under FUNC1, the global is $g"
+     DO +FUNC2 --a="set when calling FUNC2"
+ 
+ FUNC2:
+     FUNCTION
+-    RUN echo "under FUNC2, the global is $g"
++    RUN --no-cache echo "under FUNC2, the global is $g"
+ 
+ target:
+-    RUN echo "under target, the global is $g"
++    RUN --no-cache echo "under target, the global is $g"
+diff --git a/tests/wildcard/bar/Earthfile b/tests/wildcard/bar/Earthfile
+index a5d3fde3..7930c2ae 100644
+--- a/tests/wildcard/bar/Earthfile
++++ b/tests/wildcard/bar/Earthfile
+@@ -3,7 +3,9 @@ VERSION 0.8
+ FROM alpine:3.24.1
+ 
+ test:
+-  RUN echo "hello world 3"
++  # tests+wildcard-build-pwd greps earthly.output for this line, so the step
++  # has to run -- it cannot be served from a cache the caller happens to share.
++  RUN --no-cache echo "hello world 3"
+   ARG FILE_NAME_PREFIX="helloworld"
+   LET file_name="${FILE_NAME_PREFIX}3"
+   RUN echo "hello world 3" > $file_name
+diff --git a/tests/wildcard/baz/Earthfile b/tests/wildcard/baz/Earthfile
+index f322024c..192ee93a 100644
+--- a/tests/wildcard/baz/Earthfile
++++ b/tests/wildcard/baz/Earthfile
+@@ -3,7 +3,9 @@ VERSION 0.8
+ FROM alpine:3.24.1
+ 
+ test:
+-  RUN echo "hello world 2"
++  # tests+wildcard-build-pwd greps earthly.output for this line, so the step
++  # has to run -- it cannot be served from a cache the caller happens to share.
++  RUN --no-cache echo "hello world 2"
+   ARG FILE_NAME_PREFIX="helloworld"
+   LET file_name="${FILE_NAME_PREFIX}2"
+   RUN echo "hello world 2" > $file_name
+diff --git a/tests/wildcard/foo/Earthfile b/tests/wildcard/foo/Earthfile
+index 357758d7..3e9a1efd 100644
+--- a/tests/wildcard/foo/Earthfile
++++ b/tests/wildcard/foo/Earthfile
+@@ -3,7 +3,9 @@ VERSION 0.8
+ FROM alpine:3.24.1
+ 
+ test:
+-  RUN echo "hello world 1"
++  # tests+wildcard-build-pwd greps earthly.output for this line, so the step
++  # has to run -- it cannot be served from a cache the caller happens to share.
++  RUN --no-cache echo "hello world 1"
+   ARG FILE_NAME_PREFIX="helloworld"
+   LET file_name="${FILE_NAME_PREFIX}1"
+   RUN echo "hello world 1" > $file_name

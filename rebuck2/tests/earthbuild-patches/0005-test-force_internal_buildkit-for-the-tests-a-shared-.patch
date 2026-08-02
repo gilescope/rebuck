@@ -1,7 +1,7 @@
 From 6222051168a9cbb99a40674619f88a2952dde94e Mon Sep 17 00:00:00 2001
 From: Giles Cope <gilescope@gmail.com>
 Date: Sat, 1 Aug 2026 07:42:06 +0100
-Subject: [PATCH 5/5] test: force_internal_buildkit, for the tests a shared
+Subject: [PATCH 05/12] test: force_internal_buildkit, for the tests a shared
  daemon would change
 
 Sharing one buildkit across the suite changes the meaning of exactly one

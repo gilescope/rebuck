@@ -1,7 +1,7 @@
 From 0a9539f06c4aa5c456f0eec2543eb79c769a5192 Mon Sep 17 00:00:00 2001
 From: Giles Cope <gilescope@gmail.com>
 Date: Sat, 1 Aug 2026 07:36:34 +0100
-Subject: [PATCH 4/5] fix(entrypoint): decide on the address earthly will
+Subject: [PATCH 04/12] fix(entrypoint): decide on the address earthly will
  actually use
 
 The entrypoint's rule is "external if given, internal otherwise", but it read

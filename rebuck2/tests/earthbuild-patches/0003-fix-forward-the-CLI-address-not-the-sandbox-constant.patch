@@ -1,7 +1,7 @@
 From cb8bed76b49f012db12f625f7879040b8a7a32c3 Mon Sep 17 00:00:00 2001
 From: Giles Cope <gilescope@gmail.com>
 Date: Sat, 1 Aug 2026 06:36:21 +0100
-Subject: [PATCH 3/5] fix: forward the CLI address, not the sandbox constant
+Subject: [PATCH 03/12] fix: forward the CLI address, not the sandbox constant
 
 ---
  earthfile2llb/converter.go | 7 ++++++-

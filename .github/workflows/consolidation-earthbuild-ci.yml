@@ -37,6 +37,7 @@ on:
     paths:
       - ".github/workflows/consolidation-earthbuild-ci.yml"
       - "rebuck2/tests/earthbuild-patches/**"
+      - "rebuck2/tests/buildkit-patches/**"
   # Unreachable until this file reaches the default branch -- dispatch resolves
   # the workflow there, not on the ref passed. Kept for when it graduates.
   workflow_dispatch:
@@ -50,7 +51,10 @@ env:
   # silently rebased experiment produces numbers that look fine and compare
   # nothing.
   EARTHBUILD_BASE: "32308f78acd5b57ba2f54e78894c5457cf20fb8f"
-  BUILDKIT_REF: "86a419fabb82aa3932b0ce673069281d483a73e0" # giles-rebuck-single-flight
+  # The pushed tip of giles-rebuck-single-flight. The previous pin was ten
+  # commits behind it and predated P2.1 and all of P4a, so the coordinated arm
+  # would have measured a fork without the coordination being measured.
+  BUILDKIT_REF: "a8af577e1389e322bb7e49970c565309c6967e19" # giles-rebuck-single-flight
   SESSION: eb-consolidation-${{ github.run_id }}
   AGENT_PORT: "5091"
   DRIVER_PORT: "9095"
@@ -145,6 +149,7 @@ jobs:
           repository: EarthBuild/buildkit
           ref: ${{ env.BUILDKIT_REF }}
           path: buildkit
+          fetch-depth: 0 # git am needs history to apply onto
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         if: matrix.arm == 'coordinated'
         with:
@@ -173,6 +178,17 @@ jobs:
           git -c user.name=ci -c user.email=ci@local -c commit.gpgsign=false am \
             ../rebuck2src/rebuck2/tests/earthbuild-patches/*.patch
           git log --oneline "${EARTHBUILD_BASE}..HEAD"
+
+      # Anything not yet pushed to the fork branch is vendored, same reasoning as
+      # the earthbuild patches. 0001 is load-bearing for the coordinated arm:
+      # without it single-flight adopts --no-cache vertices and
+      # tests+no-cache-local-artifact-test fails.
+      - name: apply the buildkit patches
+        run: |
+          cd buildkit
+          git -c user.name=ci -c user.email=ci@local -c commit.gpgsign=false am \
+            ../rebuck2src/rebuck2/tests/buildkit-patches/*.patch
+          git log --oneline "${BUILDKIT_REF}..HEAD"
 
       - name: build earthly and buildkitd
         run: |

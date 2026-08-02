@@ -1,7 +1,7 @@
 From 544a8242e6e5823ba212a3ede08656e21e90bdc6 Mon Sep 17 00:00:00 2001
 From: Giles Cope <gilescope@gmail.com>
 Date: Fri, 31 Jul 2026 05:53:37 +0100
-Subject: [PATCH 1/5] feat(config): let TLS be set by environment
+Subject: [PATCH 01/12] feat(config): let TLS be set by environment
 
 Every other buildkit setting already has an env binding via EarthEnvVars. TLS
 alone was config-file only, which made a nested earthly impossible to configure:
