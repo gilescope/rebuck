@@ -55,7 +55,13 @@ env:
   # The stem: 32 vertices, measured at 94s, and it pulls the base images this
   # experiment is about. A whole test group would spend twenty minutes to answer
   # the same question.
-  TARGET: "+earthbuild-integration-test-base"
+  #
+  # earthly-, not earthbuild-. The target was renamed mid-project and
+  # EARTHBUILD_BASE is pinned to a commit from BEFORE the rename, so the newer
+  # name is the one that does not exist here. Reading the name off the pinned
+  # tree beats remembering it: `git show $EARTHBUILD_BASE:Earthfile | grep -n
+  # 'test-base:'`.
+  TARGET: "+earthly-integration-test-base"
 
 jobs:
   driver:
