@@ -154,8 +154,21 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg, payload: Arc<dyn Payload>) -
             conn: conn.clone(),
         });
         let bind = cfg.registry_bind;
+        // P4b step 3. The agent already answers from the local store, then from
+        // whichever peer the blooms claim, then from the driver. What it could
+        // not do was fetch a blob NOBODY holds -- that was a plain 404, buildkit
+        // went upstream itself, and the bytes never entered the fleet, so the
+        // next machine paid the same request. Configured, not default: see
+        // registry::upstream::host_from_env.
+        let upstream = crate::registry::HttpUpstream::from_env()
+            .map(|u| Arc::new(u) as Arc<dyn crate::registry::Upstream>);
+        if upstream.is_some() {
+            println!("[agent] pull-through mirror enabled");
+        }
         tokio::spawn(async move {
-            if let Err(e) = crate::registry::serve((bind, port).into(), agent).await {
+            if let Err(e) =
+                crate::registry::serve_with_upstream((bind, port).into(), agent, upstream).await
+            {
                 eprintln!("[agent] registry died: {e:#}");
             }
         });

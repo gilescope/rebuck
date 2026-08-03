@@ -282,11 +282,35 @@ pub struct Bandwidth {
     pub upload_bytes: AtomicU64,
     pub served: AtomicU64,
     pub serve_bytes: AtomicU64,
+    /// Blobs this agent had to go to the origin registry for. The plan's
+    /// Done-when for P4b is "serves rises, upstream fetches do not", so this has
+    /// to be a number rather than something inferred from a log.
+    pub upstream_fetches: AtomicU64,
+    pub upstream_bytes: AtomicU64,
+}
+
+/// Where a blob comes from when NOBODY in the fleet holds it.
+///
+/// Principle 9 -- the origin registry is a fallback, not a data path. Behind a
+/// trait so the wiring is testable without a network: what matters about a
+/// pull-through mirror is how often it goes upstream, and that is exactly what a
+/// fake can count.
+#[async_trait::async_trait]
+pub trait Upstream: Send + Sync + 'static {
+    /// The blob's bytes, or `None` if the origin does not have it either.
+    ///
+    /// `Err` means "could not ask" -- unreachable, refused, timed out -- and the
+    /// caller must treat it the same as a miss. A mirror that turns an
+    /// unreachable origin into a hard failure is strictly worse than no mirror.
+    async fn blob(&self, repo: &str, digest: &str) -> Result<Option<Vec<u8>>>;
 }
 
 struct Reg<S> {
     store: Arc<S>,
     bw: Bandwidth,
+    /// `None` unless configured. Off by default: a binary upgrade must not
+    /// start making outbound requests nobody asked for.
+    upstream: Option<Arc<dyn Upstream>>,
     next_upload: AtomicU64,
     /// Open upload sessions: id -> the blob being streamed to disk.
     ///
@@ -575,6 +599,9 @@ async fn handle<S: RegistryStore>(
     }
     // /v2/<name>/blobs/<digest>
     else if let Some((_repo, reference)) = path.rsplit_once("/blobs/") {
+        // The repo names the upstream namespace, so the mirror arm needs it.
+        // Everything before /blobs/ is the name, per the OCI spec.
+
         let Some(hex) = parse_digest(reference) else {
             return err(StatusCode::BAD_REQUEST, "DIGEST_INVALID", reference);
         };
@@ -606,7 +633,21 @@ async fn handle<S: RegistryStore>(
                         .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     blob_response(&method, bytes, reference, "application/octet-stream")
                 }
-                Ok(None) => err(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", reference),
+                // Nobody in the fleet holds it. THIS is where the bytes enter:
+                // fetch once from the origin into a store the blooms advertise,
+                // so the next machine gets it peer to peer instead of paying the
+                // same request. Without this the 404 below sends buildkit
+                // upstream itself and the fleet never learns anything.
+                Ok(None) => match pull_through(&reg, _repo, reference, hex).await {
+                    Some(bytes) => {
+                        reg.bw.served.fetch_add(1, Ordering::Relaxed);
+                        reg.bw
+                            .serve_bytes
+                            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        blob_response(&method, bytes, reference, "application/octet-stream")
+                    }
+                    None => err(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", reference),
+                },
                 Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &e.to_string()),
             },
             _ => err(StatusCode::METHOD_NOT_ALLOWED, "UNSUPPORTED", "GET/HEAD"),
@@ -717,12 +758,61 @@ async fn lease_handle<S: RegistryStore>(
 /// `GET /_rebuck/stats` — what crossed this endpoint, in JSON. The e2e reads it
 /// to answer "is the coordinator a bottleneck?" with a number rather than a
 /// hunch.
+/// Fetch a blob the fleet does not have, verify it, and keep it.
+///
+/// Returns `None` for every kind of "no" -- not configured, origin does not have
+/// it, origin unreachable, bytes did not match. The caller turns that into the
+/// same 404 it returned before this existed, and buildkit fetches the blob
+/// itself. FAIL OPEN, ALWAYS: a mirror that converts an unreachable origin into
+/// a hard failure is strictly worse than no mirror, and this is the rule this
+/// system has broken before.
+async fn pull_through<S: RegistryStore>(
+    reg: &Reg<S>,
+    repo: &str,
+    reference: &str,
+    hex: &str,
+) -> Option<Vec<u8>> {
+    let up = reg.upstream.as_ref()?;
+    let bytes = match up.blob(repo, reference).await {
+        Ok(Some(b)) => b,
+        Ok(None) => return None,
+        Err(e) => {
+            eprintln!("[registry] upstream {repo} {reference}: {e}");
+            return None;
+        }
+    };
+    // VERIFY BEFORE STORING. We store what we serve, and the blooms then
+    // advertise it, so one unchecked answer would propagate across the fleet by
+    // design -- every peer building against a layer nobody asked for. A digest
+    // is the only thing that makes a mirror safe to be transparent.
+    let got = {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(&bytes))
+    };
+    if got != hex {
+        eprintln!("[registry] upstream {repo} served sha256:{got} for {reference} -- refusing");
+        return None;
+    }
+    reg.bw.upstream_fetches.fetch_add(1, Ordering::Relaxed);
+    reg.bw
+        .upstream_bytes
+        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    // Best effort. A store failure costs the fleet a re-fetch, never an error:
+    // we already hold correct bytes and the caller is entitled to them.
+    if let Err(e) = reg.store.blob_put(&bytes).await {
+        eprintln!("[registry] could not keep {reference}: {e}");
+    }
+    Some(bytes)
+}
+
 async fn stats_handle<S: RegistryStore>(State(reg): State<Arc<Reg<S>>>) -> Response {
     let mut body = serde_json::json!({
         "uploads":      reg.bw.uploaded.load(Ordering::Relaxed),
         "upload_bytes": reg.bw.upload_bytes.load(Ordering::Relaxed),
         "serves":       reg.bw.served.load(Ordering::Relaxed),
         "serve_bytes":  reg.bw.serve_bytes.load(Ordering::Relaxed),
+        "upstream_fetches": reg.bw.upstream_fetches.load(Ordering::Relaxed),
+        "upstream_bytes":   reg.bw.upstream_bytes.load(Ordering::Relaxed),
     });
     // Only whoever owns the lease table can answer this; an agent forwards and
     // would report zeroes, which is worse than saying nothing.
@@ -741,9 +831,20 @@ async fn stats_handle<S: RegistryStore>(State(reg): State<Arc<Reg<S>>>) -> Respo
 }
 
 pub fn router<S: RegistryStore>(store: Arc<S>) -> Router {
+    router_with_upstream(store, None)
+}
+
+/// The mirror shape. `upstream` is the third step of P4b: local store, then
+/// whichever peer the blooms claim, then the driver -- and only if all of that
+/// misses, the origin, once, into a store the blooms then advertise.
+pub fn router_with_upstream<S: RegistryStore>(
+    store: Arc<S>,
+    upstream: Option<Arc<dyn Upstream>>,
+) -> Router {
     let reg = Arc::new(Reg {
         store,
         bw: Bandwidth::default(),
+        upstream,
         next_upload: AtomicU64::new(0),
         sessions: std::sync::Mutex::new(HashMap::new()),
     });
@@ -764,6 +865,24 @@ pub async fn serve<S: RegistryStore>(addr: SocketAddr, store: Arc<S>) -> Result<
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("[registry] OCI v2 on http://{}", listener.local_addr()?);
     axum::serve(listener, router(store)).await?;
+    Ok(())
+}
+
+pub async fn serve_with_upstream<S: RegistryStore>(
+    addr: SocketAddr,
+    store: Arc<S>,
+    upstream: Option<Arc<dyn Upstream>>,
+) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let via = match &upstream {
+        Some(_) => " (pull-through)",
+        None => "",
+    };
+    println!(
+        "[registry] OCI v2 on http://{}{via}",
+        listener.local_addr()?
+    );
+    axum::serve(listener, router_with_upstream(store, upstream)).await?;
     Ok(())
 }
 
@@ -1379,9 +1498,81 @@ pub mod upstream {
     /// anyone asked for.
     pub fn host_from_env() -> Option<String> {
         match std::env::var("REBUCK_UPSTREAM_REGISTRY") {
+            // "on" without having to name the host. Hub is the default because
+            // Hub is what rate-limits; anything else is already explicit in the
+            // reference, so naming it is no burden.
+            Ok(v) if matches!(v.trim(), "1" | "true" | "yes") => Some(DEFAULT_HOST.to_string()),
             Ok(v) if !v.trim().is_empty() => Some(v.trim().to_string()),
             _ => None,
         }
+    }
+}
+
+/// The origin registry over HTTPS, with Docker Hub's token dance.
+///
+/// One client for the process: reqwest pools connections, and a fleet fetching
+/// eighteen base images wants that pooling rather than eighteen TLS handshakes.
+pub struct HttpUpstream {
+    host: String,
+    http: reqwest::Client,
+}
+
+impl HttpUpstream {
+    /// `None` unless `REBUCK_UPSTREAM_REGISTRY` names a host -- see
+    /// [`upstream::host_from_env`]. Off by default, deliberately.
+    pub fn from_env() -> Option<Self> {
+        upstream::host_from_env().map(Self::new)
+    }
+
+    pub fn new(host: String) -> Self {
+        Self {
+            host,
+            // A layer can be hundreds of MB from a CDN on a cold runner; the
+            // default has no overall timeout, which is right here. Connect is
+            // bounded so an unroutable origin fails open promptly rather than
+            // stalling every build behind it.
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .user_agent("rebuck2-mirror")
+                .build()
+                .expect("rustls client"),
+        }
+    }
+
+    /// Docker Hub answers an anonymous blob request with 401 and a token
+    /// challenge. The token is per-repo and pull-scoped; asking for more is how
+    /// an anonymous client gets refused outright.
+    async fn token(&self, repo: &str) -> Result<Option<String>> {
+        let v: serde_json::Value = self
+            .http
+            .get(upstream::token_url(repo))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(v.get("token").and_then(|t| t.as_str()).map(str::to_string))
+    }
+}
+
+#[async_trait::async_trait]
+impl Upstream for HttpUpstream {
+    async fn blob(&self, repo: &str, digest: &str) -> Result<Option<Vec<u8>>> {
+        let url = upstream::blob_url(&self.host, repo, digest);
+        let mut res = self.http.get(&url).send().await?;
+        // Unauthenticated first, token only if challenged: a private registry
+        // with no auth at all should not be handed a Hub token, and Hub tells us
+        // plainly when it wants one.
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let Some(tok) = self.token(repo).await? {
+                res = self.http.get(&url).bearer_auth(tok).send().await?;
+            }
+        }
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let res = res.error_for_status()?;
+        Ok(Some(res.bytes().await?.to_vec()))
     }
 }
 
@@ -1429,5 +1620,215 @@ mod upstream_tests {
         unsafe { std::env::set_var("REBUCK_UPSTREAM_REGISTRY", " ghcr.io ") };
         assert_eq!(host_from_env().as_deref(), Some("ghcr.io"));
         unsafe { std::env::remove_var("REBUCK_UPSTREAM_REGISTRY") };
+    }
+}
+
+/// P4b -- the agent as a pull-through mirror.
+///
+/// Steps 1 and 2 of the plan's shape already work: `Agent::blob_get` goes local
+/// store -> whichever peer the blooms claim -> the driver. What is missing is
+/// step 3. A blob NOBODY holds is a plain 404, buildkit fetches it upstream
+/// itself, and the bytes never enter the fleet -- so the next machine pays the
+/// same request, and the one after that, which is what earthbuild currently buys
+/// Docker Hub credentials to survive.
+#[cfg(test)]
+mod pull_through_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::sync::atomic::AtomicUsize;
+    use tower::ServiceExt;
+
+    fn store() -> Arc<Store> {
+        Arc::new(Store::new(tempfile::tempdir().unwrap().keep()).unwrap())
+    }
+
+    async fn call(r: &Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
+        let res = r.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        (status, body)
+    }
+
+    fn sha256_of(b: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("sha256:{:x}", Sha256::digest(b))
+    }
+
+    /// An upstream that answers from memory and counts how often it was asked.
+    /// The count IS the assertion for most of these: "fetched once" is the whole
+    /// claim of a pull-through mirror.
+    struct Fake {
+        body: std::result::Result<Option<Vec<u8>>, ()>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Upstream for Fake {
+        async fn blob(&self, _repo: &str, _digest: &str) -> Result<Option<Vec<u8>>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            match &self.body {
+                Ok(v) => Ok(v.clone()),
+                Err(()) => Err(anyhow::anyhow!("upstream unreachable")),
+            }
+        }
+    }
+
+    fn fake(body: std::result::Result<Option<Vec<u8>>, ()>) -> Arc<Fake> {
+        Arc::new(Fake {
+            body,
+            calls: AtomicUsize::new(0),
+        })
+    }
+
+    /// THE property. A blob no peer holds is fetched upstream ONCE, stored, and
+    /// served -- and the second request never reaches upstream, because by then
+    /// the fleet holds it and the blooms say so.
+    #[tokio::test]
+    async fn a_blob_nobody_holds_is_fetched_once_and_then_served_locally() {
+        let bytes = b"layer bytes".to_vec();
+        let digest = sha256_of(&bytes);
+        let up = fake(Ok(Some(bytes.clone())));
+        let r = router_with_upstream(store(), Some(up.clone()));
+
+        for _ in 0..3 {
+            let (st, got) = call(
+                &r,
+                Request::get(format!("/v2/library/alpine/blobs/{digest}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(got, bytes);
+        }
+        assert_eq!(
+            up.calls.load(Ordering::Relaxed),
+            1,
+            "three requests must cost ONE upstream fetch -- that is the whole feature"
+        );
+    }
+
+    /// The failure a mirror must never have. Serving bytes whose hash does not
+    /// match the digest asked for is silently building against the wrong image,
+    /// and it would poison the fleet: we store what we serve, so one bad answer
+    /// propagates by design.
+    #[tokio::test]
+    async fn bytes_that_do_not_match_the_digest_are_refused_and_not_stored() {
+        let asked = sha256_of(b"the blob that was asked for");
+        let up = fake(Ok(Some(b"something else entirely".to_vec())));
+        let r = router_with_upstream(store(), Some(up.clone()));
+
+        let (st, _) = call(
+            &r,
+            Request::get(format!("/v2/library/alpine/blobs/{asked}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "a digest mismatch is not a hit");
+
+        // And it must not have been kept: a second request has to go back
+        // upstream rather than serve the poison from our own store.
+        let (st2, _) = call(
+            &r,
+            Request::get(format!("/v2/library/alpine/blobs/{asked}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st2, StatusCode::NOT_FOUND);
+        assert_eq!(up.calls.load(Ordering::Relaxed), 2, "nothing was cached");
+    }
+
+    /// Fail open, always. A mirror that turns an unreachable upstream into a
+    /// hard failure is strictly worse than no mirror: 404 is what we said before
+    /// this feature existed, and buildkit then fetches it itself.
+    #[tokio::test]
+    async fn an_unreachable_upstream_is_a_404_not_a_500() {
+        let digest = sha256_of(b"whatever");
+        let r = router_with_upstream(store(), Some(fake(Err(()))));
+        let (st, _) = call(
+            &r,
+            Request::get(format!("/v2/library/alpine/blobs/{digest}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    /// Off by default. The mirror reaches the internet only when configured to,
+    /// so upgrading a binary cannot start making outbound requests nobody asked
+    /// for.
+    #[tokio::test]
+    async fn without_an_upstream_a_miss_is_still_a_miss() {
+        let digest = sha256_of(b"whatever");
+        let r = router(store());
+        let (st, _) = call(
+            &r,
+            Request::get(format!("/v2/library/alpine/blobs/{digest}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    /// "upstream fetches do not rise" is half of the plan's Done-when, so it has
+    /// to be reportable rather than inferred from a log.
+    #[tokio::test]
+    async fn upstream_fetches_are_counted() {
+        let bytes = b"counted".to_vec();
+        let digest = sha256_of(&bytes);
+        let r = router_with_upstream(store(), Some(fake(Ok(Some(bytes)))));
+        let _ = call(
+            &r,
+            Request::get(format!("/v2/library/alpine/blobs/{digest}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let (_, body) = call(
+            &r,
+            Request::get("/_rebuck/stats").body(Body::empty()).unwrap(),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["upstream_fetches"], 1);
+    }
+}
+
+#[cfg(test)]
+mod upstream_env_tests {
+    use super::upstream::*;
+
+    /// The mirror is off unless asked for, and "asked for" should not require
+    /// remembering Docker Hub's registry hostname. `host_from_env` reads process
+    /// state, so these assert on the pure mapping rather than by setting env
+    /// vars -- concurrent tests share one environment and that is a race.
+    #[test]
+    fn default_host_is_hub_because_hub_is_what_rate_limits() {
+        assert_eq!(DEFAULT_HOST, "registry-1.docker.io");
+    }
+
+    #[test]
+    fn a_named_host_is_reached_directly() {
+        assert_eq!(
+            blob_url("ghcr.io", "earthbuild/earthbuild", "sha256:abc"),
+            "https://ghcr.io/v2/earthbuild/earthbuild/blobs/sha256:abc"
+        );
+    }
+
+    /// Pull-scoped and per-repo. Asking for more is how an anonymous client gets
+    /// refused outright rather than handed a narrower token.
+    #[test]
+    fn the_token_request_asks_only_for_pull_on_one_repo() {
+        let u = token_url("library/alpine");
+        assert!(u.contains("scope=repository:library/alpine:pull"), "{u}");
+        assert!(!u.contains("push"), "{u}");
     }
 }
