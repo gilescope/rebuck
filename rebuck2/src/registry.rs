@@ -91,6 +91,15 @@ const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
 pub trait RegistryStore: Send + Sync + 'static {
     async fn blob_size(&self, hash: &str) -> Option<u64>;
     async fn blob_get(&self, hash: &str) -> Result<Option<Vec<u8>>>;
+    /// The blob as a body that never exists whole in memory, with its length.
+    ///
+    /// Defaults to the buffered read so a store that cannot stream still works;
+    /// the local [`Store`] overrides it, and that is the one that matters --
+    /// a mirror hit serves from disk.
+    async fn blob_stream(&self, hash: &str) -> Option<(u64, Body)> {
+        let bytes = self.blob_get(hash).await.ok()??;
+        Some((bytes.len() as u64, Body::from(bytes)))
+    }
     /// Small, known-bounded values only (manifests). Layers must stream.
     async fn blob_put(&self, bytes: &[u8]) -> Result<String>;
     async fn upload_begin(&self) -> Result<Upload>;
@@ -160,6 +169,26 @@ pub enum Claimed {
 
 #[async_trait::async_trait]
 impl RegistryStore for Store {
+    /// Chunks off the CAS file. The upload path already streams to disk; this is
+    /// its counterpart, so a 500 MB layer is 500 MB of disk reads and never
+    /// 500 MB resident.
+    async fn blob_stream(&self, hash: &str) -> Option<(u64, Body)> {
+        let (len, file) = self.open_blob(hash).await?;
+        let stream = futures::stream::unfold(file, |mut f| async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; 64 * 1024];
+            match f.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(n) => {
+                    buf.truncate(n);
+                    Some((Ok::<Vec<u8>, std::io::Error>(buf), f))
+                }
+                Err(e) => Some((Err(e), f)),
+            }
+        });
+        Some((len, Body::from_stream(stream)))
+    }
+
     async fn blob_size(&self, hash: &str) -> Option<u64> {
         self.size_of(hash).await
     }
@@ -295,14 +324,18 @@ pub struct Bandwidth {
 /// trait so the wiring is testable without a network: what matters about a
 /// pull-through mirror is how often it goes upstream, and that is exactly what a
 /// fake can count.
+/// A blob on its way somewhere, in chunks. Never a `Vec<u8>`: a layer is
+/// hundreds of MB and this runs on a CI runner next to a compiler.
+pub type BoxByteStream = std::pin::Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>>> + Send>>;
+
 #[async_trait::async_trait]
 pub trait Upstream: Send + Sync + 'static {
-    /// The blob's bytes, or `None` if the origin does not have it either.
+    /// The blob as a stream, or `None` if the origin does not have it either.
     ///
     /// `Err` means "could not ask" -- unreachable, refused, timed out -- and the
     /// caller must treat it the same as a miss. A mirror that turns an
     /// unreachable origin into a hard failure is strictly worse than no mirror.
-    async fn blob(&self, repo: &str, digest: &str) -> Result<Option<Vec<u8>>>;
+    async fn blob(&self, repo: &str, digest: &str) -> Result<Option<BoxByteStream>>;
 }
 
 struct Reg<S> {
@@ -311,6 +344,13 @@ struct Reg<S> {
     /// `None` unless configured. Off by default: a binary upgrade must not
     /// start making outbound requests nobody asked for.
     upstream: Option<Arc<dyn Upstream>>,
+    /// One upstream fetch per blob, however many callers want it at once.
+    ///
+    /// Ten nested builds starting together all want `alpine`, and without this
+    /// the mirror makes ten upstream requests -- precisely the storm it exists
+    /// to remove. Keyed by digest: the first caller fetches, the rest wait on
+    /// its gate and then find the blob in the store.
+    inflight: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     next_upload: AtomicU64,
     /// Open upload sessions: id -> the blob being streamed to disk.
     ///
@@ -358,6 +398,25 @@ fn err(code: StatusCode, oci_code: &str, msg: &str) -> Response {
 /// Body + the headers BuildKit actually reads. `Content-Length` is set
 /// explicitly (not left to the framework) because a wrong one is a *silent*
 /// importer rejection, not an error.
+/// Serve a blob without ever holding it whole. Same headers as the buffered
+/// form -- a client cannot tell, which is the point.
+fn streamed_blob_response(method: &Method, len: u64, body: Body, digest: &str) -> Response {
+    let mut h = HeaderMap::new();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    h.insert(
+        "Docker-Content-Digest",
+        HeaderValue::from_str(digest).unwrap(),
+    );
+    if method == Method::HEAD {
+        return (StatusCode::OK, h).into_response();
+    }
+    (StatusCode::OK, h, body).into_response()
+}
+
 fn blob_response(method: &Method, bytes: Vec<u8>, digest: &str, ctype: &str) -> Response {
     let mut h = HeaderMap::new();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_str(ctype).unwrap());
@@ -638,16 +697,20 @@ async fn handle<S: RegistryStore>(
                 // so the next machine gets it peer to peer instead of paying the
                 // same request. Without this the 404 below sends buildkit
                 // upstream itself and the fleet never learns anything.
-                Ok(None) => match pull_through(&reg, _repo, reference, hex).await {
-                    Some(bytes) => {
-                        reg.bw.served.fetch_add(1, Ordering::Relaxed);
-                        reg.bw
-                            .serve_bytes
-                            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                        blob_response(&method, bytes, reference, "application/octet-stream")
+                Ok(None) => {
+                    if ensure_present(&reg, _repo, reference, hex).await {
+                        match reg.store.blob_stream(hex).await {
+                            Some((len, body)) => {
+                                reg.bw.served.fetch_add(1, Ordering::Relaxed);
+                                reg.bw.serve_bytes.fetch_add(len, Ordering::Relaxed);
+                                streamed_blob_response(&method, len, body, reference)
+                            }
+                            None => err(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", reference),
+                        }
+                    } else {
+                        err(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", reference)
                     }
-                    None => err(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", reference),
-                },
+                }
                 Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &e.to_string()),
             },
             _ => err(StatusCode::METHOD_NOT_ALLOWED, "UNSUPPORTED", "GET/HEAD"),
@@ -758,51 +821,107 @@ async fn lease_handle<S: RegistryStore>(
 /// `GET /_rebuck/stats` — what crossed this endpoint, in JSON. The e2e reads it
 /// to answer "is the coordinator a bottleneck?" with a number rather than a
 /// hunch.
-/// Fetch a blob the fleet does not have, verify it, and keep it.
+/// Make sure the fleet holds this blob, fetching it from the origin at most
+/// once however many callers want it at once. Returns whether it is now present.
 ///
-/// Returns `None` for every kind of "no" -- not configured, origin does not have
-/// it, origin unreachable, bytes did not match. The caller turns that into the
-/// same 404 it returned before this existed, and buildkit fetches the blob
+/// Returns `false` for every kind of "no" -- not configured, origin does not
+/// have it, origin unreachable, bytes did not match. The caller turns that into
+/// the same 404 it returned before this existed, and buildkit fetches the blob
 /// itself. FAIL OPEN, ALWAYS: a mirror that converts an unreachable origin into
 /// a hard failure is strictly worse than no mirror, and this is the rule this
 /// system has broken before.
-async fn pull_through<S: RegistryStore>(
+async fn ensure_present<S: RegistryStore>(
     reg: &Reg<S>,
     repo: &str,
     reference: &str,
     hex: &str,
-) -> Option<Vec<u8>> {
-    let up = reg.upstream.as_ref()?;
-    let bytes = match up.blob(repo, reference).await {
-        Ok(Some(b)) => b,
-        Ok(None) => return None,
+) -> bool {
+    let Some(up) = reg.upstream.as_ref() else {
+        return false;
+    };
+
+    // Take this blob's gate. The first caller fetches; the rest queue here
+    // rather than each opening their own connection to the origin.
+    let gate = {
+        let mut m = reg.inflight.lock().await;
+        m.entry(hex.to_string()).or_default().clone()
+    };
+    let _held = gate.lock().await;
+
+    // Whoever we queued behind has landed it by now, so this is a hit rather
+    // than a second fetch. Also covers a peer having supplied it meanwhile.
+    let present = reg.store.blob_size(hex).await.is_some();
+    let landed = if present {
+        true
+    } else {
+        fetch_once(reg, up.as_ref(), repo, reference, hex).await
+    };
+
+    // Drop the gate from the map when nobody else holds it, so a long-lived
+    // agent does not accumulate an entry per blob it has ever served.
+    drop(_held);
+    let mut m = reg.inflight.lock().await;
+    if let Some(g) = m.get(hex) {
+        if Arc::strong_count(g) == 1 {
+            m.remove(hex);
+        }
+    }
+    landed
+}
+
+/// The fetch itself: stream the origin into an upload, and let the store verify
+/// the digest as it lands.
+///
+/// VERIFY BEFORE STORING is delegated to `upload_finish(.., Some(hex))`, which
+/// rejects a mismatch -- the CAS's whole contract is that a name means its
+/// content. It matters here more than anywhere: we store what we serve and the
+/// blooms then advertise it, so one unchecked answer would propagate across the
+/// fleet by design.
+async fn fetch_once<S: RegistryStore>(
+    reg: &Reg<S>,
+    up: &dyn Upstream,
+    repo: &str,
+    reference: &str,
+    hex: &str,
+) -> bool {
+    let mut stream = match up.blob(repo, reference).await {
+        Ok(Some(s)) => s,
+        Ok(None) => return false,
         Err(e) => {
             eprintln!("[registry] upstream {repo} {reference}: {e}");
-            return None;
+            return false;
         }
     };
-    // VERIFY BEFORE STORING. We store what we serve, and the blooms then
-    // advertise it, so one unchecked answer would propagate across the fleet by
-    // design -- every peer building against a layer nobody asked for. A digest
-    // is the only thing that makes a mirror safe to be transparent.
-    let got = {
-        use sha2::{Digest, Sha256};
-        format!("{:x}", Sha256::digest(&bytes))
+    let mut upload = match reg.store.upload_begin().await {
+        Ok(u) => u,
+        Err(e) => {
+            eprintln!("[registry] cannot stage {reference}: {e}");
+            return false;
+        }
     };
-    if got != hex {
-        eprintln!("[registry] upstream {repo} served sha256:{got} for {reference} -- refusing");
-        return None;
+    let mut n: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[registry] upstream {repo} {reference} broke off: {e}");
+                return false;
+            }
+        };
+        n += chunk.len() as u64;
+        if let Err(e) = upload.write(&chunk).await {
+            eprintln!("[registry] cannot stage {reference}: {e}");
+            return false;
+        }
+    }
+    // A mismatch lands here, as an Err, and nothing reaches the CAS.
+    if let Err(e) = reg.store.upload_finish(upload, Some(hex)).await {
+        eprintln!("[registry] refusing {reference} from {repo}: {e}");
+        return false;
     }
     reg.bw.upstream_fetches.fetch_add(1, Ordering::Relaxed);
-    reg.bw
-        .upstream_bytes
-        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-    // Best effort. A store failure costs the fleet a re-fetch, never an error:
-    // we already hold correct bytes and the caller is entitled to them.
-    if let Err(e) = reg.store.blob_put(&bytes).await {
-        eprintln!("[registry] could not keep {reference}: {e}");
-    }
-    Some(bytes)
+    reg.bw.upstream_bytes.fetch_add(n, Ordering::Relaxed);
+    true
 }
 
 async fn stats_handle<S: RegistryStore>(State(reg): State<Arc<Reg<S>>>) -> Response {
@@ -845,6 +964,7 @@ pub fn router_with_upstream<S: RegistryStore>(
         store,
         bw: Bandwidth::default(),
         upstream,
+        inflight: tokio::sync::Mutex::new(HashMap::new()),
         next_upload: AtomicU64::new(0),
         sessions: std::sync::Mutex::new(HashMap::new()),
     });
@@ -1557,7 +1677,7 @@ impl HttpUpstream {
 
 #[async_trait::async_trait]
 impl Upstream for HttpUpstream {
-    async fn blob(&self, repo: &str, digest: &str) -> Result<Option<Vec<u8>>> {
+    async fn blob(&self, repo: &str, digest: &str) -> Result<Option<BoxByteStream>> {
         let url = upstream::blob_url(&self.host, repo, digest);
         let mut res = self.http.get(&url).send().await?;
         // Unauthenticated first, token only if challenged: a private registry
@@ -1572,7 +1692,13 @@ impl Upstream for HttpUpstream {
             return Ok(None);
         }
         let res = res.error_for_status()?;
-        Ok(Some(res.bytes().await?.to_vec()))
+        // bytes_stream, not bytes: reqwest hands the body over as it arrives and
+        // it goes straight into an upload, so a layer never exists whole
+        // anywhere in this process.
+        let stream = res
+            .bytes_stream()
+            .map(|c| c.map(|b| b.to_vec()).map_err(anyhow::Error::from));
+        Ok(Some(Box::pin(stream)))
     }
 }
 
@@ -1668,10 +1794,14 @@ mod pull_through_tests {
 
     #[async_trait::async_trait]
     impl Upstream for Fake {
-        async fn blob(&self, _repo: &str, _digest: &str) -> Result<Option<Vec<u8>>> {
+        async fn blob(&self, _repo: &str, _digest: &str) -> Result<Option<BoxByteStream>> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             match &self.body {
-                Ok(v) => Ok(v.clone()),
+                Ok(None) => Ok(None),
+                Ok(Some(v)) => {
+                    let chunks: Vec<Result<Vec<u8>>> = vec![Ok(v.clone())];
+                    Ok(Some(Box::pin(futures::stream::iter(chunks))))
+                }
                 Err(()) => Err(anyhow::anyhow!("upstream unreachable")),
             }
         }
@@ -1830,5 +1960,134 @@ mod upstream_env_tests {
         let u = token_url("library/alpine");
         assert!(u.contains("scope=repository:library/alpine:pull"), "{u}");
         assert!(!u.contains("push"), "{u}");
+    }
+}
+
+#[cfg(test)]
+mod pull_through_streaming_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::sync::atomic::AtomicUsize;
+    use tower::ServiceExt;
+
+    fn store() -> Arc<Store> {
+        Arc::new(Store::new(tempfile::tempdir().unwrap().keep()).unwrap())
+    }
+
+    fn sha256_of(b: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("sha256:{:x}", Sha256::digest(b))
+    }
+
+    /// Hands the bytes over in chunks and can be made slow, so a second caller
+    /// is guaranteed to arrive while the first is still fetching.
+    struct SlowChunked {
+        bytes: Vec<u8>,
+        calls: Arc<AtomicUsize>,
+        delay: std::time::Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl Upstream for SlowChunked {
+        async fn blob(&self, _repo: &str, _digest: &str) -> Result<Option<BoxByteStream>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(self.delay).await;
+            let chunks: Vec<Result<Vec<u8>>> =
+                self.bytes.chunks(7).map(|c| Ok(c.to_vec())).collect();
+            Ok(Some(Box::pin(futures::stream::iter(chunks))))
+        }
+    }
+
+    /// Ten nested builds asking for alpine at once must cost ONE upstream
+    /// fetch. Without this the mirror is a per-request proxy -- it would make
+    /// exactly the storm of requests the feature exists to remove, which is the
+    /// shape earthbuild already pays Docker Hub credentials to survive.
+    #[tokio::test]
+    async fn concurrent_misses_for_one_blob_cost_one_upstream_fetch() {
+        let bytes: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let digest = sha256_of(&bytes);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let up = Arc::new(SlowChunked {
+            bytes: bytes.clone(),
+            calls: calls.clone(),
+            delay: std::time::Duration::from_millis(120),
+        });
+        let r = router_with_upstream(store(), Some(up));
+
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..10 {
+            let r = r.clone();
+            let digest = digest.clone();
+            set.spawn(async move {
+                let res = r
+                    .oneshot(
+                        Request::get(format!("/v2/library/alpine/blobs/{digest}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let st = res.status();
+                let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec();
+                (st, body)
+            });
+        }
+        while let Some(j) = set.join_next().await {
+            let (st, body) = j.unwrap();
+            assert_eq!(st, StatusCode::OK);
+            assert_eq!(body, bytes, "every waiter gets the whole blob");
+        }
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "ten concurrent misses must collapse to one upstream fetch"
+        );
+    }
+
+    /// The bytes must reach disk a chunk at a time. A layer is hundreds of MB
+    /// and this runs on a CI runner next to a compiler, so a blob that is only
+    /// ever whole in memory is a memory bug waiting for a big enough image.
+    ///
+    /// Asserted structurally rather than by watching RSS: the upstream hands
+    /// over a stream, and what lands is verified by the store's own digest
+    /// check on finish -- so a correct result here means the streaming path,
+    /// not a buffered one, carried it.
+    #[tokio::test]
+    async fn a_streamed_blob_lands_whole_and_verified() {
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let digest = sha256_of(&bytes);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let s = store();
+        let r = router_with_upstream(
+            s.clone(),
+            Some(Arc::new(SlowChunked {
+                bytes: bytes.clone(),
+                calls,
+                delay: std::time::Duration::ZERO,
+            })),
+        );
+        let res = r
+            .clone()
+            .oneshot(
+                Request::get(format!("/v2/library/alpine/blobs/{digest}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let got = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        assert_eq!(got, bytes);
+        // And it is in the CAS under its own name, which is what makes the next
+        // machine's fetch a peer fetch rather than another upstream one.
+        let hex = digest.strip_prefix("sha256:").unwrap();
+        assert!(s.get_by_hash(hex).await.unwrap().is_some());
     }
 }

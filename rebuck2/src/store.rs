@@ -630,6 +630,17 @@ impl Store {
     }
 
     /// Blob by hash alone. See [`Store::size_of`] for why OCI needs this.
+    /// Open a blob for STREAMING, with its length -- the read counterpart of
+    /// [`Store::begin_upload`]. A layer is hundreds of MB; anything that only
+    /// ever exists whole in memory is a memory bug waiting for a big enough
+    /// image.
+    pub async fn open_blob(&self, hash: &str) -> Option<(u64, tokio::fs::File)> {
+        let path = self.cas_path(hash);
+        let file = tokio::fs::File::open(&path).await.ok()?;
+        let len = file.metadata().await.ok()?.len();
+        Some((len, file))
+    }
+
     pub async fn get_by_hash(&self, hash: &str) -> Result<Option<Vec<u8>>> {
         if hash == EMPTY_SHA256 {
             return Ok(Some(Vec::new()));
