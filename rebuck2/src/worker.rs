@@ -548,6 +548,29 @@ impl crate::registry::RegistryStore for Agent {
     async fn blob_get(&self, hash: &str) -> Result<Option<Vec<u8>>> {
         self.blobs.get_by_hash(hash).await
     }
+    /// Local disk first, and streamed. Two reasons this is not just the default
+    /// implementation: a local hit should never be read whole into memory, and
+    /// after a pull-through the blob IS local -- so serving it must not depend
+    /// on the mesh-aware read that may be exactly what failed.
+    async fn blob_stream(&self, hash: &str) -> Option<(u64, axum::body::Body)> {
+        if let Some((len, file)) = self.store.open_blob(hash).await {
+            let stream = futures::stream::unfold(file, |mut f| async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = vec![0u8; 64 * 1024];
+                match f.read(&mut buf).await {
+                    Ok(0) => None,
+                    Ok(n) => {
+                        buf.truncate(n);
+                        Some((Ok::<Vec<u8>, std::io::Error>(buf), f))
+                    }
+                    Err(e) => Some((Err(e), f)),
+                }
+            });
+            return Some((len, axum::body::Body::from_stream(stream)));
+        }
+        let bytes = self.blobs.get_by_hash(hash).await.ok()??;
+        Some((bytes.len() as u64, axum::body::Body::from(bytes)))
+    }
     async fn blob_put(&self, bytes: &[u8]) -> Result<String> {
         Ok(self.store.put(None, bytes).await?.hash)
     }

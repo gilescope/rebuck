@@ -726,7 +726,27 @@ async fn handle<S: RegistryStore>(
                         err(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", reference)
                     }
                 }
-                Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", &e.to_string()),
+                // A BROKEN FLEET LOOKUP IS NOT A BROKEN BUILD. This used to be a
+                // 500, which coupled the build's fate to the mesh's health --
+                // lose the mesh mid-run and every machine's build died with it,
+                // exactly the coupling a fallback exists to prevent. Try the
+                // origin; failing that, report the miss we would have reported
+                // before any of this existed and let the caller fetch it.
+                Err(e) => {
+                    eprintln!("[registry] local lookup for {reference} failed: {e}");
+                    if ensure_present(&reg, _repo, reference, hex).await {
+                        match reg.store.blob_stream(hex).await {
+                            Some((len, body)) => {
+                                reg.bw.served.fetch_add(1, Ordering::Relaxed);
+                                reg.bw.serve_bytes.fetch_add(len, Ordering::Relaxed);
+                                streamed_blob_response(&method, len, body, reference)
+                            }
+                            None => err(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", reference),
+                        }
+                    } else {
+                        err(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", reference)
+                    }
+                }
             },
             _ => err(StatusCode::METHOD_NOT_ALLOWED, "UNSUPPORTED", "GET/HEAD"),
         }
@@ -2191,5 +2211,119 @@ mod pull_through_head_tests {
             1,
             "HEAD then GET is ONE upstream fetch, not two"
         );
+    }
+}
+
+#[cfg(test)]
+mod mesh_down_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn sha256_of(b: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("sha256:{:x}", Sha256::digest(b))
+    }
+
+    /// A store whose reads fail, standing in for an agent whose mesh has died
+    /// under it. Everything else delegates, so the upload path still works --
+    /// which is the point: the fleet lookup is broken, the local disk is not.
+    struct MeshDown(Arc<Store>);
+
+    #[async_trait::async_trait]
+    impl RegistryStore for MeshDown {
+        async fn blob_size(&self, hash: &str) -> Option<u64> {
+            self.0.size_of(hash).await
+        }
+        async fn blob_get(&self, _hash: &str) -> Result<Option<Vec<u8>>> {
+            anyhow::bail!("mesh is gone")
+        }
+        /// Local disk still works -- that is what makes this "the mesh died",
+        /// not "the machine died". Mirrors what Agent does.
+        async fn blob_stream(&self, hash: &str) -> Option<(u64, Body)> {
+            self.0.blob_stream(hash).await
+        }
+        async fn blob_put(&self, bytes: &[u8]) -> Result<String> {
+            Ok(self.0.put(None, bytes).await?.hash)
+        }
+        async fn upload_begin(&self) -> Result<Upload> {
+            self.0.begin_upload().await
+        }
+        async fn upload_finish(&self, up: Upload, expected: Option<&str>) -> Result<String> {
+            self.0.finish_upload(up, expected).await
+        }
+        async fn tag_get(&self, key: &str) -> Option<String> {
+            self.0.tag_get(key).await
+        }
+        async fn tag_put(&self, key: &str, manifest_hash: &str) -> Result<()> {
+            self.0.tag_put(key, manifest_hash).await
+        }
+    }
+
+    struct Origin(Vec<u8>);
+
+    #[async_trait::async_trait]
+    impl Upstream for Origin {
+        async fn blob(&self, _repo: &str, _digest: &str) -> Result<Option<BoxByteStream>> {
+            let chunks: Vec<Result<Vec<u8>>> = vec![Ok(self.0.clone())];
+            Ok(Some(Box::pin(futures::stream::iter(chunks))))
+        }
+    }
+
+    /// The second half of P4b's Done-when: "with the mesh killed mid-run, both
+    /// still build."
+    ///
+    /// A dead fleet lookup must not become a failed build. Before this the GET
+    /// arm turned a store error straight into 500 and never reached the origin
+    /// -- so losing the mesh took the build with it, which is precisely the
+    /// coupling a fallback exists to prevent. Degrading to "fetch it yourself"
+    /// is always correct; failing is not.
+    #[tokio::test]
+    async fn a_dead_mesh_falls_open_to_the_origin_rather_than_failing_the_build() {
+        let bytes = b"the layer the build needs".to_vec();
+        let digest = sha256_of(&bytes);
+        let store = Arc::new(Store::new(tempfile::tempdir().unwrap().keep()).unwrap());
+        let r = router_with_upstream(
+            Arc::new(MeshDown(store)),
+            Some(Arc::new(Origin(bytes.clone()))),
+        );
+
+        let res = r
+            .oneshot(
+                Request::get(format!("/v2/library/alpine/blobs/{digest}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "a broken mesh must not fail a build the origin can serve"
+        );
+        let got = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec();
+        assert_eq!(got, bytes);
+    }
+
+    /// ...and with no origin configured it is still a 404, not a 500. The
+    /// caller then fetches it itself, which is what it did before any of this
+    /// existed.
+    #[tokio::test]
+    async fn a_dead_mesh_without_an_origin_is_a_miss_not_an_error() {
+        let store = Arc::new(Store::new(tempfile::tempdir().unwrap().keep()).unwrap());
+        let r = router(Arc::new(MeshDown(store)));
+        let res = r
+            .oneshot(
+                Request::get(format!("/v2/library/alpine/blobs/{}", sha256_of(b"x")))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 }
