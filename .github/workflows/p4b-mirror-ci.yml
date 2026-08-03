@@ -222,13 +222,24 @@ jobs:
               "$RUNNER_TEMP/earthly" --verbose --allow-privileged --no-output \
               "$TARGET" ) 2>&1 | tee build.log
 
-      - name: agent stats
+      - name: agent stats and logs
         if: always()
         run: |
           mkdir -p out
           curl -s "http://127.0.0.1:$AGENT_PORT/_rebuck/stats" \
             > "out/runner-${{ matrix.runner }}.json" || echo '{}' > "out/runner-${{ matrix.runner }}.json"
           cat "out/runner-${{ matrix.runner }}.json"
+          # The AGENT's side of the story. Everything the mirror refuses or
+          # fails to fetch is an eprintln in worker.log and nowhere else, and a
+          # job that ends without keeping it throws away the only record --
+          # which is exactly what happened to the run that cancelled, and to the
+          # buildkitd logs during the Canceled hunt before that. Keep the
+          # diagnostic BEFORE needing it.
+          cp worker.log "out/worker-${{ matrix.runner }}.log" 2>/dev/null || true
+          docker logs p4b-bk > "out/buildkitd-${{ matrix.runner }}.log" 2>&1 || true
+          cp build.log "out/build-${{ matrix.runner }}.log" 2>/dev/null || true
+          grep -c 'refusing\|upstream' "out/worker-${{ matrix.runner }}.log" 2>/dev/null \
+            | sed 's/^/worker.log mirror lines: /' || true
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()

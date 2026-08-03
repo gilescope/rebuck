@@ -668,7 +668,22 @@ async fn handle<S: RegistryStore>(
             // HEAD needs the length but not the bytes — do not read the blob
             // just to throw it away; a cache probe storm would read the store
             // end to end.
-            Method::HEAD => match reg.store.blob_size(hex).await {
+            // A HEAD miss goes to the origin too. Answering "no" here while
+            // GET answers "yes" makes the mirror contradict itself, and a
+            // client that stats before fetching -- buildkit's cache importer
+            // among them -- believes the "no". The fetch also POPULATES, so the
+            // GET that follows is a local hit rather than a second origin
+            // request.
+            Method::HEAD => match match reg.store.blob_size(hex).await {
+                Some(len) => Some(len),
+                None => {
+                    if ensure_present(&reg, _repo, reference, hex).await {
+                        reg.store.blob_size(hex).await
+                    } else {
+                        None
+                    }
+                }
+            } {
                 Some(len) => {
                     let mut h = HeaderMap::new();
                     h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
@@ -2089,5 +2104,92 @@ mod pull_through_streaming_tests {
         // machine's fetch a peer fetch rather than another upstream one.
         let hex = digest.strip_prefix("sha256:").unwrap();
         assert!(s.get_by_hash(hex).await.unwrap().is_some());
+    }
+}
+
+#[cfg(test)]
+mod pull_through_head_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use std::sync::atomic::AtomicUsize;
+    use tower::ServiceExt;
+
+    fn store() -> Arc<Store> {
+        Arc::new(Store::new(tempfile::tempdir().unwrap().keep()).unwrap())
+    }
+
+    fn sha256_of(b: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("sha256:{:x}", Sha256::digest(b))
+    }
+
+    struct One {
+        bytes: Vec<u8>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Upstream for One {
+        async fn blob(&self, _repo: &str, _digest: &str) -> Result<Option<BoxByteStream>> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let chunks: Vec<Result<Vec<u8>>> = vec![Ok(self.bytes.clone())];
+            Ok(Some(Box::pin(futures::stream::iter(chunks))))
+        }
+    }
+
+    /// A registry must not contradict itself. Before this, HEAD consulted only
+    /// the local store while GET went on to the origin -- so for one blob the
+    /// mirror answered "no" to HEAD and "yes" to GET, and which answer a client
+    /// got depended on which verb it happened to use. Clients that stat before
+    /// fetching (buildkit's cache importer among them) see the "no".
+    #[tokio::test]
+    async fn head_and_get_agree_about_a_blob_only_the_origin_has() {
+        let bytes = b"a layer the fleet has never seen".to_vec();
+        let digest = sha256_of(&bytes);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let r = router_with_upstream(
+            store(),
+            Some(Arc::new(One {
+                bytes: bytes.clone(),
+                calls: calls.clone(),
+            })),
+        );
+
+        let head = r
+            .clone()
+            .oneshot(
+                Request::head(format!("/v2/library/alpine/blobs/{digest}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK, "HEAD must not deny it");
+        assert_eq!(
+            head.headers()[header::CONTENT_LENGTH],
+            bytes.len().to_string().as_str(),
+            "and must report the real length"
+        );
+
+        let get = r
+            .clone()
+            .oneshot(
+                Request::get(format!("/v2/library/alpine/blobs/{digest}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+
+        // And the HEAD populated, so the GET after it is a local hit. A HEAD
+        // that fetched and then threw the bytes away would double the origin
+        // traffic this feature exists to remove.
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "HEAD then GET is ONE upstream fetch, not two"
+        );
     }
 }
