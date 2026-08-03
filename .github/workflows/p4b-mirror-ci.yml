@@ -1,0 +1,304 @@
+name: p4b-mirror-ci
+
+# Done-when for P4b, straight out of buildkit-plan.md:
+#
+#   "Two machines building from the same base image produce ONE upstream
+#    registry request between them, measured at the agent rather than inferred:
+#    serves rises, upstream fetches do not. And with the mesh killed mid-run,
+#    both still build."
+#
+# That is a question about REGISTRY REQUESTS, not about wall-clock, so this is
+# deliberately small: four runners building one cheap target that pulls base
+# images. Six jobs against the consolidation matrix's 36.
+#
+# NO CONTROL ARM, deliberately -- it could not be measured. A runner without the
+# mirror configured never asks its agent for anything, so its agent reports
+# zero, which is indistinguishable from a mirror whose wire is dead. What we
+# cannot see is the thing a control would have to count: requests arriving at
+# Docker Hub.
+#
+# The evidence is the DISTRIBUTION WITHIN the arm. Four runners building the
+# same target want the same base images. If the mesh works, one runner's agent
+# fetches them from the origin and the other three get them peer to peer -- so
+# the per-runner upstream counts should be lopsided, not four similar numbers.
+# Four similar numbers means every runner went upstream and the sharing did not
+# happen, whatever the totals look like.
+#
+# Single-flight is deliberately OFF. P4b is about the blob path, and leaving
+# lease coordination out means a result here has one possible cause. It also
+# avoids both arms of a shared session adopting each other's answers, which is
+# how the first draft of this file would have measured itself.
+#
+# WHAT WOULD MAKE THIS A LIE. An agent that cannot be reached by its daemon
+# reports zero upstream fetches AND zero serves, which looks like a perfect
+# result and is a dead wire -- this project lost ten days to exactly that shape
+# once. So the run asserts that SOMETHING was fetched upstream: a fleet that
+# reports no upstream fetches at all has not proved sharing, it has proved that
+# nobody asked the agent anything.
+
+on:
+  push:
+    branches: [giles-dist-buildkit]
+    paths:
+      - ".github/workflows/p4b-mirror-ci.yml"
+      - "rebuck2/src/registry.rs"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  EARTHBUILD_BASE: "32308f78acd5b57ba2f54e78894c5457cf20fb8f"
+  BUILDKIT_REF: "a8af577e1389e322bb7e49970c565309c6967e19" # giles-rebuck-single-flight
+  SESSION: p4b-${{ github.run_id }}
+  AGENT_PORT: "5091"
+  # The stem: 32 vertices, measured at 94s, and it pulls the base images this
+  # experiment is about. A whole test group would spend twenty minutes to answer
+  # the same question.
+  TARGET: "+earthbuild-integration-test-base"
+
+jobs:
+  driver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+      - run: cargo build --release --manifest-path rebuck2/Cargo.toml
+      - name: start driver
+        run: |
+          ./rebuck2/target/release/rebuck2 driver \
+            --grpc-port 9095 --session "$SESSION" \
+            --registry-port 5090 --min-workers 2 --no-local-exec \
+            --store "$HOME/.cache/rebuck2/driver" > driver.log 2>&1 &
+          echo $! > driver.pid
+      - name: hold open
+        run: |
+          # The builders own the verdict; the driver only has to outlive them.
+          # A fixed sleep is honest here in a way it is not for a whole group:
+          # this target is ~94s and the job timeout is the backstop.
+          sleep 900
+      - name: stop driver
+        if: always()
+        run: kill "$(cat driver.pid)" 2>/dev/null || true
+
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [1, 2, 3, 4]
+    name: mirror-${{ matrix.runner }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: rebuck2src
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: EarthBuild/earthbuild
+          ref: ${{ env.EARTHBUILD_BASE }}
+          path: earthbuild
+          fetch-depth: 0
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: EarthBuild/buildkit
+          ref: ${{ env.BUILDKIT_REF }}
+          path: buildkit
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+
+      - name: reclaim disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost || true
+          df -h /
+
+      - name: apply the patches
+        run: |
+          ( cd earthbuild && git -c user.name=ci -c user.email=ci@local \
+              -c commit.gpgsign=false am \
+              ../rebuck2src/rebuck2/tests/earthbuild-patches/*.patch )
+          ( cd buildkit && git -c user.name=ci -c user.email=ci@local \
+              -c commit.gpgsign=false am \
+              ../rebuck2src/rebuck2/tests/buildkit-patches/*.patch )
+
+      - name: build the pieces
+        run: |
+          cargo build --release --manifest-path rebuck2src/rebuck2/Cargo.toml
+          ( cd earthbuild && GOFLAGS=-mod=mod go build -o "$RUNNER_TEMP/earthly" ./cmd/earthly )
+          ( cd buildkit && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+              go build -o "$RUNNER_TEMP/buildkitd" ./cmd/buildkitd )
+
+      # "1" means Docker Hub, because Hub is what rate-limits. The agent prints
+      # a line when the mirror is live; grep it rather than assume, since a
+      # mirror that quietly failed to turn on measures a clean zero.
+      - name: start worker
+        env:
+          REBUCK_UPSTREAM_REGISTRY: "1"
+        run: |
+          ./rebuck2src/rebuck2/target/release/rebuck2 worker \
+            --session "$SESSION" --slots 4 \
+            --store "$HOME/.cache/rebuck2/worker" \
+            --registry-port "$AGENT_PORT" --registry-bind 0.0.0.0 > worker.log 2>&1 &
+          echo $! > worker.pid
+          for _ in $(seq 1 60); do
+            curl -sf -o /dev/null "http://127.0.0.1:$AGENT_PORT/v2/" && break
+            sleep 2
+          done
+          curl -sf -o /dev/null "http://127.0.0.1:$AGENT_PORT/v2/" \
+            || { cat worker.log; echo "::error::agent never came up"; exit 1; }
+          grep -q "pull-through mirror enabled" worker.log \
+            && echo "mirror: ON" || echo "mirror: off"
+
+      # Pointing buildkitd's registry mirror at the agent is what makes the
+      # daemon's image pulls go THROUGH us. Without it the mirror is running and
+      # nothing ever asks it anything -- the quietest possible way to measure
+      # nothing.
+      - name: start buildkitd
+        run: |
+          docker build -q -t p4b:test -f - "$RUNNER_TEMP" <<'EOF'
+          FROM earthbuild/buildkitd:v0.8.17
+          COPY buildkitd /usr/bin/buildkitd
+          EOF
+          # http = true: the agent speaks plaintext on the docker bridge, and
+          # buildkit assumes HTTPS for a mirror unless told otherwise. Getting
+          # this wrong is a silent fallback to the origin -- the build still
+          # works and the mirror measures nothing.
+          CFG=$(printf '[registry."docker.io"]\n  mirrors = ["host.docker.internal:%s"]\n[registry."host.docker.internal:%s"]\n  http = true\n' \
+            "$AGENT_PORT" "$AGENT_PORT")
+          docker run -d --name p4b-bk --privileged \
+            --add-host host.docker.internal:host-gateway \
+            -e NETWORK_MODE=cni \
+            -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
+            -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG="$CFG" \
+            -e CACHE_SIZE_MB=8000 -e BUILDKIT_MAX_PARALLELISM=4 \
+            -e BUILDKIT_SETUP_CGROUPV2_ROOT=1 \
+            --ulimit nofile=1048576:1048576 \
+            p4b:test
+          for _ in $(seq 1 60); do
+            docker exec p4b-bk buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 && break
+            sleep 2
+          done
+          docker exec p4b-bk buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 \
+            || { docker logs p4b-bk 2>&1 | tail -20; echo "::error::buildkitd never came ready"; exit 1; }
+
+      # --add-host fixes the NAME, never the ROUTE. Only an end-to-end fetch
+      # proves both, and an unreachable agent degrades in silence.
+      - name: preflight - the daemon can reach its agent
+        run: |
+          docker exec p4b-bk wget -q -T 5 -O /dev/null \
+            "http://host.docker.internal:$AGENT_PORT/v2/" \
+            || { echo "::error::buildkitd cannot reach its agent"; exit 1; }
+
+      - name: build the stem
+        run: |
+          set -o pipefail
+          BK="tcp://$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' p4b-bk):8372"
+          cat > "$RUNNER_TEMP/eb.yml" <<'EOF'
+          global:
+            tls_enabled: false
+          EOF
+          # --verbose: earthly's cancellation path prints a bare "Canceled" and
+          # DISCARDS the reason unless verbose is set (cmd/earthly/app/run.go).
+          # A previous run of the sister workflow failed twelve jobs that way and
+          # the cause is simply gone. Never again in CI.
+          ( cd earthbuild && EARTHLY_CONFIG="$RUNNER_TEMP/eb.yml" \
+              EARTHLY_BUILDKIT_HOST="$BK" EARTHLY_TLS_ENABLED=false \
+              "$RUNNER_TEMP/earthly" --verbose --allow-privileged --no-output \
+              "$TARGET" ) 2>&1 | tee build.log
+
+      - name: agent stats
+        if: always()
+        run: |
+          mkdir -p out
+          curl -s "http://127.0.0.1:$AGENT_PORT/_rebuck/stats" \
+            > "out/runner-${{ matrix.runner }}.json" || echo '{}' > "out/runner-${{ matrix.runner }}.json"
+          cat "out/runner-${{ matrix.runner }}.json"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: p4b-runner-${{ matrix.runner }}
+          path: out/
+          retention-days: 7
+
+      - name: stop
+        if: always()
+        run: |
+          docker rm -f p4b-bk >/dev/null 2>&1 || true
+          kill "$(cat worker.pid)" 2>/dev/null || true
+
+  report:
+    needs: [build]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: stats
+          merge-multiple: true
+      - name: table
+        run: |
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import json, pathlib
+          rows = []
+          for f in sorted(pathlib.Path("stats").rglob("runner-*.json")):
+              try:
+                  rows.append((f.stem, json.loads(f.read_text() or "{}")))
+              except Exception:
+                  rows.append((f.stem, {}))
+          print("| runner | upstream fetches | upstream MiB | serves | serve MiB |")
+          print("| ------ | ---------------- | ------------ | ------ | --------- |")
+          tot_f = tot_b = 0
+          for name, st in rows:
+              f_ = st.get("upstream_fetches", 0)
+              b_ = st.get("upstream_bytes", 0)
+              tot_f += f_; tot_b += b_
+              print(f"| {name} | {f_} | {b_/1048576:.1f} | {st.get('serves',0)} | "
+                    f"{st.get('serve_bytes',0)/1048576:.1f} |")
+          print(f"| **fleet** | **{tot_f}** | **{tot_b/1048576:.1f}** | | |")
+          print()
+          per = [st.get("upstream_fetches", 0) for _, st in rows]
+          hi = max(per) if per else 0
+          print(f"Per-runner upstream fetches: {per}")
+          print()
+          print("The claim is a LOPSIDED distribution -- one runner fetches the base "
+                "images from the origin and the rest get them peer to peer. Four "
+                "similar numbers means every runner went upstream and the sharing did "
+                "not happen, whatever the total looks like.")
+          if hi and tot_f >= hi * len(per) * 0.9:
+              print()
+              print("> Read: NOT shared. Every runner fetched about as much as the "
+                    "busiest one.")
+          PY
+
+      # Zeros look like a perfect result and are usually a dead wire. This
+      # project lost ten days to that shape, so a silent fleet is a failure.
+      - name: assert something was actually fetched
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, sys
+          total = 0
+          for f in pathlib.Path("stats").rglob("runner-*.json"):
+              try:
+                  total += json.loads(f.read_text() or "{}").get("upstream_fetches", 0)
+              except Exception:
+                  pass
+          print(f"fleet upstream_fetches={total}")
+          if total == 0:
+              print("::error::no runner fetched anything upstream -- buildkitd never "
+                    "asked the agent, so this measured a dead wire rather than a mirror")
+              sys.exit(1)
+          PY
