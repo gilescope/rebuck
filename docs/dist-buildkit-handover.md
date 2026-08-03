@@ -54,6 +54,38 @@ Not pushed, on the box only: the earthbuild changes (below).
   Forwarding on its own was worse than not doing it, and only that count says so.
 - **A single test sees no speedup.** `parser-smoke-test` 124s consolidated
   against a 120-126s baseline. Expected: one daemon saved out of one.
+- **P4b's Done-when is met -- with caveats.** Four GitHub runners building
+  `+earthly-integration-test-base`, mirror on, single-flight deliberately off so
+  a result had one possible cause:
+
+  | runner | upstream fetches | served MiB |
+  | ------ | ---------------: | ---------: |
+  | 1      | 0                | 197.0      |
+  | 2      | 0                | 194.3      |
+  | 3      | 0                | 197.0      |
+  | 4      | 25               | 197.0      |
+
+  One runner fetched all 25 blobs from Docker Hub; the other three fetched
+  nothing and took ~197 MiB each from the mesh. Four independent runners would
+  make 100 origin requests; this fleet made **25** -- 1/N, the floor rather than
+  an improvement at the margin. Measured at the agent, which is what the plan
+  asks for.
+
+  The caveats are load-bearing:
+
+  - **n=1**, one target, one run.
+  - **The split depends on arrival order.** Runner 4 got there first and became
+    the origin for the rest. A different stagger redistributes it; the TOTAL
+    should hold, and that is the number to quote.
+  - **No speed claim.** See "Not proven".
+  - **Mesh-death is unit-tested, never exercised for real.** The other half of
+    the Done-when -- kill the mesh mid-run, both still build -- has tests
+    (`mesh_down_tests`) and no end-to-end run.
+
+  An earlier run measured `[6, 0, 0, 24]` = 30 fetches. The six strays were
+  HEAD misses: HEAD consulted only the local store while GET went to the origin,
+  so the mirror answered "no" to HEAD and "yes" to GET for the same blob, and
+  clients that stat before fetching believed the "no".
 
 ## Not proven
 
@@ -61,10 +93,9 @@ Not pushed, on the box only: the earthbuild changes (below).
   numbers support; every cell is n=1 and the effect is inside the noise. Three
   to five repeats per cell before either number means anything. Do not use the
   CI figures (483s/471s) as a control -- different hardware, stock buildkitd.
-- **P4b (serve image layers from the mesh).** Designed in `buildkit-plan.md`,
-  not built. The agent already serves fleet-wide (`worker.rs:703` falls through
-  to `fetch_over_mesh`); the gap is POPULATION -- a blob nobody holds 404s and
-  buildkit fetches it upstream, so the bytes never enter the fleet.
+- **That P4b is FASTER.** Its Done-when is met (below) but that was never a
+  speed claim: whether a peer beats a CDN is unmeasured, and Docker Hub is fast
+  and close. Rate limits and determinism are the case; speed is a hypothesis.
 - **Inner-buildkit single-flight.** Moot under consolidation -- there is no inner
   buildkit left to coordinate. It becomes a question again only for the five
   `force_internal_buildkit` call sites.
@@ -178,7 +209,12 @@ this box at 329s.
    unpublished piece, and 3 (the entrypoint) is the one that carries the result.
 2. **Repeat the cells.** 3-5 runs of control and consolidated before quoting
    311s against 329s as anything but "not slower".
-3. **P4b.** Now the only unbuilt item on the plan.
+3. **A combined run.** Consolidation, single-flight and the mirror have each
+   been measured alone, deliberately, so a failure had one cause. Nothing has
+   yet run all three together, and that is the configuration anyone would
+   actually ship.
+4. **Kill the mesh mid-run** and confirm both machines still build. Unit-tested,
+   never exercised.
 
 ## Cleanup owed
 

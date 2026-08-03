@@ -265,6 +265,12 @@ jobs:
           # Without pipefail this reports TEE's status, so a build that died in
           # 26s goes green carrying a plausible duration.
           set -o pipefail
+          # --verbose is not decoration. earthly's cancellation path prints a
+          # bare "Canceled" and DISCARDS the reason unless verbose is set
+          # (cmd/earthly/app/run.go). The previous 36-job run failed twelve jobs
+          # that way and the cause is simply gone -- unrecoverable, because the
+          # run is over. Never again in CI.
+          #
           # 127.0.0.1 would make earthly think it MANAGES the daemon and start
           # its own (containerutil.IsLocal). Ask docker for the container IP
           # rather than assuming 172.17.0.2, which is only the first container.
@@ -281,7 +287,7 @@ jobs:
           # Inert on the stock arm, which forwards nothing.
           ( cd earthbuild && EARTHLY_CONFIG="$RUNNER_TEMP/eb.yml" \
               EARTHLY_BUILDKIT_HOST="$BK" EARTHLY_TLS_ENABLED=false \
-              "$RUNNER_TEMP/earthly" --allow-privileged --no-output \
+              "$RUNNER_TEMP/earthly" --verbose --allow-privileged --no-output \
               "+test-no-qemu-group$GROUP" ) 2>&1 | tee build.log
 
       # The instrument that settled consolidation on the box, and the only one
@@ -302,6 +308,10 @@ jobs:
           echo "nested daemons: ${NESTED:-0}"
           printf '%s %s %s %s\n' "${{ matrix.arm }}" "${{ matrix.group }}" \
             "${NESTED:-0}" "${{ steps.build.outcome }}" > "out/${{ matrix.arm }}-${{ matrix.group }}.txt"
+          # Keep the diagnostic BEFORE needing it. Twice in one day this project
+          # went looking for a log it had already deleted at job end.
+          cp build.log "out/build-${{ matrix.arm }}-${{ matrix.group }}.log" 2>/dev/null || true
+          docker logs eb-bk > "out/buildkitd-${{ matrix.arm }}-${{ matrix.group }}.log" 2>&1 || true
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
