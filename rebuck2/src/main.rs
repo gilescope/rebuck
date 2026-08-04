@@ -8,10 +8,13 @@
 //! Rendezvous needs no service: both sides derive the driver's iroh key from
 //! `--session` (default $GITHUB_RUN_ID), see mesh.rs.
 
+mod bank;
 mod bench;
 mod driver;
 mod exec;
+mod github;
 mod mesh;
+mod norm;
 mod rpc;
 mod store;
 mod worker;
@@ -25,8 +28,8 @@ use bazel_remote_apis::google::bytestream as bs;
 
 fn usage() -> ! {
     eprintln!(
-        "usage: rebuck2 driver [--grpc-port N] [--store DIR] [--session S] [--locality] \
-         [--min-workers N] [--no-local-exec] [--decentralized-cas] [--no-hardlinks] [--no-reflink] [--cache-failures]\n       \
+        "usage: rebuck2 driver [--grpc-port N] [--require-shards N] [--store DIR] [--session S] [--locality] \
+         [--min-workers N] [--no-local-exec] [--decentralized-cas] [--no-hardlinks] [--no-reflink] [--cache-failures] [--no-name-independent]\n       \
          rebuck2 worker [--store DIR] [--session S] [--slots N] [--preloaded-shard N] [--connect-wait-secs N] [--no-hardlinks] [--no-reflink]\n       \
          rebuck2 verify-store --store DIR\n       \
          rebuck2 bench [--grpc URL] [--entries N] [--poisoned-pct P] [--plant-dir DIR] [--concurrency C] [--rounds R]"
@@ -87,6 +90,10 @@ async fn main() -> Result<()> {
     let role = argv.remove(0);
     let mut args = Args(argv);
     match role.as_str() {
+        // Deterministic file munging for the CI store bank - no engine, no
+        // mesh, no store handle. Takes its own argv so the bank verbs keep
+        // the flat shape their callers already use.
+        "bank" => bank::run(&args.0).await,
         "driver" => run_driver(args).await,
         "bench" => {
             let cfg = bench::BenchCfg {
@@ -194,6 +201,7 @@ async fn main() -> Result<()> {
                 preloaded_shard: args
                     .opt("--preloaded-shard")
                     .map(|s| s.parse().expect("--preloaded-shard: number")),
+                give_up_file: args.opt("--give-up-file").map(Into::into),
             };
             args.done();
             std::fs::create_dir_all(&cfg.scratch)?;
@@ -224,12 +232,17 @@ async fn run_driver(mut args: Args) -> Result<()> {
             .opt("--min-workers")
             .map(|s| s.parse().expect("--min-workers: number"))
             .unwrap_or(0),
+        require_shards: args
+            .opt("--require-shards")
+            .map(|s| s.parse().expect("--require-shards: number"))
+            .unwrap_or(0),
         local_exec: !args.flag("--no-local-exec"),
         decentralized: args.flag("--decentralized-cas"),
         hardlinks: !args.flag("--no-hardlinks"),
         cache_failures: args.flag("--cache-failures"),
         locality: args.flag("--locality"),
         prefetch_metadata: args.flag("--prefetch-metadata"),
+        name_independent: !args.flag("--no-name-independent"),
         addr_file: args.opt("--addr-file").map(Into::into),
         finalize_file: args.opt("--finalize-file").map(Into::into),
         scratch,
@@ -263,7 +276,7 @@ async fn run_driver(mut args: Args) -> Result<()> {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 let read = store.read_bytes.load(Relaxed);
                 println!(
-                    "[stats] store={:.2} GiB served_total={:.2} GiB serve_rate={:.1} MiB/s pending_jobs={} workers={} ac_ok={} ac_fail={} dnc_exec={} queued[{}] grpc[ac {}/{}/{}u {:.2} GiB | casR {} {:.2} GiB | casW {:.2} GiB]",
+                    "[stats] store={:.2} GiB served_total={:.2} GiB serve_rate={:.1} MiB/s pending_jobs={} workers={} ac_ok={} ac_fail={} dnc_exec={} queued[{}] mem[{}] grpc[ac {}/{}/{}u {:.2} GiB | casR {} {:.2} GiB | casW {:.2} GiB]",
                     gib(store.stored_bytes.load(Relaxed)),
                     gib(read),
                     (read - last_read) as f64 / (60.0 * 1024.0 * 1024.0),
@@ -273,6 +286,7 @@ async fn run_driver(mut args: Args) -> Result<()> {
                     d.ac_hit_fail.load(Relaxed),
                     d.dnc_exec.load(Relaxed),
                     d.queue_summary().await,
+                    d.mem_summary().await,
                     rs.ac_hits.load(Relaxed),
                     rs.ac_misses.load(Relaxed),
                     rs.ac_unservable.load(Relaxed),

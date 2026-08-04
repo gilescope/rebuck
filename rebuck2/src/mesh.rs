@@ -158,7 +158,13 @@ pub enum D2W {
     /// as a dead driver and exit: a SIGTERM'd/crashed driver sends no QUIC
     /// close, and a worker blocked in recv_frame otherwise idles until its
     /// CI timeout cap (win worker 1, run 29194749613: 5h of dead runner).
-    Ping,
+    /// `vitals` (Some once a minute): driver memory/disk readout, printed
+    /// by workers so the driver's last-known vitals SURVIVE a driver-box
+    /// death - run 29232220897's OOM verdict was circumstantial because
+    /// the evidence died with the runner.
+    Ping {
+        vitals: Option<String>,
+    },
     /// Orderly shutdown: exit now (driver teardown, no shard assignment).
     Exit,
 }

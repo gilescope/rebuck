@@ -24,6 +24,15 @@ use crate::store::Store;
 pub struct DriverCfg {
     pub session: String,
     pub min_workers: usize,
+    /// Quorum by RANGE, not head-count: wait until this many DISTINCT
+    /// preloaded shards are held by joined workers before dispatching.
+    /// 0 = off. Head-count quorum starts the build while the slowest
+    /// range owners are still seeding; the earliest-scheduled actions
+    /// (proc-macros, build scripts) then get their AC results refused
+    /// as unservable - the referenced blobs ARE banked, their range is
+    /// just dark during the join window - and re-execute every lap
+    /// (run 29596537112: 283 misses, all join-race).
+    pub require_shards: usize,
     pub local_exec: bool,
     /// Outputs stay on producing workers; the driver keeps digest -> worker
     /// index and redirects fetches. Trades worker-loss resilience for
@@ -52,6 +61,15 @@ pub struct DriverCfg {
     /// driver-LOCAL (immune to worker mesh-latency variance - the linux-36m
     /// slow-leg root cause) instead of relayed per-blob at build time.
     pub prefetch_metadata: bool,
+    /// Name-independent caching: consult/populate the canonical action
+    /// cache (see norm.rs) so identical work under different labels shares
+    /// results. ON by default (--no-name-independent disables): a canonical
+    /// hit requires identical normalized command + argsfile content + source
+    /// tree, misses degrade silently, and the one behaviour change - twin
+    /// labels now get identical symbol hashes, so linking both into ONE
+    /// binary fails loudly instead of "working" via label-salted metadata -
+    /// is a shape dependency resolvers do not produce.
+    pub name_independent: bool,
     /// Write the driver's full EndpointAddr (id + relay) here once bound.
     /// CI publishes it as a run artifact so workers can dial directly -
     /// n0 discovery becomes a fallback instead of a single point of
@@ -74,6 +92,65 @@ pub enum AcLookup {
 
 /// Every CAS digest a cached result commits the server to delivering.
 /// Zero-size blobs are implicit in RE and skipped.
+/// One-line host memory/disk readout for the heartbeat. Best-effort and
+/// linux-oriented (the driver runs on ubuntu in CI); other hosts report
+/// what they can. Never fails - a vitals gap must not cost a heartbeat.
+fn host_vitals(store_root: &std::path::Path) -> String {
+    let mem = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            let field = |name: &str| {
+                s.lines()
+                    .find(|l| l.starts_with(name))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|kb| kb / 1024)
+            };
+            Some(format!(
+                "mem avail {}MB of {}MB, swap free {}MB",
+                field("MemAvailable:")?,
+                field("MemTotal:")?,
+                field("SwapFree:").unwrap_or(0),
+            ))
+        })
+        .unwrap_or_else(|| "mem ?".to_owned());
+    // Top memory consumers: WHICH process balloons is the whole question
+    // (buck2 daemon vs dice fork vs rebuck2 driver vs client commands) and
+    // zero profiling has been done - box totals alone can't attribute.
+    let top = std::process::Command::new("ps")
+        .args(["-eo", "rss=,comm=", "--sort=-rss"])
+        .output()
+        .ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .take(5)
+                .filter_map(|l| {
+                    let mut it = l.split_whitespace();
+                    let rss_kb: u64 = it.next()?.parse().ok()?;
+                    let comm = it.next()?;
+                    Some(format!("{comm} {}MB", rss_kb / 1024))
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "ps ?".to_owned());
+    let disk = std::process::Command::new("df")
+        .arg("-Pm")
+        .arg(store_root)
+        .output()
+        .ok()
+        .and_then(|o| {
+            let out = String::from_utf8_lossy(&o.stdout);
+            let l = out.lines().nth(1)?;
+            let avail = l.split_whitespace().nth(3)?;
+            Some(format!("disk avail {avail}MB at store"))
+        })
+        .unwrap_or_else(|| "disk ?".to_owned());
+    format!("{mem}; {disk}; top: {top}")
+}
+
 pub fn result_digests(r: &re::ActionResult) -> Vec<Dig> {
     let mut digs = Vec::new();
     let mut push = |d: &Option<re::Digest>| {
@@ -251,6 +328,10 @@ pub struct Driver {
     /// Cache outcome accounting for the stats heartbeat: AC hits that were
     /// successes, AC hits that were cached failures, and executions forced
     /// by do_not_cache actions (the prelude's diag wrappers).
+    /// Canonical (name-independent) action-cache memo: normalized key ->
+    /// encoded normalized ActionResult. Read-mostly hot path beside the
+    /// on-disk acn/ namespace (see norm.rs and store::acn_get).
+    memo_canonical: tokio::sync::RwLock<HashMap<String, Vec<u8>>>,
     /// Distinct shards acked (redundant assignment: a shard is banked
     /// when ANY of its assignees uploads - union-sync makes both copies
     /// complete, so whichever wins is a full artifact).
@@ -287,6 +368,7 @@ impl Driver {
             peer_conns: Mutex::new(HashMap::new()),
             affinity_owner: Mutex::new(HashMap::new()),
             mesh_fetches: Semaphore::new(64),
+            memo_canonical: tokio::sync::RwLock::new(HashMap::new()),
             finalized_shards: Mutex::new(std::collections::BTreeSet::new()),
             ac_hit_ok: AtomicU64::new(0),
             ac_hit_fail: AtomicU64::new(0),
@@ -379,14 +461,27 @@ impl Driver {
 
         // Liveness heartbeat: event-driven gossip goes silent on idle legs,
         // and a worker can't tell a quiet driver from a dead one (see
-        // D2W::Ping). 20s beat, 90s worker patience.
+        // D2W::Ping). 20s beat, 90s worker patience. Every third beat
+        // carries the driver's memory/disk vitals: workers print them, so
+        // when the driver box dies (OOM killed the runner agent on
+        // 29232220897) its final vitals survive in every worker's log.
         {
             let this = self.clone();
+            let store_root = self.store.root_dir();
             tokio::spawn(async move {
+                let mut beat = 0u64;
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                    beat += 1;
+                    let vitals = if beat.is_multiple_of(3) {
+                        Some(host_vitals(&store_root))
+                    } else {
+                        None
+                    };
                     for w in this.workers.lock().await.iter() {
-                        let _ = w.tx.send(D2W::Ping);
+                        let _ = w.tx.send(D2W::Ping {
+                            vitals: vitals.clone(),
+                        });
                     }
                 }
             });
@@ -603,6 +698,37 @@ impl Driver {
         self.cfg.cache_failures
     }
 
+    /// Approximate heap held by the driver's big in-memory maps, for the
+    /// stats heartbeat: zero memory profiling existed when the driver box
+    /// OOM'd (run 29232220897), and these maps are the engine's only
+    /// unbounded growth. Counts + estimated MB, cheap enough per minute.
+    pub async fn mem_summary(&self) -> String {
+        let providers = self.providers.lock().await;
+        // hash String (64) + endpoint String (64) + HashMap slot overhead.
+        let prov_mb = providers.len() * (64 + 64 + 96) / (1024 * 1024);
+        let prov_n = providers.len();
+        drop(providers);
+        let memo_s = self.memo_servable.read().await;
+        let memo_s_mb = memo_s.values().map(|v| v.len() + 128).sum::<usize>() / (1024 * 1024);
+        let memo_s_n = memo_s.len();
+        drop(memo_s);
+        let memo_c = self.memo_canonical.read().await;
+        let memo_c_mb = memo_c.values().map(|v| v.len() + 128).sum::<usize>() / (1024 * 1024);
+        let memo_c_n = memo_c.len();
+        drop(memo_c);
+        let blooms_mb = self
+            .blooms
+            .lock()
+            .await
+            .values()
+            .map(|b| b.bits.len())
+            .sum::<usize>()
+            / (1024 * 1024);
+        format!(
+            "prov {prov_n} (~{prov_mb}MB) memoS {memo_s_n} (~{memo_s_mb}MB) memoC {memo_c_n} (~{memo_c_mb}MB) blooms ~{blooms_mb}MB"
+        )
+    }
+
     pub async fn pending_jobs(&self) -> usize {
         self.jobs.lock().await.len()
     }
@@ -718,6 +844,27 @@ impl Driver {
         // 3,650 stale hints into hard exec failures per lap (healing4/5).
         // Both sources get the same exact HasMany verification.
         let mut by_peer: HashMap<String, Vec<usize>> = HashMap::new();
+        // Who was asked in round one, so the second chance never re-asks
+        // the same worker for the same digest.
+        let mut asked: HashMap<usize, String> = HashMap::new();
+        // Deterministic range-owner fallback for hintless digests: bloom
+        // gossip lags joins, so freshly-seeded banked blobs can have no
+        // claimant at validation time - graph-root results then read as
+        // unservable and re-execute every lap (runs 29596537112..
+        // 29613987710: the persistent-108 class survived shard-coverage
+        // gating for exactly this reason). The shard map is not gossip:
+        // first hex nibble / 2 names the owner, and its store was seeded
+        // before it joined. Same exact HasMany verification either way.
+        let shard_owner: HashMap<u8, String> = {
+            let w = self.workers.lock().await;
+            let mut m = HashMap::new();
+            for h in w.iter() {
+                if let Some(p) = h.preloaded_shard {
+                    m.entry(p).or_insert_with(|| h.endpoint.clone());
+                }
+            }
+            m
+        };
         {
             let providers = self.providers.lock().await;
             let blooms = self.blooms.lock().await;
@@ -726,13 +873,21 @@ impl Driver {
                     have[i] = true;
                     continue;
                 }
-                let peer = providers.get(&d.hash).cloned().or_else(|| {
-                    blooms
-                        .iter()
-                        .find(|(_, b)| b.contains(&d.hash))
-                        .map(|(e, _)| e.clone())
-                });
+                let peer = providers
+                    .get(&d.hash)
+                    .cloned()
+                    .or_else(|| {
+                        blooms
+                            .iter()
+                            .find(|(_, b)| b.contains(&d.hash))
+                            .map(|(e, _)| e.clone())
+                    })
+                    .or_else(|| {
+                        let nib = u8::from_str_radix(d.hash.get(..1)?, 16).ok()?;
+                        shard_owner.get(&(nib / 2)).cloned()
+                    });
                 if let Some(p) = peer {
+                    asked.insert(i, p.clone());
                     by_peer.entry(p).or_default().push(i);
                 }
             }
@@ -755,6 +910,20 @@ impl Driver {
         }))
         .await;
         for (peer, idxs, confirmed) in verdicts {
+            // Discriminate probe FAILURE (routing/transport - confirmed is
+            // None) from an honest "no": the hunt for the persistent-108
+            // died in this blind spot twice (banked + owner-held blobs
+            // still read unservable, runs 29613987710/29615666747).
+            if confirmed.is_none() {
+                let n = self.unservable_logged.fetch_add(1, Ordering::Relaxed);
+                if n < 20 {
+                    println!(
+                        "[driver] hasmany PROBE FAILED to {peer} ({} digs, first {})",
+                        idxs.len(),
+                        idxs.first().map(|&i| digs[i].hash.as_str()).unwrap_or("?")
+                    );
+                }
+            }
             let mut providers = self.providers.lock().await;
             for (k, &i) in idxs.iter().enumerate() {
                 let ok = confirmed
@@ -772,6 +941,56 @@ impl Driver {
                 }
             }
         }
+        // Second chance for denials: hints outrank the range owner, and a
+        // bloom FALSE POSITIVE is deterministic per digest - the same
+        // wrong worker gets asked every lap, honestly says no, and the
+        // owner is never consulted. That was the persistent-108 class
+        // (runs 29596537112..29617187131), immune to every join-window
+        // gate because it is not a race at all.
+        let denied: Vec<usize> = (0..digs.len()).filter(|&i| !have[i]).collect();
+        if !denied.is_empty() && !shard_owner.is_empty() {
+            let mut retry: HashMap<String, Vec<usize>> = HashMap::new();
+            for &i in &denied {
+                if let Some(owner) = u8::from_str_radix(&digs[i].hash[..1], 16)
+                    .ok()
+                    .and_then(|nib| shard_owner.get(&(nib / 2)))
+                {
+                    // Round one already asked the owner (hintless
+                    // fallback): a second identical probe gets the
+                    // same answer.
+                    if asked.get(&i) == Some(owner) {
+                        continue;
+                    }
+                    retry.entry(owner.clone()).or_default().push(i);
+                }
+            }
+            let verdicts = futures::future::join_all(retry.into_iter().map(|(peer, idxs)| {
+                let batch: Vec<Dig> = idxs.iter().map(|&i| digs[i].clone()).collect();
+                async move {
+                    let _permit = self.mesh_fetches.acquire().await;
+                    let confirmed = match self.peer_request(&peer, &BlobReq::HasMany(batch)).await {
+                        Ok(BlobResp::HaveMany(v)) => Some(v),
+                        _ => None,
+                    };
+                    (peer, idxs, confirmed)
+                }
+            }))
+            .await;
+            let mut providers = self.providers.lock().await;
+            for (peer, idxs, confirmed) in verdicts {
+                for (k, &i) in idxs.iter().enumerate() {
+                    if confirmed
+                        .as_ref()
+                        .and_then(|v| v.get(k))
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        have[i] = true;
+                        providers.insert(digs[i].hash.clone(), peer.clone());
+                    }
+                }
+            }
+        }
         have
     }
 
@@ -784,7 +1003,8 @@ impl Driver {
         // Fast path: a validated-servable entry is served from memory -
         // no disk read, no revalidation, concurrent readers.
         if let Some(cached) = self.memo_servable.read().await.get(hash).cloned() {
-            if let Ok(result) = re::ActionResult::decode(cached.as_slice()) {
+            if let Ok(mut result) = re::ActionResult::decode(cached.as_slice()) {
+                crate::norm::ensure_execution_metadata(&mut result);
                 return AcLookup::Hit(Box::new(result));
             }
         }
@@ -796,10 +1016,15 @@ impl Driver {
                 return AcLookup::Unservable;
             }
         }
-        let Ok(result) = re::ActionResult::decode(bytes.as_slice()) else {
+        let Ok(mut result) = re::ActionResult::decode(bytes.as_slice()) else {
             // Corrupt entry: re-execution overwrites it. Safer than serving.
             return AcLookup::Miss;
         };
+        // Serve-time heal: pre-fix canon-hits were re-cached under the
+        // requesting digest WITHOUT execution_metadata (rewrite_result
+        // used to strip it) and then banked - buck2's client hard-rejects
+        // such rows. Every digest-keyed serve flows through here.
+        crate::norm::ensure_execution_metadata(&mut result);
         let mut digs = result_digests(&result);
         // Top-level digests prove a directory output's Tree PROTO exists,
         // not its contents: reader 29010597531 lost 5,390 actions to
@@ -820,8 +1045,28 @@ impl Driver {
                 }),
         )
         .await;
-        for fetched in tree_blobs {
+        for (ti, fetched) in tree_blobs.into_iter().enumerate() {
             let Ok(Some(tree_bytes)) = fetched else {
+                // The tree arms were a sampling blind spot: run
+                // 29611514770 refused 484 lookups with ZERO samples -
+                // every one came through here. Name the missing tree.
+                let n = self.unservable_logged.fetch_add(1, Ordering::Relaxed);
+                if n < 20 {
+                    let td = result
+                        .output_directories
+                        .get(ti)
+                        .and_then(|od| od.tree_digest.as_ref())
+                        .map(|d| format!("{}/{}", d.hash, d.size_bytes))
+                        .unwrap_or_default();
+                    println!(
+                        "[driver] unservable sample {n}: action {hash} TREE blob missing {td} (dir {})",
+                        result
+                            .output_directories
+                            .get(ti)
+                            .map(|od| od.path.as_str())
+                            .unwrap_or("?")
+                    );
+                }
                 self.memo_unservable
                     .lock()
                     .await
@@ -829,6 +1074,10 @@ impl Driver {
                 return AcLookup::Unservable;
             };
             let Ok(tree) = re::Tree::decode(tree_bytes.as_slice()) else {
+                let n = self.unservable_logged.fetch_add(1, Ordering::Relaxed);
+                if n < 20 {
+                    println!("[driver] unservable sample {n}: action {hash} TREE decode failed");
+                }
                 self.memo_unservable
                     .lock()
                     .await
@@ -981,8 +1230,19 @@ impl Driver {
     /// action failures (healing4/5). Failed hints are evicted so
     /// rediscovery stays honest.
     pub async fn get_blob(&self, d: &Dig) -> Result<Option<Vec<u8>>> {
-        if let Some(bytes) = self.store.get(d).await? {
-            return Ok(Some(bytes));
+        if self.ensure_blob_local(d).await? {
+            return self.store.get(d).await;
+        }
+        Ok(None)
+    }
+
+    /// Read-through presence: make `d` locally available (streaming fetch
+    /// into the store), without ever holding the blob in memory. The serve
+    /// paths pair this with `Store::copy_out` so large blobs relay at
+    /// O(chunk); `get_blob` keeps the Vec API for small proto reads.
+    pub async fn ensure_blob_local(&self, d: &Dig) -> Result<bool> {
+        if self.store.has(d).await {
+            return Ok(true);
         }
         let _permit = self.mesh_fetches.acquire().await;
         // Retry rounds with backoff, candidates rebuilt fresh each round: a
@@ -1014,7 +1274,7 @@ impl Driver {
                 match self.probe_workers(d).await {
                     Some(e) => candidates.push(e),
                     // Nobody claims it and nobody failed us: honest Missing.
-                    None if !claimed_but_failed => return Ok(None),
+                    None if !claimed_but_failed => return Ok(false),
                     None => break,
                 }
             }
@@ -1023,12 +1283,11 @@ impl Driver {
             let total = candidates.len();
             for endpoint in candidates {
                 match self.fetch_blob_from(&endpoint, d).await {
-                    Ok(Some(bytes)) => {
-                        self.store.put(Some(d), &bytes).await?;
+                    Ok(true) => {
                         self.providers.lock().await.insert(d.hash.clone(), endpoint);
-                        return Ok(Some(bytes));
+                        return Ok(true);
                     }
-                    Ok(None) => {
+                    Ok(false) => {
                         // Peer explicitly lacks it (bloom false positive or
                         // eviction): drop the stale hint, count the denial.
                         denied += 1;
@@ -1062,17 +1321,18 @@ impl Driver {
                 d.size
             );
         }
-        Ok(None)
+        Ok(false)
     }
 
-    /// One blob fetch from one peer: two attempts (retry once on a fresh
-    /// connection if the pooled one went stale). Ok(None) = peer answered
-    /// Missing; Err = peer unreachable/protocol error. Callers treat both
-    /// as "not from this peer", never as a global verdict.
-    async fn fetch_blob_from(&self, endpoint: &str, d: &Dig) -> Result<Option<Vec<u8>>> {
+    /// One blob fetch from one peer, streamed straight into the store: two
+    /// attempts (retry once on a fresh connection if the pooled one went
+    /// stale). Ok(false) = peer answered Missing; Err = peer unreachable/
+    /// protocol error. Callers treat both as "not from this peer", never
+    /// as a global verdict.
+    async fn fetch_blob_from(&self, endpoint: &str, d: &Dig) -> Result<bool> {
         for attempt in 0..2 {
             let conn = self.peer_conn(endpoint).await?;
-            let res: Result<Option<Vec<u8>>> = async {
+            let res: Result<bool> = async {
                 let (mut send, mut recv) = conn.open_bi().await?;
                 mesh::send_frame(&mut send, &BlobReq::Get(d.clone())).await?;
                 send.finish()?;
@@ -1081,10 +1341,14 @@ impl Driver {
                     .context("provider closed blob stream")?
                 {
                     BlobResp::Found { size } => {
-                        let bytes = mesh::recv_raw(&mut recv, size).await?;
-                        Ok(Some(bytes))
+                        let expect = Dig {
+                            hash: d.hash.clone(),
+                            size: size as i64,
+                        };
+                        self.store.put_stream(Some(&expect), &mut recv).await?;
+                        Ok(true)
                     }
-                    BlobResp::Missing => Ok(None),
+                    BlobResp::Missing => Ok(false),
                     other => bail!("provider {endpoint} for {}: {other:?}", d.hash),
                 }
             }
@@ -1152,6 +1416,16 @@ impl Driver {
             .map(|w| w.endpoint.clone())
             .filter(|e| !e.is_empty())
             .collect();
+        // Log on ENTRY, not just on completion: the census below is 8
+        // sequential ListShard rounds with a 30s per-peer timeout, so the
+        // old first-print could be minutes in - and on a 12-minute warm
+        // lap the driver stopped first, leaving run 30241746804 with no
+        // evidence the flag had plumbed at all. An unobservable feature
+        // is an unverifiable one.
+        println!(
+            "[driver] eager prefetch: census over {} peers ({OF} shard rounds)",
+            peers.len()
+        );
         for shard in 0..OF {
             let lists = futures::future::join_all(peers.iter().map(|ep| {
                 let this = self.clone();
@@ -1524,15 +1798,185 @@ impl Driver {
         }
     }
 
+    /// Fetch a blob by walking the input-root Directory tree to `rel_path`.
+    /// Used by canonical-key computation to read @-argsfile content.
+    async fn fetch_blob_by_rel_path(
+        &self,
+        input_root: &Dig,
+        rel_path: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let mut dir_dig = input_root.clone();
+        let mut parts = rel_path.split('/').peekable();
+        loop {
+            let Some(part) = parts.next() else {
+                return Ok(None);
+            };
+            let Some(bytes) = self.get_blob(&dir_dig).await? else {
+                return Ok(None);
+            };
+            let dir = re::Directory::decode(bytes.as_slice()).context("decode Directory")?;
+            if parts.peek().is_none() {
+                let Some(f) = dir.files.iter().find(|f| f.name == part) else {
+                    return Ok(None);
+                };
+                let Some(d) = &f.digest else { return Ok(None) };
+                return self.get_blob(&d.into()).await;
+            }
+            let Some(sub) = dir.directories.iter().find(|d| d.name == part) else {
+                return Ok(None);
+            };
+            let Some(d) = &sub.digest else {
+                return Ok(None);
+            };
+            dir_dig = d.into();
+        }
+    }
+
+    /// Content hash of the input tree: sorted (rel-path, blob-hash) pairs
+    /// over every file EXCEPT the argsfiles actually reachable from the
+    /// command's @-references (those are normalized separately — their raw
+    /// bytes carry label tokens). Exact-path exclusion, not extension
+    /// matching: a crate shipping a data file named `*.args` must still
+    /// reach the key, or two actions differing only in it would share.
+    async fn source_content_hash(
+        &self,
+        input_root: &Dig,
+        exclude: &std::collections::HashSet<String>,
+    ) -> Result<[u8; 32]> {
+        use sha2::{Digest as _, Sha256};
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut stack: Vec<(Dig, String)> = vec![(input_root.clone(), String::new())];
+        while let Some((dig, prefix)) = stack.pop() {
+            let Some(bytes) = self.get_blob(&dig).await? else {
+                anyhow::bail!("input tree dir {} unavailable", dig.hash);
+            };
+            let dir = re::Directory::decode(bytes.as_slice()).context("decode Directory")?;
+            for f in &dir.files {
+                if exclude.contains(&format!("{prefix}{}", f.name)) {
+                    continue;
+                }
+                if let Some(d) = &f.digest {
+                    pairs.push((format!("{prefix}{}", f.name), d.hash.clone()));
+                }
+            }
+            for s in &dir.symlinks {
+                pairs.push((format!("{prefix}{}", s.name), format!("->{}", s.target)));
+            }
+            for d in &dir.directories {
+                if let Some(dd) = &d.digest {
+                    stack.push((dd.into(), format!("{prefix}{}/", d.name)));
+                }
+            }
+        }
+        pairs.sort();
+        let mut h = Sha256::new();
+        for (p, hash) in &pairs {
+            h.update(p.as_bytes());
+            h.update([0u8]);
+            h.update(hash.as_bytes());
+            h.update([0u8]);
+        }
+        Ok(h.finalize().into())
+    }
+
+    /// Canonical (name-independent) key for an action: normalized Command,
+    /// normalized content of every @-argsfile reachable from the arguments
+    /// (one indirection level: argsfiles referencing further @-files are
+    /// followed once), and the source-input content hash.
+    async fn compute_canonical_key(&self, cmd: &re::Command, input_root: &Dig) -> Result<String> {
+        let norm_cmd = crate::norm::normalize_command(cmd);
+        let mut argsfiles: Vec<Vec<u8>> = Vec::new();
+        let mut reachable: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut queue: Vec<String> = cmd
+            .arguments
+            .iter()
+            .filter_map(|a| a.strip_prefix('@').map(str::to_owned))
+            .collect();
+        let mut depth = 0;
+        while !queue.is_empty() && depth < 2 {
+            let mut next = Vec::new();
+            for rel in queue.drain(..) {
+                let Some(bytes) = self.fetch_blob_by_rel_path(input_root, &rel).await? else {
+                    anyhow::bail!("argsfile {rel} not reachable in input tree");
+                };
+                for line in String::from_utf8_lossy(&bytes).split('\n') {
+                    if let Some(r) = line.trim().strip_prefix('@') {
+                        next.push(r.to_owned());
+                    }
+                }
+                argsfiles.push(crate::norm::normalize_argsfile(&bytes));
+                reachable.insert(rel);
+            }
+            queue = next;
+            depth += 1;
+        }
+        let src = self.source_content_hash(input_root, &reachable).await?;
+        Ok(crate::norm::canonical_key_from_parts(
+            &norm_cmd, &argsfiles, &src,
+        ))
+    }
+
+    /// Probe the canonical cache for `cmd`. On a hit whose blobs are still
+    /// fetchable, returns the result rewritten to this action's declared
+    /// output paths. `Ok(None)` = miss (caller executes and then calls
+    /// [`Self::canonical_put`] with the fresh result).
+    async fn canonical_probe(
+        self: &Arc<Self>,
+        key: &str,
+        cmd: &re::Command,
+    ) -> Result<Option<re::ActionResult>> {
+        let cached = {
+            let memo = self.memo_canonical.read().await;
+            memo.get(key).cloned()
+        };
+        let cached = match cached {
+            Some(b) => Some(b),
+            None => self.store.acn_get(key).await,
+        };
+        let Some(bytes) = cached else { return Ok(None) };
+        let Ok(canonical) = re::ActionResult::decode(bytes.as_slice()) else {
+            return Ok(None); // corrupt row: re-execution overwrites it
+        };
+        let rewritten = crate::norm::rewrite_result(canonical, cmd);
+        // Same honesty gate as the digest-keyed AC: never serve a result
+        // whose referenced blobs the fleet can't deliver.
+        let digs = result_digests(&rewritten);
+        if !digs.is_empty() && self.has_blobs(&digs).await.iter().any(|p| !p) {
+            return Ok(None);
+        }
+        println!("[driver] canon-hit {key}");
+        Ok(Some(rewritten))
+    }
+
+    async fn canonical_put(&self, key: String, result: &re::ActionResult) {
+        let normalized = crate::norm::normalize_result(result);
+        let bytes = normalized.encode_to_vec();
+        if let Err(e) = self.store.acn_put(&key, &bytes).await {
+            eprintln!("[driver] canon-put {key} failed: {e:#}");
+            return;
+        }
+        println!("[driver] canon-put {key}");
+        self.memo_canonical.write().await.insert(key, bytes);
+    }
+
     /// Barrier: block until the agreed pool has formed once. A latch, not a
     /// level check — late joiners always add capacity, and a shrinking pool
     /// never re-blocks dispatch.
-    async fn await_pool_formed(&self) {
+    pub async fn await_pool_formed(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         if self.pool_formed.load(Relaxed) {
             return;
         }
-        while self.workers.lock().await.len() < self.cfg.min_workers {
+        loop {
+            let (n, shards) = {
+                let w = self.workers.lock().await;
+                let shards: std::collections::BTreeSet<u8> =
+                    w.iter().filter_map(|h| h.preloaded_shard).collect();
+                (w.len(), shards.len())
+            };
+            if n >= self.cfg.min_workers && shards >= self.cfg.require_shards {
+                break;
+            }
             self.worker_arrived.notified().await;
         }
         self.pool_formed.store(true, Relaxed);
@@ -1549,11 +1993,15 @@ impl Driver {
         // action/command blobs live on worker shards; a local-only read
         // silently degraded routing to PlatKey::default() and put /bin/sh
         // actions on windows workers (reader 28957851178).
-        let (plat, do_not_cache, affinity, input_root) = match self.get_blob(action_digest).await? {
+        let (plat, do_not_cache, affinity, input_root, canon_cmd) = match self
+            .get_blob(action_digest)
+            .await?
+        {
             Some(bytes) => match re::Action::decode(bytes.as_slice()) {
                 Ok(action) => {
                     let mut plat = PlatKey::from_properties(action.platform.as_ref());
                     let mut affinity_key: Option<String> = None;
+                    let mut canon_cmd: Option<re::Command> = None;
                     if let Some(cd) = &action.command_digest {
                         if let Ok(Some(cmd_bytes)) = self
                             .get_blob(&Dig {
@@ -1572,6 +2020,9 @@ impl Driver {
                                     }
                                 }
                                 affinity_key = crate_affinity_key(&cmd);
+                                if self.cfg.name_independent && crate::norm::is_rustc_action(&cmd) {
+                                    canon_cmd = Some(cmd);
+                                }
                             }
                         }
                     }
@@ -1598,12 +2049,36 @@ impl Driver {
                         action.do_not_cache,
                         affinity,
                         action.input_root_digest,
+                        canon_cmd,
                     )
                 }
-                Err(_) => (PlatKey::default(), false, None, None),
+                Err(_) => (PlatKey::default(), false, None, None, None),
             },
-            None => (PlatKey::default(), false, None, None),
+            None => (PlatKey::default(), false, None, None, None),
         };
+
+        // Name-independent probe: identical work under a different label
+        // may already have a canonical result. Failures here degrade to a
+        // plain miss - the canonical layer must never fail an action.
+        let mut canon_key: Option<String> = None;
+        if let (Some(cmd), Some(root)) = (&canon_cmd, &input_root) {
+            let root: Dig = root.into();
+            match self.compute_canonical_key(cmd, &root).await {
+                Ok(key) => {
+                    if let Ok(Some(result)) = self.canonical_probe(&key, cmd).await {
+                        return Ok(exec::Outcome {
+                            action_result: result,
+                            do_not_cache,
+                        });
+                    }
+                    canon_key = Some(key);
+                }
+                Err(e) => {
+                    // Diagnosable but non-fatal: unsupported shapes just miss.
+                    eprintln!("[driver] canon-key skip: {e:#}");
+                }
+            }
+        }
         let locality = if self.cfg.locality {
             match &input_root {
                 Some(d) => self.locality_pref(&d.into()).await,
@@ -1642,6 +2117,15 @@ impl Driver {
             .await
             .context("job dropped without completion")?
             .map_err(|e| anyhow::anyhow!("execution failed: {e}"))?;
+
+        // Populate the canonical cache with the fresh result so the next
+        // differently-named twin hits. Successes only: failures are not
+        // name-independent facts (they may be env-transient).
+        if let Some(key) = canon_key {
+            if action_result.exit_code == 0 && !do_not_cache {
+                self.canonical_put(key, &action_result).await;
+            }
+        }
 
         Ok(exec::Outcome {
             action_result,
@@ -1694,11 +2178,10 @@ impl exec::Blobs for StoreBlobs {
             }
             return Ok(());
         }
-        if self.store.link_out(d, dest).await? == crate::store::Materialized::Private
-            && is_executable
-        {
-            exec::set_exec(dest).await?;
-        }
+        // link_out_exec guarantees the exec bit on BOTH paths - including
+        // normalizing a mode-stripped shared store inode (bank-seeded
+        // blobs staged 0o100644 and died with EACCES, run 29524645875).
+        self.store.link_out_exec(d, dest, is_executable).await?;
         Ok(())
     }
 }
@@ -1728,29 +2211,26 @@ async fn serve_blob_stream(
                 // a store-only serve returned Missing for 2,756 input
                 // fetches (run 28959911677). Read-through relays and caches
                 // locally, reconstituting the driver's hot set.
-                match driver.get_blob(&d).await {
-                    Ok(Some(bytes)) => {
+                match driver.ensure_blob_local(&d).await {
+                    Ok(true) => {
                         mesh::send_frame(
                             &mut send,
                             &BlobResp::Found {
-                                size: bytes.len() as u64,
+                                size: d.size as u64,
                             },
                         )
                         .await?;
-                        send.write_all(&bytes).await?;
+                        driver.store.copy_out(&d, &mut send).await?;
                     }
-                    Ok(None) => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
+                    Ok(false) => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
                     Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
                 }
             }
         }
-        BlobReq::Put(d) => {
-            let bytes = mesh::recv_raw(&mut recv, d.size as u64).await?;
-            match driver.store.put(Some(&d), &bytes).await {
-                Ok(_) => mesh::send_frame(&mut send, &BlobResp::PutOk).await?,
-                Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
-            }
-        }
+        BlobReq::Put(d) => match driver.store.put_stream(Some(&d), &mut recv).await {
+            Ok(_) => mesh::send_frame(&mut send, &BlobResp::PutOk).await?,
+            Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
+        },
         BlobReq::HasMany(digs) => {
             let mut have = Vec::with_capacity(digs.len());
             for d in &digs {
@@ -1774,18 +2254,18 @@ async fn serve_blob_stream(
                     mesh::send_frame(&mut send, &BlobResp::Provider { endpoint }).await?;
                     continue;
                 }
-                match driver.get_blob(d).await {
-                    Ok(Some(bytes)) => {
+                match driver.ensure_blob_local(d).await {
+                    Ok(true) => {
                         mesh::send_frame(
                             &mut send,
                             &BlobResp::Found {
-                                size: bytes.len() as u64,
+                                size: d.size as u64,
                             },
                         )
                         .await?;
-                        send.write_all(&bytes).await?;
+                        driver.store.copy_out(d, &mut send).await?;
                     }
-                    Ok(None) => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
+                    Ok(false) => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
                     Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
                 }
             }
@@ -1853,6 +2333,7 @@ mod tests {
         let mut cfg = DriverCfg {
             session: "test".into(),
             min_workers: 0,
+            require_shards: 0,
             local_exec: false,
             decentralized: false,
             hardlinks: true,
@@ -1861,6 +2342,7 @@ mod tests {
             cache_failures: false,
             locality: false,
             prefetch_metadata: false,
+            name_independent: true,
             scratch: std::env::temp_dir(),
         };
         f(&mut cfg);
@@ -1874,6 +2356,7 @@ mod tests {
             DriverCfg {
                 session: "test".into(),
                 min_workers,
+                require_shards: 0,
                 local_exec,
                 decentralized: false,
                 hardlinks: true,
@@ -1882,6 +2365,7 @@ mod tests {
                 cache_failures: false,
                 locality: false,
                 prefetch_metadata: false,
+                name_independent: false,
                 scratch: std::env::temp_dir(),
             },
         )
@@ -2016,6 +2500,130 @@ mod tests {
     /// healing4/5: has_blobs testified on the bare index entry, exec-time
     /// get_blob then trusted the same stale entry and turned one peer's
     /// "Missing" into a hard action failure - 3,650 times per lap.
+    /// The caching dream end-to-end at driver level: two actions compiling
+    /// identical source under DIFFERENT labels compute one canonical key;
+    /// the first execution's canonical_put lets the second label
+    /// canonical_probe a hit whose paths are its own and whose blob
+    /// digests are the original's.
+    #[tokio::test]
+    async fn name_independent_twins_share_one_canonical_row() {
+        let d = test_driver_with(|c| c.name_independent = true);
+
+        // Shared source file + per-label argsfiles in per-label trees.
+        let src = b"pub fn f() {}".to_vec();
+        let src_dig = d.store.put(None, &src).await.unwrap();
+        let mk_tree = |args: Vec<u8>| {
+            let store = d.store.clone();
+            let src_dig = src_dig.clone();
+            async move {
+                let args_dig = store.put(None, &args).await.unwrap();
+                let dir = re::Directory {
+                    files: vec![
+                        re::FileNode {
+                            name: "lib.rs".into(),
+                            digest: Some(src_dig.to_proto()),
+                            ..Default::default()
+                        },
+                        re::FileNode {
+                            name: "cmd.args".into(),
+                            digest: Some(args_dig.to_proto()),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                };
+                let bytes = dir.encode_to_vec();
+                store.put(None, &bytes).await.unwrap()
+            }
+        };
+        let main_out = "buck-out/s/art/p/__adler-1__/a1b2c3d4e5f60718/lib.rmeta";
+        let snap_out = "buck-out/s/art/p/snapshots/2024-11/__adler-1__/ffee001122334455/lib.rmeta";
+        let root_main = mk_tree(
+            format!("-Cmetadata=fixups//third-party:adler-1#aa\n{main_out}\n").into_bytes(),
+        )
+        .await;
+        let root_snap = mk_tree(
+            format!("-Cmetadata=fixups//third-party/snapshots/2024-11:adler-1#bb\n{snap_out}\n")
+                .into_bytes(),
+        )
+        .await;
+        let mk_cmd = |out: &str| re::Command {
+            arguments: vec![
+                "python3".into(),
+                "rustc_action.py".into(),
+                "@cmd.args".into(),
+            ],
+            output_paths: vec![out.to_owned()],
+            ..Default::default()
+        };
+        let cmd_main = mk_cmd(main_out);
+        let cmd_snap = mk_cmd(snap_out);
+
+        // Different labels, one canonical key.
+        let k1 = d
+            .compute_canonical_key(&cmd_main, &root_main)
+            .await
+            .unwrap();
+        let k2 = d
+            .compute_canonical_key(&cmd_snap, &root_snap)
+            .await
+            .unwrap();
+        assert_eq!(k1, k2, "labels must not reach the canonical key");
+
+        // First build populates; the twin hits with ITS paths, SAME digest.
+        let rmeta = d.store.put(None, b"compiled bytes").await.unwrap();
+        let result = re::ActionResult {
+            output_files: vec![re::OutputFile {
+                path: main_out.into(),
+                digest: Some(rmeta.to_proto()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(d.canonical_probe(&k1, &cmd_main).await.unwrap().is_none());
+        d.canonical_put(k1, &result).await;
+        let hit = d
+            .canonical_probe(&k2, &cmd_snap)
+            .await
+            .unwrap()
+            .expect("twin must hit");
+        assert_eq!(hit.output_files[0].path, snap_out);
+        assert_eq!(
+            hit.output_files[0].digest.as_ref().unwrap().hash,
+            rmeta.hash
+        );
+
+        // Divergent source = different key: the dream never lies.
+        let src2 = d.store.put(None, b"pub fn f() { panic!() }").await.unwrap();
+        let dir2 = re::Directory {
+            files: vec![
+                re::FileNode {
+                    name: "lib.rs".into(),
+                    digest: Some(src2.to_proto()),
+                    ..Default::default()
+                },
+                re::FileNode {
+                    name: "cmd.args".into(),
+                    digest: Some(
+                        d.store
+                            .put(
+                                None,
+                                format!("-Cmetadata=x:adler-1#cc\n{snap_out}\n").as_bytes(),
+                            )
+                            .await
+                            .unwrap()
+                            .to_proto(),
+                    ),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let root2 = d.store.put(None, &dir2.encode_to_vec()).await.unwrap();
+        let k3 = d.compute_canonical_key(&cmd_snap, &root2).await.unwrap();
+        assert_ne!(k2, k3, "source divergence must change the key");
+    }
+
     #[tokio::test]
     async fn stale_provider_entry_is_a_hint_not_truth() {
         let d = test_driver(false);

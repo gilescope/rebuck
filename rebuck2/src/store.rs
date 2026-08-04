@@ -84,6 +84,10 @@ pub fn verify_cas(dir: &std::path::Path) -> anyhow::Result<(u64, u64)> {
 }
 
 impl Store {
+    pub fn root_dir(&self) -> PathBuf {
+        self.root.clone()
+    }
+
     pub fn new(root: PathBuf) -> Result<Self> {
         for sub in ["cas", "ac", "tmp"] {
             std::fs::create_dir_all(root.join(sub))?;
@@ -214,6 +218,37 @@ impl Store {
         })
     }
 
+    /// `link_out` plus the exec guarantee: when `is_executable`, the
+    /// materialized file carries the exec bit. A blob that entered the
+    /// store via a mode-less path (CI bank seed, external tar) violates
+    /// the 0o555 invariant; on the Linked path this normalizes the SHARED
+    /// inode - adding exec to immutable content is safe, write stays off,
+    /// and every past and future link of the blob heals with it (run
+    /// 29524645875: bank-era build scripts staged 0o100644, EACCES).
+    pub async fn link_out_exec(
+        &self,
+        d: &Dig,
+        dest: &std::path::Path,
+        is_executable: bool,
+    ) -> Result<Materialized> {
+        let m = self.link_out(d, dest).await?;
+        #[cfg(unix)]
+        if is_executable {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = tokio::fs::metadata(dest).await?;
+            if meta.permissions().mode() & 0o111 == 0 {
+                let mode = match m {
+                    Materialized::Private => 0o755,
+                    Materialized::Linked => 0o555,
+                };
+                tokio::fs::set_permissions(dest, std::fs::Permissions::from_mode(mode)).await?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = is_executable;
+        Ok(m)
+    }
+
     /// Materialize a blob at `dest` for near-zero cost. Chain: block clone
     /// (ReFS/btrfs — private inode) -> hardlink (shared inode, 0o555-defended)
     /// -> copy on the two honest link refusals. macOS: fs::copy = APFS clone.
@@ -298,6 +333,136 @@ impl Store {
     /// Clone path: store gets private CoW extents, source stays writable.
     /// Hardlink path: source inode goes 0o555 first on unix, so the store
     /// name is read-only from the moment it exists.
+    /// Stream a blob INTO the store: chunked read -> hash-while-writing a
+    /// tmp file -> verify -> 0o555 -> rename. O(chunk) memory where `put`
+    /// is O(blob) - the whole-blob Vec buffering measured 2.4GB peak for
+    /// 48x48MB actions on the loopback bench. When `expected` is already
+    /// present the reader is still DRAINED of exactly `expected.size`
+    /// bytes: batched wire protocols (GetMany) interleave frames and
+    /// payloads on one stream, so short-reading desynchronizes the peer.
+    pub async fn put_stream(
+        &self,
+        expected: Option<&Dig>,
+        reader: &mut (impl tokio::io::AsyncRead + Unpin),
+    ) -> Result<Dig> {
+        use sha2::{Digest as _, Sha256};
+        use tokio::io::AsyncReadExt;
+        if let Some(exp) = expected {
+            if self.has(exp).await {
+                let mut limited = reader.take(exp.size as u64);
+                tokio::io::copy(&mut limited, &mut tokio::io::sink()).await?;
+                return Ok(exp.clone());
+            }
+        }
+        let tmp = self.root.join("tmp").join(format!(
+            "stream.{}.{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut total: u64 = 0;
+        let limit = expected.map(|e| e.size as u64);
+        loop {
+            let want = match limit {
+                Some(l) if total >= l => 0,
+                Some(l) => (l - total).min(buf.len() as u64) as usize,
+                None => buf.len(),
+            };
+            if want == 0 {
+                break;
+            }
+            let n = reader.read(&mut buf[..want]).await?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            tokio::io::AsyncWriteExt::write_all(&mut file, &buf[..n]).await?;
+            total += n as u64;
+        }
+        tokio::io::AsyncWriteExt::flush(&mut file).await?;
+        drop(file);
+        let d = hasher.finalize();
+        let mut hash = String::with_capacity(64);
+        for b in d {
+            hash.push_str(&format!("{b:02x}"));
+        }
+        if let Some(exp) = expected {
+            if exp.hash != hash || exp.size as u64 != total {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                bail!(
+                    "digest mismatch: expected {}/{}, got {hash}/{total}",
+                    exp.hash,
+                    exp.size
+                );
+            }
+        }
+        let dest = self.cas_path(&hash);
+        if tokio::fs::metadata(&dest).await.is_ok() {
+            let _ = tokio::fs::remove_file(&tmp).await;
+        } else {
+            tokio::fs::create_dir_all(dest.parent().context("cas path has parent")?).await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)).await?;
+            }
+            tokio::fs::rename(&tmp, &dest).await?;
+            self.stored_bytes
+                .fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(Dig {
+            hash,
+            size: total as i64,
+        })
+    }
+
+    /// Stream a blob OUT of the store into `writer`. O(chunk) memory; the
+    /// serve paths previously loaded whole blobs.
+    pub async fn copy_out(
+        &self,
+        d: &Dig,
+        writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    ) -> Result<()> {
+        if d.size == 0 && d.hash == EMPTY_SHA256 {
+            return Ok(());
+        }
+        let mut f = tokio::fs::File::open(self.cas_path(&d.hash)).await?;
+        let n = tokio::io::copy(&mut f, writer).await?;
+        self.read_bytes
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Streaming content digest of a file (for output ingestion - reading
+    /// whole outputs to hash them was half the 2.4GB bench peak).
+    pub async fn hash_file(path: &std::path::Path) -> Result<Dig> {
+        use sha2::{Digest as _, Sha256};
+        use tokio::io::AsyncReadExt;
+        let mut f = tokio::fs::File::open(path).await?;
+        let mut hasher = Sha256::new();
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            let n = f.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            total += n as u64;
+        }
+        let d = hasher.finalize();
+        let mut hash = String::with_capacity(64);
+        for b in d {
+            hash.push_str(&format!("{b:02x}"));
+        }
+        Ok(Dig {
+            hash,
+            size: total as i64,
+        })
+    }
+
     pub async fn adopt(&self, expected: &Dig, src: &std::path::Path) -> Result<()> {
         let dest = self.cas_path(&expected.hash);
         if tokio::fs::metadata(&dest).await.is_ok() {
@@ -420,6 +585,28 @@ impl Store {
             .ok()
     }
 
+    /// Canonical (name-independent) action cache: keyed by the normalized
+    /// action key from [`crate::norm`], holding normalized ActionResults.
+    /// A separate namespace so a normalization-scheme change can never be
+    /// confused with a digest-keyed AC row.
+    pub async fn acn_get(&self, key: &str) -> Option<Vec<u8>> {
+        tokio::fs::read(self.root.join("acn").join(&key[..2]).join(key))
+            .await
+            .ok()
+    }
+
+    pub async fn acn_put(&self, key: &str, bytes: &[u8]) -> Result<()> {
+        let dir = self.root.join("acn").join(&key[..2]);
+        tokio::fs::create_dir_all(&dir).await?;
+        let tmp = self
+            .root
+            .join("tmp")
+            .join(format!("acn-{key}.{}", std::process::id()));
+        tokio::fs::write(&tmp, bytes).await?;
+        tokio::fs::rename(&tmp, dir.join(key)).await?;
+        Ok(())
+    }
+
     pub async fn ac_put(&self, action_hash: &str, bytes: &[u8]) -> Result<()> {
         let tmp = self
             .root
@@ -463,6 +650,42 @@ mod tests {
         std::fs::write(&dest, b"stale case-colliding twin").unwrap();
         store.link_out(&d, &dest).await.unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"new contents");
+    }
+
+    /// A blob that entered the store via a mode-less path (CI bank seed,
+    /// external tar) violates the 0o555 invariant; the Linked
+    /// materialization shares that inode, so an executable input stages
+    /// as 0644 and the action dies with EACCES (run 29524645875:
+    /// build_script_build mode=0o100644). link_out must normalize the
+    /// shared inode when the caller demands exec.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn link_out_heals_mode_stripped_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::new(dir.path().join("store")).unwrap();
+        let d = store.put(None, b"#!/bin/sh\ntrue\n").await.unwrap();
+        // Simulate the mode-less arrival: strip the store inode to 0644.
+        let src = store.cas_path_for_test(&d.hash);
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let dest = dir.path().join("exec/build_script_build");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        store.link_out_exec(&d, &dest, true).await.unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(&dest).unwrap();
+        let mode = meta.permissions().mode();
+        assert!(
+            mode & 0o111 != 0,
+            "materialized executable lacks exec: {mode:o}"
+        );
+        // Only a SHARED inode (hardlink path) must stay unwritable; a
+        // private clone/copy is the caller's to chmod (0o755 is fine).
+        if meta.nlink() > 1 {
+            assert!(
+                mode & 0o222 == 0,
+                "shared CAS inode must stay unwritable: {mode:o}"
+            );
+        }
     }
 
     #[test]

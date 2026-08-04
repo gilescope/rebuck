@@ -1,0 +1,145 @@
+name: rebuck2 bank restore
+description: >-
+  Seed a rebuck2 store from the CI bank - action-cache rows and, when a
+  shard is given, that range's CAS blobs. A cold bank is a normal outcome,
+  not a failure.
+
+inputs:
+  store:
+    description: >-
+      Store root. Defaults to the same place the driver/worker actions use,
+      resolved per-OS by the action rather than by the caller - which is
+      the point: no cygpath in your workflow.
+    required: false
+    default: ""
+  subdir:
+    description: >-
+      Sub-store under the resolved root, e.g. "worker" or "driver". One
+      runner can host several roles (the driver box also runs a
+      co-worker), and each needs its own store - but the ROOT is the
+      action's business, not the caller's.
+    required: false
+    default: ""
+  role:
+    description: >-
+      This node's identity in the bank. Every node banks the rows it
+      AUTHORED under its own role, so this decides which manifest is
+      "ours" and therefore what the matching publish may overwrite.
+    required: true
+  mode:
+    description: >-
+      "all" lays down every role's rows and is for the node that READS the
+      AC (the driver). "own" lays down only this role's history, which is
+      all a worker needs to re-pack, and stops it re-banking rows it never
+      authored.
+    required: false
+    default: own
+  lineage:
+    description: 'Bank lineage. Defaults to the branch (PR: the source branch).'
+    required: false
+    default: ""
+  parent-lineage:
+    description: >-
+      Trunk to inherit from, read-only. Its rows seed the store and join
+      the diff base so they are never re-banked, while every publish still
+      goes to this lineage's own manifest. Defaults to the PR base branch.
+    required: false
+    default: ""
+  shard:
+    description: >-
+      CAS range this node is primary for (0-7), or empty for AC only.
+    required: false
+    default: ""
+  verify:
+    description: >-
+      Hash-verify the seeded store before use. A CAS filename IS the
+      sha256 of its content, and artifacts cross GitHub's branch-scoping
+      wall - any run, any branch, including fork PRs, shares one
+      namespace. Verifying degrades a planted blob to a cold cache
+      instead of code execution, and makes the container artifact's own
+      provenance irrelevant. Off only if you are seeding from a source
+      you already trust and the hashing cost is not worth it.
+    required: false
+    default: "true"
+
+outputs:
+  cold:
+    description: '"1" when there was no bank to restore from.'
+    value: ${{ steps.ac.outputs.cold }}
+
+runs:
+  using: composite
+  steps:
+    # The credentials for LISTING and DOWNLOAD are GITHUB_TOKEN, which the
+    # caller passes as GH_TOKEN. Upload needs the runtime token instead -
+    # that is the bank-publish action's problem, via runtime-env.
+    - id: ac
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        # Inputs reach the script through the environment, never through
+        # ${{ }} interpolation into the body: a git ref may contain a
+        # quote, and `lineage` defaults to github.head_ref, which a fork
+        # PR author chooses. Interpolated, that is shell injection into
+        # the runner; as an env var it is just a string.
+        CAS_LINEAGE: ${{ inputs.lineage || github.head_ref || github.ref_name }}
+        CAS_PARENT_LINEAGE: ${{ inputs.parent-lineage || github.base_ref }}
+        IN_STORE: ${{ inputs.store }}
+        IN_SUBDIR: ${{ inputs.subdir }}
+        IN_ROLE: ${{ inputs.role }}
+        IN_SHARD: ${{ inputs.shard }}
+        IN_MODE: ${{ inputs.mode }}
+      run: |
+        set -euo pipefail
+        STORE="$IN_STORE"
+        # Path resolution belongs here, once, not in every consumer: a
+        # windows runner gets a native path and rebuck2 handles it, so
+        # there is no cygpath dance and no $DEV_DRIVE special case for
+        # the caller to remember.
+        if [ -z "$STORE" ]; then
+          if [ -n "${DEV_DRIVE:-}" ]; then STORE="$DEV_DRIVE/rebuck2"
+          else STORE="$HOME/.cache/rebuck2"; fi
+        fi
+        SUB="$IN_SUBDIR"
+        [ -z "$SUB" ] || STORE="$STORE/$SUB"
+        SHARD="$IN_SHARD"
+        # Per-ROLE staging. One runner hosts several roles (the driver box
+        # also runs a co-worker), and the restore leaves this role's own
+        # manifest head here for its publish to chain from. Sharing one
+        # dir would let the second restore overwrite the first's head and
+        # publish a manifest chained from the wrong role's generation.
+        BANK_WORK="${BANK_WORK:-$RUNNER_TEMP/rebuck2-bank-$IN_ROLE}"
+        export BANK_WORK
+        # ABSORB_SPILLS is the range owner's job: seed recent spills so the
+        # next publish banks them properly. Secondaries must not, or the
+        # blobs ping-pong between spill artifacts.
+        [ -z "$SHARD" ] || [ "$SHARD" = "-" ] || export ABSORB_SPILLS=1
+        echo "store=$STORE" >> "$GITHUB_OUTPUT"
+        echo "bank-work=$BANK_WORK" >> "$GITHUB_OUTPUT"
+
+        # BOTH banks. shard '-' means blob-list only: the driver needs
+        # the union to diff its spill against but seeds no range, while a
+        # worker seeds the range it owns. 3 = cold bank, which is a normal
+        # first lap on a new lineage, not a failure.
+        cold=0
+        rc=0
+        rebuck2 bank cas-restore "$STORE" "${SHARD:--}" "$CAS_LINEAGE" \
+          "${CAS_PARENT_LINEAGE:--}" || rc=$?
+        if [ "$rc" -eq 3 ]; then cold=1; elif [ "$rc" -ne 0 ]; then exit "$rc"; fi
+        rc=0
+        rebuck2 bank ac-restore "$STORE" "$IN_ROLE" "$IN_MODE" "$CAS_LINEAGE" "${CAS_PARENT_LINEAGE:--}" || rc=$?
+        if [ "$rc" -eq 3 ]; then cold=1; elif [ "$rc" -ne 0 ]; then exit "$rc"; fi
+        [ "$cold" -eq 0 ] || echo "cold=1" >> "$GITHUB_OUTPUT"
+
+    # Anything that crossed the artifact wall proves itself before the
+    # build can use it. This is the engine's own verifier: portable,
+    # parallel, and immune to the failure the shell version had - two
+    # hashers writing one pipe interleave past PIPE_BUF and the parser
+    # deleted GOOD files, which cost a whole mac fleet (run 29082052036).
+    - if: inputs.verify == 'true'
+      shell: bash
+      env:
+        STORE: ${{ steps.ac.outputs.store }}
+      run: |
+        set -euo pipefail
+        rebuck2 verify-store --store "$STORE"

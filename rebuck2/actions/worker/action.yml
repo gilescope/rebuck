@@ -1,17 +1,29 @@
 name: rebuck2 worker
 description: >-
-  Run a rebuck2 worker for the whole job: install the engine, optionally
-  preload a CAS shard from the newest run artifact, poll for the driver
-  address artifact, serve until the driver disconnects, then pack +
-  publish the shard the driver assigned at finalize (skipped when
-  unchanged since seed). Needs a rust toolchain on PATH for the engine's
-  cache-miss cargo install. Put `continue-on-error: true` on the job -
-  a lost worker must not redden the run; the driver job is the verdict.
+  A whole worker job: install the engine, restore its slice of the bank,
+  serve until the driver disconnects, then bank what it authored. There
+  is nothing consumer-specific in a worker - only the fleet position -
+  so this is the entire job bar `actions/checkout`.
+
+  Needs a rust toolchain on PATH for the engine's cache-miss cargo
+  install. Put `continue-on-error: true` on the job: a lost worker must
+  not redden the run, the driver job is the verdict.
 
 inputs:
   session:
     description: Mesh session id - must match the driver's.
     required: true
+  role:
+    description: >-
+      This node's identity in the bank. Names the AC manifest it writes
+      and its spill artifact; must be stable across laps for its history
+      to accumulate. Defaults to <os>-<job index>.
+    default: ""
+  shard:
+    description: >-
+      CAS range this worker is PRIMARY manifest writer for (0-7), or empty
+      for spill-only. One writer per range IS the work split.
+    default: ""
   rebuck2-git:
     description: Git URL of the rebuck repo to install the engine from.
     default: https://github.com/gilescope/rebuck
@@ -26,16 +38,12 @@ inputs:
       Store root (worker store = <root>/worker). Empty = $DEV_DRIVE/rebuck2
       when a Dev Drive is mounted, else ~/.cache/rebuck2.
     default: ""
-  shard:
-    description: >-
-      CAS shard number to preload during the join window (bloom gossip
-      announces it; the driver's HasMany verifies it). Empty = no preload.
-      Artifacts, not the actions cache: a 10GB LRU evicted whole shard
-      sets within an hour; artifacts don't evict.
+  lineage:
+    description: 'Bank lineage. Defaults to the branch (PR: the source branch).'
     default: ""
-  shard-artifact-prefix:
-    description: Artifact name prefix shards are stored under.
-    default: "cas-shard-"
+  parent-lineage:
+    description: Trunk to inherit from. Defaults to the PR base branch.
+    default: ""
   slots:
     description: Exec slots. Empty = engine default (nproc).
     default: ""
@@ -46,18 +54,15 @@ inputs:
     description: >-
       Run id that published the addr artifact. Defaults to this run - set
       it when workers are summoned by an autoscaler into their own run
-      (workflow_dispatch) while the driver lives in the triggering one.
+      while the driver lives in the triggering one.
     default: ${{ github.run_id }}
   addr-poll-secs:
     description: >-
       How long to poll for the address artifact (driver runner allocation
-      can tail past 30 min). n0 discovery remains the fallback. The job's
-      timeout-minutes clips this on short-lap fleets.
+      can tail past 30 min). n0 discovery remains the fallback.
     default: "2400"
   serve-timeout-secs:
-    description: >-
-      Hard cap on the serve step (guards a driver that never shows).
-      Keep it below the job's timeout-minutes on long sweep jobs.
+    description: Hard cap on the serve step (guards a driver that never shows).
     default: "20400"
   connect-wait-secs:
     description: --connect-wait-secs passed to the worker.
@@ -104,146 +109,152 @@ runs:
         REV: ${{ steps.rev.outputs.rev }}
       run: cargo install --locked --git "$IN_GIT" --rev "$REV" rebuck2
 
-    - name: Resolve store + scratch paths
+    # Everything the bank needs, resolved once: the store root per OS, the
+    # role, and the staging dir. A caller states its fleet POSITION; where
+    # any of it lives is this action's business.
+    - name: Restore this worker's slice of the bank
+      id: bank
       shell: bash
       env:
+        GH_TOKEN: ${{ inputs.github-token }}
         IN_STORE: ${{ inputs.store }}
+        IN_ROLE: ${{ inputs.role }}
+        IN_SHARD: ${{ inputs.shard }}
+        CAS_LINEAGE: ${{ inputs.lineage || github.head_ref || github.ref_name }}
+        CAS_PARENT_LINEAGE: ${{ inputs.parent-lineage || github.base_ref }}
       run: |
+        set -euo pipefail
         WORK="$RUNNER_TEMP/rebuck2-worker"
         mkdir -p "$WORK"
         STORE="$IN_STORE"
         if [ -z "$STORE" ]; then
-          if [ -n "${DEV_DRIVE:-}" ]; then STORE="$(cygpath -u "$DEV_DRIVE")/rebuck2"; else STORE="$HOME/.cache/rebuck2"; fi
+          if [ -n "${DEV_DRIVE:-}" ]; then STORE="$DEV_DRIVE/rebuck2"
+          else STORE="$HOME/.cache/rebuck2"; fi
         fi
+        ROLE="${IN_ROLE:-$RUNNER_OS-$GITHUB_JOB}"
         {
           echo "REBUCK2_WORK=$WORK"
           echo "REBUCK2_STORE=$STORE"
-          echo "REBUCK2_SEEDED_MANIFEST=$WORK/seeded.manifest"
+          echo "REBUCK2_ROLE=$ROLE"
         } >> "$GITHUB_ENV"
+        export BANK_WORK="$WORK/bank-$ROLE"
 
-    - name: Restore CAS shard (newest artifact, any run)
-      if: inputs.shard != ''
+        # One call: CAS range (or blob-list only), this role's AC history,
+        # parent-lineage inheritance, spill absorption when it owns a
+        # range, and hash verification of everything that arrived. 3 = a
+        # cold bank, which is a normal first lap on a new lineage.
+        rc=0
+        rebuck2 bank restore "$STORE/worker" "$ROLE" own "${IN_SHARD:--}" \
+          "$CAS_LINEAGE" "${CAS_PARENT_LINEAGE:--}" || rc=$?
+        if [ "$rc" -eq 3 ]; then echo "cold=1" >> "$GITHUB_OUTPUT"
+        elif [ "$rc" -ne 0 ]; then exit "$rc"; fi
+
+    - name: Serve until the driver disconnects
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
-        IN_SHARD: ${{ inputs.shard }}
-        IN_PREFIX: ${{ inputs.shard-artifact-prefix }}
-      run: |
-        mkdir -p "$REBUCK2_WORK/shard-in" "$REBUCK2_STORE/worker"
-        # Provenance filter: fork PR runs share this artifact namespace -
-        # only accept shards uploaded by runs of THIS repo's own branches.
-        AID=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$IN_PREFIX$IN_SHARD&per_page=10" \
-          --jq '[.artifacts[] | select(.expired==false and .workflow_run.head_repository_id == .workflow_run.repository_id)][0].id // empty' 2>/dev/null || true)
-        if [ -n "$AID" ]; then
-          gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$AID/zip" > "$REBUCK2_WORK/shard.zip" \
-            && unzip -o -q "$REBUCK2_WORK/shard.zip" -d "$REBUCK2_WORK/shard-in" \
-            && rm -f "$REBUCK2_WORK/shard.zip" \
-            && ls -lh "$REBUCK2_WORK/shard-in/" || echo "shard artifact fetch failed - cold start"
-        else
-          echo "no $IN_PREFIX$IN_SHARD artifact yet - cold start"
-        fi
-        for t in "$REBUCK2_WORK/shard-in"/*.tar.zst; do
-          if [ -f "$t" ]; then
-            zstd -d --long=27 < "$t" | tar -x -C "$REBUCK2_STORE/worker"
-            echo "seeded from $(basename "$t") ($(du -h "$t" | cut -f1))"
-          fi
-        done
-        rm -rf "$REBUCK2_WORK/shard-in"
-        # Blobs that crossed the artifact wall must prove themselves:
-        # a CAS filename IS the content sha256; mismatches are deleted.
-        bash "$GITHUB_ACTION_PATH/../verify-cas.sh" "$REBUCK2_STORE/worker"
-        # Record the restored shard's manifest - if finalize assigns this
-        # same shard back and nothing changed, the re-save is skipped.
-        a=$(printf '%x' $((IN_SHARD * 2))); b=$(printf '%x' $((IN_SHARD * 2 + 1)))
-        bash "$GITHUB_ACTION_PATH/../store-snapshot.sh" manifest "$REBUCK2_STORE/worker" "cas/$a* cas/$b*" \
-          > "$REBUCK2_SEEDED_MANIFEST"
-        echo "seeded shard manifest: $(cat "$REBUCK2_SEEDED_MANIFEST")"
-
-    - name: Fetch driver addr (poll; discovery remains the fallback)
-      shell: bash
-      env:
-        GH_TOKEN: ${{ inputs.github-token }}
+        IN_SESSION: ${{ inputs.session }}
+        IN_SLOTS: ${{ inputs.slots }}
+        IN_TIMEOUT: ${{ inputs.serve-timeout-secs }}
+        IN_CONNECT_WAIT: ${{ inputs.connect-wait-secs }}
+        IN_EXTRA: ${{ inputs.extra-args }}
         IN_ADDR_NAME: ${{ inputs.addr-artifact }}
         IN_ADDR_RUN: ${{ inputs.addr-run-id }}
         IN_POLL: ${{ inputs.addr-poll-secs }}
       run: |
+        set -euo pipefail
         cd "$REBUCK2_WORK"
-        for _ in $(seq 1 $((IN_POLL / 10))); do
+        # The lap-finished marker is checked in BOTH waiting rooms. A
+        # worker that arrives after the driver has gone otherwise burns
+        # its whole connect budget dialling a corpse and reds its job
+        # doing it (run 30517451940: 1h34m).
+        over=0
+        for i in $(seq 1 $((IN_POLL / 10))); do
           if gh api "repos/$GITHUB_REPOSITORY/actions/runs/$IN_ADDR_RUN/artifacts" \
                --jq ".artifacts[] | select(.name==\"$IN_ADDR_NAME\") | .id" 2>/dev/null | head -1 > aid.txt \
              && [ -s aid.txt ]; then
             gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$(cat aid.txt)/zip" > addr.zip 2>/dev/null \
               && unzip -o addr.zip > /dev/null && [ -s driver-addr.json ] && break
           fi
+          if [ $((i % 6)) -eq 0 ] \
+             && gh cache list -R "$GITHUB_REPOSITORY" \
+                  -k "rebuck2-done-$IN_ADDR_RUN" --json key -q '.[].key' | grep -q .; then
+            echo "[worker] lap finished while waiting for the driver - nothing to join"
+            over=1; break
+          fi
           sleep 10
         done
-        ls -la driver-addr.json 2>/dev/null || echo "no addr artifact - falling back to discovery"
+        if [ "$over" = "1" ]; then exit 0; fi
 
-    - name: Serve until the driver disconnects
-      shell: bash
-      env:
-        IN_SESSION: ${{ inputs.session }}
-        IN_SLOTS: ${{ inputs.slots }}
-        IN_TIMEOUT: ${{ inputs.serve-timeout-secs }}
-        IN_CONNECT_WAIT: ${{ inputs.connect-wait-secs }}
-        IN_EXTRA: ${{ inputs.extra-args }}
-      run: |
         FLAGS=(--session "$IN_SESSION"
                --connect-wait-secs "$IN_CONNECT_WAIT"
+               --give-up-file "$REBUCK2_WORK/party-over"
                --store "$REBUCK2_STORE/worker")
-        [ -s "$REBUCK2_WORK/driver-addr.json" ] && FLAGS+=(--driver-addr-file "$REBUCK2_WORK/driver-addr.json")
+        [ -s driver-addr.json ] && FLAGS+=(--driver-addr-file "$REBUCK2_WORK/driver-addr.json")
         [ -n "$IN_SLOTS" ] && FLAGS+=(--slots "$IN_SLOTS")
         # shellcheck disable=SC2206 # extra-args intentionally word-splits
         [ -n "$IN_EXTRA" ] && FLAGS+=($IN_EXTRA)
+        ( until gh cache list -R "$GITHUB_REPOSITORY" \
+                  -k "rebuck2-done-$IN_ADDR_RUN" --json key -q '.[].key' | grep -q .; do
+            sleep 60; done
+          : > "$REBUCK2_WORK/party-over" ) &
         # macOS ships GNU timeout as gtimeout (coreutils).
         T=(); command -v timeout >/dev/null && T=(timeout "$IN_TIMEOUT")
         [ ${#T[@]} -eq 0 ] && command -v gtimeout >/dev/null && T=(gtimeout "$IN_TIMEOUT")
         "${T[@]}" rebuck2 worker "${FLAGS[@]}" | tee "$REBUCK2_WORK/worker.log"
 
-    - name: Read assigned shard
-      id: sid
+    # Row and blobs were authored on this box in this lap and are banked
+    # by it in this teardown: a torn publish loses both together (an
+    # honest miss) instead of banking a row whose outputs never landed.
+    - name: Bank what this worker authored
+      id: pack
       if: always()
       shell: bash
-      run: |
-        # shard.id has no trailing newline in older engines: read returns
-        # rc=1 at EOF even after assigning - guard it or bash -e kills the
-        # step and the shard is never published.
-        shard=""; of=""
-        [ -f "$REBUCK2_STORE/worker/shard.id" ] && { read -r shard of < "$REBUCK2_STORE/worker/shard.id" || true; }
-        if [ -n "$shard" ]; then
-          echo "shard=$shard" >> "$GITHUB_OUTPUT"
-          echo "assigned shard $shard of $of"
-        else
-          echo "no shard assigned (finalize disabled, or driver died pre-finalize)"
-        fi
-
-    - name: Pack assigned shard (skip when unchanged)
-      id: pack
-      if: always() && steps.sid.outputs.shard != ''
-      shell: bash
       env:
+        CAS_LINEAGE: ${{ inputs.lineage || github.head_ref || github.ref_name }}
+        CAS_PARENT_LINEAGE: ${{ inputs.parent-lineage || github.base_ref }}
         IN_SHARD: ${{ inputs.shard }}
-        ASSIGNED: ${{ steps.sid.outputs.shard }}
       run: |
-        a=$(printf '%x' $((ASSIGNED * 2))); b=$(printf '%x' $((ASSIGNED * 2 + 1)))
-        if [ "$ASSIGNED" = "$IN_SHARD" ] \
-           && bash "$GITHUB_ACTION_PATH/../store-snapshot.sh" unchanged \
-                "$REBUCK2_STORE/worker" "$REBUCK2_SEEDED_MANIFEST" "cas/$a* cas/$b*"; then
-          echo "[shard] shard $ASSIGNED unchanged since seed - skipping pack + upload"
-          echo "skip=1" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-        mkdir -p "$REBUCK2_WORK/shard-out"
-        cd "$REBUCK2_STORE/worker"
-        find cas -mindepth 1 -maxdepth 1 -name "[$a$b]*" \
-          | tar -c -T - | zstd -T0 --long=27 -8 \
-          > "$REBUCK2_WORK/shard-out/bulk.tar.zst"
-        ls -lh "$REBUCK2_WORK/shard-out/"
+        set -euo pipefail
+        export BANK_WORK="$REBUCK2_WORK/bank-$REBUCK2_ROLE"
+        rebuck2 bank publish "$REBUCK2_STORE/worker" "$REBUCK2_ROLE" \
+          "${IN_SHARD:--}" "$CAS_LINEAGE" "$GITHUB_RUN_ID" \
+          "${CAS_PARENT_LINEAGE:--}"
 
-    - name: Publish assigned shard (artifact)
-      if: always() && steps.sid.outputs.shard != '' && steps.pack.outputs.skip != '1'
+    # Self-verification is step ORDER: each manifest upload is gated on
+    # its container landing, so a manifest can never reference a container
+    # that did not.
+    - id: cas-container
+      if: always() && steps.pack.outputs.have == '1'
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
       with:
-        name: ${{ inputs.shard-artifact-prefix }}${{ steps.sid.outputs.shard }}
-        path: ${{ runner.temp }}/rebuck2-worker/shard-out/bulk.tar.zst
+        name: cas-segs-${{ inputs.lineage || github.head_ref || github.ref_name }}-${{ github.run_id }}-${{ env.REBUCK2_ROLE }}
+        path: ${{ runner.temp }}/rebuck2-worker/bank-${{ env.REBUCK2_ROLE }}/bank-container
         compression-level: 0
+
+    - if: always() && steps.pack.outputs.manifest == '1' && steps.cas-container.outcome == 'success'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: cas-manifest-${{ inputs.lineage || github.head_ref || github.ref_name }}-r${{ inputs.shard }}
+        path: ${{ runner.temp }}/rebuck2-worker/bank-${{ env.REBUCK2_ROLE }}/bank-manifest-out
+
+    - if: always() && steps.pack.outputs.spill == '1'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: cas-spill-${{ inputs.lineage || github.head_ref || github.ref_name }}-${{ github.run_id }}-${{ env.REBUCK2_ROLE }}
+        path: ${{ runner.temp }}/rebuck2-worker/bank-${{ env.REBUCK2_ROLE }}/bank-spill
+        compression-level: 0
+
+    - id: ac-container
+      if: always() && steps.pack.outputs.ac-have == '1'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: cas-ac-segs-${{ inputs.lineage || github.head_ref || github.ref_name }}-${{ github.run_id }}-${{ env.REBUCK2_ROLE }}
+        path: ${{ runner.temp }}/rebuck2-worker/bank-${{ env.REBUCK2_ROLE }}/ac-container
+        compression-level: 0
+
+    - if: always() && steps.pack.outputs.ac-have == '1' && steps.ac-container.outcome == 'success'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: cas-manifest-${{ inputs.lineage || github.head_ref || github.ref_name }}-ac-${{ env.REBUCK2_ROLE }}
+        path: ${{ runner.temp }}/rebuck2-worker/bank-${{ env.REBUCK2_ROLE }}/ac-manifest-out

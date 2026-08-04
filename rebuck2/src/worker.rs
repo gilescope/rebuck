@@ -36,6 +36,34 @@ pub struct WorkerCfg {
     /// CI shard this worker restored before joining; finalize hands it
     /// the same shard back (see W2D::Hello::preloaded_shard).
     pub preloaded_shard: Option<u8>,
+    /// "The party is over": if this path appears while we are still
+    /// dialling, the driver has finished and there is nothing left to
+    /// join. Something outside the process creates it (in CI, a poller
+    /// watching for the driver's end-of-lap marker) — a worker that
+    /// arrives late otherwise burns its whole `connect_wait` on a driver
+    /// that exited half an hour ago, and reds its job doing it.
+    pub give_up_file: Option<std::path::PathBuf>,
+}
+
+/// What the connect-retry loop should do after a failed dial.
+#[derive(Debug, PartialEq, Eq)]
+enum Retry {
+    Again,
+    PartyOver,
+    Fatal,
+}
+
+/// The note beats the clock in BOTH directions: arriving after the lap
+/// ended is not a failure, so it must not surface as one even once the
+/// connect deadline has also passed.
+fn retry_verdict(give_up: Option<&std::path::Path>, deadline_passed: bool) -> Retry {
+    if give_up.is_some_and(std::path::Path::exists) {
+        Retry::PartyOver
+    } else if deadline_passed {
+        Retry::Fatal
+    } else {
+        Retry::Again
+    }
 }
 
 pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
@@ -92,11 +120,21 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
             };
             match attempt {
                 Ok(c) => break c,
-                Err(e) if Instant::now() < deadline => {
-                    println!("[worker] connect retry: {e}");
-                    tokio::time::sleep(Duration::from_secs(3)).await;
+                Err(e) => {
+                    match retry_verdict(cfg.give_up_file.as_deref(), Instant::now() >= deadline) {
+                        Retry::PartyOver => {
+                            println!(
+                                "[worker] driver finished before we joined — nothing to serve"
+                            );
+                            return Ok(());
+                        }
+                        Retry::Fatal => return Err(e).context("driver never became reachable"),
+                        Retry::Again => {
+                            println!("[worker] connect retry: {e}");
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                        }
+                    }
                 }
-                Err(e) => return Err(e).context("driver never became reachable"),
             }
         }
     };
@@ -219,7 +257,12 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
         };
         let (job, action) = match msg {
             D2W::Run { job, action } => (job, action),
-            D2W::Ping => continue,
+            D2W::Ping { vitals } => {
+                if let Some(v) = vitals {
+                    println!("[driver-vitals] {v}");
+                }
+                continue;
+            }
             D2W::Exit => {
                 println!("[worker] driver said exit — done");
                 return Ok(());
@@ -256,6 +299,7 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
         let ctrl = ctrl_send.clone();
         let scratch = cfg.scratch.clone();
         let slots = slots.clone();
+        let ac_store = store.clone();
         tokio::spawn(async move {
             let _permit = slots.acquire_owned().await.expect("semaphore open");
             let tracking = TrackingBlobs {
@@ -263,11 +307,14 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                 stored: Mutex::new(Vec::new()),
             };
             let reply = match exec::run_action(&tracking, &action, &scratch).await {
-                Ok(outcome) => W2D::Done {
-                    job,
-                    action_result: outcome.action_result.encode_to_vec(),
-                    stored: tracking.stored.into_inner(),
-                },
+                Ok(outcome) => {
+                    record_local_ac(&ac_store, &action.hash, &outcome).await;
+                    W2D::Done {
+                        job,
+                        action_result: outcome.action_result.encode_to_vec(),
+                        stored: tracking.stored.into_inner(),
+                    }
+                }
                 Err(e) => W2D::Failed {
                     job,
                     msg: format!("{e:#}"),
@@ -289,20 +336,20 @@ async fn serve_get(
         return Ok(());
     };
     match req {
-        BlobReq::Get(d) => match store.get(&d).await {
-            Ok(Some(bytes)) => {
+        BlobReq::Get(d) => {
+            if store.has(&d).await {
                 mesh::send_frame(
                     &mut send,
                     &BlobResp::Found {
-                        size: bytes.len() as u64,
+                        size: d.size as u64,
                     },
                 )
                 .await?;
-                send.write_all(&bytes).await?;
+                store.copy_out(&d, &mut send).await?;
+            } else {
+                mesh::send_frame(&mut send, &BlobResp::Missing).await?;
             }
-            Ok(None) => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
-            Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
-        },
+        }
         BlobReq::HasMany(digs) => {
             let mut have = Vec::with_capacity(digs.len());
             for d in &digs {
@@ -315,19 +362,17 @@ async fn serve_get(
         // an LRU eviction between a batched presence check and the read.
         BlobReq::GetMany(digs) => {
             for d in &digs {
-                match store.get(d).await {
-                    Ok(Some(bytes)) => {
-                        mesh::send_frame(
-                            &mut send,
-                            &BlobResp::Found {
-                                size: bytes.len() as u64,
-                            },
-                        )
-                        .await?;
-                        send.write_all(&bytes).await?;
-                    }
-                    Ok(None) => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
-                    Err(e) => mesh::send_frame(&mut send, &BlobResp::Err(format!("{e:#}"))).await?,
+                if store.has(d).await {
+                    mesh::send_frame(
+                        &mut send,
+                        &BlobResp::Found {
+                            size: d.size as u64,
+                        },
+                    )
+                    .await?;
+                    store.copy_out(d, &mut send).await?;
+                } else {
+                    mesh::send_frame(&mut send, &BlobResp::Missing).await?;
                 }
             }
         }
@@ -347,6 +392,30 @@ async fn serve_get(
     }
     send.finish()?;
     Ok(())
+}
+
+/// Keep a local AC row for an action this worker just executed.
+///
+/// The worker never READS the AC — the driver is the only consumer — but
+/// it is the node that authored the result, so it is the node that banks
+/// it (`ci/ac-bank-plan.md`). Row and referenced blobs are then born AND
+/// banked on the same box in the same lap: a torn publish loses both
+/// together (honest miss) instead of banking a row whose outputs never
+/// landed — the unservable class of writer 28935304124.
+///
+/// Cacheability is the strict subset of the driver's rule (rpc.rs): exit
+/// 0 and not do_not_cache. `--cache-failures` dedupes failures WITHIN a
+/// lap on the driver; a banked failure row replays forever.
+async fn record_local_ac(store: &Store, action_hash: &str, outcome: &exec::Outcome) {
+    if outcome.do_not_cache || outcome.action_result.exit_code != 0 {
+        return;
+    }
+    if let Err(e) = store
+        .ac_put(action_hash, &outcome.action_result.encode_to_vec())
+        .await
+    {
+        eprintln!("[worker] local AC row for {action_hash} not written: {e:#}");
+    }
 }
 
 /// Records which blobs an action persisted — the driver's provider index.
@@ -418,6 +487,22 @@ impl RemoteBlobs {
         }
     }
 
+    /// Streaming sibling of upload_bytes: file -> wire, O(chunk) memory.
+    async fn upload_file(&self, d: &Dig, path: &std::path::Path) -> Result<()> {
+        let (mut send, mut recv) = self.conn.open_bi().await?;
+        mesh::send_frame(&mut send, &BlobReq::Put(d.clone())).await?;
+        let mut f = tokio::fs::File::open(path).await?;
+        tokio::io::copy(&mut f, &mut send).await?;
+        send.finish()?;
+        let resp: BlobResp = mesh::recv_frame(&mut recv)
+            .await?
+            .context("driver closed blob stream")?;
+        match resp {
+            BlobResp::PutOk => Ok(()),
+            other => bail!("blob put rejected: {other:?}"),
+        }
+    }
+
     async fn fetch_from(&self, endpoint: &str, d: &Dig) -> Result<Vec<u8>> {
         let id: iroh::EndpointId = endpoint.parse().map_err(|_| {
             anyhow::anyhow!("bad provider endpoint {endpoint:?} for blob {}", d.hash)
@@ -462,8 +547,11 @@ impl RemoteBlobs {
                 .context("holder closed mid-batch")?
             {
                 BlobResp::Found { size } => {
-                    let bytes = mesh::recv_raw(&mut recv, size).await?;
-                    self.store.put(Some(d), &bytes).await?;
+                    let expect = Dig {
+                        hash: d.hash.clone(),
+                        size: size as i64,
+                    };
+                    self.store.put_stream(Some(&expect), &mut recv).await?;
                     if endpoint.is_some() {
                         self.hits_peer.fetch_add(1, Relaxed);
                     } else {
@@ -521,10 +609,16 @@ impl exec::Blobs for RemoteBlobs {
             .context("driver closed blob stream")?;
         match resp {
             BlobResp::Found { size } => {
-                let bytes = mesh::recv_raw(&mut recv, size).await?;
+                let expect = Dig {
+                    hash: d.hash.clone(),
+                    size: size as i64,
+                };
+                self.store.put_stream(Some(&expect), &mut recv).await?;
                 self.hits_driver.fetch_add(1, Relaxed);
-                self.store.put(Some(d), &bytes).await?;
-                Ok(bytes)
+                self.store
+                    .get(d)
+                    .await?
+                    .context("just-streamed blob missing")
             }
             BlobResp::Provider { endpoint } => {
                 let bytes = self.fetch_from(&endpoint, d).await?;
@@ -611,12 +705,10 @@ impl exec::Blobs for RemoteBlobs {
             // Pulls into the local store as a side effect.
             let _ = self.get(d).await?;
         }
-        // Linked = shared 0o555 inode, exec included; Private = ours to chmod.
-        if self.store.link_out(d, dest).await? == crate::store::Materialized::Private
-            && is_executable
-        {
-            exec::set_exec(dest).await?;
-        }
+        // link_out_exec guarantees the exec bit on BOTH paths - including
+        // normalizing a mode-stripped shared store inode (bank-seeded
+        // blobs staged 0o100644 and died with EACCES, run 29524645875).
+        self.store.link_out_exec(d, dest, is_executable).await?;
         Ok(())
     }
 
@@ -629,18 +721,18 @@ impl exec::Blobs for RemoteBlobs {
     }
 
     async fn put_file(&self, path: &std::path::Path) -> Result<Dig> {
-        let bytes = tokio::fs::read(path).await?;
-        let d = Dig {
-            hash: crate::store::sha256_hex(&bytes),
-            size: bytes.len() as i64,
-        };
+        // Streaming end to end: digest by chunked read, ingest by link or
+        // stream, upload straight from the file. Reading whole outputs into
+        // memory 64-wide was the ingestion half of the 2.4GB bench peak.
+        let d = Store::hash_file(path).await?;
         if self.hardlinks {
             self.store.adopt(&d, path).await?;
         } else {
-            self.store.put(Some(&d), &bytes).await?;
+            let mut f = tokio::fs::File::open(path).await?;
+            self.store.put_stream(Some(&d), &mut f).await?;
         }
         if self.upload {
-            self.upload_bytes(&d, &bytes).await?;
+            self.upload_file(&d, path).await?;
         }
         Ok(d)
     }
@@ -697,8 +789,11 @@ async fn sync_shard(
                             .await?
                             .context("driver closed mid-batch")?
                         {
-                            let bytes = mesh::recv_raw(&mut recv, size).await?;
-                            store.put(Some(d), &bytes).await?;
+                            let expect = Dig {
+                                hash: d.hash.clone(),
+                                size: size as i64,
+                            };
+                            store.put_stream(Some(&expect), &mut recv).await?;
                         }
                     }
                     Ok::<(), anyhow::Error>(())
@@ -710,4 +805,69 @@ async fn sync_shard(
         })
         .await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bazel_remote_apis::build::bazel::remote::execution::v2 as re;
+
+    fn outcome(exit_code: i32, do_not_cache: bool) -> exec::Outcome {
+        exec::Outcome {
+            action_result: re::ActionResult {
+                exit_code,
+                stdout_raw: b"hello".to_vec(),
+                ..Default::default()
+            },
+            do_not_cache,
+        }
+    }
+
+    #[test]
+    fn party_over_beats_the_connect_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let note = dir.path().join("party-over");
+
+        // Nothing to say yet: keep dialling until the deadline.
+        assert!(matches!(retry_verdict(Some(&note), false), Retry::Again));
+        // Deadline with no note is the old behaviour: a hard error.
+        assert!(matches!(retry_verdict(Some(&note), true), Retry::Fatal));
+
+        std::fs::write(&note, b"").unwrap();
+        // The note wins in BOTH directions - arriving after the lap ended
+        // is not a failure, so it must not surface as one even when the
+        // connect deadline has also passed.
+        assert!(matches!(
+            retry_verdict(Some(&note), false),
+            Retry::PartyOver
+        ));
+        assert!(matches!(retry_verdict(Some(&note), true), Retry::PartyOver));
+        // No note configured at all: deadline decides.
+        assert!(matches!(retry_verdict(None, true), Retry::Fatal));
+    }
+
+    #[tokio::test]
+    async fn banks_only_cacheable_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().to_path_buf()).unwrap();
+
+        record_local_ac(&store, &"a".repeat(64), &outcome(0, false)).await;
+        record_local_ac(&store, &"b".repeat(64), &outcome(1, false)).await;
+        record_local_ac(&store, &"c".repeat(64), &outcome(0, true)).await;
+
+        let banked = store.ac_get(&"a".repeat(64)).await.expect("row banked");
+        assert_eq!(
+            banked,
+            outcome(0, false).action_result.encode_to_vec(),
+            "banked bytes must be the encoded ActionResult"
+        );
+        assert!(
+            store.ac_get(&"b".repeat(64)).await.is_none(),
+            "failure rows must not reach the bank - the poison class"
+        );
+        assert!(
+            store.ac_get(&"c".repeat(64)).await.is_none(),
+            "do_not_cache rows must not reach the bank"
+        );
+    }
 }

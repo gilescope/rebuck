@@ -249,12 +249,14 @@ pub async fn fleet(cfg: FleetCfg) -> Result<FleetMetrics> {
         DriverCfg {
             session: session.clone(),
             min_workers: cfg.workers,
+            require_shards: 0,
             local_exec: false,
             decentralized: false,
             hardlinks: true,
             cache_failures: false,
             locality: cfg.locality,
             prefetch_metadata: cfg.prefetch,
+            name_independent: true,
             addr_file: Some(addr_file.clone()),
             finalize_file: None,
             scratch: root.join("driver-exec"),
@@ -276,7 +278,10 @@ pub async fn fleet(cfg: FleetCfg) -> Result<FleetMetrics> {
     // immediately on connect) already announces the placement. The driver
     // holds only the tree/command/action protos - never the rlib bytes,
     // so a mis-routed job MUST cross the mesh to fetch.
-    let rlib = vec![0xABu8; cfg.rlib_kb * 1024];
+    // One reusable buffer, unique suffix per action: per-action clones of
+    // 48MB rlibs dominated the bench's own max-RSS (freed pages still
+    // count on macOS), hiding the engine's real footprint.
+    let mut rlib = vec![0xABu8; cfg.rlib_kb * 1024 + 8];
     let mut actions: Vec<Dig> = Vec::new();
     let wpaths: Vec<_> = (0..cfg.workers)
         .map(|w| root.join(format!("w{w}")))
@@ -286,12 +291,12 @@ pub async fn fleet(cfg: FleetCfg) -> Result<FleetMetrics> {
         .map(|p| Store::new(p.clone()).map(Arc::new))
         .collect::<Result<_>>()?;
     for i in 0..cfg.actions {
-        let mut bytes = rlib.clone();
-        bytes.extend_from_slice(&(i as u64).to_le_bytes());
-        let rlib_dig = digest_of(&bytes);
+        let n = rlib.len();
+        rlib[n - 8..].copy_from_slice(&(i as u64).to_le_bytes());
+        let rlib_dig = digest_of(&rlib);
         let owner = i % cfg.workers;
         let rlib_d: crate::mesh::Dig = (&rlib_dig).into();
-        wstores[owner].put(Some(&rlib_d), &bytes).await?;
+        wstores[owner].put(Some(&rlib_d), &rlib).await?;
         let dir = re::Directory {
             files: vec![re::FileNode {
                 name: format!("lib{i}.rlib"),
@@ -326,6 +331,7 @@ pub async fn fleet(cfg: FleetCfg) -> Result<FleetMetrics> {
             driver_addr_file: Some(addr_file.clone()),
             hardlinks: true,
             preloaded_shard: None,
+            give_up_file: None,
         };
         std::fs::create_dir_all(&cfgw.scratch)?;
         tokio::spawn(async move { worker::run(wstore, cfgw).await });

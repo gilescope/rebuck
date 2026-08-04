@@ -13,6 +13,10 @@ futures = "0.3"
 iroh = "1"
 postcard = { version = "1", features = ["use-std"] }
 prost = "0.14"
+# Already compiled as a transitive dep (tonic/iroh) - promoting it to a
+# direct one costs a line, not a build. rustls only: no OpenSSL on the
+# windows runners.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots", "charset", "http2"] }
 reflink-copy = "0.1.30"
 rustls = { version = "0.23", features = ["ring"] }
 serde = { version = "1", features = ["derive"] }
@@ -22,6 +26,8 @@ tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tonic = "0.14"
+# GitHub wraps every artifact in a zip, whatever we put inside it.
+zip = { version = "6", default-features = false, features = ["deflate"] }
 
 [[bin]]
 name = "rebuck2"
