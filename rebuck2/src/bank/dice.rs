@@ -441,6 +441,16 @@ mod tests {
         assert_ne!(a, b, "a seed change must change the manifest name");
         assert!(a.starts_with("cas-manifest-lin-dice-"));
         assert_eq!(seed8("rev1-sweep-treehash1").len(), 8);
+
+        // Write isolation: the lineage is part of the name, so two branches
+        // publishing the same seed cannot land on each other's manifest. Drop
+        // the lineage from the format and every branch shares one bank.
+        let seed = "rev1-sweep-treehash1";
+        assert_ne!(
+            manifest_name("trunk", seed),
+            manifest_name("feature", seed),
+            "two lineages must never share a manifest name"
+        );
     }
 
     #[test]
@@ -453,6 +463,16 @@ mod tests {
         // A negative key_hi is real: sqlite stores these as signed i64 and
         // awk's arithmetic could not be trusted with them.
         assert!(Row::parse("bad").is_none());
+
+        // The other half of that bug: magnitude. 2^53+1 is the smallest
+        // integer an f64 cannot hold, so anything routing these through a
+        // float - awk once did, and a JSON number would - silently rounds it
+        // to 2^53 and collapses two distinct rows into one.
+        let big = Row::parse("7 9007199254740993 -9007199254740993 FF").unwrap();
+        assert_eq!(big.key(), "9007199254740993 -9007199254740993");
+        assert_eq!(big.line(), "7 9007199254740993 -9007199254740993 FF");
+        let extremes = format!("1 {} {} AB", i64::MAX, i64::MIN);
+        assert_eq!(Row::parse(&extremes).unwrap().line(), extremes);
     }
 
     #[test]
