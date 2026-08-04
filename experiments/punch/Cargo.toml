@@ -1,0 +1,15 @@
+[package]
+name = "punch"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+iroh = "1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+sha2 = "0.10"
+rustls = { version = "0.23.41", features = ["ring"] }
+
+[[bin]]
+name = "punch"
+path = "src/main.rs"

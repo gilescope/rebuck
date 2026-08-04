@@ -1,0 +1,350 @@
+name: rebuck2 driver
+description: >-
+  Bring up a rebuck2 driver on this runner: install buck2 + the rebuck2
+  engine, seed the store from the newest snapshot, start the driver (plus
+  optional co-worker), publish the mesh address as a run artifact for
+  workers to dial, wait for worker quorum, and point buck2 at it via
+  .buckconfig.local. Pair with the `driver-finish` action (called with
+  `if: always()`) for teardown: finalize shards, re-snapshot the store,
+  upload logs, stop the driver. Needs a rust toolchain on PATH for the
+  engine's cache-miss cargo install.
+
+inputs:
+  session:
+    description: Mesh session id. Workers must pass the same one.
+    required: true
+  buck2-version:
+    description: >-
+      Pinned facebook/buck2 release tag to install (a floating buck2
+      invalidates every warm cache hit). Empty = you manage buck2
+      yourself (e.g. a fork binary).
+    default: ""
+  rebuck2-git:
+    description: Git URL of the rebuck repo to install the engine from.
+    default: https://github.com/gilescope/rebuck
+  rebuck2-rev:
+    description: >-
+      Engine commit to install. Empty = the ref this action was pinned at
+      (github.action_ref) - pin the action by full sha for that to work.
+      Set to "skip" if rebuck2 is already on PATH.
+    default: ""
+  store:
+    description: >-
+      Store root. Driver store = <root>/driver, co-worker = <root>/co-worker.
+      Empty = $DEV_DRIVE/rebuck2 when a Dev Drive is mounted, else
+      ~/.cache/rebuck2.
+    default: ""
+  grpc-port:
+    description: Localhost REAPI port buck2 dials.
+    default: "9092"
+  min-workers:
+    description: >-
+      Worker quorum before dispatch starts. Keep it BELOW the fleet size -
+      one no-show runner must not scrap the run; late joiners drain the
+      pull queue.
+    default: "1"
+  co-worker-slots:
+    description: >-
+      Exec slots for a co-worker on the driver box. "0" = none,
+      "half" = nproc/2 (the driver is network-bound - lending half its
+      cores is usually free).
+    default: "0"
+  no-local-exec:
+    description: Driver never executes actions itself ("true"/"false").
+    default: "false"
+  cache-failures:
+    description: Cache failed action results too ("true"/"false").
+    default: "true"
+  finalize:
+    description: >-
+      Enable fleet shard finalization: at teardown each worker is assigned
+      a CAS shard to pack + publish (driver-finish raises the signal).
+    default: "false"
+  extra-args:
+    description: Extra raw flags appended to `rebuck2 driver`.
+    default: ""
+  snapshot-key-prefix:
+    description: >-
+      actions/cache key prefix for the store snapshot (restored here,
+      saved by driver-finish as <prefix><run_id>). Empty = no snapshot
+      restore/save.
+    default: "rebuck2-store-"
+  cas-shard-artifacts:
+    description: >-
+      Persist the driver's CAS as 4 digest-range shard artifacts
+      ("true"/"false"). Artifacts do not LRU-evict and are not
+      branch-scoped, each shard skips its re-upload when unchanged, and
+      losing one costs 1/4 of the warmth instead of all of it - the
+      monolith snapshot is all-or-nothing. Pair with snapshot-subdirs:
+      "ac" (the AC stays a small cache entry) and driver-finish packs +
+      publishes the shards. Restore pulls each shard's newest artifact.
+    default: "false"
+  shard-artifact-prefix:
+    description: Artifact name prefix for the CAS shards.
+    default: "cas-shard-"
+  snapshot-subdirs:
+    description: >-
+      Store subdirs the snapshot covers. "ac cas" = monolith; "ac" =
+      AC-only (CAS lives in worker shards - see the worker action).
+    default: "ac cas"
+  addr-artifact:
+    description: Run-artifact name the driver address is published under.
+    default: "driver-addr"
+  addr-wait-secs:
+    description: How long to wait for the driver to write its address.
+    default: "120"
+  quorum-wait-secs:
+    description: >-
+      How long to wait for worker quorum. A rebuck2 rev bump makes every
+      worker cold-compile the binary (~10-15 min) before it can join.
+    default: "2700"
+  write-buckconfig:
+    description: Write .buckconfig.local pointing buck2 at the driver.
+    default: "true"
+  execution-platforms:
+    description: >-
+      Target for [build].execution_platforms (e.g. root//platforms:re-exec).
+      Empty = section omitted (you manage platforms yourself).
+    default: ""
+  buckconfig-extra:
+    description: Extra .buckconfig.local sections, appended verbatim.
+    default: ""
+  buck-root:
+    description: Directory holding .buckconfig (where .buckconfig.local goes).
+    default: "."
+
+outputs:
+  addr-file:
+    description: Path of the driver address file (also published as artifact).
+    value: ${{ steps.paths.outputs.addr-file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install buck2 (pinned)
+      if: inputs.buck2-version != ''
+      shell: bash
+      env:
+        IN_VERSION: ${{ inputs.buck2-version }}
+        PLATFORM: ${{ runner.os }}-${{ runner.arch }}
+      run: bash "$GITHUB_ACTION_PATH/../install-buck2.sh" "$IN_VERSION" "$PLATFORM"
+
+    - name: Resolve rebuck2 rev
+      id: rev
+      if: inputs.rebuck2-rev != 'skip'
+      shell: bash
+      env:
+        IN_GIT: ${{ inputs.rebuck2-git }}
+        IN_REV: ${{ inputs.rebuck2-rev }}
+        ACTION_REF: ${{ github.action_ref }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        REV=$(bash "$GITHUB_ACTION_PATH/../resolve-rev.sh" "$IN_GIT" "$IN_REV" "" "$ACTION_REF")
+        echo "rev=$REV" >> "$GITHUB_OUTPUT"
+        echo "key=$(bash "$GITHUB_ACTION_PATH/../crate-key.sh" "$IN_GIT" "$REV")" >> "$GITHUB_OUTPUT"
+
+    - name: Cache rebuck2 binary (keyed by crate source)
+      id: bin
+      if: inputs.rebuck2-rev != 'skip'
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: |
+          ~/.cargo/bin/rebuck2
+          ~/.cargo/bin/rebuck2.exe
+        key: rebuck2-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.rev.outputs.key }}
+
+    - name: Install rebuck2 (cache miss only)
+      if: inputs.rebuck2-rev != 'skip' && steps.bin.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        IN_GIT: ${{ inputs.rebuck2-git }}
+        REV: ${{ steps.rev.outputs.rev }}
+      run: cargo install --locked --git "$IN_GIT" --rev "$REV" rebuck2
+
+    - name: Resolve store + scratch paths
+      id: paths
+      shell: bash
+      env:
+        IN_STORE: ${{ inputs.store }}
+        IN_SNAP_PREFIX: ${{ inputs.snapshot-key-prefix }}
+        IN_SNAP_SUBDIRS: ${{ inputs.snapshot-subdirs }}
+        IN_FINALIZE: ${{ inputs.finalize }}
+        IN_CAS_SHARDS: ${{ inputs.cas-shard-artifacts }}
+        IN_SHARD_PREFIX: ${{ inputs.shard-artifact-prefix }}
+      run: |
+        WORK="$RUNNER_TEMP/rebuck2-driver"
+        mkdir -p "$WORK"
+        STORE="$IN_STORE"
+        if [ -z "$STORE" ]; then
+          if [ -n "${DEV_DRIVE:-}" ]; then STORE="$(cygpath -u "$DEV_DRIVE")/rebuck2"; else STORE="$HOME/.cache/rebuck2"; fi
+        fi
+        {
+          echo "REBUCK2_WORK=$WORK"
+          echo "REBUCK2_STORE=$STORE"
+          echo "REBUCK2_DRIVER_LOG=$WORK/driver.log"
+          echo "REBUCK2_COWORKER_LOG=$WORK/co-worker.log"
+          echo "REBUCK2_DRIVER_PID_FILE=$WORK/driver.pid"
+          echo "REBUCK2_SEEDED_MANIFEST=$WORK/seeded.manifest"
+          echo "REBUCK2_SNAPSHOT_DIR=$WORK/snapshot"
+          echo "REBUCK2_SNAPSHOT_KEY_PREFIX=$IN_SNAP_PREFIX"
+          echo "REBUCK2_SNAPSHOT_SUBDIRS=$IN_SNAP_SUBDIRS"
+          echo "REBUCK2_CAS_SHARDS=$IN_CAS_SHARDS"
+          echo "REBUCK2_SHARD_PREFIX=$IN_SHARD_PREFIX"
+          [ "$IN_FINALIZE" = "true" ] && echo "REBUCK2_FINALIZE_FILE=$WORK/finalize.signal"
+          true
+        } >> "$GITHUB_ENV"
+        echo "addr-file=$WORK/driver-addr.json" >> "$GITHUB_OUTPUT"
+
+    - name: Restore store snapshot
+      if: inputs.snapshot-key-prefix != ''
+      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: ${{ runner.temp }}/rebuck2-driver/snapshot
+        key: ${{ inputs.snapshot-key-prefix }}${{ github.run_id }}
+        restore-keys: ${{ inputs.snapshot-key-prefix }}
+
+    - name: Restore CAS shards (newest artifact each, any branch)
+      if: inputs.cas-shard-artifacts == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        mkdir -p "$REBUCK2_SNAPSHOT_DIR"
+        for i in 0 1 2 3; do
+          # Provenance filter: fork PR runs share this artifact namespace -
+          # only accept shards uploaded by runs of THIS repo's own branches.
+          AID=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$REBUCK2_SHARD_PREFIX$i&per_page=10" --jq '[.artifacts[] | select(.expired==false and .workflow_run.head_repository_id == .workflow_run.repository_id)][0].id // empty' 2>/dev/null || true)
+          if [ -n "$AID" ]; then
+            # Extract in isolation: the shard zip's inner tar is ALSO named
+            # bulk.tar.zst - unzipping straight into SNAPSHOT_DIR overwrote
+            # the cache-restored AC tar of the same name (every lap then ran
+            # ac-cold, re-executing hundreds of actions).
+            rm -rf "$REBUCK2_WORK/shard-tmp" && mkdir -p "$REBUCK2_WORK/shard-tmp"
+            gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$AID/zip" > "$REBUCK2_WORK/shard.zip" \
+              && unzip -o -q "$REBUCK2_WORK/shard.zip" -d "$REBUCK2_WORK/shard-tmp" \
+              && rm -f "$REBUCK2_WORK/shard.zip" \
+              && mv "$REBUCK2_WORK/shard-tmp/bulk.tar.zst" "$REBUCK2_SNAPSHOT_DIR/shard-$i.tar.zst" \
+              || echo "shard $i fetch failed - partial warmth is fine"
+          else
+            echo "no $REBUCK2_SHARD_PREFIX$i artifact yet"
+          fi
+        done
+        ls -lh "$REBUCK2_SNAPSHOT_DIR/" 2>/dev/null || true
+
+    - name: Seed the driver store
+      shell: bash
+      run: |
+        mkdir -p "$REBUCK2_STORE/driver"
+        for t in "$REBUCK2_SNAPSHOT_DIR"/*.tar.zst; do
+          if [ -f "$t" ]; then
+            zstd -d --long=27 < "$t" | tar -x -C "$REBUCK2_STORE/driver"
+            echo "seeded from $(basename "$t") ($(du -h "$t" | cut -f1))"
+          fi
+        done
+        rm -rf "$REBUCK2_SNAPSHOT_DIR"
+        # Entry-list manifest: unchanged at run end = driver-finish skips
+        # the pack + upload entirely.
+        bash "$GITHUB_ACTION_PATH/../store-snapshot.sh" manifest "$REBUCK2_STORE/driver" "$REBUCK2_SNAPSHOT_SUBDIRS" \
+          > "$REBUCK2_SEEDED_MANIFEST"
+        echo "seeded manifest: $(cat "$REBUCK2_SEEDED_MANIFEST")"
+        # Blobs that crossed the artifact wall must prove themselves:
+        # a CAS filename IS the content sha256; mismatches are deleted
+        # (poisoning degrades to a cold shard, never to execution).
+        bash "$GITHUB_ACTION_PATH/../verify-cas.sh" "$REBUCK2_STORE/driver"
+        # Remember how many AC entries were seeded: driver-finish flags a
+        # lap that restored an AC yet served zero hits (silent cache
+        # regression - an AC-clobber bug hid behind three green laps).
+        echo "REBUCK2_SEEDED_AC_COUNT=$(find "$REBUCK2_STORE/driver/ac" -type f 2>/dev/null | wc -l | tr -d ' ')" >> "$GITHUB_ENV"
+        if [ "${REBUCK2_CAS_SHARDS:-false}" = "true" ]; then
+          # Per-shard manifests: shard i covers hex prefixes 4i..4i+3, and
+          # an unchanged shard skips its pack + upload independently.
+          for i in 0 1 2 3; do
+            p=$(printf 'cas/%x* cas/%x* cas/%x* cas/%x*' $((i*4)) $((i*4+1)) $((i*4+2)) $((i*4+3)))
+            bash "$GITHUB_ACTION_PATH/../store-snapshot.sh" manifest "$REBUCK2_STORE/driver" "$p" \
+              > "$REBUCK2_SEEDED_MANIFEST.shard$i"
+          done
+        fi
+
+    - name: Start driver (+ co-worker)
+      shell: bash
+      env:
+        IN_SESSION: ${{ inputs.session }}
+        IN_PORT: ${{ inputs.grpc-port }}
+        IN_MIN_WORKERS: ${{ inputs.min-workers }}
+        IN_SLOTS: ${{ inputs.co-worker-slots }}
+        IN_NO_LOCAL_EXEC: ${{ inputs.no-local-exec }}
+        IN_CACHE_FAILURES: ${{ inputs.cache-failures }}
+        IN_EXTRA: ${{ inputs.extra-args }}
+        IN_ADDR_WAIT: ${{ inputs.addr-wait-secs }}
+      run: |
+        FLAGS=(--grpc-port "$IN_PORT" --min-workers "$IN_MIN_WORKERS"
+               --session "$IN_SESSION"
+               --addr-file "$REBUCK2_WORK/driver-addr.json"
+               --store "$REBUCK2_STORE/driver")
+        [ "$IN_NO_LOCAL_EXEC" = "true" ] && FLAGS+=(--no-local-exec)
+        [ "$IN_CACHE_FAILURES" = "true" ] && FLAGS+=(--cache-failures)
+        [ -n "${REBUCK2_FINALIZE_FILE:-}" ] && FLAGS+=(--finalize-file "$REBUCK2_FINALIZE_FILE")
+        # shellcheck disable=SC2206 # extra-args intentionally word-splits
+        [ -n "$IN_EXTRA" ] && FLAGS+=($IN_EXTRA)
+        rebuck2 driver "${FLAGS[@]}" > "$REBUCK2_DRIVER_LOG" 2>&1 &
+        echo $! > "$REBUCK2_DRIVER_PID_FILE"
+        if [ "$IN_SLOTS" != "0" ] && [ -n "$IN_SLOTS" ]; then
+          SLOTS="$IN_SLOTS"
+          [ "$SLOTS" = "half" ] && SLOTS=$(($(nproc) / 2))
+          rebuck2 worker --session "$IN_SESSION" --slots "$SLOTS" \
+            --store "$REBUCK2_STORE/co-worker" > "$REBUCK2_COWORKER_LOG" 2>&1 &
+        fi
+        for _ in $(seq 1 $((IN_ADDR_WAIT / 2))); do
+          [ -s "$REBUCK2_WORK/driver-addr.json" ] && exit 0
+          sleep 2
+        done
+        cat "$REBUCK2_DRIVER_LOG"; echo "driver never wrote its addr"; exit 1
+
+    # Workers fetch this and dial the relay directly - no n0 discovery
+    # dependency (a regional discovery outage once cost two runs).
+    - name: Publish driver addr
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ inputs.addr-artifact }}
+        path: ${{ runner.temp }}/rebuck2-driver/driver-addr.json
+
+    - name: Wait for worker quorum
+      shell: bash
+      env:
+        IN_MIN_WORKERS: ${{ inputs.min-workers }}
+        IN_QUORUM_WAIT: ${{ inputs.quorum-wait-secs }}
+      run: |
+        for _ in $(seq 1 $((IN_QUORUM_WAIT / 5))); do
+          joined=$(grep -c " joined: " "$REBUCK2_DRIVER_LOG" || true)
+          [ "$joined" -ge "$IN_MIN_WORKERS" ] && { grep " joined: " "$REBUCK2_DRIVER_LOG"; exit 0; }
+          kill -0 "$(cat "$REBUCK2_DRIVER_PID_FILE")" || { cat "$REBUCK2_DRIVER_LOG"; echo "driver died"; exit 1; }
+          sleep 5
+        done
+        cat "$REBUCK2_DRIVER_LOG"; echo "quorum never formed"; exit 1
+
+    - name: Point buck2 at rebuck2
+      if: inputs.write-buckconfig == 'true'
+      shell: bash
+      env:
+        IN_PORT: ${{ inputs.grpc-port }}
+        IN_PLATFORMS: ${{ inputs.execution-platforms }}
+        IN_EXTRA_CFG: ${{ inputs.buckconfig-extra }}
+        IN_BUCK_ROOT: ${{ inputs.buck-root }}
+      run: |
+        {
+          if [ -n "$IN_PLATFORMS" ]; then
+            echo "[build]"
+            echo "execution_platforms = $IN_PLATFORMS"
+            echo
+          fi
+          if [ -n "$IN_EXTRA_CFG" ]; then
+            echo "$IN_EXTRA_CFG"
+            echo
+          fi
+          echo "[buck2_re_client]"
+          echo "action_cache_address = grpc://127.0.0.1:$IN_PORT"
+          echo "cas_address = grpc://127.0.0.1:$IN_PORT"
+          echo "engine_address = grpc://127.0.0.1:$IN_PORT"
+          echo "tls = false"
+        } > "$IN_BUCK_ROOT/.buckconfig.local"
+        cat "$IN_BUCK_ROOT/.buckconfig.local"

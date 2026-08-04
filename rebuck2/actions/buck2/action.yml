@@ -1,0 +1,26 @@
+name: install buck2 (pinned)
+description: >-
+  Install a pinned facebook/buck2 release for the runner's OS/arch.
+  Pinned because action digests must be stable - a floating buck2
+  invalidates every warm cache hit. The `driver` action embeds this
+  install (pass it `buck2-version`) - reach for this standalone form
+  only on jobs that need buck2 without a driver.
+
+inputs:
+  version:
+    description: buck2 release tag (e.g. "2026-06-01"). Pin it.
+    required: true
+  dest:
+    description: Directory to install the binary into (added to PATH).
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install buck2
+      shell: bash
+      env:
+        IN_VERSION: ${{ inputs.version }}
+        IN_DEST: ${{ inputs.dest }}
+        PLATFORM: ${{ runner.os }}-${{ runner.arch }}
+      run: bash "$GITHUB_ACTION_PATH/../install-buck2.sh" "$IN_VERSION" "$PLATFORM" "${IN_DEST:-$HOME/bin}"

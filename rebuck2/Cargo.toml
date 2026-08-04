@@ -1,0 +1,28 @@
+[package]
+name = "rebuck2"
+version = "0.0.0"
+edition = "2021"
+description = "Ad-hoc distributed Remote Execution for buck2 on GitHub Actions, over iroh P2P"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+bazel-remote-apis = "0.27"
+futures = "0.3"
+iroh = "1"
+postcard = { version = "1", features = ["use-std"] }
+prost = "0.14"
+reflink-copy = "0.1.30"
+rustls = { version = "0.23", features = ["ring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+tonic = "0.14"
+
+[[bin]]
+name = "rebuck2"
+path = "src/main.rs"

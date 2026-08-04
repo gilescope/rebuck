@@ -1,0 +1,191 @@
+# Empirical answer to "how fast is linking vs copying on the ACTUAL runners"
+# — informs docs/materialization-design.md. Tree shape mimics an action input
+# tree: many small files, some mid, a few rlib-sized. Times materialize
+# (copy / hardlink / clone) and teardown, per OS.
+name: bench-materialize
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [giles-iroh-re-punch]
+    paths: [.github/workflows/bench-materialize.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: bench
+        run: |
+          cat > bench.py <<'EOF'
+          import os, shutil, subprocess, sys, time, platform
+
+          root = os.environ.get("MATBENCH_ROOT") or os.path.join(
+              os.environ.get("RUNNER_TEMP", "/tmp"), "matbench")
+          shutil.rmtree(root, ignore_errors=True)
+          src = os.path.join(root, "store")
+          os.makedirs(src)
+
+          # 2000 x 8KB + 200 x 256KB + 20 x 16MB ~= 390MB, 2220 files
+          spec = [(2000, 8 * 1024), (200, 256 * 1024), (20, 16 * 1024 * 1024)]
+          blob = os.urandom(1024 * 1024)
+          n = 0
+          for count, size in spec:
+              for _ in range(count):
+                  d = os.path.join(src, "%02x" % (n % 256))
+                  os.makedirs(d, exist_ok=True)
+                  with open(os.path.join(d, "f%d" % n), "wb") as f:
+                      remaining = size
+                      while remaining > 0:
+                          f.write(blob[: min(remaining, len(blob))])
+                          remaining -= len(blob)
+                  n += 1
+
+          srcs = []
+          for dirp, _, names in os.walk(src):
+              for name in names:
+                  srcs.append(os.path.join(dirp, name))
+
+          def rmtree_force(path):
+              def onerr(fn, p, exc):
+                  os.chmod(p, 0o700)
+                  fn(p)
+              shutil.rmtree(path, onerror=onerr)
+
+          def bench(name, op):
+              dst = os.path.join(root, name)
+              t0 = time.monotonic()
+              try:
+                  for s in srcs:
+                      d = os.path.join(dst, os.path.relpath(s, src))
+                      os.makedirs(os.path.dirname(d), exist_ok=True)
+                      op(s, d)
+                  build = time.monotonic() - t0
+              except Exception as e:
+                  print("%12s: FAILED (%s)" % (name, e))
+                  shutil.rmtree(dst, ignore_errors=True)
+                  return
+              t0 = time.monotonic()
+              rmtree_force(dst)
+              delete = time.monotonic() - t0
+              print("%12s: materialize %8.0f ms   teardown %8.0f ms"
+                    % (name, build * 1000, delete * 1000))
+
+          total_mb = sum(os.path.getsize(s) for s in srcs) // (1024 * 1024)
+          print("== %s %s | %d files, %d MB =="
+                % (platform.system(), platform.release(), len(srcs), total_mb))
+
+          bench("copy", shutil.copyfile)
+          bench("hardlink", os.link)
+          if sys.platform == "darwin":
+              bench("clonefile", lambda s, d: subprocess.run(
+                  ["cp", "-c", s, d], check=True, capture_output=True))
+          if sys.platform.startswith("linux"):
+              bench("reflink", lambda s, d: subprocess.run(
+                  ["cp", "--reflink=always", s, d], check=True, capture_output=True))
+              out = subprocess.run(["stat", "-f", "-c", "%T", root],
+                                   capture_output=True, text=True)
+              print("filesystem:", out.stdout.strip())
+          if os.name == "nt":
+              out = subprocess.run(["fsutil", "fsinfo", "volumeinfo", "C:\\"],
+                                   capture_output=True, text=True)
+              print("\n".join(out.stdout.splitlines()[:4]))
+          EOF
+          python3 bench.py || python bench.py
+
+  bench-devdrive:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Mount a ReFS Dev Drive
+        uses: samypr100/setup-dev-drive@cf663fdf88945e3faaa980ec525b5bc2350fbf9d # v3
+        with:
+          drive-size: 8GB
+          drive-format: ReFS
+
+      - name: bench on the dev drive
+        env:
+          MATBENCH_ROOT: ${{ env.DEV_DRIVE }}\matbench
+        run: |
+          cat > bench.py <<'EOF'
+          import os, shutil, subprocess, sys, time, platform
+
+          root = os.environ.get("MATBENCH_ROOT") or os.path.join(
+              os.environ.get("RUNNER_TEMP", "/tmp"), "matbench")
+          shutil.rmtree(root, ignore_errors=True)
+          src = os.path.join(root, "store")
+          os.makedirs(src)
+
+          spec = [(2000, 8 * 1024), (200, 256 * 1024), (20, 16 * 1024 * 1024)]
+          blob = os.urandom(1024 * 1024)
+          n = 0
+          for count, size in spec:
+              for _ in range(count):
+                  d = os.path.join(src, "%02x" % (n % 256))
+                  os.makedirs(d, exist_ok=True)
+                  with open(os.path.join(d, "f%d" % n), "wb") as f:
+                      remaining = size
+                      while remaining > 0:
+                          f.write(blob[: min(remaining, len(blob))])
+                          remaining -= len(blob)
+                  n += 1
+
+          srcs = []
+          for dirp, _, names in os.walk(src):
+              for name in names:
+                  srcs.append(os.path.join(dirp, name))
+
+          def rmtree_force(path):
+              def onerr(fn, p, exc):
+                  os.chmod(p, 0o700)
+                  fn(p)
+              shutil.rmtree(path, onerror=onerr)
+
+          def bench(name, op):
+              dst = os.path.join(root, name)
+              t0 = time.monotonic()
+              try:
+                  for s in srcs:
+                      d = os.path.join(dst, os.path.relpath(s, src))
+                      os.makedirs(os.path.dirname(d), exist_ok=True)
+                      op(s, d)
+                  build = time.monotonic() - t0
+              except Exception as e:
+                  print("%12s: FAILED (%s)" % (name, e))
+                  shutil.rmtree(dst, ignore_errors=True)
+                  return
+              t0 = time.monotonic()
+              rmtree_force(dst)
+              delete = time.monotonic() - t0
+              print("%12s: materialize %8.0f ms   teardown %8.0f ms"
+                    % (name, build * 1000, delete * 1000))
+
+          total_mb = sum(os.path.getsize(s) for s in srcs) // (1024 * 1024)
+          print("== DEV DRIVE %s | %d files, %d MB | root=%s =="
+                % (platform.release(), len(srcs), total_mb, root))
+
+          bench("copy", shutil.copyfile)
+          bench("hardlink", os.link)
+          # Block-clone probe: powershell copy on ReFS may use CoW; measure
+          # a native copy for contrast with python's chunked copy.
+          out = subprocess.run(["fsutil", "fsinfo", "volumeinfo", root[:2] + "\\"],
+                               capture_output=True, text=True)
+          print("\n".join(out.stdout.splitlines()[:6]))
+          EOF
+          python3 bench.py || python bench.py

@@ -1,0 +1,31 @@
+# Local rebuck2 bench fleet: 1 driver + 3 workers, real iroh mesh, REAPI
+# exposed to the host on 19092. Drive it with bench/run.sh.
+#   docker compose -f rebuck2/bench/docker-compose.yml up -d --build
+services:
+  driver:
+    build:
+      context: ..
+      dockerfile: bench/Dockerfile
+    command: rebuck2 driver --grpc-port 9092 --min-workers 3 --session bench-fleet --store /store/driver
+    ports: ["19092:9092"]
+    volumes: [store-driver:/store]
+  worker1:
+    build: {context: .., dockerfile: bench/Dockerfile}
+    command: rebuck2 worker --session bench-fleet --slots 4 --preloaded-shard 0 --store /store/worker
+    volumes: [store-w1:/store]
+    depends_on: [driver]
+  worker2:
+    build: {context: .., dockerfile: bench/Dockerfile}
+    command: rebuck2 worker --session bench-fleet --slots 4 --preloaded-shard 1 --store /store/worker
+    volumes: [store-w2:/store]
+    depends_on: [driver]
+  worker3:
+    build: {context: .., dockerfile: bench/Dockerfile}
+    command: rebuck2 worker --session bench-fleet --slots 4 --preloaded-shard 2 --store /store/worker
+    volumes: [store-w3:/store]
+    depends_on: [driver]
+volumes:
+  store-driver: {}
+  store-w1: {}
+  store-w2: {}
+  store-w3: {}

@@ -1,0 +1,62 @@
+name: rebuck2 setup
+description: >-
+  Install the rebuck2 binary, cached in the actions cache keyed by rebuck
+  commit. Defaults to the same commit this action is pinned at, so one
+  `@sha` pins engine and choreography together. Requires a rust toolchain
+  on PATH for the cache-miss cargo install (pair with dtolnay/rust-toolchain).
+  The `driver` and `worker` actions embed this install themselves - reach
+  for this standalone form only when you manage the mesh by hand.
+
+inputs:
+  rebuck2-git:
+    description: Git URL of the rebuck repo to install from.
+    default: https://github.com/gilescope/rebuck
+  rev:
+    description: >-
+      Exact commit to install. Empty = the ref this action was pinned at
+      (github.action_ref) - pin the action by full sha for that to work.
+    default: ""
+  branch:
+    description: >-
+      Branch to resolve at run time instead of a pinned rev. Floats - warm
+      binary caches invalidate on every push. Prefer `rev`.
+    default: ""
+
+outputs:
+  rev:
+    description: The commit that was installed.
+    value: ${{ steps.resolve.outputs.rev }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve rebuck2 rev
+      id: resolve
+      shell: bash
+      env:
+        IN_GIT: ${{ inputs.rebuck2-git }}
+        IN_REV: ${{ inputs.rev }}
+        IN_BRANCH: ${{ inputs.branch }}
+        ACTION_REF: ${{ github.action_ref }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        REV=$(bash "$GITHUB_ACTION_PATH/../resolve-rev.sh" "$IN_GIT" "$IN_REV" "$IN_BRANCH" "$ACTION_REF")
+        echo "rev=$REV" >> "$GITHUB_OUTPUT"
+        echo "key=$(bash "$GITHUB_ACTION_PATH/../crate-key.sh" "$IN_GIT" "$REV")" >> "$GITHUB_OUTPUT"
+
+    - name: Cache rebuck2 binary (keyed by crate source)
+      id: bin
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      with:
+        path: |
+          ~/.cargo/bin/rebuck2
+          ~/.cargo/bin/rebuck2.exe
+        key: rebuck2-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.resolve.outputs.key }}
+
+    - name: Install rebuck2 (cache miss only)
+      if: steps.bin.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        IN_GIT: ${{ inputs.rebuck2-git }}
+        REV: ${{ steps.resolve.outputs.rev }}
+      run: cargo install --locked --git "$IN_GIT" --rev "$REV" rebuck2

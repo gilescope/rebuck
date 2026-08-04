@@ -6,3 +6,12 @@ rust_binary(
     edition = "2021",
     visibility = ["PUBLIC"],
 )
+
+# Slow on purpose: gives rebuck2's requeue e2e a window to kill the worker
+# mid-action (tests/e2e-requeue.sh).
+genrule(
+    name = "slow",
+    out = "slow.txt",
+    cmd = "sleep 8 && echo done > $OUT",
+    visibility = ["PUBLIC"],
+)

@@ -1,0 +1,24 @@
+# Spike: can two GitHub runners hole-punch a direct iroh path (vs relay)?
+# The fetch job prints one RESULT line: path=has-direct|relay-only + MB/s.
+name: iroh-punch
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [giles-iroh-re-punch]
+
+jobs:
+  punch:
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [serve, fetch]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4          # TODO pin to SHA before graduating
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --manifest-path experiments/punch/Cargo.toml
+      - name: run ${{ matrix.role }}
+        run: ./experiments/punch/target/release/punch ${{ matrix.role }}
