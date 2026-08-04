@@ -15,6 +15,32 @@ permissions:
   contents: read
 
 jobs:
+  # The engine itself. Nothing else in CI compiles rebuck2 on a PR - the jobs
+  # below prove the action's GHA lifecycle, not the Rust - so without this a
+  # broken engine merges green.
+  engine:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: rebuck2
+      - name: fmt
+        working-directory: rebuck2
+        run: cargo fmt --all --check
+      - name: clippy
+        working-directory: rebuck2
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: test
+        working-directory: rebuck2
+        run: cargo test --locked
+
   populate:
     runs-on: ubuntu-latest
     permissions:
