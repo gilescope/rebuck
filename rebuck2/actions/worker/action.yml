@@ -198,9 +198,15 @@ runs:
                   -k "rebuck2-done-$IN_ADDR_RUN" --json key -q '.[].key' | grep -q .; do
             sleep 60; done
           : > "$REBUCK2_WORK/party-over" ) &
-        # macOS ships GNU timeout as gtimeout (coreutils).
-        T=(); command -v timeout >/dev/null && T=(timeout "$IN_TIMEOUT")
-        [ ${#T[@]} -eq 0 ] && command -v gtimeout >/dev/null && T=(gtimeout "$IN_TIMEOUT")
+        # GNU timeout is `gtimeout` on macOS (coreutils) - and the runner
+        # image ships NEITHER, so running untimed is a real outcome, not a
+        # fallback nobody reaches. `env` is the no-op prefix that keeps the
+        # array non-empty: macOS bash is 3.2, where "${T[@]}" on an empty
+        # array is an unbound-variable error under `set -u` (bash >= 4.4,
+        # i.e. linux and git-bash, expands it to nothing and carries on).
+        T=(env)
+        command -v timeout >/dev/null && T=(timeout "$IN_TIMEOUT")
+        [ "${T[0]}" = env ] && command -v gtimeout >/dev/null && T=(gtimeout "$IN_TIMEOUT")
         "${T[@]}" rebuck2 worker "${FLAGS[@]}" | tee "$REBUCK2_WORK/worker.log"
 
     # Row and blobs were authored on this box in this lap and are banked
