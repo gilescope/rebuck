@@ -235,6 +235,17 @@ efficiency dominates; above it, we are buying runners to wait on a chain.
 Also if we know the critical path, then that helps make sure that we get that priority
 scheduled.
 
+**Both are now one command**: `bank timings critical <logstream-file>` prints
+the chain and the saturation N. It weights by SELF time, because a parent that
+only waits on its child is not on the critical path in any sense that matters,
+and ties break on the names so two machines derive the SAME chain -- a
+prioritisation the fleet disagrees about is worse than none.
+
+On the sample build it reports a pure chain: 2995ms of 2995ms work on the
+critical path, saturating at ONE runner. That is the shape worth watching for
+in the real suite -- where a group is a chain, no amount of fleet helps it, and
+the lever is subdividing the chain (M4) rather than adding runners.
+
 ## Bank the stem first, and compare against it
 
 Before M4/M5, the honest competitor to dispatch is: **bank the stem and keep
