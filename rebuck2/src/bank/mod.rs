@@ -32,6 +32,7 @@ use crate::store::sha256_hex;
 pub mod ac;
 pub mod cas;
 pub mod dice;
+pub mod logstream;
 pub mod manifest;
 pub mod pack;
 pub mod publish;

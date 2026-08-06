@@ -548,6 +548,17 @@ pub fn cli(args: &[&str]) -> Result<()> {
             );
             Ok(())
         }
+        // The ingest: `earthly --logstream-debug-file=X` already emits
+        // every target's name, args, span and dependencies, so nothing
+        // needs forking to learn what a build cost.
+        ["ingest", file, run, log] => {
+            super::logstream::ingest(
+                Path::new(file),
+                run.parse().context("run must be a build ordinal")?,
+                Path::new(log),
+            )?;
+            Ok(())
+        }
         ["publish", file, lineage, role] => {
             let staged = publish(
                 Publish {
@@ -587,6 +598,7 @@ pub fn cli(args: &[&str]) -> Result<()> {
         }
         _ => anyhow::bail!(
             "usage: bank timings record <file> <run> <target> <ms> <digest|-> [args...]\n\
+             \x20      bank timings ingest <file> <run> <logstream-debug-file>\n\
              \x20      bank timings stats <file> <target> [args...]\n\
              \x20      bank timings merge <file> <delta>...\n\
              \x20      bank timings plan <file> <bins> <target>...\n\

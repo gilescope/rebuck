@@ -1,0 +1,17 @@
+{"deltaManifest":{"fields":{"mainTargetId":"6c7a9160-72db-4905-903b-e89f3a557049","targets":{"6c7a9160-72db-4905-903b-e89f3a557049":{"name":"+test","canonicalName":"+test","localPath":".","runner":"local:Mac.home"}}}}}
+{"deltaManifest":{"fields":{"targets":{"6c7a9160-72db-4905-903b-e89f3a557049":{"status":"RUN_STATUS_IN_PROGRESS","startedAtUnixNanos":"1786003233747944084"}}}}}
+{"deltaManifest":{"fields":{"targets":{"6c7a9160-72db-4905-903b-e89f3a557049":{"dependsOn":["1a709700-6159-49a9-a010-3f0e53aacde7"]}}}}}
+{"deltaManifest":{"fields":{"targets":{"1a709700-6159-49a9-a010-3f0e53aacde7":{"name":"+base","canonicalName":"+base","localPath":".","runner":"local:Mac.home"}}}}}
+{"deltaManifest":{"fields":{"targets":{"1a709700-6159-49a9-a010-3f0e53aacde7":{"status":"RUN_STATUS_IN_PROGRESS","startedAtUnixNanos":"1786003233748228917"}}}}}
+{"deltaManifest":{"fields":{"targets":{"1a709700-6159-49a9-a010-3f0e53aacde7":{"status":"RUN_STATUS_SUCCESS","endedAtUnixNanos":"1786003233748276917"}}}}}
+{"deltaManifest":{"fields":{"targets":{"6c7a9160-72db-4905-903b-e89f3a557049":{"dependsOn":["ed0e0cd1-fb55-4c1a-bbfd-b4690da502e5"]}}}}}
+{"deltaManifest":{"fields":{"targets":{"ed0e0cd1-fb55-4c1a-bbfd-b4690da502e5":{"name":"+build","canonicalName":"+build","localPath":".","runner":"local:Mac.home"}}}}}
+{"deltaManifest":{"fields":{"targets":{"ed0e0cd1-fb55-4c1a-bbfd-b4690da502e5":{"status":"RUN_STATUS_IN_PROGRESS","startedAtUnixNanos":"1786003233748528375"}}}}}
+{"deltaManifest":{"fields":{"targets":{"ed0e0cd1-fb55-4c1a-bbfd-b4690da502e5":{"dependsOn":["1a709700-6159-49a9-a010-3f0e53aacde7"]}}}}}
+{"deltaManifest":{"fields":{"targets":{"ed0e0cd1-fb55-4c1a-bbfd-b4690da502e5":{"dependsOn":["4bcacb9d-7b25-436f-b752-e2d64614f9ed"]}}}}}
+{"deltaManifest":{"fields":{"targets":{"4bcacb9d-7b25-436f-b752-e2d64614f9ed":{"name":"+deps","canonicalName":"+deps","localPath":".","runner":"local:Mac.home"}}}}}
+{"deltaManifest":{"fields":{"targets":{"4bcacb9d-7b25-436f-b752-e2d64614f9ed":{"status":"RUN_STATUS_IN_PROGRESS","startedAtUnixNanos":"1786003235056798000"}}}}}
+{"deltaManifest":{"fields":{"targets":{"4bcacb9d-7b25-436f-b752-e2d64614f9ed":{"dependsOn":["1a709700-6159-49a9-a010-3f0e53aacde7"]}}}}}
+{"deltaManifest":{"fields":{"targets":{"4bcacb9d-7b25-436f-b752-e2d64614f9ed":{"status":"RUN_STATUS_SUCCESS","endedAtUnixNanos":"1786003235525886584"}}}}}
+{"deltaManifest":{"fields":{"targets":{"ed0e0cd1-fb55-4c1a-bbfd-b4690da502e5":{"status":"RUN_STATUS_SUCCESS","endedAtUnixNanos":"1786003236693886000"}}}}}
+{"deltaManifest":{"fields":{"targets":{"6c7a9160-72db-4905-903b-e89f3a557049":{"status":"RUN_STATUS_SUCCESS","endedAtUnixNanos":"1786003236743329875"}}}}}
