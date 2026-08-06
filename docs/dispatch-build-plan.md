@@ -144,12 +144,33 @@ capturing a real run rather than reasoning about the format, which is the same
 lesson as "coordinate the seam that FIRES" (principle 8): one run settled what
 inference had wrong.
 
-**Still open**: an output digest. The log stream reports none, so STABILITY --
-principle 14's admission test, and the thing that decides whether banking the
-stem beats dispatch -- is the one statistic still unanswerable. `is_cached` on
-a target is the obvious candidate proxy and is NOT obviously right: on a fresh
-runner nothing is cached even when nothing changed, so it may measure cache
-warmth rather than survival. Worth measuring before trusting.
+**Stability comes from CACHEDNESS**, since no output digest is reported. A
+target whose EXEC commands were all served from cache did not change, so an
+identity is synthesised from that: cached keeps the one it had, uncached gets a
+fresh one, and the existing stability count works unchanged.
+
+Not "all commands cached" -- measured, the structural ones (`FROM +base`,
+`SAVE ARTIFACT`) report uncached on an identical rerun while the `RUN` beside
+them reports cached. That predicate is never true, and a predicate that is
+never true is not a signal.
+
+Tested in all three directions rather than argued:
+
+| case | reports | truth | cost |
+| --------------------- | -------- | --------- | ------------- |
+| unchanged rerun | cached | unchanged | correct |
+| source edited | uncached | changed | correct |
+| unchanged, COLD cache | uncached | unchanged | a lost tenure |
+
+The third row is the fresh-runner case, and it UNDER-tenures: we fail to bank
+something we could have. The dangerous direction -- claiming unchanged when it
+moved -- needs buildkit to report a cache hit on different inputs, which is
+principle 7's determinism bound and is already accepted everywhere else here.
+**The proxy lies only in the safe direction**, which is the blooms rule applied
+to a new question.
+
+So M2's done-when is met, on real logs: three laps with two untouched tenures
+`+deps`; one edit resets stability to 1 and withdraws it.
 
 Wiring into the bank actions stays deliberately undone until a real CI lap has
 produced a table worth banking -- the dependency runs ingest -> samples ->
@@ -225,6 +246,13 @@ WITHOUT any dispatch at all.
 That would capture most of the compute saving for a fraction of the work. M2's
 stability statistic answers whether it holds; if it does, M4 and M5 must justify
 themselves on what is left, which is a much harder bar and the right one.
+
+**That question is now ASKABLE**, which it was not when this was written: run
+the suite three times with `bank timings ingest`, then `bank timings tenured`.
+If the stem's targets tenure and the leaves do not, the case for banking over
+dispatching is made in one command, on data, before a line of M4 is written.
+Note the fresh-runner caveat above -- a cold cache under-reports tenure, so the
+three laps want the bank warm, or the answer is pessimistic rather than wrong.
 
 Corollary from the same principle: do not bank what changes every commit. The
 upload is paid, the hit rate is zero, and the eviction is paid again.
