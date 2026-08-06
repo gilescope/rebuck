@@ -570,6 +570,24 @@ pub fn cli(args: &[&str]) -> Result<()> {
             )?;
             Ok(())
         }
+        // Computed ONCE, from one build's graph, because it answers a
+        // question nothing else does: the N at which adding workers
+        // stops paying.
+        ["critical", log] => {
+            let targets = super::logstream::parse(&std::fs::read_to_string(log)?);
+            let cp = super::logstream::critical_path(&targets);
+            for name in &cp.path {
+                println!("{name}");
+            }
+            eprintln!(
+                "[timings] critical path {}ms of {}ms total work; \
+                 saturates at {} runners",
+                cp.ms,
+                cp.total_ms,
+                cp.saturation_n()
+            );
+            Ok(())
+        }
         ["publish", file, lineage, role] => {
             let staged = publish(
                 Publish {
@@ -614,7 +632,8 @@ pub fn cli(args: &[&str]) -> Result<()> {
              \x20      bank timings merge <file> <delta>...\n\
              \x20      bank timings plan <file> <bins> <target>...\n\
              \x20      bank timings prune <file> <keep>\n\
-             \x20      bank timings tenured <file>"
+             \x20      bank timings tenured <file>\n\
+             \x20      bank timings critical <logstream-debug-file>"
         ),
     }
 }

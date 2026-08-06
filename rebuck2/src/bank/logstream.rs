@@ -268,6 +268,113 @@ pub fn samples(targets: &[Target], run: u64, prev: &super::timings::Store) -> Ve
         .collect()
 }
 
+/// The longest chain of dependent work, and how long it takes.
+///
+/// The plan says to compute this ONCE rather than continuously, because
+/// it answers a question nothing else does: **the N at which adding
+/// workers stops paying**. Below that N the fleet is work-bound and
+/// batch efficiency dominates; above it, runners are being bought to
+/// wait on a chain.
+///
+/// Weighted by SELF time, so a parent that only waits on its child
+/// contributes nothing of its own - otherwise the nesting would be
+/// counted twice here as well.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CriticalPath {
+    /// Target names, root-most last.
+    pub path: Vec<String>,
+    pub ms: u64,
+    /// Every target's self time added up: the work a fleet must do.
+    pub total_ms: u64,
+}
+
+impl CriticalPath {
+    /// Runners beyond which the chain, not the work, sets makespan.
+    ///
+    /// `total / path`, rounded up: with fewer runners than this the
+    /// fleet is work-bound; with more, the extra ones wait.
+    pub fn saturation_n(&self) -> u64 {
+        if self.ms == 0 {
+            return 0;
+        }
+        self.total_ms.div_ceil(self.ms)
+    }
+}
+
+pub fn critical_path(targets: &[Target]) -> CriticalPath {
+    let self_ms = self_ms(targets);
+    let by_id: BTreeMap<&str, &Target> = targets.iter().map(|t| (t.id.as_str(), t)).collect();
+    let cost = |id: &str| self_ms.get(id).copied().unwrap_or(0);
+
+    // Longest path by memoised descent. A build graph is acyclic, but
+    // the input is a file that anything could have written, so `on_stack`
+    // makes a cycle terminate at zero rather than recurse forever.
+    fn longest<'a>(
+        id: &'a str,
+        by_id: &BTreeMap<&'a str, &'a Target>,
+        cost: &dyn Fn(&str) -> u64,
+        memo: &mut BTreeMap<&'a str, (u64, Vec<String>)>,
+        on_stack: &mut std::collections::BTreeSet<&'a str>,
+    ) -> (u64, Vec<String>) {
+        if let Some(hit) = memo.get(id) {
+            return hit.clone();
+        }
+        // A dependency naming a target this stream never described - it
+        // may have come from another earth process - contributes
+        // nothing rather than losing the path that reaches it.
+        let Some(t) = by_id.get(id) else {
+            return (0, Vec::new());
+        };
+        if !on_stack.insert(id) {
+            return (0, Vec::new());
+        }
+        // `None` until a dependency RESOLVES, because a zero-cost one
+        // is still on the chain - `+base` costs nothing and dropping it
+        // leaves the path looking disconnected from its own root.
+        let mut best: Option<(u64, Vec<String>)> = None;
+        let mut deps: Vec<&String> = t.deps.iter().collect();
+        deps.sort();
+        for d in deps {
+            let got = longest(d.as_str(), by_id, cost, memo, on_stack);
+            if got.1.is_empty() {
+                continue;
+            }
+            // Longest wins; ties break on the names, so two machines
+            // computing this from the same graph name the same path.
+            best = match best {
+                Some(b) if (b.0, &b.1) >= (got.0, &got.1) => Some(b),
+                _ => Some(got),
+            };
+        }
+        on_stack.remove(id);
+        let (base_ms, mut path) = best.unwrap_or((0, Vec::new()));
+        path.push(t.name.clone());
+        let out = (base_ms + cost(id), path);
+        memo.insert(id, out.clone());
+        out
+    }
+
+    let mut memo = BTreeMap::new();
+    let mut best = (0, Vec::new());
+    for t in targets {
+        let got = longest(
+            t.id.as_str(),
+            &by_id,
+            &cost,
+            &mut memo,
+            &mut Default::default(),
+        );
+        if got.0 > best.0 {
+            best = got;
+        }
+    }
+    CriticalPath {
+        path: best.1,
+        ms: best.0,
+        total_ms: self_ms.values().sum(),
+    }
+}
+
 /// Ingest a log stream into a timing table. Returns rows added.
 pub fn ingest(table: &std::path::Path, run: u64, log: &std::path::Path) -> Result<usize> {
     let text = std::fs::read_to_string(log).unwrap_or_default();
@@ -460,6 +567,52 @@ mod tests {
         );
         // No execs, no claim.
         assert_eq!(stability_digest(Some("abc"), None, &deps, 1), None);
+    }
+
+    #[test]
+    fn the_critical_path_says_when_more_runners_stop_paying() {
+        // The real build is a pure chain: +test -> +build -> +deps ->
+        // +base. Every millisecond of it is on the critical path, so no
+        // number of runners helps and saturation is ONE. A fleet bought
+        // for this shape would sit idle, which is exactly the answer
+        // this computation exists to give.
+        let cp = critical_path(&parse(NESTED));
+        assert_eq!(cp.path, vec!["+base", "+deps", "+build", "+test"]);
+        assert_eq!(cp.ms, cp.total_ms, "a chain has no parallel work");
+        assert_eq!(cp.saturation_n(), 1);
+
+        // Widen it: two independent 100ms leaves under one root. Now
+        // there are 200ms of work on a 100ms chain, so a second runner
+        // pays and a third does not.
+        // A start of zero means "no stamp arrived", so these need real
+        // ones or self_ms treats them as unmeasured and declines to
+        // subtract their overlap.
+        let t = |id: &str, ms: u64, deps: Vec<&str>| Target {
+            id: id.into(),
+            name: format!("+{id}"),
+            start_ns: 1_000_000,
+            end_ns: (1 + ms) * 1_000_000,
+            deps: deps.into_iter().map(Into::into).collect(),
+            success: true,
+            ..Default::default()
+        };
+        // The root's own span covers both leaves, so its SELF time is
+        // what is left after they are subtracted.
+        let mut root = t("root", 100, vec!["a", "b"]);
+        root.deps = vec!["a".into(), "b".into()];
+        let wide = vec![t("a", 100, vec![]), t("b", 100, vec![]), root];
+        let cp = critical_path(&wide);
+        assert_eq!(cp.total_ms, 200, "two leaves of work");
+        assert_eq!(cp.ms, 100, "either leaf is the whole chain");
+        assert_eq!(cp.saturation_n(), 2);
+
+        // Degenerate shapes are reached on real builds, not just here.
+        assert_eq!(critical_path(&[]).saturation_n(), 0);
+        assert_eq!(critical_path(&[]).ms, 0);
+        // A dependency naming a target that is not in the stream (a
+        // target from another earth process) must not lose the path.
+        let orphan = vec![t("x", 50, vec!["gone"])];
+        assert_eq!(critical_path(&orphan).ms, 50);
     }
 
     #[test]
