@@ -1,11 +1,18 @@
 # Dispatch - distributing one buildkit build, not deduplicating many
 
-Successor to [buildkit-plan.md](buildkit-plan.md). That plan's phases (P1-P4b)
-are **deduplication**: N independent builds that avoid redoing each other's
-work. They are built and measured; see
-[dist-buildkit-handover.md](dist-buildkit-handover.md).
+Successor to the dedup plan (`buildkit-plan.md`, on
+`giles-single-buildkit-with-dist` / PR #7). Its phases P1-P4b are
+**deduplication**: N independent builds that avoid redoing each other's work.
+They are built and measured.
 
 This plan is the alternative, not the continuation.
+
+The product claims both lines answer to are in
+[dist-buildkit-principles.md](dist-buildkit-principles.md). Three of them bind
+dispatch harder than they bound dedup: the grid must behave as ONE machine (§1),
+fail open never fail wrong (§5), and the coordinator is never on the data path
+(§6) -- which for dispatch means a subtree's inputs and results travel
+peer-to-peer, never through the driver.
 
 ## Why dedup could not win the thing we kept asking it for
 
