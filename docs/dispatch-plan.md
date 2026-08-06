@@ -105,10 +105,67 @@ only because the requester blocks. Two things remove the harm:
 Deferred, not cancelled: at full utilisation, hedged work displaces real work.
 That is also when we would have the data to build a cost model properly.
 
-**Instrument first.** Nothing currently times a vertex -- the daemon log has
-`creating` lines and no completions, so "trivial vs minutes" above is inferred
-from command text. A learned bloom needs real durations, which is a one-line
-addition beside the fork's existing `SFTIME` debug log.
+**Instrument first**, and the instrument mostly exists. BuildKit already
+timestamps every vertex and streams it to the client -- `client/graph.go`'s
+`Vertex` carries `Started`/`Completed`, which is how earthly renders progress.
+What has no timings is the DEBUG LOG, which emits `creating` lines and no
+completions; that is why "trivial vs minutes" above is inferred from command
+text rather than measured. Recording what is already streamed needs no fork
+change.
+
+## A timing store, because a threshold is not a distribution
+
+A single "is this cheap" bit is the weakest thing that could be learned. What is
+actually wanted is **how long a target takes, as a distribution, subsetted by
+the args it was given** -- because args change what a target does
+(`--mode=0004` and `--mode=0777` are different work under one name).
+
+    key    = target ref + the build args that reach it
+    value  = duration samples (count, median, p90)
+
+Populated from the status stream, banked with everything else. `bank/dice.rs`
+already banks a key/value store as deterministic, replayable, order-independent
+text deltas -- a timings table is that same shape, so persistence is a reuse
+rather than a build.
+
+It then feeds four things that currently each guess separately:
+
+- **Rebalancing.** The reason step 0 stalled: a static proxy correlated only
+  r=0.734 with measured group times and was 10x wrong on small groups, and the
+  measured times were themselves confounded by warm/cold ordering. A timing
+  store is the durable fix for both.
+- **Scheduling.** Longest-processing-time-first is the standard makespan
+  heuristic and needs exactly this data.
+- **The cheap-bloom.** A learned threshold becomes a learned distribution;
+  "p90 under 50ms" is a far better predicate than one observed sample.
+- **Dispatch.** Which subtree is worth shipping, when we eventually want that
+  question answered rather than deferred.
+
+## The fleet is heterogeneous
+
+Runners are not interchangeable. earthbuild's own CI already spans linux, macOS
+and windows (`giles-mac-worker-timeout`; a windows worker once burned 5h dead),
+and dispatch must respect that or it will route work to a machine that cannot
+run it.
+
+The wire already carries what is needed: `pb.Op` has both `Platform` and
+`WorkerConstraints`, per op. And main's driver already routes REAPI actions by
+their demanded platform for buck2 -- so the fleet-side concept exists and this is
+extending it to buildkit rather than inventing it.
+
+Three consequences:
+
+- **A subtree's platform is the union of its vertices' constraints.** One
+  linux-only vertex pins the whole subtree, the same way one `LOCALLY` excludes
+  it entirely.
+- **Emulation is a trap, not a fallback.** binfmt lets a linux/amd64 worker run
+  linux/arm64 slowly (`tonistiigi/binfmt` is already in earthbuild's graph).
+  Prefer native; treat emulated capacity as a last resort rather than as
+  capacity, or the queue will happily hand arm64 work to an amd64 box and call
+  it scheduled.
+- **Idle mac and windows runners are not spare capacity for linux work.** A
+  heterogeneous fleet's utilisation must be reported PER PLATFORM, or a fleet
+  that looks 60% utilised may be 100% on linux and 0% elsewhere.
 
 ## Sequencing
 
@@ -116,11 +173,11 @@ addition beside the fork's existing `SFTIME` debug log.
 | --- | ------- |
 | 0. **rebalance the twelve groups** | free, needs nothing; group4 is ~100x group11 and SETS makespan today |
 | 1. port the dedup delta onto main | new files carry cleanly; ~1590 lines of hooks |
-| 2. time vertices | the instrument every later decision needs |
+| 2. **timing store**, banked | rebalancing, scheduling, the bloom and dispatch all guess without it |
 | 3. published-key bloom + batch query | kills per-vertex hops we already pay |
 | 4. `D2W::Lead { subtree, frontier }` | the only genuinely new protocol |
 | 5. coalesce CI to `+test-no-qemu` | one driver, N workers, existing actions |
-| 6. report **utilisation** | a 30%-idle fleet costs more than uneven shards |
+| 6. report **utilisation, per platform** | a 60%-utilised fleet may be 100% linux and 0% elsewhere |
 
 Step 0 is first on purpose: fixing the imbalance makes every later fleet number
 honest instead of flattering. Step 2 before 3 and 4 because nothing currently
