@@ -39,6 +39,14 @@ pub struct Target {
     pub end_ns: u64,
     pub deps: Vec<String>,
     pub success: bool,
+    /// Were all of this target's EXEC commands served from cache?
+    /// `None` when it ran none - `+base` is a `FROM` and nothing else,
+    /// and "no work" is not evidence either way.
+    ///
+    /// Not "all commands": structural ones (`FROM +base`, `SAVE
+    /// ARTIFACT`) report uncached even on an identical rerun, so that
+    /// predicate is never true. Measured.
+    pub execs_cached: Option<bool>,
 }
 
 impl Target {
@@ -87,16 +95,38 @@ fn strings(v: Option<&serde_json::Value>) -> Vec<String> {
 /// skipped rather than fatal.
 pub fn parse(text: &str) -> Vec<Target> {
     let mut by_id: BTreeMap<String, Target> = BTreeMap::new();
+    // cmdID -> (targetID, is an exec, was cached). Commands arrive in
+    // deltas too, and `isCached` may land in a different line from the
+    // name that says whether it is an exec at all.
+    let mut cmds: BTreeMap<String, (String, bool, bool)> = BTreeMap::new();
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        let Some(targets) = v
-            .get("deltaManifest")
-            .and_then(|d| d.get("fields"))
-            .and_then(|f| f.get("targets"))
-            .and_then(|t| t.as_object())
-        else {
+        let Some(fields) = v.get("deltaManifest").and_then(|d| d.get("fields")) else {
+            continue;
+        };
+        for (id, c) in fields
+            .get("commands")
+            .and_then(|c| c.as_object())
+            .into_iter()
+            .flatten()
+        {
+            let e = cmds.entry(id.clone()).or_default();
+            if let Some(t) = c.get("targetId").and_then(|t| t.as_str()) {
+                e.0 = t.to_owned();
+            }
+            if let Some(n) = c.get("name").and_then(|n| n.as_str()) {
+                // An EXEC is what actually does work. `FROM` and `SAVE`
+                // are structural and report uncached on an identical
+                // rerun, so counting them makes the predicate constant.
+                e.1 = n.starts_with("RUN") || n.starts_with("COPY");
+            }
+            if let Some(c) = c.get("isCached").and_then(serde_json::Value::as_bool) {
+                e.2 = c;
+            }
+        }
+        let Some(targets) = fields.get("targets").and_then(|t| t.as_object()) else {
             continue;
         };
         for (id, t) in targets {
@@ -125,6 +155,13 @@ pub fn parse(text: &str) -> Vec<Target> {
             if let Some(st) = t.get("status").and_then(|s| s.as_str()) {
                 e.success = st == "RUN_STATUS_SUCCESS";
             }
+        }
+    }
+    // One uncached exec is enough: a target is unchanged only if all
+    // of its work was.
+    for (tid, _, cached) in cmds.into_values().filter(|c| c.1) {
+        if let Some(t) = by_id.get_mut(&tid) {
+            t.execs_cached = Some(t.execs_cached.unwrap_or(true) && cached);
         }
     }
     by_id.into_values().filter(|t| !t.name.is_empty()).collect()
@@ -161,24 +198,70 @@ pub fn self_ms(targets: &[Target]) -> BTreeMap<String, u64> {
         .collect()
 }
 
+/// The identity that answers "has this target moved".
+///
+/// The log stream carries no output digest, so one is SYNTHESISED: a
+/// cached target keeps the digest it had, an uncached one is given a
+/// fresh one. `Store::stability` then counts consecutive builds that
+/// left a target alone, without knowing the difference.
+///
+/// The proxy lies only in the SAFE direction, which is the whole
+/// argument for using it. Measured on a real build:
+///
+/// | case | reports | truth | cost |
+/// | ---- | ------- | ----- | ---- |
+/// | unchanged rerun | cached | unchanged | correct |
+/// | source changed | uncached | changed | correct |
+/// | unchanged, COLD cache | uncached | unchanged | a lost tenure |
+///
+/// The last row is the fresh-runner case and it under-tenures: we fail
+/// to bank something we could have. The dangerous direction - claiming
+/// unchanged when it moved - needs buildkit to report a cache hit on
+/// different inputs, which is principle 7's determinism bound and is
+/// already accepted everywhere else in this system.
+fn stability_digest(
+    prev: Option<&str>,
+    cached: Option<bool>,
+    key: &Key,
+    run: u64,
+) -> Option<String> {
+    match cached? {
+        // Left alone: keep the identity it had. A first sighting has
+        // none to keep, so it starts a chain rather than joining one.
+        true => Some(prev.map_or_else(|| mint(key, run), str::to_owned)),
+        // Rebuilt: a fresh identity, keyed on the run so it breaks the
+        // chain exactly once and is stable if the ingest is replayed.
+        false => Some(mint(key, run)),
+    }
+}
+
+/// A synthesised identity for one (key, run). Hex, because that is what
+/// [`super::timings`] accepts, and short because nothing compares it to
+/// anything but itself.
+fn mint(key: &Key, run: u64) -> String {
+    crate::store::sha256_hex(format!("{}\0{run}", key.as_str()).as_bytes())[..16].to_owned()
+}
+
 /// Turn one build's log stream into samples for `run`.
 ///
 /// Only successes teach: a failed target's duration is how long it took
 /// to fail, which is not what it costs to build. No digest is reported,
 /// and inventing one would tenure things into the bank on a fiction -
 /// so stability stays unknown until something can answer it.
-pub fn samples(targets: &[Target], run: u64) -> Vec<(Key, Sample)> {
+pub fn samples(targets: &[Target], run: u64, prev: &super::timings::Store) -> Vec<(Key, Sample)> {
     let self_ms = self_ms(targets);
     targets
         .iter()
         .filter(|t| t.usable())
         .map(|t| {
+            let key = t.key();
+            let digest = stability_digest(prev.newest_digest(&key), t.execs_cached, &key, run);
             (
-                t.key(),
+                key,
                 Sample {
                     run,
                     ms: self_ms.get(&t.id).copied().unwrap_or(0),
-                    digest: None,
+                    digest,
                 },
             )
         })
@@ -191,7 +274,7 @@ pub fn ingest(table: &std::path::Path, run: u64, log: &std::path::Path) -> Resul
     let targets = parse(&text);
     let mut store = super::timings::Store::load(table);
     let mut added = 0;
-    for (k, s) in samples(&targets, run) {
+    for (k, s) in samples(&targets, run, &store) {
         added += usize::from(store.record(k, s));
     }
     store.save(table)?;
@@ -208,6 +291,7 @@ pub fn ingest(table: &std::path::Path, run: u64, log: &std::path::Path) -> Resul
 
 #[cfg(test)]
 mod tests {
+    use super::super::timings::Store;
     use super::*;
 
     /// Real output of `earthly --logstream-debug-file`, trimmed to the
@@ -215,6 +299,13 @@ mod tests {
     /// field names, the casing and the delta-per-line shape are all
     /// things we would otherwise be guessing at.
     const NESTED: &str = include_str!("../../tests/fixtures/logstream-nested.jsonl");
+
+    /// The SAME build, rerun with nothing changed: every exec served
+    /// from cache.
+    const CACHED: &str = include_str!("../../tests/fixtures/logstream-cached.jsonl");
+
+    /// The same build after editing what a RUN does: no exec cached.
+    const CHANGED: &str = include_str!("../../tests/fixtures/logstream-changed.jsonl");
 
     fn by_name(ts: &[Target], name: &str) -> Target {
         ts.iter()
@@ -278,7 +369,7 @@ mod tests {
     #[test]
     fn samples_carry_self_time_and_no_forged_digest() {
         let ts = parse(NESTED);
-        let got = samples(&ts, 7);
+        let got = samples(&ts, 7, &super::super::timings::Store::new());
         assert_eq!(got.len(), 4);
 
         let (_, s) = got
@@ -294,6 +385,84 @@ mod tests {
     }
 
     #[test]
+    fn cachedness_is_read_from_execs_not_from_every_command() {
+        // Structural commands report uncached even on an identical
+        // rerun - measured: FROM +base and SAVE ARTIFACT are false
+        // while the RUN beside them is true. "All commands cached" is
+        // therefore never true, and a predicate that is never true is
+        // not a signal.
+        let cached = parse(CACHED);
+        for name in ["+build", "+deps"] {
+            assert_eq!(
+                by_name(&cached, name).execs_cached,
+                Some(true),
+                "{name} was rerun unchanged"
+            );
+        }
+        for name in ["+build", "+deps"] {
+            assert_eq!(
+                by_name(&parse(CHANGED), name).execs_cached,
+                Some(false),
+                "{name}'s work was edited"
+            );
+        }
+        // A target that runs no execs is not evidence either way.
+        assert_eq!(by_name(&cached, "+base").execs_cached, None);
+    }
+
+    #[test]
+    fn a_left_alone_target_keeps_its_identity_and_tenures() {
+        // The whole point: with no output digest in the stream, one is
+        // synthesised so Store::stability can count consecutive builds
+        // that left a target alone.
+        let mut store = Store::new();
+        let deps = Key::new("+deps", []);
+
+        // Run 1 is the first sighting - it starts a chain.
+        for (k, s) in samples(&parse(CHANGED), 1, &store) {
+            store.record(k, s);
+        }
+        let first = store.newest_digest(&deps).map(str::to_owned);
+        assert!(first.is_some(), "a first sighting must start a chain");
+        assert_eq!(store.stability(&deps), 1);
+
+        // Runs 2 and 3 change nothing, so the identity carries and the
+        // target tenures at three generations (principle 14).
+        for run in 2..=3 {
+            for (k, s) in samples(&parse(CACHED), run, &store) {
+                store.record(k, s);
+            }
+        }
+        assert_eq!(store.newest_digest(&deps).map(str::to_owned), first);
+        assert_eq!(store.stability(&deps), 3);
+        assert!(store.tenured(&deps), "three untouched builds is the stem");
+
+        // An edit breaks the chain, and tenure with it - which is the
+        // rule that stops us banking what changes every commit.
+        for (k, s) in samples(&parse(CHANGED), 4, &store) {
+            store.record(k, s);
+        }
+        assert_ne!(store.newest_digest(&deps).map(str::to_owned), first);
+        assert_eq!(store.stability(&deps), 1);
+        assert!(!store.tenured(&deps));
+
+        // The synthesised identity must be stable for one (key, run) -
+        // an ingest replayed twice may not look like a change.
+        assert_eq!(
+            stability_digest(None, Some(false), &deps, 9),
+            stability_digest(None, Some(false), &deps, 9)
+        );
+        // ...and must differ per run, or an uncached rebuild would
+        // silently extend the chain it is supposed to break.
+        assert_ne!(
+            stability_digest(None, Some(false), &deps, 9),
+            stability_digest(None, Some(false), &deps, 10)
+        );
+        // No execs, no claim.
+        assert_eq!(stability_digest(Some("abc"), None, &deps, 1), None);
+    }
+
+    #[test]
     fn a_truncated_or_hostile_stream_yields_nothing_rather_than_nonsense() {
         // The file is written by a build that may be killed mid-write,
         // so a half-line is normal input, not corruption.
@@ -305,17 +474,17 @@ mod tests {
         // it has no duration and must not be recorded as one.
         let unfinished = r#"{"deltaManifest":{"fields":{"targets":{"a":{"name":"+x","canonicalName":"+x","startedAtUnixNanos":"100"}}}}}"#;
         assert_eq!(parse(unfinished).len(), 1);
-        assert!(samples(&parse(unfinished), 1).is_empty());
+        assert!(samples(&parse(unfinished), 1, &Store::new()).is_empty());
 
         // An end BEFORE the start is a clock that moved, not a negative
         // duration. Dropping it costs one estimate; a wrapped u64 would
         // put an 18-exasecond target at the head of every schedule.
         let backwards = r#"{"deltaManifest":{"fields":{"targets":{"a":{"name":"+x","canonicalName":"+x","startedAtUnixNanos":"200","endedAtUnixNanos":"100","status":"RUN_STATUS_SUCCESS"}}}}}"#;
-        assert!(samples(&parse(backwards), 1).is_empty());
+        assert!(samples(&parse(backwards), 1, &Store::new()).is_empty());
 
         // A failed target's duration is the time it took to fail, which
         // is not what it costs to build. Only successes teach.
         let failed = r#"{"deltaManifest":{"fields":{"targets":{"a":{"name":"+x","canonicalName":"+x","startedAtUnixNanos":"100","endedAtUnixNanos":"200","status":"RUN_STATUS_FAILURE"}}}}}"#;
-        assert!(samples(&parse(failed), 1).is_empty());
+        assert!(samples(&parse(failed), 1, &Store::new()).is_empty());
     }
 }

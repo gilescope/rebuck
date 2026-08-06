@@ -220,6 +220,17 @@ impl Store {
             .count() as u32
     }
 
+    /// The newest run's digest for a key, if it reported one. What an
+    /// ingest carries forward when a target was left alone.
+    pub fn newest_digest(&self, key: &Key) -> Option<&str> {
+        self.by_key
+            .get(key)?
+            .values()
+            .next_back()?
+            .digest
+            .as_deref()
+    }
+
     /// Principle 14: promote by survival, never by size.
     pub fn tenured(&self, key: &Key) -> bool {
         self.stability(key) >= TENURE_GENERATIONS
