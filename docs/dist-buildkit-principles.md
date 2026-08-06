@@ -195,3 +195,44 @@ beats a CDN is unmeasured; every speed prediction this project has made from
 first principles has been wrong. Fetch-once is worth doing because the fleet
 should not be N customers of someone else's quota — if it is also faster, that
 is a result to measure, not a premise to assume.
+
+## 10. Hand over TREES, not vertices
+
+The unit of work one machine asks another for is a subtree — in earthbuild
+terms, a target. Never a single vertex.
+
+A vertex's inputs are usually larger than its work. Measured on two shards, over
+half of every exec vertex is milliseconds of it — 58% of group3's 214 and 54% of
+group5's 521 are `echo`, `test`, `diff`, `mkdir`. Handing one of those to a peer
+means shipping its input snapshot, running for 5ms, shipping the result back,
+then shipping the same inputs out again for the vertex that depends on it. The
+transfer is the work.
+
+Send the subtree and the arithmetic inverts:
+
+| | per vertex | per subtree |
+| ---------------- | ---------------------- | ----------------------- |
+| inputs | once per vertex | **once** |
+| intermediates | cross the wire, twice | **never leave the peer** |
+| paid for | everything | **the boundary only** |
+
+And the boundary does not need inventing. An earthly target already is one: a
+chain of vertices with one output and a declared frontier, written by the author,
+connected by `BUILD` edges, and already what the lease key keys on. A
+partitioning heuristic here would be us re-deriving, worse, a boundary the
+Earthfile states outright.
+
+The same error has a smaller twin in the coordination protocol: `claim` is one
+round trip per vertex, and one pair run recorded `led=828` — over half of them
+for vertices cheaper than the round trip that asked about them. Per-vertex is the
+wrong granularity for talking about work as well as for moving it.
+
+Three consequences, all conservative:
+
+- **Exclusions propagate upward.** One `LOCALLY`, one cache mount, one secret,
+  one privileged exec anywhere in the subtree excludes the WHOLE subtree. A
+  partially-dispatchable tree is not dispatchable.
+- **Platform is the union of the subtree's constraints.** One linux-only vertex
+  pins the tree.
+- **Failure granularity is the subtree.** It fails as a unit and re-runs as a
+  unit, which is the price of not paying for its interior.
