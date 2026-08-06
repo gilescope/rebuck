@@ -236,3 +236,67 @@ Three consequences, all conservative:
   pins the tree.
 - **Failure granularity is the subtree.** It fails as a unit and re-runs as a
   unit, which is the price of not paying for its interior.
+
+## 11. A tree subdivides at its narrowest declared seam
+
+Principle 10 says the unit is a tree. The obvious objection is that a tree can be
+too big -- `+earthly` is most of a shard, and handing it over whole leaves
+nothing to balance.
+
+It subdivides, and not by a heuristic: an Earthfile already DECLARES several
+seams, and they differ in the only thing that matters -- how much has to cross
+the wire for the piece to be built elsewhere.
+
+| seam | what the frontier is | width |
+| ------------------------- | --------------------------------- | ----- |
+| `FROM <registry image>` | a digest any machine can fetch | **~free** -- the mesh already serves it (P4b) |
+| `COPY +target/artifact` | one named artifact | narrow |
+| `RUN --mount=from=...` | one mounted path | narrow |
+| `FROM +target` / `BUILD +target` | a whole snapshot or image | wide |
+| mid-chain, between two RUNs | a whole snapshot, AND a target cut in half | widest, and undeclared |
+
+So the rule is **cut at the narrowest declared seam available**, not "at the next
+`BUILD` edge". A chain rooted at `FROM alpine:3.24.1` is the best possible
+handover: its entire frontier is a public digest, so a peer needs nothing from
+us at all. A `COPY +deps/lockfile` boundary is next best -- one artifact crosses,
+not a rootfs.
+
+The word DECLARED is load-bearing. The moment we cut somewhere the Earthfile does
+not name, we are inventing a boundary and have re-introduced the partitioning
+heuristic principle 10 rejects -- and paying a full snapshot for the privilege.
+
+Exclusions and platform still propagate upward within each piece: a child
+containing `LOCALLY` is undispatchable, and its parent is undispatchable AS A
+WHOLE, but the parent's OTHER children remain free to travel.
+
+Corollary: seam width is a property we can MEASURE, not merely rank. Preferring
+the narrowest available frontier is a scheduling input the timing store can
+learn, the same way it learns duration.
+
+## 12. Finishing beats starting -- worker-to-worker work has priority
+
+When worker A subdivides its tree and hands a branch to worker B, **A is
+blocked on B**. That work has a machine waiting on it. New work from the driver
+does not.
+
+So: a worker takes worker-to-worker work first, and pushes back on the driver.
+Refusal IS the backpressure -- a driver that cannot place work has learned the
+fleet is saturated, without needing a metric to tell it.
+
+Three reasons this is a principle and not a tuning knob:
+
+- **Completions set makespan, starts do not.** A fleet that always accepts new
+  work converges on every machine being 90% through something and nothing
+  finishing. The queue looks busy and the build does not progress.
+- **A part-built subtree holds state**: materialised inputs, intermediate
+  snapshots, a warm daemon. Interleaving a second tree either evicts that state
+  or doubles the footprint, and both are worse than waiting.
+- **Without it, subdivision makes things worse rather than better.** If B
+  prefers fresh driver work, A stalls while holding everything it has built --
+  so the very mechanism meant to improve balance produces a fleet of blocked
+  machines sitting on warm state. Subdivision without backpressure is a
+  regression.
+
+Corollary: the driver must be able to be told "no". A dispatch protocol where
+the coordinator assigns rather than offers cannot express this, and would have
+to rediscover it as a load metric -- later, and worse.

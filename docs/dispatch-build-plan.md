@@ -110,6 +110,14 @@ existing `adoptLeaderResult` path is unchanged.
   subtree. Platform is the union of the subtree's constraints.
 - **Principle 6 rules out the obvious implementation**: the frontier and the
   result must travel peer-to-peer. The driver arbitrates and carries nothing.
+- **The driver OFFERS; it does not assign** (principle 12). A worker must be
+  able to refuse, because refusal is the backpressure -- and a protocol where
+  the coordinator assigns cannot express it and would have to rediscover it as a
+  load metric, later and worse.
+- **Worker-to-worker beats driver-dispatched.** A subdivided branch has a
+  machine blocked on it; new driver work does not. Without this, subdivision is
+  a REGRESSION: workers sit on warm state waiting for peers who took fresh work
+  instead.
 - **Done when**: a single earthly build whose vertices demonstrably executed on
   machines that did not invoke it, and the driver's disk stays flat.
 
@@ -126,11 +134,15 @@ driver job owning the invocation, N worker jobs lending CPU, via main's existing
 
 ## Open, and honest about it
 
-- **A target may be too big to schedule.** `+earthly` is most of a shard.
-  Principle 10 makes the tree right for correctness and transfer; it may be too
-  coarse for load balancing, and nothing here resolves that. Splitting a target
-  for scheduling would re-introduce exactly the partitioning heuristic principle
-  10 rejects.
+- **How deep to subdivide, and where.** Principles 11 and 12 answer the "a
+  target is too big" objection: cut at the narrowest DECLARED seam -- a chain
+  rooted at `FROM <registry image>` needs nothing from us at all, a
+  `COPY +t/artifact` boundary crosses one artifact, and `BUILD +t` crosses a
+  whole snapshot -- and prioritise worker-to-worker work so a subdividing worker
+  is never left blocked on a peer that took fresh driver work instead. What is
+  NOT settled is when to STOP: one level deeper is always available, and past
+  some depth the frontier costs more than the work. Both seam width and work are
+  measurable, so this is a job for M2's timing store rather than a constant.
 - **Two groups fail cold and pass warm.** Same class as the `secrets` and
   `aws-flag` false passes: a warm cache changes what a test means. Expect more
   of these as coalescing makes everything warm.
