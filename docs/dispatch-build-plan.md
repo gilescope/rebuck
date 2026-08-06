@@ -83,6 +83,12 @@ Record per-vertex `Started`/`Completed` from buildkit's status stream (already
 streamed -- `client/graph.go`; no fork change), keyed by target + the build args
 that reach it, banked via `bank/`'s existing key/value machinery.
 
+**Keyed COARSELY on purpose** (principle 13). Not on the cache key, not on
+content: a content-keyed table is perfect and useless, because every commit
+empties it. `+deps` takes about as long as it did last week whether or not a
+source file moved. We are choosing robustness over precision, and the estimate
+only ever feeds decisions where being wrong is cheap.
+
 - **Done when**: a second run can answer "how long does `+deps` take with these
   args" with a median and a p90.
 - **Why before M3-M5**: rebalancing, longest-first scheduling, the cheap-bloom
@@ -142,7 +148,11 @@ driver job owning the invocation, N worker jobs lending CPU, via main's existing
   is never left blocked on a peer that took fresh driver work instead. What is
   NOT settled is when to STOP: one level deeper is always available, and past
   some depth the frontier costs more than the work. Both seam width and work are
-  measurable, so this is a job for M2's timing store rather than a constant.
+  measurable, so M2's timing store answers it rather than a constant -- and
+  because that store is coarse by design (principle 13) it keeps answering
+  across commits instead of emptying on every source change. The first build of
+  anything has no statistics: fall back to not subdividing, and let run two be
+  informed.
 - **Two groups fail cold and pass warm.** Same class as the `secrets` and
   `aws-flag` false passes: a warm cache changes what a test means. Expect more
   of these as coalescing makes everything warm.

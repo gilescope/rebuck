@@ -300,3 +300,38 @@ Three reasons this is a principle and not a tuning knob:
 Corollary: the driver must be able to be told "no". A dispatch protocol where
 the coordinator assigns rather than offers cannot express this, and would have
 to rediscover it as a load metric -- later, and worse.
+
+## 13. Estimates are COARSE on purpose -- that is what makes them survive
+
+The timing store is keyed on the target and the args that reach it. Never on the
+cache key, and never on content. That is deliberate, and it is the opposite of
+what every other key in this system wants.
+
+A cache key must be EXACT: under-specific and a follower gets someone else's
+layer (principle 5). An estimate must be STABLE: it is consulted to decide
+scheduling order, how deep to subdivide, and what is worth dispatching -- and
+being wrong by 20% costs a slightly worse schedule, while having no entry at all
+costs no schedule.
+
+Key the estimate on content and it is perfect and useless: every commit
+invalidates every sample, and a build system whose input changes constantly
+would carry a permanently cold statistics table. Key it on the target and it is
+approximate and durable -- `+deps` takes about as long as it did last week
+whether or not a source file moved, because what dominates its duration is what
+it DOES, not which bytes it did it to.
+
+So: precision and robustness are in tension here, and we choose robustness. The
+one lesson to carry is that **the same identity must not serve both jobs.**
+Reusing the cache key as the statistics key looks like tidy engineering and
+produces a table that is empty exactly when it is needed.
+
+Two consequences:
+
+- **Estimates may only feed decisions where being wrong is CHEAP.** Ordering,
+  subdivision depth, dispatch selection: all recoverable. Never correctness,
+  never a cache-hit decision, never an exclusion.
+- **The first build of anything has no statistics, and that must be survivable
+  rather than special-cased.** Fall back to not subdividing and to structural
+  order; the table fills as a side effect of the run, and run two is already
+  informed. A cold-start path that has to be maintained separately is a second
+  scheduler nobody tests.
