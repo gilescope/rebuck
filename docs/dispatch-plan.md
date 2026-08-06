@@ -1,0 +1,171 @@
+# Dispatch - distributing one buildkit build, not deduplicating many
+
+Successor to [buildkit-plan.md](buildkit-plan.md). That plan's phases (P1-P4b)
+are **deduplication**: N independent builds that avoid redoing each other's
+work. They are built and measured; see
+[dist-buildkit-handover.md](dist-buildkit-handover.md).
+
+This plan is the alternative, not the continuation.
+
+## Why dedup could not win the thing we kept asking it for
+
+**On independent runners with spare capacity, duplicated work is free in
+wall-clock.** Twelve runners each building the 94s stem *in parallel* costs 94s.
+Twelve runners coordinating means one builds it and eleven BLOCK, then proceed:
+the same wall-clock at best, worse by `T_xfer` at the margin.
+
+So dedup buys cost and rate limits, and cannot buy latency. Measured, repeatedly:
+consolidation is *not slower*; single-flight on an idle box is *not faster*
+(373s coordinated vs 342s uncoordinated, inside a ~10% run-to-run spread).
+
+Both remain worth having. P4b took 100 origin requests to 25 across four
+runners, which is a rate-limit fix rather than a speed one. But the latency
+question needs a different mechanism.
+
+## The one structural fact
+
+**A queue needs one scheduler with global knowledge of readiness.** BuildKit's
+solver already is exactly that -- per build. So a fine-grained queue exists only
+if there is ONE build. With N independent solvers you can dedup between them and
+never queue across them, because nobody knows what is ready.
+
+The twelve `+test-no-qemu-groupN` shards exist *because* buildkit could not
+distribute one build. `+test-no-qemu` already BUILDs all twelve and needs no
+repo reorganisation. Give buildkit dispatch and the sharding is vestigial.
+
+## The unit is a SUBTREE, and it already has a name
+
+Dispatching one vertex at a time is absurd: ship the inputs, run 5ms, ship the
+result back, ship them out again for the dependent vertex. Over half of every
+shard is milliseconds of work (measured: 58% of group3's 214 exec vertices, 54%
+of group5's 521 are `echo`/`test`/`diff`/`mkdir`).
+
+Send a **subtree** instead and the arithmetic inverts:
+
+- its external inputs transfer ONCE
+- its intermediates are born and consumed on the peer and never cross the wire
+- only its boundary is paid for
+
+An **earthly target** is already that subtree: a chain of vertices with one
+output and a declared frontier. No graph partitioning, no heuristic boundary
+selection -- use the boundary the Earthfile author already wrote, that `BUILD`
+edges already connect, and that the lease key already keys on.
+
+Fewer, larger units also make each decision affordable to get right, which is
+the third argument against a cost model (below).
+
+## What already exists
+
+| piece | where | state |
+| ------------------------- | ------------------------------- | ----- |
+| serialisable work spec | `pb.ExecOp` - args, env, mounts, network, security | protobuf already |
+| receive a peer's result | `adoptLeaderResult` -> `worker.FromRemote` | built (P2) |
+| move layers peer-to-peer | mesh registry + blooms | built (P1/P4b) |
+| fleet choreography | `rebuck2/actions`: one driver job, N worker jobs | built, stress-tested |
+| persistence across runs | `bank/` - artifact pool, 8 ranges, primary-owner writes | built, stress-tested |
+
+The transport is done. The missing piece is **dispatch**: one protocol message
+saying *"lead on someone else's behalf"*, carrying a subtree's spec and the
+descriptor chains of its frontier.
+
+## Coordination must be batched, and mostly local
+
+`claim` is one HTTP POST per key, and it LONG-POLLS for followers. Group1's pair
+run recorded `led=828`: 828 round trips, over half of them for vertices cheaper
+than the round trip.
+
+Three levers, composing:
+
+1. **A gossiped bloom of published keys.** Not present -> definitely not
+   published -> build it, ZERO network operations. Present -> maybe -> one
+   batched query. Most vertices in a cold run are published by nobody, so the
+   common case costs nothing. `D2W::Blooms` already gossips; `mesh::Bloom`
+   already exists and is already documented as lying "only in the safe
+   direction".
+2. **Split the protocol.** A non-blocking BATCH query per wave (`published /
+   leading / free`), then blocking `claim` only for the few we intend to follow.
+   One request cannot hold open on behalf of twelve keys where three are
+   followers.
+3. **Dispatch by subtree**, so there are far fewer decisions to coordinate.
+
+## No cost model - a learned bloom instead
+
+A cost model is only needed if a wrong decision is HARMFUL, and it is harmful
+only because the requester blocks. Two things remove the harm:
+
+- **Stall-triggered offers.** Anything still running after N seconds is by
+  definition not a 5ms `echo`. Self-calibrating, and simpler than a threshold
+  table.
+- **A learned cheap-bloom.** Execute, record the duration, and add the key below
+  threshold. False positive = "cheap when it isn't" = we do the work ourselves,
+  which is what we were going to do. False negative is impossible. Learned from
+  data, not declared as patterns -- the failure mode of a declared model is that
+  a wrong threshold changes behaviour silently.
+
+Deferred, not cancelled: at full utilisation, hedged work displaces real work.
+That is also when we would have the data to build a cost model properly.
+
+**Instrument first.** Nothing currently times a vertex -- the daemon log has
+`creating` lines and no completions, so "trivial vs minutes" above is inferred
+from command text. A learned bloom needs real durations, which is a one-line
+addition beside the fork's existing `SFTIME` debug log.
+
+## Sequencing
+
+| | why now |
+| --- | ------- |
+| 0. **rebalance the twelve groups** | free, needs nothing; group4 is ~100x group11 and SETS makespan today |
+| 1. port the dedup delta onto main | new files carry cleanly; ~1590 lines of hooks |
+| 2. time vertices | the instrument every later decision needs |
+| 3. published-key bloom + batch query | kills per-vertex hops we already pay |
+| 4. `D2W::Lead { subtree, frontier }` | the only genuinely new protocol |
+| 5. coalesce CI to `+test-no-qemu` | one driver, N workers, existing actions |
+| 6. report **utilisation** | a 30%-idle fleet costs more than uneven shards |
+
+Step 0 is first on purpose: fixing the imbalance makes every later fleet number
+honest instead of flattering. Step 2 before 3 and 4 because nothing currently
+times a vertex, and a threshold picked without data is a guess wearing a number.
+
+## Excluded from dispatch by construction
+
+Propagates to the WHOLE subtree -- one excluded vertex excludes its subtree,
+conservatively:
+
+- `LOCALLY` - means *this* machine, definitionally
+- cache mounts - already excluded from single-flight; adoption is unsound
+  (`ExecOp.hasCacheMount`, measured: a follower got a dangling symlink)
+- `Secretenv` - shipping the spec ships the secret reference
+- `security=insecure` - granting a peer privileged exec is a trust decision, not
+  a scheduling one
+
+## Non-goals
+
+- **Normalisation** (a `norm.rs` analogue). buck2 injects the target label into
+  an otherwise-identical command, so normalising removes contamination that was
+  never semantic. A buildkit `ExecOp` has NO label -- measured twice: cross-shard
+  sharing is 10 commands with a ceiling of 41, and every within-shard
+  near-collapse is explained by `span`, which is display metadata already absent
+  from the cache key. buildkit already dedups these.
+- **A fourth `Executor` implementation.** Wrong seam: it is handed host mount
+  paths, not content digests, so shipping from there means tarring a mounted
+  rootfs and losing every bit of layer sharing.
+- **A second persistence mechanism.** `bank/` exists.
+- **More dedup measurement.** Its ceiling is understood.
+
+## Invariants this cost us to learn
+
+- **A `should_fail` test whose failure depends on something ABSENT from the
+  cache key cannot be served from cache and still mean anything.** Secrets and
+  credentials are deliberately outside buildkit's cache key, so a shared daemon
+  turned two negative tests green. 88 `should_fail` call sites exist; two were
+  reached. This class announces nothing when it breaks.
+- **An instrument that counts log lines is not counting daemons.** `grep -c` on
+  `running under pid=` overcounted ~8x once `--verbose` changed how much inner
+  output was echoed. Sample the machine (`pgrep -c buildkitd` at peak), not the
+  log.
+- **A bare `Canceled` is a real failure and earthly discards its reason** unless
+  `--verbose` is set. Twelve CI jobs died that way with the cause unrecoverable.
+- **Blooms must lie in the safe direction, and which direction that is depends
+  on the question.** For holdings, a false positive costs a confirmation. For
+  cheapness, it costs local execution. Both are safe; state which one before
+  reusing a bloom for a new question.
