@@ -335,3 +335,34 @@ Two consequences:
   order; the table fills as a side effect of the run, and run two is already
   informed. A cold-start path that has to be maintained separately is a second
   scheduler nobody tests.
+
+## 14. Bank by GENERATION, not by size
+
+Most of what a build produces dies young: it is rebuilt next commit and the
+banked copy is never read. A minority survives for months -- base images,
+dependency trees, toolchains, the stem. Banking both costs the same upload and
+returns wildly different value.
+
+So promote by SURVIVAL, exactly as a generational collector does. Track, per
+coarse key (principle 13), how many consecutive builds produced the same content
+digest. Below the tenuring threshold -- two or three generations -- do not bank
+it at all; it will be invalid before anything reads it, and every byte spent on
+it is spent twice: once uploading, once evicting.
+
+    changes every commit   -> never bank. Upload cost, zero hit rate.
+    stable 2-3 builds      -> tenure it. High hit rate per byte.
+    stable for months      -> the stem, the base images. The whole prize.
+
+This is a different question to `bank/`'s existing compaction policy, which
+decides WHEN to repack what is already banked. This decides what is admitted at
+all, and it is the cheaper lever: nothing beats not uploading.
+
+The statistic is a sibling of the duration one and wants the same coarse key for
+the same reason -- content-keyed stability is a contradiction, since the key
+changes exactly when the content does. Key on the target and ask "did this
+target's output digest change between runs", which is answerable and stable.
+
+Corollary: a cheap way to be wrong is to bank by SIZE, on the reasoning that big
+things are expensive to rebuild. Size is uncorrelated with survival. A 2 GB image
+layer rebuilt every commit is worth less than a 40 MB toolchain that has not
+moved since March.

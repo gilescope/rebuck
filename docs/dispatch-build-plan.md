@@ -89,8 +89,14 @@ empties it. `+deps` takes about as long as it did last week whether or not a
 source file moved. We are choosing robustness over precision, and the estimate
 only ever feeds decisions where being wrong is cheap.
 
+- **Also record STABILITY**, not only duration: how many consecutive builds
+  produced the same output digest for this key. That is what decides admission
+  to the bank (principle 14) -- and it wants the same coarse key, because
+  content-keyed stability is a contradiction: the key changes exactly when the
+  content does.
 - **Done when**: a second run can answer "how long does `+deps` take with these
-  args" with a median and a p90.
+  args" with a median and a p90, and "has `+deps` changed in the last three
+  builds".
 - **Why before M3-M5**: rebalancing, longest-first scheduling, the cheap-bloom
   and dispatch selection currently guess separately. This is the one instrument
   all four need, and M1 is presently blocked on not having it.
@@ -137,6 +143,34 @@ driver job owning the invocation, N worker jobs lending CPU, via main's existing
   ~3,590, with makespan no worse.
 - **Report utilisation PER PLATFORM**: a 60%-utilised heterogeneous fleet may be
   100% on linux and 0% elsewhere.
+
+## Why the critical path is not the binding constraint (but measure it anyway)
+
+The fleet is expected to be WORK-bound, not depth-bound: the suite's total work
+is far larger than the fleet's capacity, so makespan is set by throughput and
+batch efficiency rather than by the longest chain. That is the case for
+dispatch, and it is why per-vertex handover (principle 10) and per-vertex
+coordination were both the wrong granularity.
+
+It is still worth computing the critical path ONCE, from the graph plus M2's
+timings, because it answers a question nothing else does: **the N at which
+adding workers stops paying.** Below that N the fleet is work-bound and batch
+efficiency dominates; above it, we are buying runners to wait on a chain.
+
+## Bank the stem first, and compare against it
+
+Before M4/M5, the honest competitor to dispatch is: **bank the stem and keep
+twelve shards.** If the stem is stable across builds -- and by inspection it
+should be, it is the toolchain and the base images -- principle 14 tenures it,
+run two restores it, and the 1,176s of duplicated stem largely evaporates
+WITHOUT any dispatch at all.
+
+That would capture most of the compute saving for a fraction of the work. M2's
+stability statistic answers whether it holds; if it does, M4 and M5 must justify
+themselves on what is left, which is a much harder bar and the right one.
+
+Corollary from the same principle: do not bank what changes every commit. The
+upload is paid, the hit rate is zero, and the eviction is paid again.
 
 ## Open, and honest about it
 
