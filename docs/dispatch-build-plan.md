@@ -11,18 +11,18 @@ Per-group wall-clock, each measured COLD in its own rig invocation, because
 leaves the daemon warm for targets 2..N and every number after the first
 measures something else. Both columns are the same twelve groups.
 
-| group | cold | warm | delta |
-| ----- | ---: | ---: | ----: |
-| 1     | 321s | 361s |       |
-| 3     | 210s | 226s |       |
-| 4     | 435s | 312s |       |
-| 6     | 189s |  91s | **+98** |
-| 7     | 369s | 227s | +142  |
+| group | cold | warm |    delta |
+| ----- | ---: | ---: | -------: |
+| 1     | 321s | 361s |          |
+| 3     | 210s | 226s |          |
+| 4     | 435s | 312s |          |
+| 6     | 189s |  91s |  **+98** |
+| 7     | 369s | 227s |     +142 |
 | 8     | 195s |  94s | **+101** |
-| 9     | 414s | 300s |       |
+| 9     | 414s | 300s |          |
 | 10    | 203s |  90s | **+113** |
-| 11    | 222s | 110s |       |
-| 2, 5  | FAIL | 142s |       |
+| 11    | 222s | 110s |          |
+| 2, 5  | FAIL | 142s |          |
 
 The three bolded rows are the finding: groups whose own work is ~90s cost ~190s
 cold. **The delta is the shared stem, ~100s, and every group pays it.** That
@@ -76,6 +76,13 @@ of last resort, not a cost model).
 - **Done when**: cold makespan drops from ~550s toward ~300s, measured the same
   way as M0.
 - **Cost**: an Earthfile change and one measurement round. No new mechanism.
+- **The packer is built** -- `rebuck2 bank timings plan <table> <bins> <target>...`,
+  longest-processing-time-first, deterministic across machines so two runners
+  derive the same plan rather than disagreeing about which group each is
+  building. A target with no samples costs the MEDIAN of those that have them,
+  and the plan reports how many were placed that way, because a plan that is
+  mostly guesses should be read as one. What M1 now waits on is not the
+  mechanism but the SAMPLES -- see M2.
 
 ### M2 - the timing store
 
@@ -100,6 +107,31 @@ only ever feeds decisions where being wrong is cheap.
 - **Why before M3-M5**: rebalancing, longest-first scheduling, the cheap-bloom
   and dispatch selection currently guess separately. This is the one instrument
   all four need, and M1 is presently blocked on not having it.
+
+**Built** (`rebuck2/src/bank/timings.rs`): the coarse key, both statistics,
+tenure, the bin-packer, and banking across runs. `bank timings record | stats |
+plan | prune | tenured | merge | restore | publish`.
+
+Three decisions worth carrying, because each was a fork in the road:
+
+- **The banked unit is an OBSERVATION, not an aggregate** -- one row per
+  (key, run), with medians, p90s and stability computed at read time. That is
+  what lets a delta replay the way `bank/dice.rs`'s does: idempotent,
+  order-independent, first writer wins. Two runners adding to the same mean is
+  not order-independent, and the tidier-looking design is the broken one.
+- **The whole table travels, not a delta.** A few thousand lines after pruning
+  to eight samples a key, so one role's artifact bootstraps a cold machine.
+  `dice.rs` deltas because it is millions of rows.
+- **Fail open at every step**: an unreadable table, an artifact that will not
+  download, a digest that is not a digest -- each costs an estimate and never a
+  build. An estimate may only feed decisions where being wrong is cheap
+  (principle 13), and that has to include being absent.
+
+**Still open, and it is the whole remaining cost**: nothing yet RECORDS a
+sample. The `Started`/`Completed` ingest is earthbuild-side, and until it
+exists the table is empty, M1 has no numbers to pack with, and wiring the bank
+actions would bank nothing. That is also why the actions are deliberately not
+wired yet -- the dependency runs ingest -> samples -> wiring, not the reverse.
 
 ### M3 - batched, mostly-local coordination
 
@@ -156,6 +188,9 @@ It is still worth computing the critical path ONCE, from the graph plus M2's
 timings, because it answers a question nothing else does: **the N at which
 adding workers stops paying.** Below that N the fleet is work-bound and batch
 efficiency dominates; above it, we are buying runners to wait on a chain.
+
+Also if we know the critical path, then that helps make sure that we get that priority
+scheduled.
 
 ## Bank the stem first, and compare against it
 
