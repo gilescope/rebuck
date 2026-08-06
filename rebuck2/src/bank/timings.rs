@@ -127,6 +127,34 @@ pub struct Stats {
     pub p90_ms: u64,
 }
 
+/// Nearest-rank median of an unsorted slice; 0 for nothing at all.
+fn median(v: &[u64]) -> u64 {
+    if v.is_empty() {
+        return 0;
+    }
+    let mut v = v.to_vec();
+    v.sort_unstable();
+    v[(v.len() - 1) / 2]
+}
+
+/// An assignment of keys to runners, and what it expects each to cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    pub bins: Vec<Vec<Key>>,
+    pub totals: Vec<u64>,
+    /// How many keys were placed on the fallback prior rather than on
+    /// their own samples. A plan that is mostly guesses is one.
+    pub guessed: usize,
+}
+
+impl Plan {
+    /// The makespan this plan predicts: the worst bin, since they run in
+    /// parallel and the build is not done until the last one is.
+    pub fn makespan_ms(&self) -> u64 {
+        self.totals.iter().copied().max().unwrap_or(0)
+    }
+}
+
 /// Every observation, keyed coarsely, one row per (key, run).
 #[derive(Debug, Default, Clone)]
 pub struct Store {
@@ -243,6 +271,85 @@ impl Store {
         v
     }
 
+    /// Drop all but the newest `n` observations of each key.
+    ///
+    /// The table would otherwise grow one row per key per build forever,
+    /// and the old rows answer nothing: both statistics read from the
+    /// newest end. Pruning is not idempotent ACROSS machines - a peer
+    /// that still holds run 1 re-adds it on the next merge - but that is
+    /// harmless, because the row is dropped again and the estimate it
+    /// perturbs is coarse by construction.
+    pub fn retain_recent(&mut self, n: usize) -> usize {
+        let mut dropped = 0;
+        for runs in self.by_key.values_mut() {
+            while runs.len() > n {
+                let oldest = *runs.keys().next().expect("non-empty");
+                runs.remove(&oldest);
+                dropped += 1;
+            }
+        }
+        dropped
+    }
+
+    /// Split `keys` across `bins` runners, longest-processing-time-first.
+    ///
+    /// The standard makespan heuristic, and the reason M1 waited for
+    /// this module: the static per-target proxy it would otherwise use
+    /// correlates r=0.734 and is 10x wrong on groups with few targets.
+    ///
+    /// A key with no samples is costed at the MEDIAN of the keys that
+    /// have them. Zero would pile every unknown into one bin, and
+    /// refusing to place it is not an option - it still has to be built.
+    /// `Plan::guessed` says how many were placed that way, because a
+    /// plan that is mostly guesses should be read as one.
+    pub fn bin_pack(&self, keys: &[Key], bins: usize) -> Plan {
+        let mut plan = Plan {
+            bins: vec![Vec::new(); bins],
+            totals: vec![0; bins],
+            guessed: 0,
+        };
+        if bins == 0 {
+            return plan;
+        }
+
+        let known: Vec<u64> = keys
+            .iter()
+            .filter_map(|k| self.stats(k))
+            .map(|s| s.median_ms)
+            .collect();
+        let prior = median(&known);
+        // Descending cost, ties on the key: same input, same plan, on
+        // every machine (an unstable order here would make two runners
+        // disagree about which group they are building).
+        let mut costed: Vec<(u64, &Key, bool)> = keys
+            .iter()
+            .map(|k| match self.stats(k) {
+                Some(s) => (s.median_ms, k, false),
+                None => (prior, k, true),
+            })
+            .collect();
+        costed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+
+        for (ms, key, guessed) in costed {
+            // Lightest bin - LPT's greedy step. Ties break on how many
+            // keys the bin already holds, THEN on index: with a cold
+            // table every key costs the same nothing, and a tie-break on
+            // index alone would put all of them in bin 0. Same hazard
+            // for genuinely instant targets, of which this build has
+            // hundreds.
+            let (i, _) = plan
+                .totals
+                .iter()
+                .enumerate()
+                .min_by_key(|(i, t)| (**t, plan.bins[*i].len(), *i))
+                .expect("bins > 0");
+            plan.bins[i].push(key.clone());
+            plan.totals[i] += ms;
+            plan.guessed += usize::from(guessed);
+        }
+        plan
+    }
+
     /// Replay rows. Returns how many were new.
     ///
     /// Idempotent and order-independent, so a restore may apply several
@@ -308,6 +415,34 @@ pub fn cli(args: &[&str]) -> Result<()> {
             println!("{new}");
             Ok(())
         }
+        // M1: twelve groups of equal expected cost. Prints one line per
+        // bin, `<expected ms>\t<key>[\t<key>...]`, so the caller can
+        // hand bin N to runner N without re-deriving anything.
+        ["plan", file, bins, targets @ ..] => {
+            let s = Store::load(Path::new(file));
+            let keys: Vec<Key> = targets.iter().map(|t| Key::new(t, [])).collect();
+            let bins: usize = bins.parse().context("bins must be a runner count")?;
+            let plan = s.bin_pack(&keys, bins);
+            for (total, keys) in plan.totals.iter().zip(&plan.bins) {
+                let names: Vec<&str> = keys.iter().map(Key::as_str).collect();
+                println!("{total}\t{}", names.join("\t"));
+            }
+            eprintln!(
+                "[timings] makespan {}ms, {} of {} keys costed by prior",
+                plan.makespan_ms(),
+                plan.guessed,
+                keys.len()
+            );
+            Ok(())
+        }
+        ["prune", file, keep] => {
+            let path = Path::new(file);
+            let mut s = Store::load(path);
+            let dropped = s.retain_recent(keep.parse().context("keep must be a sample count")?);
+            s.save(path)?;
+            println!("{dropped}");
+            Ok(())
+        }
         // What is worth banking at all - the cheaper lever, since
         // nothing beats not uploading (principle 14).
         ["tenured", file] => {
@@ -320,6 +455,8 @@ pub fn cli(args: &[&str]) -> Result<()> {
             "usage: bank timings record <file> <run> <target> <ms> <digest|-> [args...]\n\
              \x20      bank timings stats <file> <target> [args...]\n\
              \x20      bank timings merge <file> <delta>...\n\
+             \x20      bank timings plan <file> <bins> <target>...\n\
+             \x20      bank timings prune <file> <keep>\n\
              \x20      bank timings tenured <file>"
         ),
     }
@@ -551,6 +688,114 @@ mod tests {
             s.stability(&k),
             1,
             "an unreadable digest teaches nothing about survival"
+        );
+    }
+
+    #[test]
+    fn the_table_does_not_grow_without_bound() {
+        // One row per key per build, forever, is not a statistics table -
+        // it is a log. Both statistics read from the newest end, so the
+        // old rows answer nothing.
+        let k = Key::new("+deps", []);
+        let mut s = Store::new();
+        for run in 1..=10 {
+            s.record(k.clone(), sample(run, run * 10, "beef"));
+        }
+        assert_eq!(s.retain_recent(3), 7);
+        assert_eq!(s.stats(&k).unwrap().count, 3);
+        assert_eq!(
+            s.to_lines(),
+            vec![
+                "8\t80\tbeef\t+deps",
+                "9\t90\tbeef\t+deps",
+                "10\t100\tbeef\t+deps"
+            ],
+            "the NEWEST runs must survive, not the first three seen"
+        );
+        assert_eq!(s.retain_recent(3), 0, "pruning twice drops nothing");
+
+        // A peer that still holds the old rows re-adds them on merge.
+        // Harmless: they are dropped again, and the estimate they
+        // perturb is coarse by construction.
+        let mut peer = Store::new();
+        peer.record(k.clone(), sample(1, 10, "beef"));
+        s.merge(peer.to_lines());
+        assert_eq!(s.stats(&k).unwrap().count, 4);
+        s.retain_recent(3);
+        assert_eq!(s.stats(&k).unwrap().count, 3);
+    }
+
+    #[test]
+    fn longest_first_packs_the_groups_m1_could_not() {
+        // M1's actual job: twelve groups of equal expected cost. The
+        // static proxy it would otherwise use correlates r=0.734 and is
+        // 10x wrong on small groups.
+        let mut s = Store::new();
+        let keys: Vec<Key> = [500u64, 400, 300, 300, 200, 100]
+            .iter()
+            .enumerate()
+            .map(|(i, ms)| {
+                let k = Key::new(&format!("+t{i}"), []);
+                s.record(k.clone(), sample(1, *ms, "beef"));
+                k
+            })
+            .collect();
+
+        let plan = s.bin_pack(&keys, 3);
+        assert_eq!(plan.guessed, 0);
+        assert_eq!(plan.totals.iter().sum::<u64>(), 1800, "no work may vanish");
+        assert_eq!(
+            plan.bins.iter().map(Vec::len).sum::<usize>(),
+            keys.len(),
+            "no key may be dropped or duplicated"
+        );
+        // LPT on 500/400/300/300/200/100 into 3 gives 600 each. The
+        // point of the exercise: the naive split sets makespan by the
+        // worst bin, and this one has no worst bin.
+        assert_eq!(plan.totals, vec![600, 600, 600]);
+        assert_eq!(plan.makespan_ms(), 600);
+
+        // Determinism: two runners must derive the SAME plan, or they
+        // disagree about which group each is building.
+        assert_eq!(plan, s.bin_pack(&keys, 3));
+        let shuffled: Vec<Key> = keys.iter().rev().cloned().collect();
+        assert_eq!(
+            plan.totals,
+            s.bin_pack(&shuffled, 3).totals,
+            "input order must not change the plan"
+        );
+
+        // A key with no samples costs the median of those that have
+        // them - zero would pile every unknown into one bin, and the
+        // work still has to be built somewhere.
+        let cold = Key::new("+brand-new", []);
+        let mut with_cold = keys.clone();
+        with_cold.push(cold);
+        let p = s.bin_pack(&with_cold, 3);
+        assert_eq!(p.guessed, 1);
+        assert_eq!(p.totals.iter().sum::<u64>(), 1800 + 300);
+
+        // A wholly cold table still produces a plan - round-robin by
+        // construction, since every key costs the same nothing.
+        let empty = Store::new();
+        let p = empty.bin_pack(&keys, 3);
+        assert_eq!(p.guessed, 6);
+        assert_eq!(
+            p.bins.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![2, 2, 2]
+        );
+
+        // Degenerate shapes must not panic: they are reached on the
+        // first build of a new lineage, not in a test only.
+        assert_eq!(s.bin_pack(&keys, 0).bins.len(), 0);
+        assert_eq!(s.bin_pack(&[], 3).totals, vec![0, 0, 0]);
+        assert_eq!(
+            s.bin_pack(&keys, 12)
+                .bins
+                .iter()
+                .filter(|b| b.is_empty())
+                .count(),
+            6
         );
     }
 
