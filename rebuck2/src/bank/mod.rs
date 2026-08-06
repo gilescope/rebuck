@@ -64,6 +64,23 @@ pub async fn run(args: &[String]) -> Result<()> {
         ["tar", store, batch, out] => tar(Path::new(store), Path::new(batch), Path::new(out)),
         ["link", store, paths, dst] => link(Path::new(store), Path::new(paths), Path::new(dst)),
         ["purge-failures", dir] => purge_failures(Path::new(dir)),
+        // Async, so it cannot live in `timings::cli` with the rest.
+        // Exit 3 = cold, as every other restore in here reports it.
+        ["timings", "restore", file, lineage, rest @ ..] => {
+            let got = timings::restore(
+                timings::Restore {
+                    table: Path::new(file),
+                    lineage,
+                    parent: rest.first().copied().filter(|p| !p.is_empty() && *p != "-"),
+                },
+                &bank_work(),
+            )
+            .await?;
+            if got.is_none() {
+                std::process::exit(3);
+            }
+            Ok(())
+        }
         ["timings", rest @ ..] => timings::cli(rest),
         ["fetch-list", m, owned] => {
             let m = manifest::Manifest::read(Path::new(m))?;

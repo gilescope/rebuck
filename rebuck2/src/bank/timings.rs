@@ -365,6 +365,119 @@ impl Store {
     }
 }
 
+/// How many observations of each key survive a publish.
+///
+/// Both statistics read from the newest end, so this is the whole
+/// history anything consults. It also bounds the artifact: the table
+/// would otherwise grow one row per key per build, forever.
+const KEEP_SAMPLES: usize = 8;
+
+/// `timings-<lineage>-<role>` - ONE artifact name per role per lineage.
+///
+/// Not per run: [`crate::github::Client::by_prefix`] already keeps the
+/// newest artifact of each name, so a stable name gives a self-cleaning
+/// head per role and a restore that downloads N artifacts for an
+/// N-machine fleet rather than N per lap.
+///
+/// The lineage is in the name because artifact names are not namespaced
+/// and provenance is checked against it - drop it and a branch feeds the
+/// trunk's schedule. The role is in the name because two roles on one
+/// run may not upload the same artifact name.
+pub fn artifact_name(lineage: &str, role: &str) -> String {
+    format!("timings-{lineage}-{role}")
+}
+
+pub struct Restore<'a> {
+    pub table: &'a Path,
+    pub lineage: &'a str,
+    pub parent: Option<&'a str>,
+}
+
+/// Merge every role's banked table into the local one.
+///
+/// Returns the rows gained, or `None` when nothing was found - a cold
+/// table is a normal first lap, and the caller falls back to structural
+/// order rather than to a made-up number.
+pub async fn restore(r: Restore<'_>, work: &Path) -> Result<Option<usize>> {
+    let gh = crate::github::Client::from_env()?;
+    std::fs::create_dir_all(work)?;
+
+    let mut arts = gh
+        .by_prefix(&format!("timings-{}-", r.lineage), r.lineage)
+        .await?;
+    // A branch with no table of its own inherits the trunk's. The
+    // estimate is coarse by construction, so the trunk's numbers are
+    // exactly as good a prior as this branch's would have been.
+    if arts.is_empty() {
+        if let Some(parent) = r.parent.filter(|p| *p != r.lineage) {
+            arts = gh.by_prefix(&format!("timings-{parent}-"), parent).await?;
+            if !arts.is_empty() {
+                println!("[timings] inheriting {parent}'s table");
+            }
+        }
+    }
+    if arts.is_empty() {
+        println!("[timings] no banked table - cold");
+        return Ok(None);
+    }
+
+    let mut store = Store::load(r.table);
+    let mut gained = 0;
+    for a in crate::github::newest_first(arts) {
+        let dir = work.join("timings-in");
+        // One role's table failing to download costs its samples, not
+        // the restore: an estimate may only feed decisions where being
+        // wrong is cheap, and that includes being absent.
+        if let Err(e) = gh.download_to(a.id, &dir).await {
+            eprintln!("[timings] {} unreadable, skipping: {e}", a.name);
+            continue;
+        }
+        gained += store.merge(
+            std::fs::read_to_string(dir.join("timings.txt"))
+                .unwrap_or_default()
+                .lines(),
+        );
+    }
+    store.retain_recent(KEEP_SAMPLES);
+    store.save(r.table)?;
+    println!(
+        "[timings] merged {gained} rows; {} keys tenured",
+        store.tenured_keys().len()
+    );
+    Ok(Some(gained))
+}
+
+pub struct Publish<'a> {
+    pub table: &'a Path,
+    pub lineage: &'a str,
+    pub role: &'a str,
+}
+
+/// Stage the whole table for upload. Returns false when there is
+/// nothing to bank.
+///
+/// The WHOLE table, not this lap's delta: it is a few thousand lines
+/// after pruning, and self-contained means one artifact bootstraps a
+/// cold machine. `bank/dice.rs` deltas because it is millions of rows;
+/// copying that machinery here would be ceremony for a text file.
+pub fn publish(p: Publish<'_>, work: &Path) -> Result<bool> {
+    let mut store = Store::load(p.table);
+    if store.to_lines().is_empty() {
+        println!("[timings] nothing recorded this lap");
+        return Ok(false);
+    }
+    store.retain_recent(KEEP_SAMPLES);
+    let out = work.join("timings-out");
+    std::fs::create_dir_all(&out)?;
+    store.save(&out.join("timings.txt"))?;
+    println!(
+        "[timings] staged {} rows as {}",
+        store.to_lines().len(),
+        artifact_name(p.lineage, p.role)
+    );
+    Ok(true)
+}
+
 /// `rebuck2 bank timings <verb> ...` - the seam a build step writes
 /// through, so recording a sample costs a shell line rather than a
 /// binding.
@@ -433,6 +546,27 @@ pub fn cli(args: &[&str]) -> Result<()> {
                 plan.guessed,
                 keys.len()
             );
+            Ok(())
+        }
+        ["publish", file, lineage, role] => {
+            let staged = publish(
+                Publish {
+                    table: Path::new(file),
+                    lineage,
+                    role,
+                },
+                &super::bank_work(),
+            )?;
+            if staged {
+                if let Ok(out) = std::env::var("GITHUB_OUTPUT") {
+                    use std::io::Write;
+                    writeln!(
+                        std::fs::OpenOptions::new().append(true).open(out)?,
+                        "have=1\nname={}",
+                        artifact_name(lineage, role)
+                    )?;
+                }
+            }
             Ok(())
         }
         ["prune", file, keep] => {
@@ -797,6 +931,72 @@ mod tests {
                 .count(),
             6
         );
+    }
+
+    #[test]
+    fn the_artifact_name_isolates_lineage_and_role() {
+        // Artifact names are not namespaced, and provenance is checked
+        // against the lineage IN the name - drop it and a branch feeds
+        // the trunk's schedule with its own numbers.
+        assert_ne!(
+            artifact_name("main", "driver"),
+            artifact_name("feature", "driver")
+        );
+        // Two roles on one run may not upload the same artifact name,
+        // and one runner hosts several (the driver box also runs a
+        // co-worker).
+        assert_ne!(
+            artifact_name("main", "driver"),
+            artifact_name("main", "worker")
+        );
+        // The prefix a restore lists on must match what a publish
+        // writes, or the bank is silently write-only.
+        assert!(artifact_name("main", "driver").starts_with("timings-main-"));
+    }
+
+    #[test]
+    fn a_publish_stages_a_bounded_self_contained_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("timings.txt");
+        let work = dir.path().join("work");
+
+        // Nothing recorded is not a failure - it is a lap that built
+        // only cache hits.
+        assert!(!publish(
+            Publish {
+                table: &table,
+                lineage: "main",
+                role: "driver"
+            },
+            &work
+        )
+        .unwrap());
+
+        let k = Key::new("+deps", []);
+        let mut s = Store::new();
+        for run in 1..=20 {
+            s.record(k.clone(), sample(run, 90_000 + run, "beef"));
+        }
+        s.save(&table).unwrap();
+        assert!(publish(
+            Publish {
+                table: &table,
+                lineage: "main",
+                role: "driver"
+            },
+            &work
+        )
+        .unwrap());
+
+        // Bounded: the artifact must not grow one row per key per build
+        // forever, and the newest samples are the ones that answer.
+        let staged = Store::load(&work.join("timings-out/timings.txt"));
+        assert_eq!(staged.stats(&k).unwrap().count, KEEP_SAMPLES);
+        assert_eq!(staged.stats(&k).unwrap().median_ms, 90_000 + 16);
+        // Self-contained: a cold machine restoring ONE role's artifact
+        // has a usable table, which is why the whole table travels
+        // rather than a delta.
+        assert!(staged.tenured(&k));
     }
 
     fn moved_record(s: &mut Store, k: &Key, run: u64, digest: &str) {
