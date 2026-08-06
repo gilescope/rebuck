@@ -127,11 +127,33 @@ Three decisions worth carrying, because each was a fork in the road:
   build. An estimate may only feed decisions where being wrong is cheap
   (principle 13), and that has to include being absent.
 
-**Still open, and it is the whole remaining cost**: nothing yet RECORDS a
-sample. The `Started`/`Completed` ingest is earthbuild-side, and until it
-exists the table is empty, M1 has no numbers to pack with, and wiring the bank
-actions would bank nothing. That is also why the actions are deliberately not
-wired yet -- the dependency runs ingest -> samples -> wiring, not the reverse.
+**The ingest needs no fork, and no earthbuild change either.** This plan said
+to record per-vertex `Started`/`Completed` from buildkit's status stream. It
+turns out `earthly --logstream-debug-file=X` already writes protojson deltas
+whose `TargetManifest` carries `canonicalName`, `overrideArgs`, both stamps and
+`dependsOn` -- and `overrideArgs` is already the `k=v` form the coarse key
+takes. Per-target is also COARSER than per-vertex, which is what principle 13
+wanted in the first place. `bank timings ingest <table> <run> <log>`.
+
+**Spans NEST, and it would have poisoned every estimate.** Measured on a real
+three-target build: `+test` 2995ms *contains* `+build` 2945ms *contains*
+`+deps` 469ms, so the spans of a 2995s build sum to 6409ms. A bin-packer fed
+those believes three targets' work where there is one target's. Samples carry
+SELF time -- span less what its dependencies were occupying. This was found by
+capturing a real run rather than reasoning about the format, which is the same
+lesson as "coordinate the seam that FIRES" (principle 8): one run settled what
+inference had wrong.
+
+**Still open**: an output digest. The log stream reports none, so STABILITY --
+principle 14's admission test, and the thing that decides whether banking the
+stem beats dispatch -- is the one statistic still unanswerable. `is_cached` on
+a target is the obvious candidate proxy and is NOT obviously right: on a fresh
+runner nothing is cached even when nothing changed, so it may measure cache
+warmth rather than survival. Worth measuring before trusting.
+
+Wiring into the bank actions stays deliberately undone until a real CI lap has
+produced a table worth banking -- the dependency runs ingest -> samples ->
+wiring, not the reverse.
 
 ### M3 - batched, mostly-local coordination
 
