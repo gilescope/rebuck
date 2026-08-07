@@ -9,6 +9,12 @@ license = "MIT"
 anyhow = "1"
 async-trait = "0.1"
 bazel-remote-apis = "0.27"
+# BuildKit's LLB wire types (pb::Op / ExecOp / Definition). The buildkit-
+# facing side of the fleet has to read what a subtree IS before deciding
+# whether it may travel. This crate rides bollard, tracks buildkit, and is
+# on the same prost/tonic 0.14 as everything else here - buildkit-proto,
+# the other candidate, has not moved since 2020.
+bollard-buildkit-proto = "0.8"
 futures = "0.3"
 iroh = "1"
 postcard = { version = "1", features = ["use-std"] }

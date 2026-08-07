@@ -10,6 +10,7 @@
 
 mod bank;
 mod bench;
+mod dispatch;
 mod driver;
 mod exec;
 mod github;
