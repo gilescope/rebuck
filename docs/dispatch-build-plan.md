@@ -176,6 +176,40 @@ Wiring into the bank actions stays deliberately undone until a real CI lap has
 produced a table worth banking -- the dependency runs ingest -> samples ->
 wiring, not the reverse.
 
+### M2.5 - port the dedup delta onto trunk (measured, and it is the blocker)
+
+M3 and M4 both extend `rebuck2/src/lease.rs`, which exists only on
+`giles-single-buildkit-with-dist`. That branch forked at `423e21a` (2026-07-12)
+and has 74 commits since -- but it never took what TRUNK gained in the same
+period, which includes the entire `bank/` module. So the three lines have three
+different module sets:
+
+| | has |
+| ------------------- | ---------------------------------- |
+| `origin/main` | `bank/` |
+| `giles-dispatch` | `bank/` + the timing store |
+| dedup branch | `lease.rs`, `registry.rs`, `payload/` |
+
+Merged in a scratch worktree to size it rather than guess:
+
+- **24 conflict hunks in 4 files** (`driver.rs` 10, `worker.rs` 5, `main.rs` 4,
+  `Cargo.lock` 5) between the dedup branch and TRUNK -- with none of the
+  dispatch work involved. This debt is pre-existing and grows with every
+  commit to either line.
+- **The dispatch work adds ONE hunk** to that, in this file. The timing store
+  is new files, and new files carry cleanly exactly as the plan predicted.
+- The conflicts are not union-able: the dedup branch MOVED code (e.g.
+  `result_digests` from `driver.rs` to `payload/reapi.rs`), so a side that
+  looks deleted is relocated, and a naive union duplicates it.
+- **`Cargo.toml` auto-merges into an INVALID file** -- no conflict marker, two
+  `reqwest` keys, one 0.12 and one 0.13. `cargo metadata` catches it; a merge
+  that only compiles the resolved conflicts does not. Resolution is 0.13 with
+  `stream` unioned in, which the mirror needs.
+
+So the plan's step 1 is its own PR against trunk, and it should happen before
+M3 rather than alongside it. Sequencing it after M2 rather than before cost
+nothing: the timing store never needed the lease.
+
 ### M3 - batched, mostly-local coordination
 
 A gossiped bloom of published lease keys, plus a non-blocking batch query;
