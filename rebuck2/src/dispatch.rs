@@ -245,6 +245,62 @@ pub fn next_work(load: Load, peer: &[u64], driver: &[u64]) -> Next {
     driver.first().map_or(Next::Idle, |&j| Next::Driver(j))
 }
 
+/// Below this, shipping a subtree costs more than building it.
+///
+/// NOT a cost model, which the plan rules out: it is the stall trigger.
+/// Anything still running after this is BY DEFINITION not a 5ms `echo`, and
+/// that is self-calibrating in a way a threshold table is not. The value is
+/// deliberately coarse - two orders of magnitude above the millisecond
+/// vertices (58% of one shard's execs are `echo`/`test`/`diff`/`mkdir`) and
+/// an order below the stem at ~94s - so being wrong by a factor of two
+/// changes no decision.
+pub const STALL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A peer we could offer this subtree to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Candidate {
+    pub id: u64,
+    pub platform: String,
+    pub load: Load,
+}
+
+/// Is this subtree big enough to be worth sending anywhere?
+///
+/// `est_p90` is the timing store's answer for this target, when it has one.
+/// A first build has none, and the fallback is the stall itself - which is
+/// why no cold-start path has to be maintained separately.
+pub fn worth_offering(
+    est_p90: Option<std::time::Duration>,
+    running_for: std::time::Duration,
+) -> bool {
+    // An estimate answers before the work has run, which is the whole value
+    // of keeping one: run two does not re-learn what run one already knew.
+    // Without one, the stall IS the answer, so the first build of anything
+    // needs no special case.
+    est_p90.unwrap_or(running_for) > STALL
+}
+
+/// Who to offer this subtree to, best first. Empty means build it yourself.
+pub fn offer_order(v: &Verdict, cands: &[Candidate]) -> Vec<u64> {
+    let mut able: Vec<&Candidate> = cands
+        .iter()
+        .filter(|c| {
+            // Ask the same question the peer will. A candidate that would
+            // decline is a wasted round trip, and a saturated one says so
+            // in its own load without being asked.
+            !matches!(
+                consider(c.load, v, &c.platform),
+                Err(Refusal::Undispatchable(_)) | Err(Refusal::WrongPlatform { .. })
+            ) && c.load.free() > 0
+        })
+        .collect();
+    // Emptiest first, so the work starts soonest. Ties on id, so two
+    // drivers deciding from the same state offer in the same order rather
+    // than crossing over.
+    able.sort_by_key(|c| (std::cmp::Reverse(c.load.free()), c.id));
+    able.into_iter().map(|c| c.id).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,6 +519,114 @@ mod tests {
             postcard::from_bytes::<W2D>(&bytes).unwrap(),
             W2D::Decline { job: 42, .. }
         ));
+    }
+
+    #[test]
+    fn only_work_worth_shipping_is_shipped() {
+        use std::time::Duration;
+        let s = Duration::from_secs;
+        let ms = Duration::from_millis;
+
+        // A cost model is only needed if a wrong decision is HARMFUL. The
+        // plan rules one out in favour of the stall trigger: anything still
+        // running after STALL is by definition not a 5ms echo.
+        assert!(!worth_offering(Some(ms(5)), ms(1)), "an echo stays home");
+        assert!(worth_offering(Some(s(94)), ms(1)), "the stem travels");
+
+        // No estimate is the FIRST build of anything, and it must be
+        // survivable rather than special-cased: the stall answers it.
+        assert!(!worth_offering(None, ms(200)));
+        assert!(worth_offering(None, s(30)), "still running - not an echo");
+
+        // The estimate decides even before the work has run long, which is
+        // the whole value of having one: run two does not wait to find out
+        // what run one already learned.
+        assert!(worth_offering(Some(s(60)), Duration::ZERO));
+    }
+
+    #[test]
+    fn an_offer_goes_to_someone_who_could_actually_take_it() {
+        let cand = |id, plat: &str, l: Load| Candidate {
+            id,
+            platform: plat.into(),
+            load: l,
+        };
+        let v = ok_verdict();
+
+        // Emptiest first: the work starts soonest, and the offer is least
+        // likely to come back as a decline.
+        let got = offer_order(
+            &v,
+            &[
+                cand(1, "linux/arm64", load(4, 2, 1)),
+                cand(2, "linux/arm64", load(4, 0, 0)),
+                cand(3, "linux/arm64", load(4, 1, 0)),
+            ],
+        );
+        assert_eq!(got, vec![2, 3, 1]);
+
+        // A saturated peer is not offered to at all - asking costs a round
+        // trip to be told what its load already said.
+        let got = offer_order(
+            &v,
+            &[
+                cand(1, "linux/arm64", load(2, 1, 1)),
+                cand(2, "linux/arm64", load(4, 0, 0)),
+            ],
+        );
+        assert_eq!(got, vec![2]);
+
+        // Platform is honoured before anything else. Idle mac and windows
+        // runners are NOT spare capacity for linux work, and emulation is a
+        // trap rather than a fallback - a queue that hands arm64 work to an
+        // amd64 box and calls it scheduled is the failure here.
+        let pinned = {
+            let mut o = plain();
+            o.platform = Some(pb::Platform {
+                os: "linux".into(),
+                architecture: "arm64".into(),
+                ..Default::default()
+            });
+            inspect(&def(vec![o]))
+        };
+        let got = offer_order(
+            &pinned,
+            &[
+                cand(1, "linux/amd64", load(8, 0, 0)),
+                cand(2, "darwin/arm64", load(8, 0, 0)),
+                cand(3, "linux/arm64", load(4, 3, 0)),
+            ],
+        );
+        assert_eq!(got, vec![3], "the only peer that can run it, busy or not");
+
+        // Nobody able => build it yourself. Duplicate work is always
+        // correct; a stall is worse than the work we set out to avoid.
+        assert_eq!(
+            offer_order(&pinned, &[cand(1, "linux/amd64", load(8, 0, 0))]),
+            Vec::<u64>::new()
+        );
+        assert_eq!(offer_order(&v, &[]), Vec::<u64>::new());
+
+        // An undispatchable subtree is offered to NOBODY, however idle the
+        // fleet is - the exclusion is about the work, not the capacity.
+        let bad = inspect(&def(vec![with_exec(plain(), |e| {
+            e.mounts = vec![mount(pb::MountType::Cache)]
+        })]));
+        assert_eq!(
+            offer_order(&bad, &[cand(1, "linux/arm64", load(8, 0, 0))]),
+            Vec::<u64>::new()
+        );
+
+        // Ties break on id, so two drivers deciding from the same state
+        // offer in the same order rather than crossing over.
+        let got = offer_order(
+            &v,
+            &[
+                cand(9, "linux/arm64", load(4, 0, 0)),
+                cand(2, "linux/arm64", load(4, 0, 0)),
+            ],
+        );
+        assert_eq!(got, vec![2, 9]);
     }
 
     #[test]
