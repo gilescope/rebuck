@@ -210,6 +210,43 @@ So the plan's step 1 is its own PR against trunk, and it should happen before
 M3 rather than alongside it. Sequencing it after M2 rather than before cost
 nothing: the timing store never needed the lease.
 
+**Port status** (worktree `~/git/gilescope/rebuck2-port`, branch
+`giles-port-dedup`): `Cargo.toml`, `Cargo.lock`, `main.rs` and `worker.rs`
+resolved; `driver.rs` is the whole remainder. Two resolutions worth keeping
+whatever happens next:
+
+- The worker's own AC row survives the payload seam by adding `exit_code` to
+  `payload::Done`. The fleet then applies trunk's policy
+  (`!do_not_cache && exit_code == 0`) by reading two scalars the payload
+  already decoded, instead of naming a proto type in worker code -- which is
+  the one thing that seam exists to prevent.
+- `norm::ensure_execution_metadata` moves from `driver.rs` to the REAPI
+  frontend, because after the refactor `AcLookup::Hit` carries opaque bytes and
+  `rpc.rs` is where they are decoded. Normalisation is a REAPI concern and
+  belongs where the proto is.
+
+**And one thing that is NOT a merge conflict.** Trunk's name-independent
+caching and the dedup branch's single-flight lease both restructure
+`Driver::execute`: trunk writes a `canonical_put` after execution, the dedup
+branch wraps submission in a `LeaderGuard`. They collide because **a canonical
+key and a lease key are two different identities for the same work**, and
+principle 3 -- one canonical result per key, first writer wins -- does not say
+which one the lease is taken on.
+
+Both answers are defensible and they are not equivalent:
+
+- **Lease on the ACTION key**: single-flight stays exactly as measured, and two
+  label-different-but-identical actions still both build. The canonical cache
+  then dedups them only on the SECOND run.
+- **Lease on the CANONICAL key**: label-different actions merge in the same
+  run, which is strictly more sharing -- but the lease key stops being what
+  buildkit matches on, which is principle 4's rule, and a canonicalisation bug
+  becomes a wrong-layer bug rather than a missed hit. Principle 5 says prefer
+  over-specific to under-specific, and that argues for the action key.
+
+Unresolved deliberately: it wants a decision, not a merge, and picking one
+quietly inside a conflict resolution is how it would go wrong.
+
 ### M3 - batched, mostly-local coordination
 
 A gossiped bloom of published lease keys, plus a non-blocking batch query;
