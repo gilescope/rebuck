@@ -257,6 +257,22 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
         };
         let (job, action) = match msg {
             D2W::Run { job, action } => (job, action),
+            // The offer is live and the answer is always no - for now, and
+            // safely. Building a subtree needs a buildkitd this worker does
+            // not yet drive, and declining IS the protocol working: the
+            // requester builds it itself, which is what it would have done
+            // anyway. Fail open, never fail wrong.
+            D2W::Lead { job, .. } => {
+                let _ = mesh::send_frame(
+                    &mut *ctrl_send.lock().await,
+                    &W2D::Decline {
+                        job,
+                        why: "no buildkit side on this worker yet".into(),
+                    },
+                )
+                .await;
+                continue;
+            }
             D2W::Ping { vitals } => {
                 if let Some(v) = vitals {
                     println!("[driver-vitals] {v}");

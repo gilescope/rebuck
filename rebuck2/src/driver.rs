@@ -607,6 +607,12 @@ impl Driver {
                     return Ok(()); // clean disconnect
                 };
                 match msg {
+                    // Refusal is not a failure - it is how the driver learns
+                    // the fleet is saturated without asking (principle 12).
+                    // The job stays ours to place elsewhere or build here.
+                    W2D::Decline { job, why } => {
+                        println!("[driver] worker declined subtree job {job}: {why}");
+                    }
                     W2D::Done {
                         job,
                         action_result,

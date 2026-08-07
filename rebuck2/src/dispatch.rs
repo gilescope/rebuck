@@ -159,6 +159,92 @@ pub fn inspect(def: &pb::Definition) -> Verdict {
     }
 }
 
+/// Why a worker said no to an offer.
+///
+/// Every one is a REASON, not an error: a decline is the protocol working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// No free slot. The backpressure signal proper.
+    Saturated,
+    /// This peer cannot run it - the subtree is pinned elsewhere.
+    WrongPlatform { wants: String, have: String },
+    /// The subtree may not travel at all; whoever offered it should not
+    /// have. Refusing rather than trusting the offerer's check is cheap.
+    Undispatchable(Exclusion),
+}
+
+/// A worker's current occupancy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Load {
+    pub slots: usize,
+    /// Subtrees being built for a PEER - each has a machine blocked on it.
+    pub peer: usize,
+    /// Ordinary jobs from the driver. Nobody is waiting on these.
+    pub driver: usize,
+}
+
+impl Load {
+    pub fn free(&self) -> usize {
+        self.slots.saturating_sub(self.peer + self.driver)
+    }
+}
+
+/// What a worker should pick up next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Next {
+    /// A peer is blocked on this. Always first.
+    Peer(u64),
+    Driver(u64),
+    Idle,
+}
+
+/// Should this worker accept an offered subtree?
+pub fn consider(load: Load, v: &Verdict, my_platform: &str) -> Result<(), Refusal> {
+    // Checked in this order on purpose. "This should never have been
+    // offered" and "I can never run this" must outrank "not right now":
+    // Saturated invites the offer back, and an offer that can never be
+    // accepted would then circulate forever.
+    if let Some((_, why)) = v.exclusions.first() {
+        return Err(Refusal::Undispatchable(why.clone()));
+    }
+    let wants = match &v.platform {
+        Platform::Any => None,
+        Platform::Pinned(p) => Some(p.clone()),
+        // Nowhere can run a split subtree, so no platform string matches.
+        Platform::Conflict(set) => Some(set.iter().cloned().collect::<Vec<_>>().join(" and ")),
+    };
+    if let Some(wants) = wants {
+        if wants != my_platform {
+            return Err(Refusal::WrongPlatform {
+                wants,
+                have: my_platform.to_owned(),
+            });
+        }
+    }
+    if load.free() == 0 {
+        return Err(Refusal::Saturated);
+    }
+    Ok(())
+}
+
+/// Which pending item to start. Principle 12: finishing beats starting.
+pub fn next_work(load: Load, peer: &[u64], driver: &[u64]) -> Next {
+    // Start nothing when full. Completions set makespan, starts do not - a
+    // fleet that always accepts converges on every machine being 90%
+    // through something and nothing finishing.
+    if load.free() == 0 {
+        return Next::Idle;
+    }
+    // Peer work first, unconditionally. A subdivided branch has a machine
+    // BLOCKED on it; new driver work does not. Without this, subdivision is
+    // a regression: workers sit on warm state waiting for peers who took
+    // fresh driver work instead.
+    if let Some(&j) = peer.first() {
+        return Next::Peer(j);
+    }
+    driver.first().map_or(Next::Idle, |&j| Next::Driver(j))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,6 +295,174 @@ mod tests {
             m.cache_opt = Some(pb::CacheOpt::default());
         }
         m
+    }
+
+    // --- M4: the offer, and the right to refuse ------------------------
+
+    fn load(slots: usize, peer: usize, driver: usize) -> Load {
+        Load {
+            slots,
+            peer,
+            driver,
+        }
+    }
+
+    fn ok_verdict() -> Verdict {
+        inspect(&def(vec![plain()]))
+    }
+
+    #[test]
+    fn a_worker_may_refuse_and_that_is_the_backpressure() {
+        let v = ok_verdict();
+        assert_eq!(consider(load(4, 1, 1), &v, "linux/arm64"), Ok(()));
+
+        // Saturated is the signal principle 12 is built on: a driver that
+        // cannot place work has learned the fleet is full without a metric.
+        assert_eq!(
+            consider(load(2, 1, 1), &v, "linux/arm64"),
+            Err(Refusal::Saturated)
+        );
+
+        // A pinned subtree offered to the wrong machine. Emulation is a
+        // trap, not a fallback - accepting here is how an amd64 box ends up
+        // running arm64 work slowly and the queue calls it scheduled.
+        let pinned = {
+            let mut o = plain();
+            o.platform = Some(pb::Platform {
+                os: "linux".into(),
+                architecture: "arm64".into(),
+                ..Default::default()
+            });
+            inspect(&def(vec![o]))
+        };
+        assert_eq!(
+            consider(load(4, 0, 0), &pinned, "linux/amd64"),
+            Err(Refusal::WrongPlatform {
+                wants: "linux/arm64".into(),
+                have: "linux/amd64".into()
+            })
+        );
+        assert_eq!(consider(load(4, 0, 0), &pinned, "linux/arm64"), Ok(()));
+        // An unpinned subtree runs anywhere.
+        assert_eq!(consider(load(4, 0, 0), &v, "windows/amd64"), Ok(()));
+
+        // The offerer already checked dispatchability. Checking again costs
+        // one comparison and means a bug there cannot ship us a secret.
+        let bad = inspect(&def(vec![with_exec(plain(), |e| {
+            e.secretenv = vec![SecretEnv {
+                id: "tok".into(),
+                name: "TOK".into(),
+                ..Default::default()
+            }]
+        })]));
+        assert_eq!(
+            consider(load(4, 0, 0), &bad, "linux/arm64"),
+            Err(Refusal::Undispatchable(Exclusion::Secret))
+        );
+
+        // Refusing an undispatchable subtree outranks being saturated: the
+        // offer was wrong, and saying "try me later" invites it back.
+        assert_eq!(
+            consider(load(1, 1, 0), &bad, "linux/arm64"),
+            Err(Refusal::Undispatchable(Exclusion::Secret))
+        );
+    }
+
+    #[test]
+    fn peer_work_goes_first_or_subdivision_is_a_regression() {
+        // Principle 12. When A subdivides and hands a branch to B, A is
+        // BLOCKED on B. If B prefers fresh driver work, A stalls while
+        // holding everything it has built - so the very mechanism meant to
+        // improve balance produces a fleet of blocked machines sitting on
+        // warm state.
+        assert_eq!(next_work(load(4, 0, 0), &[7], &[1, 2]), Next::Peer(7));
+        assert_eq!(next_work(load(4, 0, 0), &[], &[1, 2]), Next::Driver(1));
+        assert_eq!(next_work(load(4, 0, 0), &[], &[]), Next::Idle);
+
+        // Order within a queue is arrival order; the PRIORITY is between
+        // the queues, not inside them.
+        assert_eq!(next_work(load(4, 0, 0), &[9, 3], &[]), Next::Peer(9));
+
+        // No free slot: start nothing. Completions set makespan, starts do
+        // not - a fleet that always accepts converges on every machine
+        // being 90% through something and nothing finishing.
+        assert_eq!(next_work(load(2, 1, 1), &[7], &[1]), Next::Idle);
+        assert_eq!(next_work(load(0, 0, 0), &[7], &[1]), Next::Idle);
+    }
+
+    #[test]
+    fn the_wire_stays_readable_to_a_peer_that_has_not_been_updated() {
+        // postcard encodes an enum variant by INDEX, so inserting one in
+        // the middle silently reinterprets every later variant on a mixed-
+        // version fleet - a Ping read as a Finalize. New variants go on the
+        // END, and this pins the ones that already shipped.
+        use crate::mesh::{Dig, D2W, W2D};
+        let at = |v: &D2W| postcard::to_allocvec(v).unwrap()[0];
+        assert_eq!(
+            at(&D2W::Welcome {
+                decentralized: true
+            }),
+            0
+        );
+        assert_eq!(
+            at(&D2W::Run {
+                job: 1,
+                action: Dig {
+                    hash: "a".into(),
+                    size: 1
+                }
+            }),
+            1
+        );
+        assert_eq!(at(&D2W::Blooms { peers: vec![] }), 2);
+        assert_eq!(at(&D2W::Finalize { shard: 0, of: 1 }), 3);
+        assert_eq!(at(&D2W::Ping { vitals: None }), 4);
+        assert_eq!(at(&D2W::Exit), 5);
+        assert_eq!(
+            at(&D2W::Lead {
+                job: 1,
+                subtree: vec![],
+                frontier: vec![]
+            }),
+            6,
+            "Lead must be LAST - moving it renumbers everything before it"
+        );
+
+        // And it must survive the round trip with its payload intact: the
+        // subtree is a serialised Definition and the frontier is what the
+        // peer needs to fetch, so a lossy encode is a build that cannot start.
+        let lead = D2W::Lead {
+            job: 42,
+            subtree: b"\x0a\x02hi".to_vec(),
+            frontier: vec![Dig {
+                hash: "beef".into(),
+                size: 7,
+            }],
+        };
+        let bytes = postcard::to_allocvec(&lead).unwrap();
+        match postcard::from_bytes::<D2W>(&bytes).unwrap() {
+            D2W::Lead {
+                job,
+                subtree,
+                frontier,
+            } => {
+                assert_eq!(job, 42);
+                assert_eq!(subtree, b"\x0a\x02hi".to_vec());
+                assert_eq!(frontier.len(), 1);
+                assert_eq!(frontier[0].hash, "beef");
+            }
+            other => panic!("round trip lost the variant: {other:?}"),
+        }
+
+        let decline = W2D::Decline {
+            job: 42,
+            why: "saturated".into(),
+        };
+        let bytes = postcard::to_allocvec(&decline).unwrap();
+        assert!(matches!(
+            postcard::from_bytes::<W2D>(&bytes).unwrap(),
+            W2D::Decline { job: 42, .. }
+        ));
     }
 
     #[test]

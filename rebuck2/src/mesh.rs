@@ -132,6 +132,15 @@ pub enum W2D {
     Finalized {
         shard: u8,
     },
+    /// "No." Refusal IS the backpressure (principle 12): a driver that
+    /// cannot place work has learned the fleet is saturated without needing
+    /// a metric to tell it, and a protocol where the coordinator ASSIGNS
+    /// cannot express this and would have to rediscover it as a load
+    /// signal, later and worse.
+    Decline {
+        job: u64,
+        why: String,
+    },
 }
 
 /// Driver → worker, on the control stream.
@@ -167,6 +176,19 @@ pub enum D2W {
     },
     /// Orderly shutdown: exit now (driver teardown, no shard assignment).
     Exit,
+    /// Build this subtree on someone else's behalf - an OFFER, never an
+    /// assignment. Answer with [`W2D::Decline`] to refuse it.
+    ///
+    /// `subtree` is a serialised buildkit `pb.Definition`; `frontier` is the
+    /// blobs the peer needs to start, which it fetches over the mesh. The
+    /// driver arbitrates and carries NEITHER (principle 6) - the frontier
+    /// and the result travel peer to peer, and the test for that is blunt:
+    /// after the build, look at the driver's disk.
+    Lead {
+        job: u64,
+        subtree: Vec<u8>,
+        frontier: Vec<Dig>,
+    },
 }
 
 /// Worker → driver, each on a fresh bi-stream (header, then raw bytes for Put).
