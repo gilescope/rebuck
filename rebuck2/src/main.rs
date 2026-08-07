@@ -13,6 +13,7 @@ mod bench;
 mod driver;
 mod exec;
 mod github;
+mod lease;
 mod mesh;
 mod norm;
 mod rpc;
