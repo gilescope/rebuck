@@ -119,6 +119,35 @@ pub enum Claim {
     Done(Vec<u8>),
 }
 
+/// Non-blocking status of a key - what a batch query answers.
+///
+/// Principle 10's smaller twin: `claim` is one round trip per vertex, and a
+/// pair run recorded `led=828`, over half of them for vertices cheaper than
+/// the round trip that asked about them. Per-vertex is the wrong granularity
+/// for TALKING about work as well as for moving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyState {
+    /// A canonical result exists. Claim it and adopt - do not build.
+    Published,
+    /// Someone holds the lease and is building it. Claim only if you intend
+    /// to WAIT; that is the one case worth a blocking round trip.
+    Leading,
+    /// Nobody has it. Build it, and spend ZERO network operations finding
+    /// that out - which is the common case on a cold run.
+    Free,
+}
+
+/// A lease key, as the bloom must see it.
+///
+/// [`crate::mesh::Bloom`] slices its probe positions straight out of the hex
+/// of a sha256 - it was built for blob hashes. Lease keys are ARBITRARY
+/// strings (`resolve-abc`, a buildkit cache key), so handing one over raw
+/// makes every probe fail to parse: the insert is a no-op, `contains` is
+/// always false, and the whole optimisation is silently inert. Hash first.
+pub fn bloom_key(key: &str) -> String {
+    crate::store::sha256_hex(key.as_bytes())
+}
+
 /// The lease table. One per driver — it is the fleet's single coordinator, so
 /// there is no consensus problem to solve, only a liveness one.
 pub struct Leases {
@@ -237,6 +266,45 @@ impl Leases {
             self.resolve_merged
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// Status of many keys in ONE non-blocking pass, taking no lease and
+    /// waking no waiter. Order matches `keys`.
+    pub fn query(&self, keys: &[&str]) -> Vec<KeyState> {
+        let map = self.inner.lock().unwrap();
+        keys.iter()
+            .map(|k| match map.get(*k) {
+                Some(e) if e.done.is_some() => KeyState::Published,
+                // An EXPIRED holder is not leading anything - saying so
+                // would send a caller off to follow a corpse. `reap` will
+                // clear it; until then it reads as free, which is the
+                // answer that makes them build rather than wait.
+                Some(e) if e.expires.is_some_and(|t| t <= Instant::now()) => KeyState::Free,
+                Some(_) => KeyState::Leading,
+                None => KeyState::Free,
+            })
+            .collect()
+    }
+
+    /// A bloom of every key with a canonical result, for gossip.
+    ///
+    /// Absent => definitely not published => build it, zero network. Present
+    /// => maybe => one batched query. The lie is one wasted query, never a
+    /// missed result: for THIS question a false positive is the safe
+    /// direction, and stating which direction that is before reusing a bloom
+    /// is the rule.
+    pub fn published_bloom(&self) -> crate::mesh::Bloom {
+        let map = self.inner.lock().unwrap();
+        let published: Vec<&String> = map
+            .iter()
+            .filter(|(_, e)| e.done.is_some())
+            .map(|(k, _)| k)
+            .collect();
+        let mut b = crate::mesh::Bloom::with_capacity(published.len());
+        for k in published {
+            b.insert(&bloom_key(k));
+        }
+        b
     }
 
     /// (led, merged) restricted to image resolutions. The number that says a
@@ -449,6 +517,89 @@ impl Leases {
 
 #[cfg(test)]
 mod tests {
+    // --- M3: batched, mostly-local coordination -------------------------
+
+    #[test]
+    fn a_raw_lease_key_is_inert_in_the_blob_bloom() {
+        use crate::mesh::Bloom;
+        // The hazard this module's `bloom_key` exists for. mesh::Bloom was
+        // built for blob hashes and slices probe positions out of the hex;
+        // a lease key is an arbitrary string, so every probe fails to parse
+        // and the insert silently does NOTHING.
+        //
+        // Pinned as a test because the failure is invisible: the bloom
+        // answers "not present" forever and the optimisation looks like it
+        // is merely not helping. Single-flight was inert for every build
+        // with a COPY for exactly this shape of reason.
+        let mut raw = Bloom::with_capacity(64);
+        raw.insert("resolve-alpine:3.20");
+        assert!(
+            !raw.contains("resolve-alpine:3.20"),
+            "if this ever passes, mesh::Bloom learned to hash and bloom_key \
+             can go - until then, removing it makes M3 silently inert"
+        );
+
+        // Hashed first, it behaves.
+        let mut hashed = Bloom::with_capacity(64);
+        hashed.insert(&super::bloom_key("resolve-alpine:3.20"));
+        assert!(hashed.contains(&super::bloom_key("resolve-alpine:3.20")));
+        assert!(!hashed.contains(&super::bloom_key("resolve-alpine:3.21")));
+    }
+
+    #[test]
+    fn the_published_bloom_routes_and_lies_only_the_safe_way() {
+        use super::*;
+        let l = Leases::default();
+        // Two keys built and published, one still building, one untouched.
+        assert!(matches!(l.claim_local("built-a"), Claim::Leader));
+        l.release("built-a", None, Outcome::Done(b"A".to_vec()));
+        assert!(matches!(l.claim_local("built-b"), Claim::Leader));
+        l.release("built-b", None, Outcome::Done(b"B".to_vec()));
+        assert!(matches!(l.claim_local("in-flight"), Claim::Leader));
+
+        let bloom = l.published_bloom();
+        // Present => maybe => worth one batched query.
+        assert!(bloom.contains(&bloom_key("built-a")));
+        assert!(bloom.contains(&bloom_key("built-b")));
+        // A key still being BUILT has no result, so it must not be in the
+        // published bloom - a follower would adopt a result that does not
+        // exist yet.
+        assert!(!bloom.contains(&bloom_key("in-flight")));
+        // Absent => DEFINITELY not published => build it, zero network. This
+        // is the common case on a cold run and the whole saving.
+        assert!(!bloom.contains(&bloom_key("never-heard-of-it")));
+    }
+
+    #[test]
+    fn a_batch_query_answers_many_keys_and_takes_nothing() {
+        use super::*;
+        let l = Leases::default();
+        assert!(matches!(l.claim_local("done"), Claim::Leader));
+        l.release("done", None, Outcome::Done(b"r".to_vec()));
+        assert!(matches!(l.claim_local("busy"), Claim::Leader));
+
+        let got = l.query(&["done", "busy", "free"]);
+        assert_eq!(
+            got,
+            vec![KeyState::Published, KeyState::Leading, KeyState::Free],
+            "order must match the keys asked about"
+        );
+
+        // The POINT: a query is not a claim. Asking must not make us the
+        // leader of a free key, or a wave-wide query would take out a lease
+        // on every vertex in the wave - which is worse than the per-vertex
+        // claim it replaces.
+        assert_eq!(l.query(&["free"]), vec![KeyState::Free]);
+        assert!(
+            matches!(l.claim_local("free"), Claim::Leader),
+            "querying a free key must leave it free"
+        );
+
+        // Nor may it consume the canonical result or wake a waiter.
+        assert!(matches!(l.claim_local("done"), Claim::Done(_)));
+        assert_eq!(l.query(&[]), Vec::new(), "an empty wave asks nothing");
+    }
+
     use super::*;
 
     fn leader(c: Claim) -> bool {
