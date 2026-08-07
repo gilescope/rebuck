@@ -92,6 +92,13 @@ runs:
             "$CAS_LINEAGE" "$GITHUB_RUN_ID" "${CAS_PARENT_LINEAGE:--}"
         fi
 
+        # Coarse per-target estimates. Never fatal, for the same reason the
+        # restore is not: a lap that banks no timings schedules worse next
+        # time and builds the same thing.
+        rebuck2 bank timings publish "$BANK_WORK/timings.txt" \
+          "$CAS_LINEAGE" "$IN_ROLE" || \
+          echo "[timings] publish failed - no estimates banked this lap"
+
     # Self-verification is step ORDER, not a checker: each manifest upload
     # is gated on the container upload that precedes it succeeding, so a
     # manifest can never reference a container that did not land. A death
@@ -119,6 +126,15 @@ runs:
         name: cas-spill-${{ steps.pack.outputs.lineage }}-${{ github.run_id }}-${{ inputs.role }}
         path: ${{ steps.pack.outputs.bank-work }}/bank-spill
         compression-level: 0
+
+    # Name must match `timings::artifact_name` - the restore lists on
+    # `timings-<lineage>-` and a mismatch makes the bank silently
+    # write-only. Not gated on a container: the table IS the artifact.
+    - if: always() && steps.pack.outputs.timings-have == '1'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: timings-${{ steps.pack.outputs.lineage }}-${{ inputs.role }}
+        path: ${{ steps.pack.outputs.bank-work }}/timings-out
 
     - id: ac-container
       if: always() && steps.pack.outputs.ac-have == '1'

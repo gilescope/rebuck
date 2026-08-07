@@ -600,9 +600,12 @@ pub fn cli(args: &[&str]) -> Result<()> {
             if staged {
                 if let Ok(out) = std::env::var("GITHUB_OUTPUT") {
                     use std::io::Write;
+                    // NOT `have` - cas-publish already owns that key in
+                    // the same step's output, and the two uploads would
+                    // gate on each other.
                     writeln!(
                         std::fs::OpenOptions::new().append(true).open(out)?,
-                        "have=1\nname={}",
+                        "timings-have=1\ntimings-name={}",
                         artifact_name(lineage, role)
                     )?;
                 }
@@ -994,6 +997,25 @@ mod tests {
         // The prefix a restore lists on must match what a publish
         // writes, or the bank is silently write-only.
         assert!(artifact_name("main", "driver").starts_with("timings-main-"));
+    }
+
+    #[test]
+    fn the_action_uploads_under_the_name_the_restore_lists() {
+        // The bank is silently WRITE-ONLY if these drift: publish uploads
+        // `timings-<lineage>-<role>`, restore lists the prefix
+        // `timings-<lineage>-`, and nothing anywhere fails if the two stop
+        // agreeing - the table just never comes back. So the workflow's
+        // string is checked against the function that defines it.
+        let yaml = include_str!("../../actions/bank-publish/action.yml");
+        let expected = "name: timings-${{ steps.pack.outputs.lineage }}-${{ inputs.role }}";
+        assert!(
+            yaml.contains(expected),
+            "bank-publish must upload as {expected:?}, matching artifact_name"
+        );
+        assert_eq!(artifact_name("LIN", "ROLE"), "timings-LIN-ROLE");
+        // And the gate may not be `have`, which cas-publish already owns in
+        // the same step - the two uploads would gate on each other.
+        assert!(yaml.contains("steps.pack.outputs.timings-have == '1'"));
     }
 
     #[test]

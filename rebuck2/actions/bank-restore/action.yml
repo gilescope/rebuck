@@ -66,6 +66,12 @@ outputs:
   cold:
     description: '"1" when there was no bank to restore from.'
     value: ${{ steps.ac.outputs.cold }}
+  timings-table:
+    description: >-
+      Path to the coarse per-target timing table. Pass it to
+      `rebuck2 bank timings ingest <table> <run> <logstream-debug-file>`
+      after the build, and bank-publish will bank it.
+    value: ${{ steps.ac.outputs.timings-table }}
 
 runs:
   using: composite
@@ -130,6 +136,22 @@ runs:
         rebuck2 bank ac-restore "$STORE" "$IN_ROLE" "$IN_MODE" "$CAS_LINEAGE" "${CAS_PARENT_LINEAGE:--}" || rc=$?
         if [ "$rc" -eq 3 ]; then cold=1; elif [ "$rc" -ne 0 ]; then exit "$rc"; fi
         [ "$cold" -eq 0 ] || echo "cold=1" >> "$GITHUB_OUTPUT"
+
+        # The coarse per-target estimates, which are NOT part of the bank's
+        # cold/warm question: a build with no timing table schedules worse
+        # and builds the same thing. So a cold or broken table is a warning
+        # and never `cold=1`, which gates real bank behaviour, and never a
+        # non-zero exit. An estimate may only feed decisions where being
+        # wrong is cheap - and that has to include being absent.
+        TABLE="$BANK_WORK/timings.txt"
+        echo "timings-table=$TABLE" >> "$GITHUB_OUTPUT"
+        rc=0
+        rebuck2 bank timings restore "$TABLE" "$CAS_LINEAGE" "${CAS_PARENT_LINEAGE:--}" || rc=$?
+        case "$rc" in
+          0) ;;
+          3) echo "[timings] cold table - this lap schedules structurally" ;;
+          *) echo "[timings] restore failed (rc=$rc) - continuing without estimates" ;;
+        esac
 
     # Anything that crossed the artifact wall proves itself before the
     # build can use it. This is the engine's own verifier: portable,
