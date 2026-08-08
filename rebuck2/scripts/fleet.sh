@@ -37,6 +37,10 @@ PROXY_PORT=${PROXY_PORT:-11234}
 # uniform, and placement that ignores capacity is invisible until one machine
 # is slower than the rest.
 SLOW=${SLOW:-}
+# How many times to run the build set through the SAME proxy. One round can
+# only ever measure a cold fleet: every solve of a fan-out is placed before
+# any of them has finished, so nothing learned during a round can affect it.
+ROUNDS=${ROUNDS:-1}
 
 crate=$(cd "$(dirname "$0")/.." && pwd)
 rm -rf "$RUN"
@@ -168,33 +172,37 @@ else
   done
 fi
 
-say "$BUILDS builds through $addr"
-start=$(date +%s)
-n=0
-builds=()
-for f in "$RUN"/llb/*.llb; do
-  if [ "$n" -ge "$BUILDS" ]; then break; fi
-  # Export the result. Exit 0 says a build ran; it says nothing about what
-  # came back, and a distributed buildkit that returns the wrong bytes is
-  # worse than a slow one. The exported tree is what gets hashed below.
-  bctl --addr "$addr" build --no-cache \
-    --output "type=local,dest=$RUN/out-$n" <"$f" >"$RUN/build-$n.log" 2>&1 &
-  builds+=($!)
-  n=$((n + 1))
-done
-# Wait on the BUILD pids only. A bare `wait` also waits on the registry and
-# the proxy, neither of which ever exits, so the harness hangs forever
-# having already finished the measurement.
 fail=0
-for p in "${builds[@]}"; do
-  wait "$p" || fail=1
+walls=()
+for round in $(seq 1 "$ROUNDS"); do
+  say "round $round/$ROUNDS: $BUILDS builds through $addr"
+  start=$(date +%s)
+  n=0
+  builds=()
+  for f in "$RUN"/llb/*.llb; do
+    if [ "$n" -ge "$BUILDS" ]; then break; fi
+    # Export the result. Exit 0 says a build ran; it says nothing about what
+    # came back, and a distributed buildkit that returns the wrong bytes is
+    # worse than a slow one. The exported tree is what gets hashed below.
+    rm -rf "$RUN/out-$n"
+    bctl --addr "$addr" build --no-cache \
+      --output "type=local,dest=$RUN/out-$n" <"$f" >"$RUN/build-$n.log" 2>&1 &
+    builds+=($!)
+    n=$((n + 1))
+  done
+  # Wait on the BUILD pids only. A bare `wait` also waits on the registry and
+  # the proxy, neither of which ever exits, so the harness hangs forever
+  # having already finished the measurement.
+  for p in "${builds[@]}"; do
+    wait "$p" || fail=1
+  done
+  walls+=($(($(date +%s) - start)))
 done
-elapsed=$(($(date +%s) - start))
 
 say "result"
 echo "daemons : $DAEMONS"
 echo "builds  : $BUILDS"
-echo "wall    : ${elapsed}s"
+echo "wall    : ${walls[*]}s (per round)"
 echo "failed  : $fail"
 
 if [ -z "$NOPROXY" ]; then

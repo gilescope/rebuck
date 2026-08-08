@@ -406,6 +406,38 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # Remembering, and a control that nearly was not run
+//!
+//! Taking work back is reactive: without memory the fleet rediscovers the
+//! slow machine once per solve, paying the bound every time. A peer taken
+//! back from is struck, and a strike biases placement away from it.
+//!
+//! Three rounds of the same six builds through ONE proxy, and a uniform
+//! fleet run as a control:
+//!
+//! ```text
+//! slow peer  wall 39 10 10s   placed {home: 6, peer1: 10, peer2: 2}
+//! uniform    wall 12 10 10s   placed {home: 6, peer1:  6, peer2: 6}
+//! ```
+//!
+//! The wall clock is NOT the evidence, and reading it as such was the near
+//! miss. "Round 2 dropped to 10s, so avoidance works" is wrong: the control
+//! shows a uniform fleet also drops to 10s, because rounds 2 and 3 hit the
+//! peers' own caches. 10s is the cached floor, reached either way.
+//!
+//! The evidence is the placement counts, which had to be added to see it:
+//! peer 2 took 2 of 18 placements - its two cold round-1 solves - and nothing
+//! afterwards, against 6 in the control. The inference from timing does hold
+//! once stated properly (peer 2 is both slow AND still cold, so a round-2
+//! placement there would have cost ~160s, not 10s), but an argument that
+//! subtle is a reason to count the thing directly.
+//!
+//! A strike is a bias, not a ban: a struck peer still wins against peers
+//! holding several jobs each, because a fleet that banned machines outright
+//! would shrink itself on one bad minute. And when EVERY away peer is struck,
+//! the work goes home - otherwise a two-daemon fleet with one bad peer would
+//! offer, wait out the bound and take it back, on every single solve.
+//!
 //! Two counting bugs surfaced here, both of the same kind - a number that
 //! blames the wrong thing. The take-back arrived at the caller as an `Err`
 //! and was counted as "peer refused", accusing a machine of refusing work it
@@ -684,6 +716,12 @@ pub struct Proxy {
     /// What completed adoptions have cost, in ms. The basis for calling one
     /// slow - see `hedge_after`.
     adopted_ms: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    /// How many times each peer has been taken back from, indexed by peer.
+    ///
+    /// Never reset. Within one proxy's life a machine that was four times
+    /// slower than the fleet stays four times slower; forgetting means
+    /// rediscovering it once per solve, at the cost of the bound each time.
+    strikes: std::sync::Arc<Vec<std::sync::atomic::AtomicUsize>>,
     /// Adoptions currently in flight on each AWAY peer, indexed by peer.
     ///
     /// Index 0 is unused and always zero: peer 0 never adopts. Kept aligned
@@ -708,6 +746,7 @@ impl Proxy {
             peers: Default::default(),
             adopted_ms: Default::default(),
             outstanding: Default::default(),
+            strikes: Default::default(),
             next_peer: Default::default(),
             ref_home: Default::default(),
         })
@@ -718,22 +757,22 @@ impl Proxy {
     }
 
     /// Whose turn it is next, over the WHOLE fleet.
-    fn next_turn(&self) -> usize {
+    /// `None` means build it here. See `place`.
+    fn next_place(&self) -> Option<usize> {
         let cursor = self
             .next_peer
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let t = turn(cursor, self.peers.len());
-        if t == 0 {
-            return 0;
-        }
-        // Away. WHICH away is a separate question with better information
-        // behind it - see `least_loaded`. Indices 1.. only, offset back into
-        // fleet space.
-        let load: Vec<usize> = self.outstanding[1..]
-            .iter()
-            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
-            .collect();
-        1 + least_loaded(&load, cursor)
+        let read = |v: &[std::sync::atomic::AtomicUsize]| -> Vec<usize> {
+            v.iter()
+                .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                .collect()
+        };
+        place(
+            cursor,
+            self.peers.len(),
+            &read(&self.outstanding[1..]),
+            &read(&self.strikes[1..]),
+        )
     }
 
     /// Wait for a peer to build it - but not forever, once the fleet has said
@@ -791,8 +830,9 @@ impl Proxy {
                         .lock()
                         .expect("wire")
                         .rejected
-                        .entry("peer too slow".to_owned())
+                        .entry(format!("peer {peer} too slow"))
                         .or_default() += 1;
+                    self.strikes[peer].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Adoption::TookBack;
                 }
             }
@@ -820,6 +860,11 @@ impl Proxy {
         }
         println!("[proxy] {} daemon(s) in the fleet", peers.len());
         self.outstanding = std::sync::Arc::new(
+            (0..peers.len())
+                .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                .collect(),
+        );
+        self.strikes = std::sync::Arc::new(
             (0..peers.len())
                 .map(|_| std::sync::atomic::AtomicUsize::new(0))
                 .collect(),
@@ -1142,6 +1187,44 @@ fn hedge_after(observed: &[u64]) -> Option<std::time::Duration> {
     ))
 }
 
+/// Where this solve goes: `None` means home.
+///
+/// Three inputs, because each answers something the others cannot. `cursor`
+/// keeps peer 0 in the rotation (its own occupancy is unobservable from here).
+/// `load` is exact in-flight adoptions. `strikes` is memory: a peer taken back
+/// for being abnormally slow is not merely busy, and without memory the fleet
+/// rediscovers that fact once per solve.
+///
+/// `load` and `strikes` are indexed over AWAY peers only - peer 0 is neither
+/// counted nor struck - so the returned index is offset back into fleet space
+/// by the caller.
+fn place(cursor: usize, peers: usize, load: &[usize], strikes: &[usize]) -> Option<usize> {
+    /// A struck peer is treated as though it already holds this many jobs.
+    ///
+    /// Deliberately the same number as `hedge_after`'s factor: the peer
+    /// exceeded three times normal, so it is discounted by three times a job.
+    /// This is a bias, not a ban - a peer with one strike still wins against
+    /// peers holding four jobs each, and a fleet that banned machines
+    /// outright would shrink itself on one bad minute.
+    const STRIKE_WEIGHT: usize = 3;
+    if peers <= 1 || turn(cursor, peers) == 0 {
+        return None;
+    }
+    debug_assert_eq!(load.len(), strikes.len(), "away peers counted twice over");
+    // Every away peer has misbehaved: home is the fail-open answer
+    // (principle 5). Without this a two-daemon fleet whose only peer is bad
+    // would offer to it, wait out the bound, and take it back - every solve.
+    if !strikes.is_empty() && strikes.iter().all(|&s| s > 0) {
+        return None;
+    }
+    let effective: Vec<usize> = load
+        .iter()
+        .zip(strikes)
+        .map(|(&l, &s)| l + s * STRIKE_WEIGHT)
+        .collect();
+    Some(1 + least_loaded(&effective, cursor))
+}
+
 /// Which away peer, given how much each is already holding.
 ///
 /// `turn` decides home-or-away and this decides WHICH away, because the two
@@ -1261,6 +1344,13 @@ pub struct Wire {
     /// because the zero is the finding: neither gateway call is where the
     /// time is, so the next person does not have to re-measure it.
     pub returns: Vec<u64>,
+    /// Where each solve was placed: key 0 is home, 1.. are peers.
+    ///
+    /// Added because "round 2 was fast" is not evidence of avoidance - a
+    /// control run showed a uniform fleet reaching the same wall clock purely
+    /// from the peers' own caches. Which machine got what has to be counted,
+    /// not inferred from a timing.
+    pub placed: std::collections::BTreeMap<usize, u64>,
     /// Per-solve timing, in arrival order.
     pub spans: Vec<Span>,
     /// Solves whose turn fell to peer 0 and were built where they already
@@ -1380,6 +1470,7 @@ impl Wire {
         println!("[wire] gateway calls  : {counts:?}");
         println!("[wire] solves routed  : {} to other daemons", self.routed);
         println!("[wire] built at home  : {} (peer 0's own share)", self.home);
+        println!("[wire] placed         : {:?} (0 = home)", self.placed);
         for (i, s) in self.spans.iter().enumerate() {
             println!(
                 "[wire] solve {i} ms     : total {} = portable {} + peer {} + answer {} \
@@ -1730,8 +1821,17 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 // excluded solve consume a turn means an earthly build burns
                 // eleven turns and hands its one movable solve to whichever
                 // machine the arithmetic lands on.
-                let peer = allowed.then(|| self.next_turn());
-                if peer == Some(0) {
+                let peer = if allowed { self.next_place() } else { None };
+                if allowed {
+                    *self
+                        .wire
+                        .lock()
+                        .expect("wire")
+                        .placed
+                        .entry(peer.unwrap_or(0))
+                        .or_default() += 1;
+                }
+                if allowed && peer.is_none() {
                     // Peer 0's turn. It already holds the job, the session
                     // and the graph, so its share is served by falling
                     // through to the ordinary solve below - no publish, no
@@ -2081,6 +2181,55 @@ mod tests {
                 "uneven over {peers} peers: {seen:?}"
             );
         }
+    }
+
+    /// A struck peer stops getting an equal share.
+    #[test]
+    fn a_peer_taken_back_from_is_avoided() {
+        // Two away peers, peer 2 struck once. Every away turn goes to peer 1.
+        let load = [0usize, 0];
+        let strikes = [0usize, 1];
+        let away: Vec<usize> = (0..12)
+            .filter_map(|c| super::place(c, 3, &load, &strikes))
+            .collect();
+        assert!(!away.is_empty(), "no away turns at all");
+        assert!(
+            away.iter().all(|&p| p == 1),
+            "struck peer 2 still got work: {away:?}"
+        );
+    }
+
+    /// A bias, not a ban. A struck peer beats peers that are genuinely
+    /// swamped - otherwise one bad minute permanently shrinks the fleet.
+    #[test]
+    fn a_struck_peer_still_beats_a_swamped_one() {
+        let away: Vec<usize> = (0..6)
+            .filter_map(|c| super::place(c, 3, &[9, 0], &[0, 1]))
+            .collect();
+        assert!(
+            away.iter().all(|&p| p == 2),
+            "peer 1 holding nine jobs was preferred to a once-struck idle peer: {away:?}"
+        );
+    }
+
+    /// Nowhere good to send it is not a reason to send it somewhere bad.
+    ///
+    /// Without this a two-daemon fleet whose only peer is slow would offer,
+    /// wait out the bound and take it back on EVERY solve - paying the
+    /// straggler tax forever to learn something it already knew.
+    #[test]
+    fn a_wholly_struck_fleet_builds_at_home() {
+        for cursor in 0..8 {
+            assert_eq!(super::place(cursor, 2, &[0], &[1]), None);
+            assert_eq!(super::place(cursor, 3, &[0, 0], &[2, 1]), None);
+        }
+    }
+
+    /// A lone daemon has nowhere to send anything.
+    #[test]
+    fn a_fleet_of_one_never_dispatches() {
+        assert_eq!(super::place(0, 1, &[], &[]), None);
+        assert_eq!(super::place(7, 1, &[], &[]), None);
     }
 
     /// With nothing observed, nothing is slow.
