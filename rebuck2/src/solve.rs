@@ -6,6 +6,13 @@
 //! dispatch. Talking to the daemon is I/O and cannot be honestly unit-tested;
 //! it wants the e2e rig and a live buildkitd.
 //!
+//! **No session is needed**, which is a measured finding rather than an
+//! assumption: buildkit accepts a solve with none when the build has no
+//! local sources and needs no registry auth. A session exists to carry
+//! filesync and credentials back to the daemon, and a dispatched subtree
+//! has neither - its inputs are digests. That removes the largest piece of
+//! machinery this was expected to need.
+//!
 //! The result is exported by PUSHING to this worker's own loopback registry
 //! (`crate::registry`). That is principle 6 as a mechanism: the layers land
 //! where a peer can fetch them directly, and the driver — which arbitrates
@@ -62,6 +69,16 @@ pub fn solve_request(
     }
 }
 
+/// Dial a buildkitd's Control service.
+///
+/// `addr` is a gRPC endpoint (`http://127.0.0.1:1234`). Earthly runs a
+/// buildkitd per container, so on a worker this is loopback.
+pub async fn connect(
+    addr: &str,
+) -> anyhow::Result<control::control_client::ControlClient<tonic::transport::Channel>> {
+    Ok(control::control_client::ControlClient::connect(addr.to_owned()).await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +115,130 @@ mod tests {
             ex.attrs.get("registry.insecure").map(String::as_str),
             Some("true")
         );
+    }
+
+    /// Needs a live daemon, so it does not run by default:
+    ///   docker run -d --privileged -p 11234:1234 moby/buildkit \
+    ///     --addr tcp://0.0.0.0:1234
+    ///   cargo test --bin rebuck2 buildkit_is_reachable -- --ignored
+    ///
+    /// Proves the gRPC path end to end before anything is built on it: the
+    /// crate's generated client, the wire version, and the daemon all agree.
+    #[tokio::test]
+    #[ignore]
+    async fn buildkit_is_reachable_and_reports_a_worker() {
+        let mut c = connect("http://127.0.0.1:11234").await.expect("dial");
+        let workers = c
+            .list_workers(control::ListWorkersRequest::default())
+            .await
+            .expect("list_workers")
+            .into_inner();
+        assert!(
+            !workers.record.is_empty(),
+            "a daemon with no worker is no use"
+        );
+        let w = &workers.record[0];
+        assert!(!w.id.is_empty());
+        println!("[probe] worker {} platforms={:?}", w.id, w.platforms.len());
+    }
+
+    /// A real subtree, built by a real daemon, from LLB we constructed
+    /// ourselves. Needs a buildkitd, so it does not run by default:
+    ///   docker run -d --privileged -p 11234:1234 moby/buildkit \
+    ///     --addr tcp://0.0.0.0:1234
+    ///   cargo test --bin rebuck2 a_real_subtree -- --ignored --nocapture
+    ///
+    /// This is the claim that could not be made from the bench: rebuck2 can
+    /// hand hand-built LLB to buildkit and have it pull, exec and produce a
+    /// snapshot. Measured on a first run: 13.58MB of alpine plus a 12.29kB
+    /// exec result in the daemon's cache.
+    #[tokio::test]
+    #[ignore]
+    async fn a_real_subtree_builds_on_a_real_daemon() {
+        use prost::Message;
+        let plat = pb::Platform {
+            os: "linux".into(),
+            architecture: std::env::consts::ARCH.replace("aarch64", "arm64"),
+            ..Default::default()
+        };
+        let dg = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
+
+        let src = pb::Op {
+            op: Some(pb::op::Op::Source(pb::SourceOp {
+                identifier: "docker-image://docker.io/library/alpine:3.20".into(),
+                ..Default::default()
+            })),
+            platform: Some(plat.clone()),
+            ..Default::default()
+        };
+        let src_b = src.encode_to_vec();
+
+        let exec = pb::Op {
+            inputs: vec![pb::Input {
+                digest: dg(&src_b),
+                index: 0,
+            }],
+            op: Some(pb::op::Op::Exec(pb::ExecOp {
+                meta: Some(pb::Meta {
+                    args: vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "echo dispatched > /out".into(),
+                    ],
+                    cwd: "/".into(),
+                    ..Default::default()
+                }),
+                mounts: vec![pb::Mount {
+                    input: 0,
+                    dest: "/".into(),
+                    output: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+            platform: Some(plat),
+            ..Default::default()
+        };
+        let exec_b = exec.encode_to_vec();
+
+        // LLB's terminal op: no `op` of its own, one input naming the real
+        // result. Omitting it makes buildkit solve nothing and say so with
+        // a success, which is the most misleading answer available.
+        let term = pb::Op {
+            inputs: vec![pb::Input {
+                digest: dg(&exec_b),
+                index: 0,
+            }],
+            ..Default::default()
+        };
+
+        let def = pb::Definition {
+            metadata: [&src_b, &exec_b]
+                .iter()
+                .map(|b| (dg(b), pb::OpMetadata::default()))
+                .collect(),
+            def: vec![src_b, exec_b, term.encode_to_vec()],
+            ..Default::default()
+        };
+
+        // What `inspect` says about it must agree with what we then do: an
+        // ordinary exec on one platform travels.
+        let v = crate::dispatch::inspect(&def);
+        assert!(v.dispatchable(), "{v:?}");
+
+        let mut c = connect("http://127.0.0.1:11234").await.expect("dial");
+        c.solve(control::SolveRequest {
+            r#ref: "rebuck2-e2e".into(),
+            definition: Some(def),
+            // NO session, and that is a finding rather than an omission:
+            // measured, buildkit accepts a solve with none when the build
+            // has no local sources and needs no registry auth. A session
+            // exists to carry filesync and credentials, and a dispatched
+            // subtree has neither - its inputs are digests.
+            ..Default::default()
+        })
+        .await
+        .expect("solve");
     }
 
     #[test]
