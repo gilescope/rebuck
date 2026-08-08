@@ -170,6 +170,20 @@ fn hazard(op: &pb::Op) -> Option<Exclusion> {
     if !e.secretenv.is_empty() {
         return Some(Exclusion::Secret);
     }
+    // NOT detected: a mount that binds a path from the WORKER's filesystem.
+    //
+    // Deliberate, and settled by experiment rather than left as a hole. The
+    // proto has no host-bind flag, and the obvious encoding - `Bind` with
+    // `input = -1` and a selector - is not one: a stock daemon reads the
+    // selector against an empty input and fails with `open <path>: no such
+    // file or directory`. `llb.HostBind()` comes from earthbuild's FORK of
+    // buildkit (go.mod replaces moby/buildkit with earthbuild/buildkit), so
+    // it is not expressible in a graph a stock daemon would accept.
+    //
+    // Which means a host bind can only reach us from an earthly client, and
+    // those graphs are already excluded by the secret and ssh mounts that
+    // come with it. Guessing at a detection rule for an encoding this tree
+    // cannot produce would be a check that never fires, tested by nothing.
     e.mounts.iter().find_map(|m| {
         // Read BOTH the type and the option: a cache mount is identified by
         // either, and trusting one alone leaves the other as a way through.

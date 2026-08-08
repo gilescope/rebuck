@@ -1734,3 +1734,97 @@ mod tests {
         assert_eq!(r.session, "sess-abc");
     }
 }
+
+#[cfg(test)]
+mod hostbind {
+    use super::*;
+    use prost::Message;
+
+    /// How is a HOST BIND encoded, and would we notice one?
+    ///
+    /// `dispatch::hazard` detects cache, secret and ssh mounts, insecure exec
+    /// and host networking. It does NOT detect a mount that binds a path from
+    /// the worker's filesystem, and the proto has no flag for one - so the
+    /// question is which combination of ordinary fields means it.
+    ///
+    /// Under test: `MountType::Bind` with `input = -1` (no LLB input) and a
+    /// non-empty `selector`. If that mounts a real file from the worker, the
+    /// detection rule follows from it.
+    ///
+    ///   BUILDKIT=tcp://127.0.0.1:18372 cargo test --bin rebuck2 hostbind \
+    ///     -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn a_host_bind_is_input_minus_one_with_a_selector() {
+        let addr = std::env::var("BUILDKIT").expect("set BUILDKIT=tcp://host:port");
+        let dg = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
+        let src = pb::Op {
+            op: Some(pb::op::Op::Source(pb::SourceOp {
+                identifier: "docker-image://docker.io/library/alpine:3.20".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let src_b = src.encode_to_vec();
+        let exec = pb::Op {
+            inputs: vec![pb::Input {
+                digest: dg(&src_b),
+                index: 0,
+            }],
+            op: Some(pb::op::Op::Exec(pb::ExecOp {
+                meta: Some(pb::Meta {
+                    args: vec!["/bin/sh".into(), "-c".into(), "test -s /probe".into()],
+                    cwd: "/".into(),
+                    ..Default::default()
+                }),
+                mounts: vec![
+                    pb::Mount {
+                        input: 0,
+                        dest: "/".into(),
+                        output: 0,
+                        ..Default::default()
+                    },
+                    pb::Mount {
+                        input: -1,
+                        selector: "/usr/bin/buildctl".into(),
+                        dest: "/probe".into(),
+                        output: -1,
+                        readonly: true,
+                        mount_type: pb::MountType::Bind as i32,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let exec_b = exec.encode_to_vec();
+        let term = pb::Op {
+            inputs: vec![pb::Input {
+                digest: dg(&exec_b),
+                index: 0,
+            }],
+            ..Default::default()
+        };
+        let def = pb::Definition {
+            metadata: [&src_b, &exec_b]
+                .iter()
+                .map(|b| (dg(b), pb::OpMetadata::default()))
+                .collect(),
+            def: vec![src_b, exec_b, term.encode_to_vec()],
+            ..Default::default()
+        };
+        let mut c = connect(&addr.replace("tcp://", "http://")).await.unwrap();
+        let out = c
+            .solve(control::SolveRequest {
+                r#ref: format!("hostbind-probe-{}", std::process::id()),
+                definition: Some(def),
+                ..Default::default()
+            })
+            .await;
+        match out {
+            Ok(_) => println!("RESULT: bind + input -1 + selector MOUNTED a worker file"),
+            Err(e) => println!("RESULT: not a host bind that way - {}", e.message()),
+        }
+    }
+}
