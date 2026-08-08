@@ -290,6 +290,37 @@
 //! free because nothing is contended. The work has to be CPU-bound before
 //! either number means anything.
 //!
+//! Both numbers above, and every number below, are now produced by
+//! `scripts/fleet.sh` - which exists because they were produced by hand
+//! twenty-five times first, and a measurement you retype is a measurement
+//! you cannot compare.
+//!
+//! # The fleet was OFFLOADING, not parallelising
+//!
+//! Same harness, after peer 0 was let back into the round robin - the
+//! per-daemon cache is the honest witness, because work leaves a mark where
+//! it actually ran:
+//!
+//! ```text
+//! before  daemon 0: 0        daemon 1: 13.60MB   (4 routed, 0 home)
+//! after   daemon 0: 13.60MB  daemon 1: 13.60MB   (2 routed, 2 home)
+//! wall    10s direct -> 11s proxied
+//! ```
+//!
+//! "4 of 4 solves routed" read as a triumph and was a symptom: peer 0 was
+//! excluded from dispatch by arithmetic (`1 + n % (len - 1)`), so a
+//! two-machine fleet ran every exec on ONE machine and shipped bytes with
+//! the other. It could not have gone faster than a single daemon no matter
+//! how many machines were added, because peer 0's share was always zero.
+//! See `turn` for why the reasoning behind that was sound and the conclusion
+//! was not.
+//!
+//! The 10s -> 11s is the residual tax and it is now visible for the first
+//! time: two adoptions cost two publishes and two imports through the
+//! registry, about half a second each, and no amount of local capacity pays
+//! that back. On a real fleet it is paid once against a machine's worth of
+//! parallelism.
+//!
 //! # 100% dispatch, on a client that is not earthly
 //!
 //! Four plain-LLB builds through the proxy, two stock buildkitds:
@@ -555,6 +586,15 @@ impl Proxy {
         self.client.clone()
     }
 
+    /// Whose turn it is next, over the WHOLE fleet.
+    fn next_turn(&self) -> usize {
+        turn(
+            self.next_peer
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            self.peers.len(),
+        )
+    }
+
     /// The gateway rides the same channel, because the client's does.
     fn gw(&self) -> GwClient {
         gw::llb_bridge_client::LlbBridgeClient::new(self.channel.clone())
@@ -815,6 +855,25 @@ fn trace(wire: &std::sync::Mutex<Wire>, call: &str) {
     wire.lock().expect("wire").calls.push(call.to_owned());
 }
 
+/// Round-robin over a fleet of `peers`, peer 0 included.
+///
+/// This was `1 + cursor % (peers - 1)`, which excluded peer 0 from
+/// dispatched work entirely. The reasoning behind that was sound and the
+/// conclusion was not: peer 0 does hold the client's job and must answer
+/// the gateway Solve, so adopting onto peer 0 means building there, pushing
+/// to the mirror and importing back to the same daemon - a round-trip for
+/// nothing. But skipping peer 0 turns a two-machine fleet into OFFLOADING:
+/// one machine builds, the other shuffles bytes, and half the grid is idle
+/// by construction. Principle 1 says the grid is one machine; a machine
+/// does not retire a core to hold the paperwork.
+///
+/// Peer 0 takes its turn and the graph is built in place, which is the
+/// round-trip skipped rather than paid.
+fn turn(cursor: usize, peers: usize) -> usize {
+    debug_assert!(peers > 0, "a fleet with no peers has no turns");
+    cursor % peers.max(1)
+}
+
 /// One gateway Solve, characterised.
 ///
 /// Deliberately NOT "how many cuts could mechanism A take" - that prices one
@@ -863,6 +922,11 @@ pub struct Wire {
     pub calls: Vec<String>,
     /// Solves placed on a peer other than the upstream.
     pub routed: u64,
+    /// Solves whose turn fell to peer 0 and were built where they already
+    /// were. Not a rejection: peer 0 is a machine like any other, and
+    /// counting its share as "not routed" understates a fleet by exactly
+    /// 1/n - a perfectly-balanced pair would report 50% dispatch.
+    pub home: u64,
     /// Why a solve was NOT placed, counted.
     ///
     /// One routed solve out of twelve is either a fleet barely working or a
@@ -974,6 +1038,7 @@ impl Wire {
         }
         println!("[wire] gateway calls  : {counts:?}");
         println!("[wire] solves routed  : {} to other daemons", self.routed);
+        println!("[wire] built at home  : {} (peer 0's own share)", self.home);
         println!("[wire] not routed     : {:?}", self.rejected);
         println!("[wire] call order     : {}", self.calls.join(" "));
         println!(
@@ -1325,12 +1390,25 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         .entry(why)
                         .or_default() += 1;
                 }
-                if movable {
-                    let peer = 1 + self
-                        .next_peer
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        % (self.peers.len() - 1);
+                // Draw ONCE. Two calls advance the cursor twice, so the
+                // peer that gets the work is not the peer whose turn it
+                // was - which round-robins at half rate and skips a
+                // machine every other solve.
+                let peer = movable.then(|| self.next_turn());
+                if peer == Some(0) {
+                    // Peer 0's turn. It already holds the job, the session
+                    // and the graph, so its share is served by falling
+                    // through to the ordinary solve below - no publish, no
+                    // import, no adoption. This is not merely the cheaper
+                    // route: peer 0's `addr` is the sentinel "upstream", so
+                    // it is the only route.
+                    self.wire.lock().expect("wire").home += 1;
+                } else if let Some(peer) = peer {
                     let addr = self.peers[peer].addr.clone();
+                    debug_assert_ne!(
+                        addr, "upstream",
+                        "peer 0 has no dialable address; its turn is the home path"
+                    );
                     match crate::solve::build_and_publish(&addr, &mirror.registry, portable.clone())
                         .await
                     {
@@ -1548,5 +1626,40 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
             .exec_process(Request::from_parts(meta, ext, inbound))
             .await?;
         Ok(Response::new(Box::pin(s.into_inner())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::turn;
+
+    /// The regression: peer 0 must get its share.
+    ///
+    /// Under the old `1 + cursor % (peers - 1)` this fails on the first
+    /// assert - peer 0 never came up, however many solves arrived, so a
+    /// two-machine fleet ran on one machine and called it dispatch.
+    #[test]
+    fn every_peer_in_the_fleet_gets_a_turn() {
+        for peers in 1..6usize {
+            let mut seen = vec![0usize; peers];
+            for cursor in 0..peers * 3 {
+                seen[turn(cursor, peers)] += 1;
+            }
+            assert_eq!(seen[0], 3, "peer 0 skipped in a fleet of {peers}");
+            assert!(
+                seen.iter().all(|&n| n == 3),
+                "uneven over {peers} peers: {seen:?}"
+            );
+        }
+    }
+
+    /// A cursor that has wrapped `usize` still lands in the fleet. Round
+    /// robin over a long-lived proxy is the only user of this and it counts
+    /// up forever.
+    #[test]
+    fn a_wrapped_cursor_still_names_a_peer() {
+        for peers in 1..6usize {
+            assert!(turn(usize::MAX, peers) < peers);
+        }
     }
 }

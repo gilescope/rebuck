@@ -284,7 +284,6 @@ pub async fn build_and_publish(
     registry: &str,
     def: pb::Definition,
 ) -> anyhow::Result<String> {
-    use prost::Message;
     let mut bytes: Vec<u8> = Vec::new();
     for op in &def.def {
         bytes.extend_from_slice(op);
@@ -955,7 +954,16 @@ mod tests {
             ..Default::default()
         };
         let dg = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
-        for i in 0..4 {
+        // Where and how many, so `scripts/fleet.sh` can vary the fan-out
+        // without editing this file.
+        let out = std::env::var("REBUCK2_LLB_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let n: usize = std::env::var("REBUCK2_LLB_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        for i in 0..n {
             let src = pb::Op {
                 op: Some(pb::op::Op::Source(pb::SourceOp {
                     identifier: "docker-image://docker.io/library/alpine:3.20".into(),
@@ -1017,7 +1025,7 @@ mod tests {
                 def: vec![src_b, exec_b, term.encode_to_vec()],
                 ..Default::default()
             };
-            let path = std::env::temp_dir().join(format!("rebuck2-fanout-{i}.llb"));
+            let path = out.join(format!("rebuck2-fanout-{i}.llb"));
             std::fs::write(&path, def.encode_to_vec()).unwrap();
             println!("[fixture] {}", path.display());
         }
