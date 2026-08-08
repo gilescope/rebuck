@@ -406,6 +406,42 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # What a dispatch actually costs: 0.1s, plus one base image
+//!
+//! Three iterations blamed three different things for the cost of shipping a
+//! build - the registry, the network, then peer 0's import. One measurement
+//! with no contention at all settles it. A single build, once locally and
+//! once forced away:
+//!
+//! ```text
+//! 1 build, no fleet     10s
+//! 1 build, dispatched   11s
+//!   portable 1586ms + peer 8815ms + answer 3ms, client saw 10511ms
+//! ```
+//!
+//! Subtract: 10511 - 1586 - 8815 leaves **110ms** for everything else,
+//! including peer 0 importing the result. The import is not the cost either.
+//!
+//! What a dispatch costs, finally:
+//!
+//! | | cost |
+//! | ------------------------------ | ---------------------------------- |
+//! | mirror the base, per arch | ~1.6s ONCE, shared by every solve |
+//! | ship and import a result | ~0.1s per build |
+//! | the peer building it | whatever that peer is worth |
+//!
+//! Note the peer built it in 8.8s against 10s here, so on this pair
+//! dispatching a single build is very nearly free before the base is
+//! mirrored, and free after.
+//!
+//! Which means the earlier "pushing more work out made a four-peer fleet
+//! slower" was never about dispatch overhead. Four daemons sharing one
+//! 32-core box, amd64, are simply worth less per build than local cores when
+//! all of them are loaded. That is peer CAPACITY - heterogeneity again -
+//! and the weights measurement already showed capacity cannot be guessed
+//! from hardware. It has to be observed, and observing it is the open
+//! problem, not the transport.
+//!
 //! # Where added machines stop paying
 //!
 //! Twenty-four builds, remote daemons added one at a time:
