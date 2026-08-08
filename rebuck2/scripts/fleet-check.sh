@@ -159,6 +159,40 @@ present "and only the dead one is struck" "$out" 'struck *: {2:'
 absent "and only the dead one is struck (peer 1 spared)" "$out" 'struck *: {1:'
 
 echo
+echo "== a peer that is slow rather than dead"
+# Step 5 of the placement algorithm - a bounded wait, past which an adoption
+# is withdrawn and built at home - and nothing exercised it end to end. A
+# machine that dies is easy; one that merely crawls holds a slot open and is
+# the case the hedge exists for.
+#
+# --cpus 0.15 on the last daemon. The peer is NOT cancelled when withdrawn,
+# so both copies race and whoever publishes first wins.
+out=$(run DAEMONS=3 SLOW=0.15 ROUNDS=2 REBUCK2_HOME_SLOTS=4 EXPECT="$base/digests.txt" || true)
+echo "$out" | grep -E '^wall|placed|struck|not routed' | tr -s ' ' | sed 's/^/  /'
+guard "every build still finishes" "$out" && check "every build still finishes" "$(count "$out" '^failed  : 0')" 1 || true
+check "outputs still identical" "$(count "$out" 'outputs identical')" 1
+# The mechanism, not the symptom: a run where the straggler simply finished
+# in time would pass the two checks above having tested nothing.
+present "the straggler is withdrawn from" "$out" 'too slow'
+present "and it is the SLOW one that is struck" "$out" 'struck *: {2:'
+
+echo
+echo "== a named frontend cannot be distributed"
+# Documented as structural rather than a gap, and asserted nowhere.
+# `--frontend dockerfile.v0` is resolved INSIDE the daemon, so its LLB never
+# crosses the proxy and there is nothing to place. The point of the check is
+# that this stays a clean no-op: the build must still work.
+out=$(run DAEMONS=2 DOCKERFILE=1 || true)
+echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
+guard "the build still succeeds" "$out" && check "the build still succeeds" "$(count "$out" '^failed  : 0')" 1 || true
+guard "and nothing was placed on a peer" "$out" &&
+  check "and nothing was placed on a peer" "$(placed "$out" 1)" "" || true
+# An empty `placed` is ALSO what a completely broken fleet produces, so the
+# check above would pass for one. The reason has to be the structural one.
+present "for the structural reason, not a broken fleet" "$out" \
+  'frontend runs in the daemon: dockerfile.v0'
+
+echo
 echo "== the registry destroyed mid-build"
 out=$(run DAEMONS=2 KILL_REGISTRY_AFTER=2 EXPECT="$base/digests.txt" || true)
 echo "$out" | grep -E '^wall' | tr -s ' ' | sed 's/^/  /'
