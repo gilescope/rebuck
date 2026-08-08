@@ -147,6 +147,10 @@ Still excluded, deliberately: cache mounts, ssh sockets and host binds. Each
 needs a different service, and lifting them together would be assuming three
 things from evidence about one.
 
+The shapes those wrong turns took, collected with their countermeasures, are
+in [how-this-lies.md](how-this-lies.md) - nine of the ten produced a GREEN
+result.
+
 Recurring theme, stated once so the sections below do not each have to: nearly
 every wrong turn recorded here was a plausible cause accepted without a
 control. The ones that cost most were a metric that improved for an unrelated

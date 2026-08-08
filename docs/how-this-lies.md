@@ -1,0 +1,121 @@
+# How this system lies to you
+
+A distributed build system that fails open has a specific hazard: **almost
+every way it breaks still produces a correct build.** The user gets their
+bytes, the exit code is zero, and the thing you built does nothing.
+
+These are the shapes that actually occurred while building it, each with the
+instance that taught it and the countermeasure that now exists. They are not
+general testing advice - they are what goes wrong *here*.
+
+## 1. Fail-open hides an idle fleet
+
+Nothing dispatched, everything built at home, build succeeded. Indistinguishable
+from a fleet with nothing to distribute.
+
+**Instance:** following this repo's own quickstart. The daemons had no
+`[registry]` stanza, so every peer refused; publishing is insecure per-solve
+so the mirror filled and the log looked healthy.
+
+**Countermeasure:** `placed` in the wire report is the only honest evidence,
+and the proxy now says `no solve completed on a peer` with a likely cause.
+
+## 2. An assertion that cannot fail
+
+A check that would pass whether or not the thing under test worked.
+
+**Instance:** `grep -c 'placed : {0: '` to assert an emulated peer got no
+work. True whichever peer got it. It passed while that peer took a third of
+the build.
+
+**Countermeasure:** run the negative case. If removing the mechanism does not
+turn the test red, the test is decoration.
+
+## 3. A cached pass
+
+The assertion is right, the setup is right, and the system answers from
+memory instead of doing the work.
+
+**Instance:** the ssh probe reported success with the agent removed, in
+0.19s. Buildkit served the previous run's result, so the strengthened
+assertion had never once executed.
+
+**Countermeasure:** `ignore_cache` on any exec a probe depends on. Suspect
+any pass that is faster than the work it claims to have done.
+
+## 4. A setup that does not create the condition
+
+The test names a scenario it does not construct.
+
+**Instances:** an "unresolvable secret" test that set the variable to an EMPTY
+string, which `env::var` returns as `Ok("")`. An emulation test that used an
+UNPINNED graph, where every peer is native by design.
+
+**Countermeasure:** assert the discriminating observation, not the outcome -
+and check that the two arms of a pair actually differ.
+
+## 5. A metric that improved for another reason
+
+Real improvement, wrong attribution.
+
+**Instance:** rounds 2 and 3 dropped 39s to 10s after adding peer strikes. A
+control with strikes disabled also dropped to 10s: the peers had warmed their
+own caches. 10s was the floor either way.
+
+**Countermeasure:** the control run. Twice in this project it overturned the
+conclusion.
+
+## 6. A plausible stand-in for the quantity you want
+
+**Instance:** weighting a 32-core peer 2x against a 16-core host. Cores are
+not throughput once transfer dominates, and the "informed" weight measured
+WORSE than a flat split - 21s against 18s.
+
+**Countermeasure:** measure the quantity, or leave the knob at its default.
+
+## 7. A feedback signal the controller moves
+
+**Instance:** deriving peer weights from observed service time. Load a side,
+its mean rises, the controller reads "straggler" and sends more work away,
+which raises the other mean. One run looked like a win; the next was worse
+than doing nothing.
+
+**Countermeasure:** ask whether the input is a function of the output. If it
+is, the loop chases itself - ship it off by default with the measurement
+attached.
+
+## 8. Attempted counted as achieved
+
+**Instance:** the idle-fleet check first used `placed`, which counts placement
+DECISIONS. A solve sent to a peer that refused it is placed and not routed -
+exactly the case the check existed for - so it stayed silent on its own
+motivating bug.
+
+**Countermeasure:** every counter says which it is. `placed` is decisions,
+`routed` is successes, and they are never the same number when it matters.
+
+## 9. An environmental failure read as a regression
+
+**Instance:** twelve assertions went red right after a registry change.
+Consistent failure looked like code. It was `429 Too Many Requests` from
+Docker Hub, from a day of fresh daemons pulling the same base image.
+
+**Countermeasure:** read the failing output before forming a theory. The
+harness now prints `RATE LIMITED` and the suite skips rather than fails.
+
+## 10. The author's environment inside the instructions
+
+**Instance:** the quickstart, written from a working system, omitted the
+daemon config the author had set up months earlier.
+
+**Countermeasure:** run the instructions from an empty directory. A
+quickstart nobody has executed is a hypothesis.
+
+## The common thread
+
+Nine of these ten produced a GREEN result. Not one announced itself.
+
+The discipline that caught them is the same every time: **find the
+observation that differs between the world where it works and the world where
+it does not, and check that one.** Wall clock rarely is that observation.
+`placed` usually is.
