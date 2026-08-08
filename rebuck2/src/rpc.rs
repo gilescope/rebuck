@@ -57,6 +57,19 @@ pub struct RpcStats {
 
 type OpStream = Pin<Box<dyn Stream<Item = Result<Operation, Status>> + Send + 'static>>;
 
+/// Validate a client digest and normalise it to the store's one spelling.
+///
+/// REAPI does not forbid uppercase hex, and `is_ascii_hexdigit` accepts it, but
+/// the store is content-addressed BY FILENAME - so `AB..` and `ab..` are the
+/// same blob on a case-insensitive filesystem (macOS APFS, windows) and two
+/// different ones on a case-sensitive filesystem (linux ext4). Left
+/// unnormalised that is a bug that only appears on some of the fleet: the blob
+/// is accepted, then never found, and the action re-executes forever.
+///
+/// Lowercasing here is the single choke point - `parse_resource` routes through
+/// it too - so every store key, mesh advertisement and bloom filter downstream
+/// sees one spelling. Responses still echo the client's own casing, because
+/// they are built from the request digests rather than from these.
 fn dig(d: &re::Digest) -> Result<Dig, Status> {
     if d.hash.len() != 64 || !d.hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Status::invalid_argument(format!(
@@ -65,7 +78,7 @@ fn dig(d: &re::Digest) -> Result<Dig, Status> {
         )));
     }
     Ok(Dig {
-        hash: d.hash.clone(),
+        hash: d.hash.to_ascii_lowercase(),
         size: d.size_bytes,
     })
 }
@@ -877,6 +890,25 @@ mod tests {
     }
 
     // ---- probes: edges a real client can reach -----------------------------
+
+    /// Platform-independent guard for the same defect the end-to-end probe
+    /// below catches only on a case-SENSITIVE filesystem. It passed on macOS
+    /// (APFS folds case, so the lookup accidentally worked) and failed on
+    /// linux CI - so the unit-level assertion is the one that actually holds
+    /// the line on every runner in a heterogeneous fleet.
+    #[test]
+    fn a_client_digest_is_normalised_to_one_spelling() {
+        let d = dig(&re::Digest {
+            hash: ABC.to_uppercase(),
+            size_bytes: 3,
+        })
+        .expect("uppercase hex is valid REAPI");
+        assert_eq!(
+            d.hash, ABC,
+            "the store keys blobs by filename, so an unnormalised uppercase digest is the \
+             same blob on macOS/windows and a different one on linux - accepted, then never found"
+        );
+    }
 
     /// `dig()` accepts any ASCII hex digit, so an UPPERCASE digest passes
     /// validation. If the store keys on lowercase, such a digest is accepted
