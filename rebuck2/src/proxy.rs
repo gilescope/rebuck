@@ -257,7 +257,49 @@
 //! working: an unportable graph is not a dispatch failure, it is a graph
 //! that stays home.
 //!
-//! # What actually limits dispatch here: SECRETS
+//! # What actually limits dispatch here: earthly's DEBUGGER
+//!
+//! The eleven excluded solves do not carry a user secret. They carry this,
+//! and every earthly `RUN` carries it:
+//!
+//! ```text
+//! mount /run/secrets/earthly_debugger_settings
+//!   id=name=da39a3ee5e6b4b0d3255bfef95601890afd80709&org=&project=&v=1
+//! ```
+//!
+//! `earthfile2llb/converter.go` attaches a debugger settings SECRET mount
+//! and a `llb.HostBind()` mount for the debugger binary to every exec, and
+//! the only guard is `if !opts.Locally`. Not `--interactive`: the
+//! interactive flag decides whether to ERROR when the capability is
+//! missing, not whether to attach the mounts. The id is a query string
+//! whose org and project are empty and whose name is the sha1 of the empty
+//! string - nothing is being protected here.
+//!
+//! So every earthly exec is pinned to one machine twice over, by a secret
+//! and a host bind, in support of a debugger nobody asked for. The
+//! exclusion is CORRECT - principle 10 does not get to make exceptions
+//! about secrets - and the consequence is that essentially no earthly exec
+//! can be dispatched as things stand.
+//!
+//! Three ways out, and the first is the honest one:
+//!
+//! - earthbuild omits the debugger plumbing when not debugging. A small
+//!   upstream change with an obvious rationale, and the only one that does
+//!   not weaken a safety rule or lie about a graph.
+//! - the proxy strips known-inert frontend plumbing. Tempting and wrong by
+//!   default: it changes the graph the client asked for, and "inert" is a
+//!   judgement about someone else's mount.
+//! - target clients that do not do this. buildx and dagger graphs carry no
+//!   such plumbing, so they are dispatchable today - which is an argument
+//!   for the product being a distributed BUILDKIT rather than a
+//!   distributed earthly.
+//!
+//! This is also the honest cost of principle 15. "The client must not have
+//! to change" is the right claim, and this client's own plumbing prevents
+//! distribution - so for earthly, either earthbuild changes or nothing
+//! moves.
+//!
+//! # What the secret exclusion previously looked like
 //!
 //! With the exclusion check finally wired into placement, the twelve
 //! solves of a real earthly build resolve as:
@@ -1185,11 +1227,37 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 let movable = local_clear && bases_clear && allowed;
                 if !movable {
                     let why = match (local_clear, bases_clear, allowed) {
-                        (_, _, false) => verdict
-                            .exclusions
-                            .first()
-                            .map(|(_, e)| format!("excluded: {e:?}"))
-                            .unwrap_or_else(|| "excluded: platform".to_owned()),
+                        (_, _, false) => {
+                            // Name the secret, not just its kind. A build
+                            // that declares none can still be full of them:
+                            // a frontend may attach its own, and "excluded:
+                            // Secret" then reads as the user's fault.
+                            use prost::Message;
+                            let mut detail: Vec<String> = Vec::new();
+                            for b in &portable.def {
+                                if let Some(bollard_buildkit_proto::pb::op::Op::Exec(e)) =
+                                    bollard_buildkit_proto::pb::Op::decode(b.as_slice())
+                                        .ok()
+                                        .and_then(|o| o.op)
+                                {
+                                    for se in &e.secretenv {
+                                        detail.push(format!("env {}={}", se.name, se.id));
+                                    }
+                                    for m in &e.mounts {
+                                        if let Some(so) = &m.secret_opt {
+                                            detail.push(format!("mount {} id={}", m.dest, so.id));
+                                        }
+                                    }
+                                }
+                            }
+                            detail.sort();
+                            detail.dedup();
+                            verdict
+                                .exclusions
+                                .first()
+                                .map(|(_, e)| format!("excluded: {e:?} {detail:?}"))
+                                .unwrap_or_else(|| "excluded: platform".to_owned())
+                        }
                         (false, false, _) => "context and base unmirrored".to_owned(),
                         (false, true, _) => "context unmirrored".to_owned(),
                         (true, false, _) => "base unmirrored".to_owned(),
