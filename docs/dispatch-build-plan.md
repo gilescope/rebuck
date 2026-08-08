@@ -22,33 +22,64 @@ read as "what got built and what it proved" rather than as a roadmap.
 | M4 | **done and demonstrated** -- a peer builds a subtree, driver disk reads 0 bytes |
 | M5 | not done |
 | gateway | **done** -- the proxy sees any client's graph on one connection |
+| fleet | **done and measured on two machines** -- see below |
 
-**What is NOT established, and it is the important half:**
+## What is now measured, not argued
+
+All from `rebuck2/scripts/fleet.sh`, which produces every number here.
+
+| claim | evidence |
+| ------------------------------- | ------------------------------------- |
+| a peer really builds the work | per-daemon cache grows where it ran |
+| the result is CORRECT | outputs byte-identical to a one-machine baseline, verified per build |
+| two machines are faster | 24 CPU-bound builds, 64s -> 32s |
+| a context can leave its machine | `local://` published as content; a sessionless peer builds from it |
+| native multi-arch is real | an emulated peer takes 0 of 6 placements against 2 in a uniform fleet |
+| a slow peer cannot hold the build | withdrawn after 3x the observed median; 164s -> 40s |
+| a dead peer does not break it | peer destroyed mid-build: 24/24 finish, bytes identical |
+| a dead registry does not either | mirror destroyed mid-build: 24/24 finish, bytes identical |
+
+Placement is one rule with no per-workload tuning: ship only when the local
+machine is full. It matches the best hand-swept split at the build size where
+the fleet matters most, and no constant in it was chosen to fit a fixture.
+
+## What is still NOT established
 
 - No real earthbuild graph has been through `analyse`. Cut counts on a 3-op
   fixture prove the plumbing, not the opportunity.
-- Nothing has run at fleet scale. Every measurement here is one machine.
-- Nothing produces an offer in anger: subdivision does not exist.
-- The "bank the stem" comparison below is still unrun, and it is the thing
-  that decides whether any of M4 is worth keeping.
+- **Subdivision does not exist.** Everything measured dispatches WHOLE solves.
+  Whether cutting a graph beats routing it is untested, and the mechanism
+  question below is still open for that reason.
+- Earthly dispatches 1 solve in 12, and cannot do better without a change to
+  earthbuild -- see [earthly-dispatch.md](earthly-dispatch.md).
+- A named frontend (`docker build`) dispatches NOTHING and structurally
+  cannot: the daemon resolves the frontend, so the graph never crosses the
+  proxy.
+- The "bank the stem" comparison below is still unrun.
+- Everything above is two machines on one LAN. Three or more, and a WAN, are
+  untested.
 
-## The next measurement is mechanism-NEUTRAL
+## The mechanism-neutral measurement was taken, and it decided
 
-The tempting next step is to count free-frontier cuts on a real shard. That
-prices exactly one mechanism, and asking it first is how you measure the
-wrong thing convincingly.
+The plan called for a characterisation of a real build on the wire before
+pricing any one mechanism -- how many Solves, how big, how unbalanced, how
+much is `local://`, how much two Solves overlap. It was collected, and it
+chose per-Solve routing over subtree cutting for the first implementation:
 
-What prices all of them at once is a characterisation of a real build on the
-wire, which the proxy can already collect:
+- **Solves are the natural unit.** A real build issues many, each a whole
+  graph, and routing one needs no cut analysis at all.
+- **`local://` is not a blocker.** It was assumed to pin work to the client's
+  machine. Publishing the context as content unpins it, and a sessionless peer
+  then builds from a digest.
+- **Overlap is 39%, not 73%.** The first reading counted byte-identical
+  RESENDS as shared work; graphs NEST, and the corrected number is small
+  enough that deduplicating across Solves is not the prize.
 
-- how many `LLBBridge.Solve` calls a build makes, and how big each graph is
-- wall-clock per Solve, and how unbalanced they are
-- platform spread, and how much of the graph is pinned
-- source schemes, and how much is `local://` and therefore not going anywhere
-- how much two Solves overlap
-
-That single run says whether subtree dispatch, per-Solve routing, or a shared
-lease table is the answer -- and it needs no new mechanism to collect.
+What this does NOT settle is whether CUTTING a graph beats routing it whole.
+Every measurement in this repo dispatches whole solves, so subdivision remains
+untested rather than rejected. It becomes interesting exactly where routing
+runs out: a build whose Solves are few and enormous, where there is nothing to
+spread.
 
 ## The numbers this plan is built on
 

@@ -205,6 +205,10 @@ is a result to measure, not a premise to assume.
 The unit of work one machine asks another for is a subtree — in earthbuild
 terms, a target. Never a single vertex.
 
+In the built system the unit is a whole gateway `Solve`, which is a graph and
+therefore satisfies this comfortably. Cutting a Solve into smaller subtrees is
+untested rather than rejected: everything measured routes Solves whole.
+
 A vertex's inputs are usually larger than its work. Measured on two shards, over
 half of every exec vertex is milliseconds of it — 58% of group3's 214 and 54% of
 group5's 521 are `echo`, `test`, `diff`, `mkdir`. Handing one of those to a peer
@@ -419,6 +423,17 @@ Three consequences:
   cut, a subtree nobody will take: every one of these must produce the build
   an ordinary buildkitd would have produced, at ordinary speed. Principle 5
   said fail open; §15 says the client must not be able to tell.
+
+And the tension this principle has to own rather than hide: earthbuild, the
+first consumer, dispatches 1 solve in 12 and cannot do better without an
+upstream patch — see [earthly-dispatch.md](earthly-dispatch.md). That looks
+like the thing §15 forbids. The distinction it turns on is narrow and worth
+stating: earthly SENDS its graph, so we distribute what a client already
+sends, and the patch removes plumbing earthly attaches for a debugger that is
+switched off. We need no cooperation, no flag and no side-channel; we need a
+client to stop making every `RUN` undispatchable by accident. A reader should
+still weigh that for themselves, because "it is really their bug" is what
+every violation of this principle would say about itself.
 
 Corollary, and it is the honest cost: **we inherit the whole Control surface**
 — disk usage, prune, build history, cache import and export — whether or not
