@@ -905,6 +905,56 @@ mod tests {
         }
     }
 
+    /// A bare hash must find a blob whose size we never knew - and the
+    /// size-carrying path must NOT be used for it. `has()` compares the
+    /// recorded size against the file length, so a fabricated size-0 `Dig`
+    /// calls a blob we are holding absent, and `put` then rejects the very
+    /// bytes it already has. That is why `get_blob_by_hash` exists at all.
+    #[tokio::test]
+    async fn a_bare_hash_finds_what_a_sizeless_dig_would_miss() {
+        let (s, _root) = tmp_store();
+        let d = s.put(None, b"a layer of some size").await.unwrap();
+
+        assert_eq!(
+            s.get_by_hash(&d.hash).await.unwrap().as_deref(),
+            Some(&b"a layer of some size"[..]),
+            "by hash alone must find it"
+        );
+        assert_eq!(s.size_of(&d.hash).await, Some(20));
+
+        // The trap, pinned: pretend we did not know the size.
+        let sizeless = Dig {
+            hash: d.hash.clone(),
+            size: 0,
+        };
+        assert!(
+            !s.has(&sizeless).await,
+            "a size-0 Dig calls a held blob absent - this is why OCI lookups \
+             may not fabricate one"
+        );
+        assert!(
+            s.put(Some(&sizeless), b"a layer of some size")
+                .await
+                .is_err(),
+            "and putting under one is rejected outright"
+        );
+
+        // The empty blob is the one case where size 0 is the truth.
+        assert!(
+            s.has(&Dig {
+                hash: EMPTY_SHA256.into(),
+                size: 0
+            })
+            .await
+        );
+        assert_eq!(s.get_by_hash(EMPTY_SHA256).await.unwrap(), Some(Vec::new()));
+        assert_eq!(s.size_of(EMPTY_SHA256).await, Some(0));
+
+        // A hash we have never seen is a clean miss, not an error.
+        assert_eq!(s.get_by_hash(&"f".repeat(64)).await.unwrap(), None);
+        assert_eq!(s.size_of(&"f".repeat(64)).await, None);
+    }
+
     fn tmp_store() -> (Store, PathBuf) {
         let root = tempfile::tempdir().unwrap().keep();
         (Store::new(root.clone()).unwrap(), root)

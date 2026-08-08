@@ -1242,6 +1242,25 @@ impl Driver {
         Ok(None)
     }
 
+    /// Blob by hash ALONE, for OCI.
+    ///
+    /// REAPI hands us a `Digest` carrying a size; an OCI registry hands us a
+    /// bare `sha256:...` and nothing else. That difference is not cosmetic
+    /// here, because the size is load-bearing everywhere else in this file:
+    /// [`crate::store::Store::has`] compares it against the file length, so a
+    /// FABRICATED size-0 `Dig` reports "absent" for a blob we are holding,
+    /// and `put` rejects the bytes when they arrive. Hence by-hash lookups
+    /// go through the size-free path rather than inventing a `Dig`.
+    ///
+    /// LOCAL ONLY, deliberately, for now: the mesh fetch chain is
+    /// size-carrying end to end, and threading an unknown size through it
+    /// touches the retry logic that run 29007342337 paid for. A miss here
+    /// means BuildKit re-pushes a layer the fleet may already hold - one
+    /// wasted upload, never wrong bytes. Fail open.
+    pub async fn get_blob_by_hash(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        self.store.get_by_hash(hash).await
+    }
+
     /// Read-through presence: make `d` locally available (streaming fetch
     /// into the store), without ever holding the blob in memory. The serve
     /// paths pair this with `Store::copy_out` so large blobs relay at
