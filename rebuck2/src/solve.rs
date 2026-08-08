@@ -941,6 +941,80 @@ mod tests {
         );
     }
 
+    /// Emit N distinct plain-LLB builds - no frontend, no secrets, no host
+    /// binds. What a client that is not earthly sends.
+    ///
+    ///   cargo test --bin rebuck2 write_fanout_llb -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn write_fanout_llb() {
+        use prost::Message;
+        let plat = pb::Platform {
+            os: "linux".into(),
+            architecture: std::env::consts::ARCH.replace("aarch64", "arm64"),
+            ..Default::default()
+        };
+        let dg = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
+        for i in 0..4 {
+            let src = pb::Op {
+                op: Some(pb::op::Op::Source(pb::SourceOp {
+                    identifier: "docker-image://docker.io/library/alpine:3.20".into(),
+                    ..Default::default()
+                })),
+                platform: Some(plat.clone()),
+                ..Default::default()
+            };
+            let src_b = src.encode_to_vec();
+            let exec = pb::Op {
+                inputs: vec![pb::Input {
+                    digest: dg(&src_b),
+                    index: 0,
+                }],
+                op: Some(pb::op::Op::Exec(pb::ExecOp {
+                    meta: Some(pb::Meta {
+                        // Distinct work per build, and slow enough that
+                        // parallelism would be visible if it happened.
+                        args: vec![
+                            "/bin/sh".into(),
+                            "-c".into(),
+                            format!("sleep 2 && echo task-{i} > /out"),
+                        ],
+                        cwd: "/".into(),
+                        ..Default::default()
+                    }),
+                    mounts: vec![pb::Mount {
+                        input: 0,
+                        dest: "/".into(),
+                        output: 0,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })),
+                platform: Some(plat.clone()),
+                ..Default::default()
+            };
+            let exec_b = exec.encode_to_vec();
+            let term = pb::Op {
+                inputs: vec![pb::Input {
+                    digest: dg(&exec_b),
+                    index: 0,
+                }],
+                ..Default::default()
+            };
+            let def = pb::Definition {
+                metadata: [&src_b, &exec_b]
+                    .iter()
+                    .map(|b| (dg(b), pb::OpMetadata::default()))
+                    .collect(),
+                def: vec![src_b, exec_b, term.encode_to_vec()],
+                ..Default::default()
+            };
+            let path = std::env::temp_dir().join(format!("rebuck2-fanout-{i}.llb"));
+            std::fs::write(&path, def.encode_to_vec()).unwrap();
+            println!("[fixture] {}", path.display());
+        }
+    }
+
     /// Emit a sample LLB Definition in the wire form `buildctl build` reads
     /// on stdin. A fixture generator, not an assertion:
     ///   cargo test --bin rebuck2 write_sample_llb -- --ignored

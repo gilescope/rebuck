@@ -257,6 +257,27 @@
 //! working: an unportable graph is not a dispatch failure, it is a graph
 //! that stays home.
 //!
+//! # 100% dispatch, on a client that is not earthly
+//!
+//! Four plain-LLB builds through the proxy, two stock buildkitds:
+//!
+//! ```text
+//! [wire] gateway solves : 4
+//! [wire] solves routed  : 4 to other daemons
+//! [wire] not routed     : {"considered": 4}
+//! build 0..3 exit=0
+//! peer 2 cache          : Total 13.63MB
+//! ```
+//!
+//! Every solve dispatched. The 1-in-12 ceiling on earthly builds was
+//! entirely the debugger plumbing described below - not a limit of the
+//! mechanism, not a property of build graphs, and not the user's secrets.
+//!
+//! It also settles what the product is. A distributed BUILDKIT works today
+//! for clients that send ordinary LLB; a distributed EARTHLY additionally
+//! needs one upstream change. Those are different amounts of work and the
+//! difference was invisible until a non-earthly client was tried.
+//!
 //! # What actually limits dispatch here: earthly's DEBUGGER
 //!
 //! The eleven excluded solves do not carry a user secret. They carry this,
