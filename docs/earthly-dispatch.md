@@ -86,4 +86,6 @@ what this product is: a distributed BuildKit works today for any client that
 builds its own LLB, and a distributed earthly additionally needs this one
 upstream patch.
 
-- Found: 2026-08-08. Not raised upstream; needs consent before any push or PR.
+- Found: 2026-08-08.
+- Raised upstream: [EarthBuild/earthbuild#784](https://github.com/EarthBuild/earthbuild/issues/784).
+  Issue only - no patch offered, and any PR needs consent first.
