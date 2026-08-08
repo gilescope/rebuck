@@ -406,6 +406,50 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # Native multi-arch, and why a platform FILTER would have done nothing
+//!
+//! Placement ignored platform entirely, in a system whose stated first job is
+//! native multi-arch. The obvious fix - ask each peer what platforms it
+//! supports and filter - is a no-op, and the daemons say so plainly. A stock
+//! buildkitd on an arm64 host:
+//!
+//! ```text
+//! linux/arm64,linux/amd64,linux/amd64/v2,linux/riscv64,linux/ppc64le,...
+//! ```
+//!
+//! and the same image forced to amd64:
+//!
+//! ```text
+//! linux/amd64,linux/amd64/v2,linux/amd64/v3,linux/arm64,linux/riscv64,...
+//! ```
+//!
+//! Every daemon claims nearly every platform, because binfmt will run
+//! anything. "Supports linux/amd64" is answered YES by every peer in any
+//! fleet. The worker's OWN architecture is the one it lists FIRST, and that
+//! is the whole distinction: an emulated build is legal and five to ten times
+//! slower.
+//!
+//! Three daemons, the last one `--platform linux/amd64`, six arm64 builds:
+//!
+//! ```text
+//! peer 0 upstream native linux/arm64
+//! peer 1 ...:18373 native linux/arm64
+//! peer 2 ...:18374 native linux/amd64
+//! placed {home: 2, peer1: 4}      wall 12s, outputs identical
+//! ```
+//!
+//! The emulated peer took none of six, against two in a uniform fleet, and
+//! the build paid no emulation penalty. Emulation is deprioritised rather
+//! than refused: a fleet with no native peer still builds, slowly, and if
+//! that turns out ruinous the take-back catches it.
+//!
+//! This also caught the harness measuring something other than it claimed.
+//! `IMAGE` pinned a TAG, so the daemons' architecture was whatever was in the
+//! local image cache - and pulling that tag once with `--platform
+//! linux/amd64` leaves an amd64 image under it, after which every daemon runs
+//! under QEMU. Docker says so in one warning line on stderr and nothing else
+//! changes. The harness now pins and prints the architecture.
+//!
 //! # Remembering, and a control that nearly was not run
 //!
 //! Taking work back is reactive: without memory the fleet rediscovers the
@@ -651,6 +695,10 @@ pub struct Mirror {
 /// One upstream daemon.
 #[derive(Clone)]
 pub struct Peer {
+    /// What this daemon says it can run, in ITS order - first is native.
+    /// Empty if it would not say (a daemon that cannot answer ListWorkers is
+    /// still usable; it is simply never preferred as native).
+    platforms: Vec<String>,
     pub addr: String,
     channel: Chan,
 }
@@ -758,7 +806,7 @@ impl Proxy {
 
     /// Whose turn it is next, over the WHOLE fleet.
     /// `None` means build it here. See `place`.
-    fn next_place(&self) -> Option<usize> {
+    fn next_place(&self, want: &crate::dispatch::Platform) -> Option<usize> {
         let cursor = self
             .next_peer
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -767,11 +815,20 @@ impl Proxy {
                 .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
                 .collect()
         };
+        // An unpinned graph is native everywhere: there is nothing to emulate.
+        let native: Vec<bool> = match want {
+            crate::dispatch::Platform::Pinned(p) => self.peers[1..]
+                .iter()
+                .map(|peer| native_for(&peer.platforms, p))
+                .collect(),
+            _ => vec![true; self.peers.len().saturating_sub(1)],
+        };
         place(
             cursor,
             self.peers.len(),
             &read(&self.outstanding[1..]),
             &read(&self.strikes[1..]),
+            &native,
         )
     }
 
@@ -847,16 +904,26 @@ impl Proxy {
     /// Add daemons to route to. Peer 0 is always this proxy's upstream.
     pub async fn with_peers(mut self, addrs: &[String]) -> anyhow::Result<Self> {
         let mut peers = vec![Peer {
+            platforms: platforms_of(self.channel.clone()).await,
             addr: "upstream".into(),
             channel: self.channel.clone(),
         }];
         for a in addrs {
+            let channel = tonic::transport::Endpoint::new(a.clone())?
+                .connect()
+                .await?;
             peers.push(Peer {
+                platforms: platforms_of(channel.clone()).await,
                 addr: a.clone(),
-                channel: tonic::transport::Endpoint::new(a.clone())?
-                    .connect()
-                    .await?,
+                channel,
             });
+        }
+        for (i, p) in peers.iter().enumerate() {
+            println!(
+                "[proxy] peer {i} {} native {}",
+                p.addr,
+                p.platforms.first().map(String::as_str).unwrap_or("unknown")
+            );
         }
         println!("[proxy] {} daemon(s) in the fleet", peers.len());
         self.outstanding = std::sync::Arc::new(
@@ -1187,6 +1254,63 @@ fn hedge_after(observed: &[u64]) -> Option<std::time::Duration> {
     ))
 }
 
+/// Ask a daemon what it can run, in its own order.
+///
+/// A daemon that will not answer is not excluded - it is simply never
+/// preferred as native. Failing closed here would turn one unhealthy
+/// ListWorkers into a fleet of one (principle 5).
+async fn platforms_of(channel: Chan) -> Vec<String> {
+    match control::control_client::ControlClient::new(channel)
+        .list_workers(control::ListWorkersRequest::default())
+        .await
+    {
+        Ok(r) => r
+            .into_inner()
+            .record
+            .first()
+            .map(|w| {
+                w.platforms
+                    .iter()
+                    .map(|p| format!("{}/{}", p.os, p.architecture))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(e) => {
+            println!("[proxy] a daemon would not list workers ({e}); never preferred as native");
+            Vec::new()
+        }
+    }
+}
+
+/// Whether a peer can build this platform NATIVELY.
+///
+/// Measured, and it is the whole reason platform filtering is not a one-line
+/// set membership test. A stock buildkitd on an arm64 host reports:
+///
+/// ```text
+/// linux/arm64,linux/amd64,linux/amd64/v2,linux/riscv64,linux/ppc64le,...
+/// ```
+///
+/// and the same image forced to amd64 reports:
+///
+/// ```text
+/// linux/amd64,linux/amd64/v2,linux/amd64/v3,linux/arm64,linux/riscv64,...
+/// ```
+///
+/// Every daemon claims nearly every platform, because binfmt/QEMU will run
+/// anything. So "does this peer support linux/amd64" is answered YES by every
+/// peer in any fleet and filtering on it is a no-op. The worker's OWN
+/// architecture is the one it lists FIRST, and that is the distinction native
+/// multi-arch is about: an emulated build is legal and five to ten times
+/// slower.
+///
+/// Emulation is not refused here - a fleet with no native peer should still
+/// build. It is deprioritised, and if it turns out ruinous the existing
+/// take-back catches it.
+fn native_for(worker_platforms: &[String], want: &str) -> bool {
+    worker_platforms.first().is_some_and(|p| p == want)
+}
+
 /// Where this solve goes: `None` means home.
 ///
 /// Three inputs, because each answers something the others cannot. `cursor`
@@ -1198,7 +1322,15 @@ fn hedge_after(observed: &[u64]) -> Option<std::time::Duration> {
 /// `load` and `strikes` are indexed over AWAY peers only - peer 0 is neither
 /// counted nor struck - so the returned index is offset back into fleet space
 /// by the caller.
-fn place(cursor: usize, peers: usize, load: &[usize], strikes: &[usize]) -> Option<usize> {
+fn place(
+    cursor: usize,
+    peers: usize,
+    load: &[usize],
+    strikes: &[usize],
+    // `true` where the away peer can build the wanted platform natively.
+    // All-true when the graph pins no platform, which is the common case.
+    native: &[bool],
+) -> Option<usize> {
     /// A struck peer is treated as though it already holds this many jobs.
     ///
     /// Deliberately the same number as `hedge_after`'s factor: the peer
@@ -1211,16 +1343,23 @@ fn place(cursor: usize, peers: usize, load: &[usize], strikes: &[usize]) -> Opti
         return None;
     }
     debug_assert_eq!(load.len(), strikes.len(), "away peers counted twice over");
+    debug_assert_eq!(load.len(), native.len(), "away peers counted twice over");
     // Every away peer has misbehaved: home is the fail-open answer
     // (principle 5). Without this a two-daemon fleet whose only peer is bad
     // would offer to it, wait out the bound, and take it back - every solve.
     if !strikes.is_empty() && strikes.iter().all(|&s| s > 0) {
         return None;
     }
+    /// What an emulated peer is discounted by. Larger than STRIKE_WEIGHT
+    /// because emulation is a known 5-10x, where a strike is one bad
+    /// observation - but finite, so a fleet with no native peer still builds
+    /// rather than refusing work it can do slowly.
+    const EMULATED_WEIGHT: usize = 8;
     let effective: Vec<usize> = load
         .iter()
         .zip(strikes)
-        .map(|(&l, &s)| l + s * STRIKE_WEIGHT)
+        .zip(native)
+        .map(|((&l, &s), &n)| l + s * STRIKE_WEIGHT + usize::from(!n) * EMULATED_WEIGHT)
         .collect();
     Some(1 + least_loaded(&effective, cursor))
 }
@@ -1821,7 +1960,11 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 // excluded solve consume a turn means an earthly build burns
                 // eleven turns and hands its one movable solve to whichever
                 // machine the arithmetic lands on.
-                let peer = if allowed { self.next_place() } else { None };
+                let peer = if allowed {
+                    self.next_place(&verdict.platform)
+                } else {
+                    None
+                };
                 if allowed {
                     *self
                         .wire
@@ -2183,6 +2326,49 @@ mod tests {
         }
     }
 
+    /// Native beats emulated, but emulated still beats nowhere.
+    ///
+    /// Every buildkitd claims nearly every platform because binfmt will run
+    /// anything, so a set-membership filter is answered YES by every peer and
+    /// changes nothing. The worker's own architecture is the one it lists
+    /// FIRST.
+    #[test]
+    fn a_native_peer_is_preferred_and_an_emulated_one_is_not_refused() {
+        let arm = vec!["linux/arm64".to_owned(), "linux/amd64".to_owned()];
+        let x86 = vec!["linux/amd64".to_owned(), "linux/arm64".to_owned()];
+        assert!(super::native_for(&arm, "linux/arm64"));
+        assert!(
+            !super::native_for(&arm, "linux/amd64"),
+            "emulation is not native"
+        );
+        assert!(super::native_for(&x86, "linux/amd64"));
+        // Peer 1 emulates, peer 2 is native: every away turn goes to peer 2.
+        let away: Vec<usize> = (0..8)
+            .filter_map(|c| super::place(c, 3, &[0, 0], &[0, 0], &[false, true]))
+            .collect();
+        assert!(!away.is_empty());
+        assert!(
+            away.iter().all(|&p| p == 2),
+            "emulated peer chosen: {away:?}"
+        );
+        // Nobody native: the work still goes out rather than being refused.
+        let away: Vec<usize> = (0..8)
+            .filter_map(|c| super::place(c, 3, &[0, 0], &[0, 0], &[false, false]))
+            .collect();
+        assert!(
+            !away.is_empty(),
+            "a fleet with no native peer refused work it could do"
+        );
+    }
+
+    /// A daemon that will not answer ListWorkers is usable, just never
+    /// preferred - failing closed would turn one bad health check into a
+    /// fleet of one.
+    #[test]
+    fn a_silent_daemon_is_not_native_and_not_excluded() {
+        assert!(!super::native_for(&[], "linux/arm64"));
+    }
+
     /// A struck peer stops getting an equal share.
     #[test]
     fn a_peer_taken_back_from_is_avoided() {
@@ -2190,7 +2376,7 @@ mod tests {
         let load = [0usize, 0];
         let strikes = [0usize, 1];
         let away: Vec<usize> = (0..12)
-            .filter_map(|c| super::place(c, 3, &load, &strikes))
+            .filter_map(|c| super::place(c, 3, &load, &strikes, &[true, true]))
             .collect();
         assert!(!away.is_empty(), "no away turns at all");
         assert!(
@@ -2204,7 +2390,7 @@ mod tests {
     #[test]
     fn a_struck_peer_still_beats_a_swamped_one() {
         let away: Vec<usize> = (0..6)
-            .filter_map(|c| super::place(c, 3, &[9, 0], &[0, 1]))
+            .filter_map(|c| super::place(c, 3, &[9, 0], &[0, 1], &[true, true]))
             .collect();
         assert!(
             away.iter().all(|&p| p == 2),
@@ -2220,16 +2406,19 @@ mod tests {
     #[test]
     fn a_wholly_struck_fleet_builds_at_home() {
         for cursor in 0..8 {
-            assert_eq!(super::place(cursor, 2, &[0], &[1]), None);
-            assert_eq!(super::place(cursor, 3, &[0, 0], &[2, 1]), None);
+            assert_eq!(super::place(cursor, 2, &[0], &[1], &[true]), None);
+            assert_eq!(
+                super::place(cursor, 3, &[0, 0], &[2, 1], &[true, true]),
+                None
+            );
         }
     }
 
     /// A lone daemon has nowhere to send anything.
     #[test]
     fn a_fleet_of_one_never_dispatches() {
-        assert_eq!(super::place(0, 1, &[], &[]), None);
-        assert_eq!(super::place(7, 1, &[], &[]), None);
+        assert_eq!(super::place(0, 1, &[], &[], &[]), None);
+        assert_eq!(super::place(7, 1, &[], &[], &[]), None);
     }
 
     /// With nothing observed, nothing is slow.

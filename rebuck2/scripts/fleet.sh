@@ -29,6 +29,13 @@ DAEMONS=${DAEMONS:-2}
 BUILDS=${BUILDS:-4}
 NOPROXY=${NOPROXY:-}
 IMAGE=${IMAGE:-moby/buildkit:latest}
+# The daemon's ARCHITECTURE, pinned. Without this the fleet's architecture is
+# whatever happens to be in the local image cache: pulling the same tag once
+# with `--platform linux/amd64` leaves an amd64 image under it, and every
+# later `docker run` silently reuses it under QEMU. That is a 5-10x slowdown
+# that looks like a slow fleet, and it is invisible except for one warning
+# line docker prints to stderr.
+PLATFORM=${PLATFORM:-linux/$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')}
 RUN=${RUN:-${TMPDIR:-/tmp}/rebuck2-fleet}
 BASE_PORT=${BASE_PORT:-18372}
 REG_PORT=${REG_PORT:-15000}
@@ -98,6 +105,10 @@ say "generate llb"
   cargo test --quiet --bin rebuck2 write_fanout_llb -- --ignored >/dev/null)
 printf "%s\n" "$RUN"/llb/*.llb
 
+say "daemons: $IMAGE on $PLATFORM"
+docker pull --platform "$PLATFORM" -q "$IMAGE" >/dev/null
+echo "image arch: $(docker image inspect "$IMAGE" --format '{{.Architecture}}')"
+
 say "registry on 0.0.0.0:$REG_PORT (daemons reach it as host.docker.internal)"
 "$bin" registry --bind "0.0.0.0:$REG_PORT" --store "$RUN/store" >"$RUN/registry.log" 2>&1 &
 pids+=($!)
@@ -122,6 +133,14 @@ for i in $(seq 0 $((DAEMONS - 1))); do
   port=$((BASE_PORT + i))
   name="rebuck2-fleet-$i"
   docker rm -f "$name" >/dev/null 2>&1 || true
+  # FOREIGN=linux/amd64 makes the LAST daemon a foreign-architecture one, so
+  # native-vs-emulated placement has something to choose between.
+  plat="$PLATFORM"
+  if [ -n "${FOREIGN:-}" ] && [ "$i" -eq $((DAEMONS - 1)) ]; then
+    plat="$FOREIGN"
+    docker pull --platform "$plat" -q "$IMAGE" >/dev/null
+    say "daemon $i is FOREIGN ($plat)"
+  fi
   limit=()
   if [ -n "$SLOW" ] && [ "$i" -eq $((DAEMONS - 1)) ]; then
     limit=(--cpus "$SLOW")
@@ -132,6 +151,7 @@ for i in $(seq 0 $((DAEMONS - 1))); do
   # fails with "invalid reference format". Bash 5 handles an empty `[@]` under
   # `set -u` correctly on its own.
   docker run -d --name "$name" --privileged \
+    --platform "$plat" \
     "${limit[@]}" \
     -p "$BIND:$port:8372" \
     -v "$RUN/buildkitd.toml:/etc/buildkit/buildkitd.toml:ro" \
@@ -210,7 +230,7 @@ if [ -z "$NOPROXY" ]; then
   # everything with SIGTERM.
   kill -INT "$proxy_pid" 2>/dev/null || true
   sleep 2
-  grep -E '^\[wire\]|^\[proxy\] adopted' "$RUN/proxy.log" || true
+  grep -E '^\[wire\]|^\[proxy\] (adopted|peer|taking)' "$RUN/proxy.log" || true
 fi
 
 # The identity of the result, per build. Written to a file so a proxied run
