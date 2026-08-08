@@ -22,6 +22,8 @@ base="${TMPDIR:-/tmp}/rebuck2-check-base"
 
 pass=0
 fail=0
+skipped=0
+IMAGE_PROBE=${IMAGE:-moby/buildkit:latest}
 ok() {
   printf '  \033[32mPASS\033[0m %s\n' "$1"
   pass=$((pass + 1))
@@ -131,6 +133,21 @@ check "and the refusal names the secret" \
 
 echo
 echo "== a foreign-architecture peer, on a PINNED graph"
+# Needs emulation for the foreign platform, which a bare CI runner does not
+# have until someone installs binfmt. Skipped rather than failed: a suite
+# that goes red because of the machine it is on teaches people to ignore it.
+foreign=${FOREIGN_PLATFORM:-linux/amd64}
+native="linux/$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')"
+if [ "$foreign" = "$native" ]; then
+  foreign=linux/arm64
+fi
+# `--entrypoint`, or this runs `buildkitd true` and starts a daemon that
+# never exits - the probe then hangs instead of answering.
+if ! timeout 60 docker run --rm --platform "$foreign" \
+  --entrypoint /bin/true "$IMAGE_PROBE" >/dev/null 2>&1; then
+  printf '  \033[33mSKIP\033[0m no emulation for %s on this machine\n' "$foreign"
+  skipped=$((skipped + 1))
+else
 # No REBUCK2_LLB_PLATFORM=any here, and that is the whole scenario. An
 # unpinned graph is native on every peer, because the base is mirrored for
 # whichever architecture the peer runs - so testing emulation with one asks
@@ -138,10 +155,11 @@ echo "== a foreign-architecture peer, on a PINNED graph"
 # the emulated peer took a third of the work.
 out=$(env -u REMOTE -u MIRROR_HOST REBUCK2_LLB_WORK="$work" \
   REBUCK2_HOME_SLOTS="$slots" \
-  BUILDS="$builds" DAEMONS=2 FOREIGN=linux/amd64 "$fleet" 2>&1)
+  BUILDS="$builds" DAEMONS=2 FOREIGN="$foreign" "$fleet" 2>&1)
 echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
 check "every build still finishes" "$(echo "$out" | grep -c '^failed  : 0')" 1
 check "the emulated peer is given nothing" "$(placed "$out" 1)" ""
+fi
 
 if [ -n "${REMOTE:-}" ]; then
   echo
@@ -162,5 +180,5 @@ if [ -n "${REMOTE:-}" ]; then
 fi
 
 echo
-printf '\n%s passed, %s failed\n' "$pass" "$fail"
+printf '\n%s passed, %s failed, %s skipped\n' "$pass" "$fail" "$skipped"
 [ "$fail" -eq 0 ]
