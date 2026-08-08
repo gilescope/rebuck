@@ -39,6 +39,14 @@ PLATFORM=${PLATFORM:-linux/$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
 RUN=${RUN:-${TMPDIR:-/tmp}/rebuck2-fleet}
 BASE_PORT=${BASE_PORT:-18372}
 REG_PORT=${REG_PORT:-15000}
+# The base image the fixtures build on.
+#
+# Fresh daemons pull it every run, and a day of that earns a 429 from Docker
+# Hub that looks exactly like a product failure. Overridable so a site with
+# its own mirror can avoid that; there is no built-in answer, because
+# rebuck2's own pull-through registry serves BLOBS by digest and not
+# manifests, so it cannot stand in for Hub without being extended.
+export REBUCK2_LLB_BASE="${REBUCK2_LLB_BASE:-docker-image://docker.io/library/alpine:3.20}"
 PROXY_PORT=${PROXY_PORT:-11234}
 # CPU quota for the LAST daemon, e.g. SLOW=0.25. A real fleet is never
 # uniform, and placement that ignores capacity is invisible until one machine
@@ -236,6 +244,7 @@ if [ -z "${NO_REGISTRY_TRUST:-}" ]; then
   insecure = true
 TOML
 fi
+
 
 peers=()
 for i in $(seq 0 $((DAEMONS - 1))); do

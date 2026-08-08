@@ -489,7 +489,7 @@ mod tests {
 
         let src = pb::Op {
             op: Some(pb::op::Op::Source(pb::SourceOp {
-                identifier: "docker-image://docker.io/library/alpine:3.20".into(),
+                identifier: base_image(),
                 ..Default::default()
             })),
             platform: Some(plat.clone()),
@@ -786,7 +786,7 @@ mod tests {
         // ran and failed. Two iterations were spent on that.
         let base = pb::Op {
             op: Some(pb::op::Op::Source(pb::SourceOp {
-                identifier: "docker-image://docker.io/library/alpine:3.20".into(),
+                identifier: base_image(),
                 ..Default::default()
             })),
             platform: Some(plat.clone()),
@@ -1001,6 +1001,17 @@ mod tests {
         );
     }
 
+    /// The base image every fixture builds on.
+    ///
+    /// Overridable so the harness can point at a pull-through cache instead
+    /// of Docker Hub. Fresh daemons pull the base on every run, and a day of
+    /// that earns a `429 Too Many Requests` that looks exactly like a product
+    /// failure - twelve red assertions with nothing wrong in this repo.
+    pub(super) fn base_image() -> String {
+        std::env::var("REBUCK2_LLB_BASE")
+            .unwrap_or_else(|_| "docker-image://docker.io/library/alpine:3.20".to_owned())
+    }
+
     /// Emit N builds whose exec mounts an SSH AGENT.
     ///
     /// The exec requires the agent to ANSWER, not merely for a socket to
@@ -1021,7 +1032,7 @@ mod tests {
         for i in 0..n {
             let base = pb::Op {
                 op: Some(pb::op::Op::Source(pb::SourceOp {
-                    identifier: "docker-image://docker.io/library/alpine:3.20".into(),
+                    identifier: base_image(),
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -1128,7 +1139,7 @@ mod tests {
         for i in 0..n {
             let base = pb::Op {
                 op: Some(pb::op::Op::Source(pb::SourceOp {
-                    identifier: "docker-image://docker.io/library/alpine:3.20".into(),
+                    identifier: base_image(),
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -1235,7 +1246,7 @@ mod tests {
         for i in 0..n {
             let base = pb::Op {
                 op: Some(pb::op::Op::Source(pb::SourceOp {
-                    identifier: "docker-image://docker.io/library/alpine:3.20".into(),
+                    identifier: base_image(),
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -1357,7 +1368,7 @@ mod tests {
         for i in 0..n {
             let base = pb::Op {
                 op: Some(pb::op::Op::Source(pb::SourceOp {
-                    identifier: "docker-image://docker.io/library/alpine:3.20".into(),
+                    identifier: base_image(),
                     ..Default::default()
                 })),
                 platform: plat.clone(),
@@ -1511,7 +1522,7 @@ mod tests {
         for i in 0..n {
             let src = pb::Op {
                 op: Some(pb::op::Op::Source(pb::SourceOp {
-                    identifier: "docker-image://docker.io/library/alpine:3.20".into(),
+                    identifier: base_image(),
                     ..Default::default()
                 })),
                 platform: plat.clone(),
@@ -1715,7 +1726,7 @@ mod tests {
         let dg = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
         let src = pb::Op {
             op: Some(pb::op::Op::Source(pb::SourceOp {
-                identifier: "docker-image://docker.io/library/alpine:3.20".into(),
+                identifier: base_image(),
                 ..Default::default()
             })),
             platform: Some(plat.clone()),
@@ -1837,6 +1848,7 @@ mod tests {
 
 #[cfg(test)]
 mod hostbind {
+    use super::tests::base_image;
     use super::*;
     use prost::Message;
 
@@ -1860,7 +1872,7 @@ mod hostbind {
         let dg = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
         let src = pb::Op {
             op: Some(pb::op::Op::Source(pb::SourceOp {
-                identifier: "docker-image://docker.io/library/alpine:3.20".into(),
+                identifier: base_image(),
                 ..Default::default()
             })),
             ..Default::default()
