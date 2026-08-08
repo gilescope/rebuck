@@ -257,6 +257,31 @@
 //! working: an unportable graph is not a dispatch failure, it is a graph
 //! that stays home.
 //!
+//! # The bind a peer is currently in
+//!
+//! Twelve solves are offered and one completes. The other eleven fail on
+//! the PEER, and which way they fail depends on which daemon it is:
+//!
+//! | peer | failure |
+//! | ----------------------- | ------------------------------------ |
+//! | `earthbuild/buildkitd` | `no active sessions` - it wants a session to export |
+//! | `moby/buildkit` | `unknown API capability exec.mount.sock` |
+//!
+//! So a peer cannot be stock buildkit, because earthly's LLB uses a
+//! capability only its fork declares; and the fork will not export without
+//! a session, which is exactly what a peer does not have.
+//!
+//! The way out is to give the peer a session of OUR making - not the
+//! client's. Buildkit does not need the client's credentials here, it needs
+//! SOMEBODY to ask; an empty auth service satisfies it. That means serving
+//! a session to the peer, which is the tunnelled gRPC server this proxy has
+//! so far avoided implementing.
+//!
+//! The one solve that does complete is the one whose export finds
+//! everything already local, so no auth is resolved. That is a warm-cache
+//! success, and it is why the number was 1 rather than 0 - not evidence
+//! that placement works better than it does.
+//!
 //! # Where this actually got to
 //!
 //! A real `earthly +all` on a two-daemon fleet, and the whole chain fired:
@@ -715,6 +740,13 @@ pub struct Wire {
     pub calls: Vec<String>,
     /// Solves placed on a peer other than the upstream.
     pub routed: u64,
+    /// Why a solve was NOT placed, counted.
+    ///
+    /// One routed solve out of twelve is either a fleet barely working or a
+    /// fleet barely used, and the difference is not visible from the
+    /// outside. Counting the reason is what turns "improve routing" into a
+    /// specific thing to fix.
+    pub rejected: std::collections::BTreeMap<String, u64>,
 }
 
 impl Wire {
@@ -819,6 +851,7 @@ impl Wire {
         }
         println!("[wire] gateway calls  : {counts:?}");
         println!("[wire] solves routed  : {} to other daemons", self.routed);
+        println!("[wire] not routed     : {:?}", self.rejected);
         println!("[wire] call order     : {}", self.calls.join(" "));
         println!(
             "[wire] session bytes  : {} KiB client->daemon, {} KiB daemon->client",
@@ -1071,6 +1104,20 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         // graph that merely imports it. Peer 0 fetches content instead of
         // building, and the ref it returns is its own.
         let mut req = req;
+        {
+            let mut w = self.wire.lock().expect("wire");
+            let key = match (
+                self.peers.len() > 1,
+                self.mirror.is_some(),
+                req.definition.is_some(),
+            ) {
+                (false, _, _) => "no fleet",
+                (_, false, _) => "no mirror",
+                (_, _, false) => "no definition",
+                _ => "considered",
+            };
+            *w.rejected.entry(key.to_owned()).or_default() += 1;
+        }
         if self.peers.len() > 1 {
             if let (Some(mirror), Some(def)) = (&self.mirror, req.definition.clone()) {
                 let session = self.session_for(&meta);
@@ -1081,23 +1128,39 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 // base was still being mirrored go out anyway - concurrent
                 // solves skip an in-flight copy - and the peer then reached
                 // for Docker Hub with no credentials and panicked.
-                let movable = crate::dispatch::analyse(&portable, 1)
+                let local_clear = crate::dispatch::analyse(&portable, 1)
                     .cuts
                     .first()
-                    .is_none_or(|c| c.frontier.local == 0)
-                    && portable.def.iter().all(|b| {
-                        use prost::Message;
-                        match bollard_buildkit_proto::pb::Op::decode(b.as_slice())
-                            .ok()
-                            .and_then(|o| o.op)
-                        {
-                            Some(bollard_buildkit_proto::pb::op::Op::Source(src)) => src
-                                .identifier
-                                .strip_prefix("docker-image://")
-                                .is_none_or(|r| r.starts_with(&mirror.registry)),
-                            _ => true,
-                        }
-                    });
+                    .is_none_or(|c| c.frontier.local == 0);
+                let bases_clear = portable.def.iter().all(|b| {
+                    use prost::Message;
+                    match bollard_buildkit_proto::pb::Op::decode(b.as_slice())
+                        .ok()
+                        .and_then(|o| o.op)
+                    {
+                        Some(bollard_buildkit_proto::pb::op::Op::Source(src)) => src
+                            .identifier
+                            .strip_prefix("docker-image://")
+                            .is_none_or(|r| r.starts_with(&mirror.registry)),
+                        _ => true,
+                    }
+                });
+                let movable = local_clear && bases_clear;
+                if !movable {
+                    let why = match (local_clear, bases_clear) {
+                        (false, false) => "context and base unmirrored",
+                        (false, true) => "context unmirrored",
+                        (true, false) => "base unmirrored",
+                        (true, true) => unreachable!(),
+                    };
+                    *self
+                        .wire
+                        .lock()
+                        .expect("wire")
+                        .rejected
+                        .entry(why.to_owned())
+                        .or_default() += 1;
+                }
                 if movable {
                     let peer = 1 + self
                         .next_peer
@@ -1112,7 +1175,21 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         }
                         // Fail open: build it here, exactly as we would
                         // have without a fleet.
-                        Err(e) => println!("[proxy] peer {peer} could not take it: {e:#}"),
+                        Err(e) => {
+                            println!("[proxy] peer {peer} could not take it: {e:#}");
+                            // Count the FAILURES too. `routed` counts only
+                            // successes, so a fleet attempting twelve
+                            // adoptions and completing one looked identical
+                            // to a fleet attempting one - which sent me
+                            // hunting a placement bug that did not exist.
+                            *self
+                                .wire
+                                .lock()
+                                .expect("wire")
+                                .rejected
+                                .entry("peer refused".to_owned())
+                                .or_default() += 1;
+                        }
                     }
                 }
             }
