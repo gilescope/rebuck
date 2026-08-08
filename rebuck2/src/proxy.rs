@@ -406,6 +406,45 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # The balance condition is real; feeding it back is unstable
+//!
+//! The sweep left an obvious question: can the optimum be found rather than
+//! swept for? Measuring what the client waits, split by where the work went,
+//! says yes - the optimum is exactly where the two sides finish together:
+//!
+//! ```text
+//! 12:12  wall 18s   home 11425ms  away 17235ms  ratio 1.51
+//! 16: 8  wall 15s   home 15228ms  away 15506ms  ratio 1.02
+//! ```
+//!
+//! And the arithmetic on the bad split points at the good one:
+//! `derive_weights(11425, 17235)` is 3:2, next door to the 16:8 that measured
+//! best. That is a control law with no core counts in it.
+//!
+//! Feeding it back does not work, and two runs of the same experiment are how
+//! that showed:
+//!
+//! ```text
+//! adapt   24 builds x3   18 14 14s   placed 40:32
+//! adapt   same again     24 17 24s   placed 34:38   <- drifted the wrong way
+//! pinned  control        18 15 16s   placed 36:36
+//! ```
+//!
+//! Service time is ENDOGENOUS - what is measured is caused by what is set.
+//! Load the home side, its mean rises, the ratio drops below one, the
+//! controller reads "home is the straggler" and sends more work away, which
+//! raises the away mean in turn. The first run looked like a win over the
+//! hand-tuned 15s; the second was worse than doing nothing.
+//!
+//! So it ships OFF, behind `REBUCK2_ADAPT=1`, with the measurement kept: the
+//! law is worth having and this loop around it is not. A stable version has
+//! to break the feedback - compare against a quantity the controller does not
+//! move, or damp and converge rather than jump to the ratio each time.
+//!
+//! The control run earns its own line. Rounds two and three are faster
+//! whatever placement does, because the peers warm their own caches; a
+//! self-tuner left switched on would have taken credit for that too.
+//!
 //! # Capacity cannot be guessed from cores, and the guess made it WORSE
 //!
 //! The 50/50 split of the previous result looked like the obvious waste: the
@@ -951,6 +990,10 @@ pub struct Proxy {
     /// minted a ref must serve every later call naming it, or the eleventh
     /// call of a working-looking build fails with "ref not found".
     ref_home: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    /// build id -> where its work went. Written by the gateway solve, read by
+    /// `Control.Solve` when it finishes, because only the gateway knows the
+    /// placement and only Control knows what the client actually waited.
+    went: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Option<usize>>>>,
     /// What completed adoptions have cost, in ms. The basis for calling one
     /// slow - see `hedge_after`.
     adopted_ms: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
@@ -985,6 +1028,7 @@ impl Proxy {
             adopted_ms: Default::default(),
             outstanding: Default::default(),
             strikes: Default::default(),
+            went: Default::default(),
             next_peer: Default::default(),
             ref_home: Default::default(),
         })
@@ -1032,7 +1076,51 @@ impl Proxy {
                 .collect(),
             None => vec![true; self.peers.len().saturating_sub(1)],
         };
-        let weights: Vec<usize> = self.peers.iter().map(|p| p.weight).collect();
+        // Declared weights are the starting point; observation overrides them
+        // once there is any. Deliberately not the other way round - a
+        // declaration is a guess about hardware, and the guess measured
+        // WORSE than a flat split.
+        let mut weights: Vec<usize> = self.peers.iter().map(|p| p.weight).collect();
+        // OFF by default. `REBUCK2_ADAPT=1` opts in.
+        //
+        // The law is right and this implementation of it is not. Service time
+        // is ENDOGENOUS: the thing being measured is caused by the thing being
+        // set. Load the home side and its mean rises, the ratio falls below
+        // one, the controller reads that as "home is the straggler" and sends
+        // MORE work away, which raises the away mean, and so on. Two runs of
+        // the same three rounds:
+        //
+        // ```text
+        // adapt   24 builds x3   18 14 14s   placed 40:32
+        // adapt   same again     24 17 24s   placed 34:38   <- drifted away
+        // pinned  control        18 15 16s   placed 36:36
+        // pinned  control        18 15 16s   placed 36:36
+        // ```
+        //
+        // The control also shows where most of the round-two gain comes from,
+        // and it is not placement: the peers warm their own caches, and a
+        // self-tuner left switched on would have taken the credit.
+        let adapt = std::env::var("REBUCK2_ADAPT").as_deref() == Ok("1");
+        if adapt && weights.len() == 2 {
+            // Two-machine fleets only, for now: with more peers the balance
+            // condition is a system of equations, not a ratio, and shipping
+            // the two-peer arithmetic as though it generalised would be the
+            // same error as guessing from cores.
+            let w = self.wire.lock().expect("wire");
+            let mean = |v: &[u64]| -> u64 {
+                if v.len() < MIN_SAMPLES {
+                    0
+                } else {
+                    v.iter().sum::<u64>() / v.len() as u64
+                }
+            };
+            let (h, a) = (mean(&w.home_ms), mean(&w.away_ms));
+            drop(w);
+            if h > 0 && a > 0 {
+                let (wh, wa) = derive_weights(h, a, WEIGHT_CAP);
+                weights = vec![wh, wa];
+            }
+        }
         place(
             cursor,
             &weights,
@@ -1259,6 +1347,9 @@ impl control::control_server::Control for Proxy {
                 .expect("sessions")
                 .insert(req.r#ref.clone(), req.session.clone());
         }
+        // Kept before the request is consumed: the client blocks on this call,
+        // and the gateway solve that chose a peer names the same build id.
+        let build_id = req.r#ref.clone();
         // THIS is where a build's time actually is. Both cheaper
         // candidates were tried and are near-zero: a gateway Solve returns a
         // ref in ~1ms, and `return` merely registers it. The client blocks
@@ -1269,11 +1360,16 @@ impl control::control_server::Control for Proxy {
             .client()
             .solve(Request::from_parts(meta, ext, req))
             .await;
-        self.wire
-            .lock()
-            .expect("wire")
-            .control_solves
-            .push(t.elapsed().as_millis() as u64);
+        let ms = t.elapsed().as_millis() as u64;
+        let went = self.went.lock().expect("went").get(&build_id).copied();
+        let mut w = self.wire.lock().expect("wire");
+        w.control_solves.push(ms);
+        match went {
+            Some(Some(_)) => w.away_ms.push(ms),
+            Some(None) => w.home_ms.push(ms),
+            // Never placed - excluded, no fleet, no mirror. Neither bucket.
+            None => {}
+        }
         out
     }
 
@@ -1427,6 +1523,52 @@ fn trace(wire: &std::sync::Mutex<Wire>, call: &str) {
 ///
 /// Peer 0 takes its turn and the graph is built in place, which is the
 /// round-trip skipped rather than paid.
+/// How many completed builds before a side's mean means anything.
+const MIN_SAMPLES: usize = 2;
+/// Largest weight `derive_weights` will hand out. Bounds how blocky `turn`'s
+/// rotation can get.
+const WEIGHT_CAP: usize = 8;
+
+/// Turn two mean service times into a pair of small weights.
+///
+/// The control law, and it is measured rather than reasoned: at the split
+/// that minimises wall clock, the two sides FINISH TOGETHER. Twenty-four
+/// builds across two machines -
+///
+/// ```text
+/// 12:12  wall 18s   home 11425ms  away 17235ms  ratio 1.51
+/// 16: 8  wall 15s   home 15228ms  away 15506ms  ratio 1.02
+/// ```
+///
+/// - so a ratio above one says the away side is the straggler and the share
+/// should move home, and the balance point is ratio 1. Shares therefore go as
+/// the INVERSE of service time, which needs no core counts and no declared
+/// capacity: an operator guessing from cores got 21s, and this arithmetic on
+/// the 12:12 numbers gives 3:2, which is next to the 16:8 that measured best.
+///
+/// Small integers, because `turn` hands out contiguous blocks: weights of
+/// 15228 and 15506 would send fifteen thousand consecutive solves to one peer
+/// before the other saw a single one. `cap` bounds the denominator, and the
+/// approximation is the best rational within it rather than a truncation -
+/// 1.51 must become 3:2, not 1:1.
+fn derive_weights(home_ms: u64, away_ms: u64, cap: usize) -> (usize, usize) {
+    if home_ms == 0 || away_ms == 0 {
+        return (1, 1);
+    }
+    // home:away = away_ms:home_ms - the side that takes longer gets fewer.
+    let ratio = away_ms as f64 / home_ms as f64;
+    let (mut best, mut err) = ((1usize, 1usize), f64::INFINITY);
+    for d in 1..=cap {
+        let n = ((ratio * d as f64).round() as usize).clamp(1, cap);
+        let e = (ratio - n as f64 / d as f64).abs();
+        if e < err {
+            err = e;
+            best = (n, d);
+        }
+    }
+    best
+}
+
 fn turn(cursor: usize, weights: &[usize]) -> usize {
     debug_assert!(!weights.is_empty(), "a fleet with no peers has no turns");
     // Weighted, because machines are not interchangeable and buildkit will
@@ -1741,6 +1883,13 @@ pub struct Wire {
     pub calls: Vec<String>,
     /// Solves placed on a peer other than the upstream.
     pub routed: u64,
+    /// Client-visible build times, split by where the work went.
+    ///
+    /// The sweep says the best split is 2:1 toward home, and a weight can
+    /// only be derived from measurement if the ratio the sweep implies is
+    /// actually observable. These two are what would have to predict it.
+    pub home_ms: Vec<u64>,
+    pub away_ms: Vec<u64>,
     /// How long each `Control.Solve` took - the call the CLIENT blocks on,
     /// and so the only honest measure of a build's duration from here.
     pub control_solves: Vec<u64>,
@@ -1878,6 +2027,20 @@ impl Wire {
         println!("[wire] solves routed  : {} to other daemons", self.routed);
         println!("[wire] built at home  : {} (peer 0's own share)", self.home);
         println!("[wire] placed         : {:?} (0 = home)", self.placed);
+        let mean = |v: &[u64]| -> u64 {
+            if v.is_empty() {
+                0
+            } else {
+                v.iter().sum::<u64>() / v.len() as u64
+            }
+        };
+        let (h, a) = (mean(&self.home_ms), mean(&self.away_ms));
+        println!(
+            "[wire] service ms     : home {h} ({}) away {a} ({}) ratio {:.2}",
+            self.home_ms.len(),
+            self.away_ms.len(),
+            if h == 0 { 0.0 } else { a as f64 / h as f64 }
+        );
         for (i, s) in self.spans.iter().enumerate() {
             println!(
                 "[wire] solve {i} ms     : total {} = portable {} + peer {} + answer {} \
@@ -2285,6 +2448,12 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         .placed
                         .entry(peer.unwrap_or(0))
                         .or_default() += 1;
+                    if let Some(id) = meta
+                        .get("buildkit-controlapi-buildid")
+                        .and_then(|v| v.to_str().ok())
+                    {
+                        self.went.lock().expect("went").insert(id.to_owned(), peer);
+                    }
                 }
                 if allowed && peer.is_none() {
                     // Peer 0's turn. It already holds the job, the session
@@ -2778,6 +2947,35 @@ mod tests {
             Some(std::time::Duration::from_secs(5)),
             "270ms would abandon peers over scheduling noise"
         );
+    }
+
+    /// The control law reproduces the measured optimum.
+    ///
+    /// These are the real numbers from two machines. The flat split's
+    /// observation must point AT the split that measured best, or the law is
+    /// just an equation that happens to run.
+    #[test]
+    fn observed_service_times_point_at_the_measured_optimum() {
+        // 12:12, wall 18s - away is the straggler.
+        assert_eq!(super::derive_weights(11_425, 17_235, 8), (3, 2));
+        // 16:8, wall 15s - balanced, so stay put.
+        assert_eq!(super::derive_weights(15_228, 15_506, 8), (1, 1));
+    }
+
+    /// 1.51 must become 3:2, not 1:1. Truncating the ratio would report
+    /// "balanced" for a fleet that is half again slower on one side.
+    #[test]
+    fn a_ratio_between_whole_numbers_is_not_truncated() {
+        assert_eq!(super::derive_weights(1_000, 1_510, 8), (3, 2));
+        assert_eq!(super::derive_weights(1_000, 1_250, 8), (5, 4));
+        assert_eq!(super::derive_weights(1_000, 2_000, 8), (2, 1));
+    }
+
+    /// No samples, no opinion.
+    #[test]
+    fn a_side_with_no_time_gets_an_even_split() {
+        assert_eq!(super::derive_weights(0, 5_000, 8), (1, 1));
+        assert_eq!(super::derive_weights(5_000, 0, 8), (1, 1));
     }
 
     /// A declared weight buys proportionally more turns.
