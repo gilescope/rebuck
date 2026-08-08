@@ -472,6 +472,120 @@ pub fn analyse(def: &pb::Definition, min_ops: usize) -> Analysis {
     }
 }
 
+/// Rewrite every `local://` source to fetch from somewhere a peer can reach.
+///
+/// The build context has exactly one holder - the client - and it arrives by
+/// filesync over the session. Measured: a 32 MiB context is 32 MiB through
+/// whoever proxies that session. So a peer cannot obtain it, and every
+/// `COPY`-bearing subtree is undispatchable without putting the coordinator
+/// on the data path for the whole repository, once per peer.
+///
+/// Principle 9 already answers this shape. The client is an ORIGIN, and the
+/// rule for origins is fetch once into the fleet and serve peer to peer. We
+/// receive the context anyway (we are proxying the session); publishing it
+/// as content and rewriting the graph to point at that content turns N
+/// transfers through the coordinator into one, after which the mesh serves
+/// it like any other blob.
+///
+/// # The digest cascade, which is the whole difficulty
+///
+/// LLB ops reference each other BY THE DIGEST OF THEIR BYTES. Change one
+/// op and its digest changes, so every op that inputs from it now points at
+/// something that does not exist - and those ops' digests change in turn,
+/// all the way to the root. A rewrite is therefore not a substitution; it is
+/// a rebuild of the graph in topological order.
+///
+/// `replacement` is asked per local source NAME (`context`, `dockerfile`),
+/// because those are different directories. Returning `None` leaves that
+/// source alone, which keeps the subtree undispatchable rather than wrong.
+pub fn rewrite_local_sources(
+    def: &pb::Definition,
+    replacement: &dyn Fn(&str) -> Option<String>,
+) -> pb::Definition {
+    let digest = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
+
+    // Nothing local: return the bytes untouched rather than equivalent.
+    // Reserialising an unchanged graph changes every digest for nothing,
+    // and buildkit would read the result as a cache miss for the whole
+    // build - the most expensive possible no-op.
+    let has_local = def.def.iter().any(|b| {
+        matches!(
+            pb::Op::decode(b.as_slice()).ok().and_then(|o| o.op),
+            Some(pb::op::Op::Source(s)) if s.identifier.starts_with("local://")
+        )
+    });
+    if !has_local {
+        return def.clone();
+    }
+
+    // Ops arrive topologically sorted (buildkit marshals them that way), so
+    // one forward pass suffices: by the time an op is reached, everything it
+    // inputs from has been rewritten and its new digest is known.
+    let mut remap: BTreeMap<String, String> = BTreeMap::new();
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(def.def.len());
+
+    for bytes in &def.def {
+        let Ok(mut op) = pb::Op::decode(bytes.as_slice()) else {
+            // Unreadable: carry it verbatim. Its digest is unchanged, so
+            // anything referencing it still resolves.
+            out.push(bytes.clone());
+            continue;
+        };
+        let before = digest(bytes);
+
+        for input in &mut op.inputs {
+            if let Some(new) = remap.get(&input.digest) {
+                input.digest = new.clone();
+            }
+        }
+        if let Some(pb::op::Op::Source(src)) = &mut op.op {
+            if let Some(name) = src.identifier.strip_prefix("local://") {
+                // Per SOURCE, not one replacement for all of them. Earthly
+                // passes `context` and `dockerfile` separately and they are
+                // different directories; rewriting both to one identifier
+                // makes them encode identically, so they collapse to one op
+                // and the second content silently becomes the first.
+                let Some(new) = replacement(name) else {
+                    out.push(bytes.clone());
+                    continue;
+                };
+                src.identifier = new;
+                // Local sources carry filesync attrs - include patterns,
+                // session ids - that mean nothing to a registry source and
+                // would be a stale reference to a session the peer has no
+                // part in.
+                src.attrs.clear();
+            }
+        }
+
+        let rebuilt = op.encode_to_vec();
+        let after = digest(&rebuilt);
+        if after != before {
+            remap.insert(before, after);
+        }
+        out.push(rebuilt);
+    }
+
+    // Metadata is keyed by op digest, so it has to follow the remap or the
+    // graph loses its descriptions and cache hints.
+    let metadata = def
+        .metadata
+        .iter()
+        .map(|(k, v)| {
+            (
+                remap.get(k).cloned().unwrap_or_else(|| k.clone()),
+                v.clone(),
+            )
+        })
+        .collect();
+
+    pb::Definition {
+        def: out,
+        metadata,
+        source: def.source.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -991,6 +1105,80 @@ mod tests {
         ]);
         d.def.push(b"not a protobuf".to_vec());
         assert_eq!(analyse(&d, 2).ops, 3, "the op still counts as present");
+    }
+
+    #[test]
+    fn rewriting_a_source_relinks_every_op_that_depended_on_it() {
+        // The cascade. ops reference each other by the digest of their
+        // BYTES, so changing a source changes its digest, which orphans its
+        // consumer, which changes that op's digest too, to the root.
+        let d = chain(vec![
+            (src("local://context"), vec![]),
+            (plain(), vec![0]),
+            (plain(), vec![1]),
+        ]);
+        let out = rewrite_local_sources(&d, &|n| {
+            Some(format!("docker-image://mesh.local/{n}@sha256:abc"))
+        });
+
+        assert_eq!(out.def.len(), d.def.len(), "no op may be added or lost");
+        let a = analyse(&out, 1);
+        assert_eq!(
+            a.cuts.iter().map(|c| c.ops).max(),
+            Some(3),
+            "the chain must still be a chain - if the relink failed, the \
+             top op reaches nothing and its closure is 1"
+        );
+
+        // The point of the exercise: no local source survives, so the
+        // frontier is free and the subtree can travel.
+        let top = a.cuts.first().unwrap();
+        assert_eq!(top.frontier.local, 0);
+        assert_eq!(top.frontier.registry, 1);
+        assert!(top.frontier.is_free(), "{:?}", top.frontier);
+    }
+
+    #[test]
+    fn a_graph_with_nothing_local_is_returned_untouched() {
+        // Byte-identical, not merely equivalent: a rewrite that reserialises
+        // an untouched graph changes every digest for nothing, and buildkit
+        // would treat the result as a cache miss for the entire build.
+        let d = chain(vec![
+            (src("docker-image://alpine:3.20"), vec![]),
+            (plain(), vec![0]),
+        ]);
+        let out = rewrite_local_sources(&d, &|n| Some(format!("docker-image://x/{n}")));
+        assert_eq!(out.def, d.def, "an untouched graph must not be rebuilt");
+    }
+
+    #[test]
+    fn every_local_source_is_rewritten_not_just_the_first() {
+        // Two contexts is normal - earthly passes `context` and
+        // `dockerfile` separately, and a build with several COPY roots has
+        // more. Rewriting one and leaving the rest still grounds the cut.
+        let d = chain(vec![
+            (src("local://context"), vec![]),
+            (src("local://dockerfile"), vec![]),
+            (plain(), vec![0, 1]),
+        ]);
+        // Each gets its OWN replacement. One identifier for both would make
+        // them encode identically, collapse to a single op, and hand the
+        // dockerfile's content to whatever wanted the context.
+        let out = rewrite_local_sources(&d, &|n| Some(format!("docker-image://mesh/{n}")));
+        let top = analyse(&out, 1).cuts.first().cloned().unwrap();
+        assert_eq!(top.frontier.local, 0, "both must go");
+        assert_eq!(top.frontier.registry, 2, "and they must stay DISTINCT");
+        assert_eq!(top.ops, 3);
+
+        // A source we have no replacement for is left alone - the subtree
+        // stays undispatchable, which is the safe answer, rather than being
+        // rewritten to point at content nobody published.
+        let partial = rewrite_local_sources(&d, &|n| {
+            (n == "context").then(|| "docker-image://mesh/context".to_owned())
+        });
+        let top = analyse(&partial, 1).cuts.first().cloned().unwrap();
+        assert_eq!(top.frontier.local, 1, "the unmapped one survives");
+        assert!(!top.frontier.is_free());
     }
 
     #[test]
