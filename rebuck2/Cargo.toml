@@ -1,3 +1,9 @@
+[workspace]
+# The session crate is a sibling rather than a module: it speaks a protocol
+# that has nothing to do with dispatch, and anyone wanting to serve buildkit
+# attachables should be able to take it without taking a build scheduler.
+members = [".", "buildkit-session"]
+
 [package]
 name = "rebuck2"
 version = "0.0.0"
