@@ -406,6 +406,31 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # Build size was a proxy for SATURATION, and wiring the gate proved it
+//!
+//! The sweep below argued for a per-subtree rule: ship a subtree only if it
+//! is bigger than its own transfer. Wiring it is what showed the rule is
+//! wrong, and it took two corrections to get there.
+//!
+//! The first overhead estimate was away-time minus what the peer spent
+//! building. The gate never fired, because the duration compared against is
+//! itself an away duration and already contains that overhead - the test was
+//! `est > (est - build)`, true almost always. Comparing two client-visible
+//! numbers in the same units fixes that.
+//!
+//! It still does not fire, and the model is why. At small build sizes home is
+//! not SATURATED: twenty-four short builds fit comfortably in sixteen cores,
+//! so shipping adds latency without relieving anything. Per-build durations
+//! cannot see that, however carefully they are compared. Build size was only
+//! ever standing in for how full the local machine is - bigger builds
+//! saturate it sooner, which is why the sweep looked like a size effect.
+//!
+//! Ships off, behind `REBUCK2_GATE=1`, with the estimator live and reported.
+//! The measurement is sound; the question put to it was wrong. Saturation is
+//! a different mechanism and the local core count is a legitimate input to it
+//! - "is this machine full" is not the same question as "how fast is this
+//! machine", which is the one core counts got wrong two sections down.
+//!
 //! # The optimal split belongs to the WORKLOAD, not the fleet
 //!
 //! Two machines, twenty-four builds, the split swept at three build sizes.
@@ -1029,7 +1054,12 @@ pub struct Proxy {
     /// build id -> where its work went. Written by the gateway solve, read by
     /// `Control.Solve` when it finishes, because only the gateway knows the
     /// placement and only Control knows what the client actually waited.
-    went: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Option<usize>>>>,
+    went: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, (Option<usize>, String)>>,
+    >,
+    /// graph key -> observed client-visible durations. The estimate that
+    /// decides whether a subtree is worth shipping.
+    seen_ms: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u64>>>>,
     /// What completed adoptions have cost, in ms. The basis for calling one
     /// slow - see `hedge_after`.
     adopted_ms: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
@@ -1065,6 +1095,7 @@ impl Proxy {
             outstanding: Default::default(),
             strikes: Default::default(),
             went: Default::default(),
+            seen_ms: Default::default(),
             next_peer: Default::default(),
             ref_home: Default::default(),
         })
@@ -1072,6 +1103,45 @@ impl Proxy {
 
     fn client(&self) -> Client {
         self.client.clone()
+    }
+
+    /// What this graph has cost before, as a median.
+    ///
+    /// Median rather than mean: one build that queued behind everything else
+    /// must not make a subtree look permanently expensive, and therefore
+    /// permanently worth shipping.
+    fn estimate(&self, key: &str) -> Option<u64> {
+        let seen = self.seen_ms.lock().expect("seen_ms");
+        let v = seen.get(key)?;
+        if v.is_empty() {
+            return None;
+        }
+        let mut v = v.clone();
+        v.sort_unstable();
+        Some(v[v.len() / 2])
+    }
+
+    /// What shipping COSTS, in ms: away time minus home time.
+    ///
+    /// First written as away minus what the peer spent building - and the
+    /// gate then never fired, because the estimate it is compared against is
+    /// itself an away duration and already contains that overhead. Comparing
+    /// two client-visible numbers in the same units is the fix: the
+    /// difference is exactly what shipping cost, whatever it was made of.
+    ///
+    /// Zero until both sides have run, which makes everything worth shipping.
+    /// That is the deliberate cold start - something has to run somewhere
+    /// before there is anything to know.
+    fn overhead_ms(&self) -> u64 {
+        let w = self.wire.lock().expect("wire");
+        let mean = |v: &[u64]| -> u64 {
+            if v.is_empty() {
+                0
+            } else {
+                v.iter().sum::<u64>() / v.len() as u64
+            }
+        };
+        mean(&w.away_ms).saturating_sub(mean(&w.home_ms))
     }
 
     /// Whose turn it is next, over the WHOLE fleet.
@@ -1397,14 +1467,23 @@ impl control::control_server::Control for Proxy {
             .solve(Request::from_parts(meta, ext, req))
             .await;
         let ms = t.elapsed().as_millis() as u64;
-        let went = self.went.lock().expect("went").get(&build_id).copied();
+        let went = self.went.lock().expect("went").get(&build_id).cloned();
         let mut w = self.wire.lock().expect("wire");
         w.control_solves.push(ms);
-        match went {
-            Some(Some(_)) => w.away_ms.push(ms),
-            Some(None) => w.home_ms.push(ms),
+        match &went {
+            Some((Some(_), _)) => w.away_ms.push(ms),
+            Some((None, _)) => w.home_ms.push(ms),
             // Never placed - excluded, no fleet, no mirror. Neither bucket.
             None => {}
+        }
+        drop(w);
+        if let Some((_, key)) = went {
+            self.seen_ms
+                .lock()
+                .expect("seen_ms")
+                .entry(key)
+                .or_default()
+                .push(ms);
         }
         out
     }
@@ -1559,6 +1638,57 @@ fn trace(wire: &std::sync::Mutex<Wire>, call: &str) {
 ///
 /// Peer 0 takes its turn and the graph is built in place, which is the
 /// round-trip skipped rather than paid.
+/// A graph's identity, for remembering how long it took.
+///
+/// The same bytes `solve::build_and_publish` tags the adopted image with, so
+/// "this graph" means the same thing to the estimator and to the mirror.
+fn graph_key(def: &bollard_buildkit_proto::pb::Definition) -> String {
+    let mut bytes: Vec<u8> = Vec::new();
+    for op in &def.def {
+        bytes.extend_from_slice(op);
+    }
+    crate::store::sha256_hex(&bytes)
+}
+
+/// Is this subtree big enough to be worth shipping? OFF by default, and the
+/// reason is the interesting part.
+///
+/// The workload sweep showed the fleet HURTING at small build sizes -
+/// twenty-four short builds took 12s split evenly against 8s with no fleet at
+/// all - and helping 2x at large ones, so "ship it only if it is bigger than
+/// its own transfer" looked like the rule. It is not, and wiring it is what
+/// showed that: with real numbers the gate never fires.
+///
+/// Twice, for two different reasons, both worth keeping:
+///
+/// 1. The first overhead estimate was away-time minus what the PEER spent
+///    building. But the duration being compared against is itself an away
+///    duration and already contains that overhead, so the comparison was
+///    est > (est - build), which is nearly always true. Fixed by comparing
+///    two client-visible numbers in the same units.
+/// 2. With that fixed it still does not fire, and the model is why. At small
+///    build sizes home is not SATURATED - twenty-four short builds fit
+///    comfortably in sixteen cores - so shipping adds latency without
+///    relieving anything, and per-build times cannot see that. Build size was
+///    only ever a proxy for how full the local machine is.
+///
+/// So the signal is saturation, not size, and that is a different mechanism
+/// from this one. Left in behind `REBUCK2_GATE=1` with its measurement live,
+/// because the estimator is sound and only the question put to it is wrong.
+fn worth_shipping(est_ms: Option<u64>, overhead_ms: u64) -> bool {
+    /// How much bigger than the overhead before shipping pays.
+    ///
+    /// 1, from the measured numbers: at work=90 a build costs 11.4s at home
+    /// and shipping costs 5.8s on top, and the fleet DID help there - 18s
+    /// against 24s. A margin of 2 puts the threshold at 11.6s, just above
+    /// that 11.4s build, and would have refused a third of the wall clock.
+    const MARGIN: u64 = 1;
+    match est_ms {
+        None => true,
+        Some(est) => est > overhead_ms.saturating_mul(MARGIN),
+    }
+}
+
 /// How many completed builds before a side's mean means anything.
 const MIN_SAMPLES: usize = 2;
 /// Largest weight `derive_weights` will hand out. Bounds how blocky `turn`'s
@@ -2471,7 +2601,26 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 // excluded solve consume a turn means an earthly build burns
                 // eleven turns and hands its one movable solve to whichever
                 // machine the arithmetic lands on.
-                let peer = if allowed {
+                // Is it big enough to be worth moving at all? Asked before
+                // WHERE, because "nowhere" is a legitimate answer and the
+                // cheapest one - at small build sizes an even split measured
+                // 50% SLOWER than having no fleet.
+                let key = graph_key(&def);
+                // OFF by default; `REBUCK2_GATE=1` opts in. The estimator is
+                // measured and reported, and the gate around it does not
+                // hold up - see `worth_shipping`.
+                let worth = std::env::var("REBUCK2_GATE").as_deref() != Ok("1")
+                    || worth_shipping(self.estimate(&key), self.overhead_ms());
+                if allowed && !worth {
+                    *self
+                        .wire
+                        .lock()
+                        .expect("wire")
+                        .rejected
+                        .entry("not worth shipping".to_owned())
+                        .or_default() += 1;
+                }
+                let peer = if allowed && worth {
                     self.next_place(&verdict.platform)
                 } else {
                     None
@@ -2488,7 +2637,10 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         .get("buildkit-controlapi-buildid")
                         .and_then(|v| v.to_str().ok())
                     {
-                        self.went.lock().expect("went").insert(id.to_owned(), peer);
+                        self.went
+                            .lock()
+                            .expect("went")
+                            .insert(id.to_owned(), (peer, key.clone()));
                     }
                 }
                 if allowed && peer.is_none() {
@@ -2983,6 +3135,33 @@ mod tests {
             Some(std::time::Duration::from_secs(5)),
             "270ms would abandon peers over scheduling noise"
         );
+    }
+
+    /// Nothing known yet means ship it. A system that refused everything it
+    /// had not measured would never measure anything.
+    #[test]
+    fn an_unknown_subtree_is_shipped() {
+        assert!(super::worth_shipping(None, 5_000));
+        assert!(super::worth_shipping(None, 0));
+    }
+
+    /// A build shorter than twice its own transfer stays home. These are the
+    /// measured numbers: at work=20 a build takes about 1.5s against roughly
+    /// 2s of overhead, and shipping it made twenty-four builds 50% slower
+    /// than having no fleet at all.
+    #[test]
+    fn a_subtree_smaller_than_its_transfer_stays_home() {
+        assert!(!super::worth_shipping(Some(1_500), 2_000));
+        // The measured case that must still ship: work=90, 11.4s at home
+        // against 5.8s of shipping cost, where the fleet was worth a third
+        // of the wall clock.
+        assert!(super::worth_shipping(Some(11_425), 5_810));
+    }
+
+    /// Overhead not yet known: ship, and find out.
+    #[test]
+    fn zero_overhead_ships_everything() {
+        assert!(super::worth_shipping(Some(1), 0));
     }
 
     /// The control law reproduces the measured optimum.
