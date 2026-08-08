@@ -74,6 +74,10 @@ REMOTE_WEIGHT=${REMOTE_WEIGHT:-1}
 # a build must still finish, with the right bytes, when a peer dies holding
 # work.
 KILL_AFTER=${KILL_AFTER:-}
+# Kill the REGISTRY this many seconds into the build. Everything flows
+# through it - published contexts, mirrored bases, adopted results - so it is
+# the single point the fleet actually depends on.
+KILL_REGISTRY_AFTER=${KILL_REGISTRY_AFTER:-}
 
 crate=$(cd "$(dirname "$0")/.." && pwd)
 rm -rf "$RUN"
@@ -168,7 +172,8 @@ echo "image arch: $(docker image inspect "$IMAGE" --format '{{.Architecture}}')"
 
 say "registry on 0.0.0.0:$REG_PORT (daemons reach it as host.docker.internal)"
 "$bin" registry --bind "0.0.0.0:$REG_PORT" --store "$RUN/store" >"$RUN/registry.log" 2>&1 &
-pids+=($!)
+reg_pid=$!
+pids+=("$reg_pid")
 
 # Daemons trust the mirror over plain HTTP. Without this a peer with no
 # session cannot pull what another daemon published, and the failure looks
@@ -294,6 +299,11 @@ for round in $(seq 1 "$ROUNDS"); do
     builds+=($!)
     n=$((n + 1))
   done
+  if [ -n "$KILL_REGISTRY_AFTER" ]; then
+    ( sleep "$KILL_REGISTRY_AFTER"
+      echo "=== killing the registry mid-build"
+      kill "$reg_pid" 2>/dev/null || true ) &
+  fi
   if [ -n "$KILL_AFTER" ]; then
     victim="rebuck2-fleet-$((DAEMONS - 1))"
     ( sleep "$KILL_AFTER"

@@ -406,6 +406,32 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # Killing the REGISTRY mid-build
+//!
+//! The mirror is the one thing the whole fleet shares - published contexts,
+//! mirrored bases, adopted results all pass through it - so it is the single
+//! point the design actually depends on. Destroyed five seconds into
+//! twenty-four builds:
+//!
+//! ```text
+//! wall 28s (baseline with no fleet: 24s)   failed 0
+//! placed {home: 16, peer1: 8}   not routed {"peer 1 refused": 8}
+//! outputs identical to the single-machine baseline
+//! ```
+//!
+//! Nothing hung and nothing was wrong. The eight in flight could no longer
+//! push or pull, refused, and were built at home; the 4s over baseline is
+//! what those doomed offers cost before failing. Principle 9 holds in the
+//! strong sense: the registry is a fallback, not a data path a build cannot
+//! live without.
+//!
+//! One honest wrinkle. The refusals strike PEER 1, and peer 1 did nothing
+//! wrong - the shared infrastructure failed. It costs nothing while the
+//! registry is down, because no dispatch can work anyway, but a healthy
+//! machine stays penalised after the registry comes back. Distinguishing
+//! "this peer is bad" from "the thing between us is bad" needs a signal
+//! neither end has on its own.
+//!
 //! # Killing a peer mid-build
 //!
 //! Fail-open is principle 5 and had never been tested by actually breaking
