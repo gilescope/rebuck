@@ -406,6 +406,47 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # Where added machines stop paying
+//!
+//! Twenty-four builds, remote daemons added one at a time:
+//!
+//! ```text
+//! remotes  wall   placed
+//!       0   24s   {home: 24}
+//!       1   16s   {home: 16, 8}
+//!       2   15s   {home: 16, 4, 4}
+//!       3   15s   {home: 16, 3, 3, 2}
+//!       4   15s   {home: 16, 2, 2, 2, 2}
+//! ```
+//!
+//! It plateaus at two, and the arithmetic says why before the experiment
+//! does: with sixteen local slots, a twenty-four build fan-out has exactly
+//! EIGHT solves to export. Further peers subdivide the same eight into
+//! smaller shares and sit idle the rest of the time.
+//!
+//! The obvious reading is that the gate is too conservative and home should
+//! keep less. Tested, and it is wrong - pushing MORE work to a four-peer
+//! fleet makes it SLOWER:
+//!
+//! ```text
+//! home slots  placed                      wall
+//!         16  {home: 16, 2, 2, 2, 2}       14s
+//!          8  {home:  8, 4, 4, 4, 4}       17s
+//!          4  {home:  4, 5, 5, 5, 5}       20s
+//! ```
+//!
+//! Home is not the bottleneck; the wire is. Every dispatched build pays a
+//! push and a pull, a local one pays neither, and that cost does not go away
+//! by spreading it over more machines. This is the same result the split
+//! sweep found on two machines, reached independently with four peers.
+//!
+//! So the useful size of a fleet is set by HOW MUCH WORK IS WORTH EXPORTING,
+//! not by how many machines are in it - and that in turn is set by transfer
+//! cost against build size. It also retro-justifies the saturation gate,
+//! which lands near the measured optimum for a reason rather than by luck:
+//! exporting only the local surplus is exporting roughly the amount that is
+//! worth exporting.
+//!
 //! # Three daemons, two hosts
 //!
 //! Every fleet measurement until now had exactly ONE away peer, which means
