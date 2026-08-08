@@ -406,7 +406,52 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
-//! # Dispatching on saturation: three accounting bugs, and an unexplained split
+//! # Dispatching on saturation, and the suspect that was wrong
+//!
+//! Work ships only once the local machine is FULL - `home_slots` against
+//! builds running at home. One mechanism, no per-workload tuning, against the
+//! splits that had to be swept for by hand:
+//!
+//! ```text
+//! work   no fleet   saturation gate   best hand-swept
+//!   20        8s      10s  {16, 8}     7s  at 22:2
+//!   90       24s      17s  {16, 8}    15s  at 16:8
+//!  250       64s      32s  {16, 8}    32s  at 12:12
+//! ```
+//!
+//! It matches the swept optimum at the size where the fleet matters most and
+//! is a few seconds off at the smallest, where the fleet is worth little
+//! either way. No number in it was chosen to make a fixture look good.
+//!
+//! Getting there meant refuting my own explanation. The gate produced
+//! `{20, 4}` at every build size, and the prime suspect was the harness -
+//! each `buildctl` is a container start, so perhaps the clients did not
+//! really arrive together. Measured instead of assumed:
+//!
+//! ```text
+//! arrivals: 24 solves spread over 393ms
+//! ```
+//!
+//! Simultaneous. The suspect was wrong, and the counter that settled it -
+//! `"home has room": 16` - named the real fault. TWO MECHANISMS WERE DECIDING
+//! THE SAME THING IN SERIES. Saturation decides home-or-away; then `place`
+//! ran its weighted rotation and sent half the saturated solves home anyway.
+//! Sixteen placed while home had room, then eight saturated of which the
+//! rotation kept four: exactly the twenty and four observed.
+//!
+//! Three accounting bugs came first, each found by printing the counter
+//! rather than reading the code:
+//!
+//! 1. Load-then-increment is check-then-act. Twenty-four concurrent solves
+//!    all read 15 before any increment landed - `home peak 20 of 16 slots`.
+//!    A slot is now CLAIMED with `fetch_update`.
+//! 2. An excluded solve claimed a slot and never released it, because only
+//!    dispatchable solves were recorded. Eleven in twelve are excluded on an
+//!    earthly build, so the counter would have drifted up until the fleet
+//!    believed home was permanently full.
+//! 3. A saturated solve with nowhere to go still builds at home, and was
+//!    releasing a slot it had never been granted.
+//!
 //!
 //! Work is now shipped only once the local machine is FULL - `home_slots`
 //! against builds currently running at home. The core count is a legitimate
@@ -1193,7 +1238,7 @@ impl Proxy {
 
     /// Whose turn it is next, over the WHOLE fleet.
     /// `None` means build it here. See `place`.
-    fn next_place(&self, want: &crate::dispatch::Platform) -> Option<usize> {
+    fn next_place(&self, want: &crate::dispatch::Platform, home_allowed: bool) -> Option<usize> {
         let cursor = self
             .next_peer
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1276,6 +1321,7 @@ impl Proxy {
         }
         place(
             cursor,
+            home_allowed,
             &weights,
             &read(&self.outstanding[1..]),
             &read(&self.strikes[1..]),
@@ -1959,6 +2005,9 @@ fn native_for(worker_platforms: &[String], want: &str) -> bool {
 /// by the caller.
 fn place(
     cursor: usize,
+    // `false` once the caller has established the work must leave - then this
+    // only chooses WHICH peer.
+    home_allowed: bool,
     // One per peer INCLUDING peer 0, so home takes a share proportional to
     // its own capacity rather than a flat 1/n.
     weights: &[usize],
@@ -1976,7 +2025,16 @@ fn place(
     /// peers holding four jobs each, and a fleet that banned machines
     /// outright would shrink itself on one bad minute.
     const STRIKE_WEIGHT: usize = 3;
-    if weights.len() <= 1 || turn(cursor, weights) == 0 {
+    if weights.len() <= 1 {
+        return None;
+    }
+    // The home/away decision may already have been made, and if it has, do
+    // not make it again. Saturation says home is FULL; running the weighted
+    // rotation on top of that sent half the saturated solves home anyway -
+    // two mechanisms deciding the same thing in series, each unaware of the
+    // other. It showed as `placed {0: 20, 1: 4}` with 16 slots: sixteen while
+    // home had room, then eight saturated of which the rotation kept four.
+    if home_allowed && turn(cursor, weights) == 0 {
         return None;
     }
     debug_assert_eq!(load.len(), strikes.len(), "away peers counted twice over");
@@ -2148,6 +2206,15 @@ pub struct Wire {
     /// because the zero is the finding: neither gateway call is where the
     /// time is, so the next person does not have to re-measure it.
     pub returns: Vec<u64>,
+    /// When each gateway solve arrived, ms after the first.
+    ///
+    /// The saturation gate assumes solves arrive together; if they trickle in
+    /// over the length of a build, home never fills and the gate never opens.
+    /// That is a property of the CLIENT, not of placement, and it is invisible
+    /// from any counter that only records what was decided.
+    pub arrivals: Vec<u64>,
+    /// When the first gateway solve landed, so arrivals are relative.
+    pub first_solve: Option<std::time::Instant>,
     /// The most builds ever running at home at once, against the slot count
     /// that gates dispatch. If this never reaches the limit, the gate never
     /// opens and the fleet is idle for a reason that has nothing to do with
@@ -2281,6 +2348,13 @@ impl Wire {
         println!("[wire] solves routed  : {} to other daemons", self.routed);
         println!("[wire] built at home  : {} (peer 0's own share)", self.home);
         println!("[wire] placed         : {:?} (0 = home)", self.placed);
+        if let (Some(&first), Some(&last)) = (self.arrivals.first(), self.arrivals.last()) {
+            println!(
+                "[wire] arrivals       : {} solves spread over {}ms (first {first}, last {last})",
+                self.arrivals.len(),
+                last.saturating_sub(first)
+            );
+        }
         println!(
             "[wire] home peak      : {} of {} slots{}",
             self.peak_home,
@@ -2611,6 +2685,12 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         // until it is split into publish / peer build / answer, because two
         // of those three are not round-trips at all.
         let t_solve = std::time::Instant::now();
+        {
+            let mut w = self.wire.lock().expect("wire");
+            let first = *w.first_solve.get_or_insert(t_solve);
+            let at = t_solve.duration_since(first).as_millis() as u64;
+            w.arrivals.push(at);
+        }
         let mut t_portable = 0u64;
         let mut t_adopt = 0u64;
         // Publish any build context this graph needs, so the subtree stops
@@ -2763,7 +2843,8 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         .or_default() += 1;
                 }
                 let peer = if allowed && worth && saturated {
-                    self.next_place(&verdict.platform)
+                    // Home is full: this only chooses which peer.
+                    self.next_place(&verdict.platform, false)
                 } else {
                     None
                 };
@@ -3170,7 +3251,7 @@ mod tests {
         assert!(super::native_for(&x86, "linux/amd64"));
         // Peer 1 emulates, peer 2 is native: every away turn goes to peer 2.
         let away: Vec<usize> = (0..8)
-            .filter_map(|c| super::place(c, &[1, 1, 1], &[0, 0], &[0, 0], &[false, true]))
+            .filter_map(|c| super::place(c, true, &[1, 1, 1], &[0, 0], &[0, 0], &[false, true]))
             .collect();
         assert!(!away.is_empty());
         assert!(
@@ -3182,7 +3263,7 @@ mod tests {
         // the mirrored base is single-architecture and a foreign peer fails
         // with `exit code: 255` after pulling it.
         let away: Vec<usize> = (0..8)
-            .filter_map(|c| super::place(c, &[1, 1, 1], &[0, 0], &[0, 0], &[false, false]))
+            .filter_map(|c| super::place(c, true, &[1, 1, 1], &[0, 0], &[0, 0], &[false, false]))
             .collect();
         assert!(
             away.is_empty(),
@@ -3205,7 +3286,7 @@ mod tests {
         let load = [0usize, 0];
         let strikes = [0usize, 1];
         let away: Vec<usize> = (0..12)
-            .filter_map(|c| super::place(c, &[1, 1, 1], &load, &strikes, &[true, true]))
+            .filter_map(|c| super::place(c, true, &[1, 1, 1], &load, &strikes, &[true, true]))
             .collect();
         assert!(!away.is_empty(), "no away turns at all");
         assert!(
@@ -3219,7 +3300,7 @@ mod tests {
     #[test]
     fn a_struck_peer_still_beats_a_swamped_one() {
         let away: Vec<usize> = (0..6)
-            .filter_map(|c| super::place(c, &[1, 1, 1], &[9, 0], &[0, 1], &[true, true]))
+            .filter_map(|c| super::place(c, true, &[1, 1, 1], &[9, 0], &[0, 1], &[true, true]))
             .collect();
         assert!(
             away.iter().all(|&p| p == 2),
@@ -3235,9 +3316,12 @@ mod tests {
     #[test]
     fn a_wholly_struck_fleet_builds_at_home() {
         for cursor in 0..8 {
-            assert_eq!(super::place(cursor, &[1, 1], &[0], &[1], &[true]), None);
             assert_eq!(
-                super::place(cursor, &[1, 1, 1], &[0, 0], &[2, 1], &[true, true]),
+                super::place(cursor, true, &[1, 1], &[0], &[1], &[true]),
+                None
+            );
+            assert_eq!(
+                super::place(cursor, true, &[1, 1, 1], &[0, 0], &[2, 1], &[true, true]),
                 None
             );
         }
@@ -3246,8 +3330,8 @@ mod tests {
     /// A lone daemon has nowhere to send anything.
     #[test]
     fn a_fleet_of_one_never_dispatches() {
-        assert_eq!(super::place(0, &[1], &[], &[], &[]), None);
-        assert_eq!(super::place(7, &[1], &[], &[], &[]), None);
+        assert_eq!(super::place(0, true, &[1], &[], &[], &[]), None);
+        assert_eq!(super::place(7, true, &[1], &[], &[], &[]), None);
     }
 
     /// With nothing observed, nothing is slow.
@@ -3347,6 +3431,30 @@ mod tests {
         assert_eq!(super::derive_weights(5_000, 0, 8), (1, 1));
     }
 
+    /// Once home is full, the rotation must not send work home anyway.
+    ///
+    /// The regression: with `home_allowed` ignored, half of every saturated
+    /// solve went home on its turn, and a fleet with sixteen slots and
+    /// twenty-four builds placed twenty at home instead of sixteen.
+    #[test]
+    fn a_full_home_is_not_offered_the_work_again() {
+        let away: Vec<Option<usize>> = (0..8)
+            .map(|c| super::place(c, false, &[1, 1], &[0], &[0], &[true]))
+            .collect();
+        assert!(
+            away.iter().all(|p| *p == Some(1)),
+            "work went home when home was full: {away:?}"
+        );
+        // And with home allowed, it still takes its share.
+        let mixed: Vec<Option<usize>> = (0..8)
+            .map(|c| super::place(c, true, &[1, 1], &[0], &[0], &[true]))
+            .collect();
+        assert!(
+            mixed.iter().any(|p| p.is_none()),
+            "home got no turns at all"
+        );
+    }
+
     /// A declared weight buys proportionally more turns.
     ///
     /// Buildkit will not say how big a machine is, so an operator saying
@@ -3368,7 +3476,7 @@ mod tests {
         // peer 1 has weight 2 and holds 3; peer 2 has weight 1 and holds 2.
         // 3/2 > 2/1 is false, so peer 1 is the less loaded of the two.
         let away: Vec<usize> = (0..4)
-            .filter_map(|c| super::place(c, &[0, 2, 1], &[3, 2], &[0, 0], &[true, true]))
+            .filter_map(|c| super::place(c, true, &[0, 2, 1], &[3, 2], &[0, 0], &[true, true]))
             .collect();
         assert!(
             !away.is_empty(),
