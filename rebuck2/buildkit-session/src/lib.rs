@@ -28,6 +28,18 @@
 //! protocol rather than from their source: the header names below are facts
 //! about buildkit's wire format, not borrowed expression.
 //!
+//! # The callback rides the connection WE opened
+//!
+//! The daemon never dials us. It answers down the same stream we opened to
+//! it, so serving attachables needs no inbound port, no published address and
+//! no hole in anyone's firewall. Verified across two machines: an x86 box on
+//! the LAN asked this laptop for a secret and got it.
+//!
+//! That is what makes this deployable rather than merely correct. A peer
+//! behind NAT, a laptop with no routable address, a container that cannot
+//! reach its own host - none of it matters, because the direction of the TCP
+//! connection and the direction of the gRPC call are opposites.
+//!
 //! No filesync here, deliberately. A build context can be published as
 //! content once and pulled by every peer, which is better than syncing it N
 //! times - so the hard half of the protocol is the half we do not need.
