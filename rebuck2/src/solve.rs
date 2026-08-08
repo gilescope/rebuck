@@ -1257,6 +1257,106 @@ mod tests {
         }
     }
 
+    /// Emit N builds whose exec asks for PRIVILEGED mode.
+    ///
+    /// The one class of exclusion with no lift and no plan for one. Cache
+    /// mounts, secrets and agents are scheduling problems with a knob each;
+    /// privileged exec is a trust decision, and no session service makes a
+    /// peer's `--privileged` mean what this machine's would have meant.
+    ///
+    /// Exists so that claim is checked against a running fleet rather than
+    /// only against `inspect`. The wiring in between - env var to `Allow` to
+    /// verdict - is where a lift would widen by accident, and a unit test on
+    /// either end sees none of it.
+    ///
+    ///   cargo test --bin rebuck2 write_insecure_llb -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn write_insecure_llb() {
+        use prost::Message;
+        let dg = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
+        let out = std::env::var("REBUCK2_LLB_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let n: usize = std::env::var("REBUCK2_LLB_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let work: usize = std::env::var("REBUCK2_LLB_WORK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90);
+        for i in 0..n {
+            let base = pb::Op {
+                op: Some(pb::op::Op::Source(pb::SourceOp {
+                    identifier: base_image(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let base_b = base.encode_to_vec();
+            let exec = pb::Op {
+                inputs: vec![pb::Input {
+                    digest: dg(&base_b),
+                    index: 0,
+                }],
+                op: Some(pb::op::Op::Exec(pb::ExecOp {
+                    meta: Some(pb::Meta {
+                        args: vec![
+                            "/bin/sh".into(),
+                            "-c".into(),
+                            format!(
+                                "i=0; while [ $i -lt {work} ]; do dd if=/dev/zero bs=1M \
+                                 count=20 2>/dev/null | sha256sum >/dev/null; \
+                                 i=$((i+1)); done; mkdir -p /result; \
+                                 echo task-{i} > /result/task"
+                            ),
+                        ],
+                        cwd: "/".into(),
+                        ..Default::default()
+                    }),
+                    // The whole point of the fixture.
+                    security: pb::SecurityMode::Insecure as i32,
+                    mounts: vec![
+                        pb::Mount {
+                            input: 0,
+                            dest: "/".into(),
+                            output: 0,
+                            ..Default::default()
+                        },
+                        pb::Mount {
+                            input: -1,
+                            dest: "/result".into(),
+                            output: 1,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let exec_b = exec.encode_to_vec();
+            let term = pb::Op {
+                inputs: vec![pb::Input {
+                    digest: dg(&exec_b),
+                    index: 1,
+                }],
+                ..Default::default()
+            };
+            let def = pb::Definition {
+                metadata: [&base_b, &exec_b]
+                    .iter()
+                    .map(|b| (dg(b), pb::OpMetadata::default()))
+                    .collect(),
+                def: vec![base_b, exec_b, term.encode_to_vec()],
+                ..Default::default()
+            };
+            let path = out.join(format!("rebuck2-fanout-{i}.llb"));
+            std::fs::write(&path, def.encode_to_vec()).unwrap();
+            println!("[fixture] {}", path.display());
+        }
+    }
+
     /// Emit N builds whose exec mounts a SECRET.
     ///
     /// The shape that was undispatchable by construction until a peer could

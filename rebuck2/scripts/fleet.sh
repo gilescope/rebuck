@@ -67,6 +67,11 @@ CONTEXT=${CONTEXT:-}
 # LLB whose exec mounts a SECRET. Undispatchable by construction until a peer
 # could be handed a session, so this is the fixture that proves it can.
 SECRET=${SECRET:-}
+# LLB whose exec asks for PRIVILEGED mode. The one exclusion with no lift:
+# cache mounts, secrets and agents each have a knob, but granting a peer
+# privileged exec is a trust decision and no session service makes the peer's
+# `--privileged` mean what this machine's would have meant.
+INSECURE=${INSECURE:-}
 # LLB whose exec mounts a CACHE. Excluded from dispatch until a peer was
 # allowed its own, which is what REBUCK2_PEER_CACHE_MOUNTS=1 permits.
 CACHE=${CACHE:-}
@@ -198,6 +203,7 @@ say "generate llb"
 fixture=write_fanout_llb
 if [ -n "$CACHE" ]; then fixture=write_cache_llb; fi
 if [ -n "$SSHM" ]; then fixture=write_ssh_llb; fi
+if [ -n "$INSECURE" ]; then fixture=write_insecure_llb; fi
 if [ -n "$SECRET" ]; then
   fixture=write_secret_llb
   export rebuck2_probe=the-value
@@ -274,7 +280,8 @@ for i in $(seq 0 $((DAEMONS - 1))); do
     -p "$BIND:$port:8372" \
     -v "$RUN/buildkitd.toml:/etc/buildkit/buildkitd.toml:ro" \
     --add-host host.docker.internal:host-gateway \
-    "$IMAGE" >/dev/null
+    "$IMAGE" \
+    ${INSECURE:+--allow-insecure-entitlement security.insecure} >/dev/null
   containers+=("$name")
   say "daemon $i on 127.0.0.1:$port ($name)"
   # `if`, not `[ ] &&`: a false test is the loop body's last command, and
@@ -369,6 +376,12 @@ for round in $(seq 1 "$ROUNDS"); do
       # ones need the proxy to serve a second session to the peer.
       bctl --addr "$addr" build --no-cache \
         --secret id=rebuck2_probe,env=rebuck2_probe \
+        --output "type=local,dest=$RUN/out-$n" <"$f" >"$RUN/build-$n.log" 2>&1 &
+    elif [ -n "$INSECURE" ]; then
+      # The daemon needs the entitlement too, granted at launch. Without
+      # both halves every build fails with "insecure is not allowed" and the
+      # scenario degenerates into proving a broken build does not travel.
+      bctl --addr "$addr" build --no-cache --allow security.insecure \
         --output "type=local,dest=$RUN/out-$n" <"$f" >"$RUN/build-$n.log" 2>&1 &
     else
       bctl --addr "$addr" build --no-cache \
