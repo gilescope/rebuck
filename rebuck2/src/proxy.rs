@@ -315,11 +315,38 @@
 //! See `turn` for why the reasoning behind that was sound and the conclusion
 //! was not.
 //!
-//! The 10s -> 11s is the residual tax and it is now visible for the first
-//! time: two adoptions cost two publishes and two imports through the
-//! registry, about half a second each, and no amount of local capacity pays
-//! that back. On a real fleet it is paid once against a machine's worth of
-//! parallelism.
+//! # Where the tax actually is, and the two guesses that were wrong
+//!
+//! "Two adoptions' worth of registry round-trip" was the obvious reading of
+//! 10s -> 11s and it was wrong. Timing every phase instead:
+//!
+//! ```text
+//! solve 0  total     1 = portable    0 + peer    0 + answer 1   home
+//! solve 1  total     2 = portable    0 + peer    0 + answer 2   home
+//! solve 2  total 10984 = portable 1555 + peer 9427 + answer 0   dispatched
+//! solve 3  total 10984 = portable 1546 + peer 9437 + answer 0   dispatched
+//! build ms  [10661, 10655, 11049, 11044]   what the client waits for
+//! return ms [1, 0, 0, 0]
+//! ```
+//!
+//! Three things fell out, none of them the round-trip:
+//!
+//! 1. `make_portable` costs ~1.6s - publishing the context and mirroring the
+//!    base - and EVERY solve paid it, including the two that were never
+//!    going to leave. Moving the rewrite behind the placement decision took
+//!    those from 1613ms to 1ms. The cheap check (exclusions) now runs first
+//!    and the expensive one (rewrite) only for graphs that are leaving. That
+//!    matters most where dispatch is worst: earthly excludes eleven solves
+//!    in twelve, and was mirroring a base for each of them.
+//! 2. A gateway Solve is LAZY - ~1ms whether it stands for a nine-second
+//!    build or a pull. Read alone it says answering is free.
+//! 3. `return` is ALSO ~1ms, which was the next guess and also wrong. The
+//!    client's wait lives in `Control.Solve`, which is now timed.
+//!
+//! What is left is ~0.4s per dispatched build (11.05s against 10.66s at
+//! home) plus a one-time ~1.6s to mirror a base image, shared by every
+//! solve that needs it and amortised to nothing across a real build. On a
+//! real fleet that is paid once against a machine's worth of parallelism.
 //!
 //! # 100% dispatch, on a client that is not earthly
 //!
@@ -714,9 +741,22 @@ impl control::control_server::Control for Proxy {
                 .expect("sessions")
                 .insert(req.r#ref.clone(), req.session.clone());
         }
-        self.client()
+        // THIS is where a build's time actually is. Both cheaper
+        // candidates were tried and are near-zero: a gateway Solve returns a
+        // ref in ~1ms, and `return` merely registers it. The client blocks
+        // on the Control.Solve response, so timing it is the only way the
+        // proxy sees a build's duration at all.
+        let t = std::time::Instant::now();
+        let out = self
+            .client()
             .solve(Request::from_parts(meta, ext, req))
-            .await
+            .await;
+        self.wire
+            .lock()
+            .expect("wire")
+            .control_solves
+            .push(t.elapsed().as_millis() as u64);
+        out
     }
 
     async fn disk_usage(
@@ -883,6 +923,40 @@ fn turn(cursor: usize, peers: usize) -> usize {
 /// whole Solves have enough to route?), how much is `local://` (that part is
 /// going nowhere whatever we build), and what platforms appear (is there
 /// native multi-arch work here at all?).
+/// Where one gateway solve spent its time, in ms.
+///
+/// `total` is the whole call as the client experienced it. The three parts
+/// do NOT sum to it and are not meant to.
+///
+/// `answer` is measured and is almost always 1ms, which is not a mistake:
+/// a gateway Solve is LAZY. It returns a ref, and the ref is evaluated on
+/// `return` - so a nine-second build and a registry pull are both a
+/// millisecond here. Look at `Wire::returns` for the other half. This was
+/// nearly read as "answering is free", which would have sent the next
+/// iteration optimising the wrong end.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Span {
+    pub total: u64,
+    /// Rewriting the graph: publishing the context, mirroring base images.
+    pub portable: u64,
+    /// The peer building it and pushing the result.
+    pub adopt: u64,
+    /// Peer 0 answering - after adoption this is a PULL, not a build.
+    pub answer: u64,
+}
+
+impl Span {
+    /// What dispatch cost that a local build would not have paid.
+    ///
+    /// Not `total - adopt`: the peer's build replaces work peer 0 would have
+    /// done anyway, so charging it as overhead double-counts the build and
+    /// makes dispatch look catastrophic. Only preparation and the answer are
+    /// new - and since the answer is lazy, in practice this is `portable`.
+    pub fn tax(&self) -> u64 {
+        self.portable + self.answer
+    }
+}
+
 #[derive(Default)]
 pub struct Wire {
     pub solves: u64,
@@ -922,6 +996,18 @@ pub struct Wire {
     pub calls: Vec<String>,
     /// Solves placed on a peer other than the upstream.
     pub routed: u64,
+    /// How long each `Control.Solve` took - the call the CLIENT blocks on,
+    /// and so the only honest measure of a build's duration from here.
+    pub control_solves: Vec<u64>,
+    /// How long each `return` took.
+    ///
+    /// Measured on the theory that a lazy gateway solve's work lands here.
+    /// It does not - these come back in about a millisecond too. Kept
+    /// because the zero is the finding: neither gateway call is where the
+    /// time is, so the next person does not have to re-measure it.
+    pub returns: Vec<u64>,
+    /// Per-solve timing, in arrival order.
+    pub spans: Vec<Span>,
     /// Solves whose turn fell to peer 0 and were built where they already
     /// were. Not a rejection: peer 0 is a machine like any other, and
     /// counting its share as "not routed" understates a fleet by exactly
@@ -1039,6 +1125,25 @@ impl Wire {
         println!("[wire] gateway calls  : {counts:?}");
         println!("[wire] solves routed  : {} to other daemons", self.routed);
         println!("[wire] built at home  : {} (peer 0's own share)", self.home);
+        for (i, s) in self.spans.iter().enumerate() {
+            println!(
+                "[wire] solve {i} ms     : total {} = portable {} + peer {} + answer {} \
+                 (tax {})",
+                s.total,
+                s.portable,
+                s.adopt,
+                s.answer,
+                s.tax()
+            );
+        }
+        println!(
+            "[wire] build ms       : {:?} (Control.Solve - what the client waits for)",
+            self.control_solves
+        );
+        println!(
+            "[wire] return ms      : {:?} (near-zero; not where work lands)",
+            self.returns
+        );
         println!("[wire] not routed     : {:?}", self.rejected);
         println!("[wire] call order     : {}", self.calls.join(" "));
         println!(
@@ -1277,6 +1382,13 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         let (meta, ext, req) = request.into_parts();
         trace(&self.wire, "solve");
         report_gateway(&self.wire, &req);
+        // Where the time goes. The tax was invisible until peer 0 rejoined
+        // the round robin (10s -> 11s); "attack the round-trip" is a guess
+        // until it is split into publish / peer build / answer, because two
+        // of those three are not round-trips at all.
+        let t_solve = std::time::Instant::now();
+        let mut t_portable = 0u64;
+        let mut t_adopt = 0u64;
         // Publish any build context this graph needs, so the subtree stops
         // being pinned to the one machine holding the client's disk. The
         // build itself is untouched and still goes upstream: publishing is
@@ -1308,80 +1420,47 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         }
         if self.peers.len() > 1 {
             if let (Some(mirror), Some(def)) = (&self.mirror, req.definition.clone()) {
-                let session = self.session_for(&meta);
-                let portable = self.make_portable(&def, &session, mirror).await;
-                // Portable means EVERY source is something a sessionless
-                // peer can fetch: nothing local, and every image already in
-                // our mirror. Checking only `local == 0` let a graph whose
-                // base was still being mirrored go out anyway - concurrent
-                // solves skip an in-flight copy - and the peer then reached
-                // for Docker Hub with no credentials and panicked.
-                let local_clear = crate::dispatch::analyse(&portable, 1)
-                    .cuts
-                    .first()
-                    .is_none_or(|c| c.frontier.local == 0);
-                let bases_clear = portable.def.iter().all(|b| {
-                    use prost::Message;
-                    match bollard_buildkit_proto::pb::Op::decode(b.as_slice())
-                        .ok()
-                        .and_then(|o| o.op)
-                    {
-                        Some(bollard_buildkit_proto::pb::op::Op::Source(src)) => src
-                            .identifier
-                            .strip_prefix("docker-image://")
-                            .is_none_or(|r| r.starts_with(&mirror.registry)),
-                        _ => true,
-                    }
-                });
-                // The EXCLUSIONS. This check existed from the start -
-                // principle 10's "one cache mount, secret, ssh agent or
-                // privileged exec anywhere grounds the whole subtree" - and
-                // was never wired into the path that places work. Earthly's
-                // execs carry an SSH SOCKET mount, which needs the
-                // session's sshforward service, so every one of those
-                // solves was offered to a peer that could not possibly take
-                // it and refused with "no active sessions".
-                let verdict = crate::dispatch::inspect(&portable);
+                // The EXCLUSIONS, checked FIRST because they are free.
+                // Principle 10 - one cache mount, secret, ssh agent or
+                // privileged exec anywhere grounds the whole subtree - and
+                // this ran on the REWRITTEN graph until the rewrite was
+                // timed at 1.6s a solve. Earthly excludes eleven solves in
+                // twelve, so eleven rewrites were published, mirrored and
+                // thrown away. Hazards live on ExecOps and rewriting only
+                // touches source identifiers, so the original graph gives
+                // the same verdict for nothing.
+                let verdict = crate::dispatch::inspect(&def);
                 let allowed = verdict.dispatchable();
-                let movable = local_clear && bases_clear && allowed;
-                if !movable {
-                    let why = match (local_clear, bases_clear, allowed) {
-                        (_, _, false) => {
-                            // Name the secret, not just its kind. A build
-                            // that declares none can still be full of them:
-                            // a frontend may attach its own, and "excluded:
-                            // Secret" then reads as the user's fault.
-                            use prost::Message;
-                            let mut detail: Vec<String> = Vec::new();
-                            for b in &portable.def {
-                                if let Some(bollard_buildkit_proto::pb::op::Op::Exec(e)) =
-                                    bollard_buildkit_proto::pb::Op::decode(b.as_slice())
-                                        .ok()
-                                        .and_then(|o| o.op)
-                                {
-                                    for se in &e.secretenv {
-                                        detail.push(format!("env {}={}", se.name, se.id));
-                                    }
-                                    for m in &e.mounts {
-                                        if let Some(so) = &m.secret_opt {
-                                            detail.push(format!("mount {} id={}", m.dest, so.id));
-                                        }
-                                    }
+                if !allowed {
+                    // Name the secret, not just its kind. A build that
+                    // declares none can still be full of them: a frontend
+                    // may attach its own, and "excluded: Secret" then reads
+                    // as the user's fault.
+                    use prost::Message;
+                    let mut detail: Vec<String> = Vec::new();
+                    for b in &def.def {
+                        if let Some(bollard_buildkit_proto::pb::op::Op::Exec(e)) =
+                            bollard_buildkit_proto::pb::Op::decode(b.as_slice())
+                                .ok()
+                                .and_then(|o| o.op)
+                        {
+                            for se in &e.secretenv {
+                                detail.push(format!("env {}={}", se.name, se.id));
+                            }
+                            for m in &e.mounts {
+                                if let Some(so) = &m.secret_opt {
+                                    detail.push(format!("mount {} id={}", m.dest, so.id));
                                 }
                             }
-                            detail.sort();
-                            detail.dedup();
-                            verdict
-                                .exclusions
-                                .first()
-                                .map(|(_, e)| format!("excluded: {e:?} {detail:?}"))
-                                .unwrap_or_else(|| "excluded: platform".to_owned())
                         }
-                        (false, false, _) => "context and base unmirrored".to_owned(),
-                        (false, true, _) => "context unmirrored".to_owned(),
-                        (true, false, _) => "base unmirrored".to_owned(),
-                        (true, true, true) => unreachable!(),
-                    };
+                    }
+                    detail.sort();
+                    detail.dedup();
+                    let why = verdict
+                        .exclusions
+                        .first()
+                        .map(|(_, e)| format!("excluded: {e:?} {detail:?}"))
+                        .unwrap_or_else(|| "excluded: platform".to_owned());
                     *self
                         .wire
                         .lock()
@@ -1390,11 +1469,13 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         .entry(why)
                         .or_default() += 1;
                 }
-                // Draw ONCE. Two calls advance the cursor twice, so the
-                // peer that gets the work is not the peer whose turn it
-                // was - which round-robins at half rate and skips a
-                // machine every other solve.
-                let peer = movable.then(|| self.next_turn());
+                // Draw ONCE, and only among solves that COULD move. Two
+                // calls advance the cursor twice, so the peer that gets the
+                // work is not the peer whose turn it was; and letting an
+                // excluded solve consume a turn means an earthly build burns
+                // eleven turns and hands its one movable solve to whichever
+                // machine the arithmetic lands on.
+                let peer = allowed.then(|| self.next_turn());
                 if peer == Some(0) {
                     // Peer 0's turn. It already holds the job, the session
                     // and the graph, so its share is served by falling
@@ -1409,17 +1490,82 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         addr, "upstream",
                         "peer 0 has no dialable address; its turn is the home path"
                     );
-                    match crate::solve::build_and_publish(&addr, &mirror.registry, portable.clone())
-                        .await
-                    {
-                        Ok(reference) => {
+                    // Only NOW is the rewrite worth its 1.6s: this graph is
+                    // leaving. Publishing a context and mirroring a base for
+                    // a solve that stays home buys nothing at all.
+                    let session = self.session_for(&meta);
+                    let t = std::time::Instant::now();
+                    let portable = self.make_portable(&def, &session, mirror).await;
+                    t_portable = t.elapsed().as_millis() as u64;
+                    // Portable means EVERY source is something a sessionless
+                    // peer can fetch: nothing local, and every image already
+                    // in our mirror. Checking only `local == 0` let a graph
+                    // whose base was still being mirrored go out anyway -
+                    // concurrent solves skip an in-flight copy - and the peer
+                    // then reached for Docker Hub with no credentials and
+                    // panicked.
+                    let local_clear = crate::dispatch::analyse(&portable, 1)
+                        .cuts
+                        .first()
+                        .is_none_or(|c| c.frontier.local == 0);
+                    let bases_clear = portable.def.iter().all(|b| {
+                        use prost::Message;
+                        match bollard_buildkit_proto::pb::Op::decode(b.as_slice())
+                            .ok()
+                            .and_then(|o| o.op)
+                        {
+                            Some(bollard_buildkit_proto::pb::op::Op::Source(src)) => src
+                                .identifier
+                                .strip_prefix("docker-image://")
+                                .is_none_or(|r| r.starts_with(&mirror.registry)),
+                            _ => true,
+                        }
+                    });
+                    // Counting the reason is not the same as ACTING on it:
+                    // an unportable graph must not be sent, or the peer
+                    // reaches for Docker Hub with no credentials. Moving the
+                    // rewrite in here turned a `movable` conjunction into a
+                    // count-and-continue, which is how a check becomes
+                    // decoration.
+                    let adopted = if local_clear && bases_clear {
+                        let t = std::time::Instant::now();
+                        let r = crate::solve::build_and_publish(
+                            &addr,
+                            &mirror.registry,
+                            portable.clone(),
+                        )
+                        .await;
+                        t_adopt = t.elapsed().as_millis() as u64;
+                        Some(r)
+                    } else {
+                        let why = match (local_clear, bases_clear) {
+                            (false, false) => "context and base unmirrored",
+                            (false, true) => "context unmirrored",
+                            (true, false) => "base unmirrored",
+                            (true, true) => unreachable!(),
+                        };
+                        *self
+                            .wire
+                            .lock()
+                            .expect("wire")
+                            .rejected
+                            .entry(why.to_owned())
+                            .or_default() += 1;
+                        None
+                    };
+                    match adopted {
+                        // Nothing was offered, so nothing refused. Reporting
+                        // "peer refused" here would blame a machine that was
+                        // never asked.
+                        None => {}
+                        Some(Ok(reference)) => {
                             println!("[proxy] adopted from peer {peer}: {reference}");
                             self.wire.lock().expect("wire").routed += 1;
                             req.definition = Some(crate::dispatch::import_graph(&reference));
                         }
                         // Fail open: build it here, exactly as we would
                         // have without a fleet.
-                        Err(e) => {
+                        Some(Err(e)) => {
                             use prost::Message;
                             let srcs: Vec<String> = portable
                                 .def
@@ -1459,7 +1605,15 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
 
         // Always peer 0: it holds the client's job, and after adoption the
         // graph is a fetch rather than a build.
+        let t_answer = std::time::Instant::now();
         let out = self.gw().solve(Request::from_parts(meta, ext, req)).await?;
+        let answer = t_answer.elapsed().as_millis() as u64;
+        self.wire.lock().expect("wire").spans.push(Span {
+            total: t_solve.elapsed().as_millis() as u64,
+            portable: t_portable,
+            adopt: t_adopt,
+            answer,
+        });
         let out = out.into_inner();
         self.remember(&out.result, 0);
         Ok(Response::new(out))
@@ -1607,9 +1761,22 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
     ) -> Result<Response<gw::ReturnResponse>, Status> {
         trace(&self.wire, "return");
         let (meta, ext, req) = request.into_parts();
-        self.gw()
+        // Timed, because `solve` is LAZY. A gateway Solve hands back a ref
+        // in about a millisecond whether it stands for a nine-second build
+        // or a registry pull; the work happens when the ref is evaluated,
+        // which is here. Measuring only `solve` said the answer cost 1ms
+        // and made a pull look free.
+        let t = std::time::Instant::now();
+        let out = self
+            .gw()
             .r#return(Request::from_parts(meta, ext, req))
-            .await
+            .await;
+        self.wire
+            .lock()
+            .expect("wire")
+            .returns
+            .push(t.elapsed().as_millis() as u64);
+        out
     }
 
     type ExecProcessStream =
@@ -1651,6 +1818,31 @@ mod tests {
                 "uneven over {peers} peers: {seen:?}"
             );
         }
+    }
+
+    /// The peer's build is not overhead.
+    ///
+    /// A dispatched solve whose peer took 9s and whose own preparation and
+    /// pull took 300ms and 700ms has cost a second, not ten. Charging the
+    /// peer's build as tax makes every dispatch look ruinous and would have
+    /// argued for switching dispatch off.
+    #[test]
+    fn tax_excludes_the_work_the_peer_did_instead_of_us() {
+        let dispatched = super::Span {
+            total: 10_000,
+            portable: 300,
+            adopt: 9_000,
+            answer: 700,
+        };
+        assert_eq!(dispatched.tax(), 1_000);
+        // A solve that stayed home pays no tax, however long it took.
+        let home = super::Span {
+            total: 10_000,
+            portable: 0,
+            adopt: 0,
+            answer: 9_990,
+        };
+        assert_eq!(home.tax(), 9_990);
     }
 
     /// A cursor that has wrapped `usize` still lands in the fleet. Round
