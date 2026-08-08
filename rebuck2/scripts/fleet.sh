@@ -16,6 +16,11 @@
 #   DAEMONS=3 BUILDS=6 rebuck2/scripts/fleet.sh
 #   NOPROXY=1 rebuck2/scripts/fleet.sh  # baseline: one daemon, client talks direct
 #
+# Correctness, not just speed - build the baseline, then check the fleet
+# returns the same bytes:
+#   NOPROXY=1 DAEMONS=1 RUN=~/data/base rebuck2/scripts/fleet.sh
+#   EXPECT=~/data/base/digests.txt rebuck2/scripts/fleet.sh
+#
 # Needs docker. buildctl is used from the host if present and borrowed from
 # the buildkit image otherwise. Leaves nothing running.
 set -euo pipefail
@@ -65,8 +70,10 @@ else
   bctl() {
     local args=()
     for a in "$@"; do args+=("${a//127.0.0.1/host.docker.internal}"); done
+    # $RUN is mounted at the same path so `--output dest=$RUN/...` lands on
+    # the host and not inside a container that is about to be deleted.
     docker run --rm -i --add-host host.docker.internal:host-gateway \
-      --entrypoint buildctl "$IMAGE" "${args[@]}"
+      -v "$RUN:$RUN" --entrypoint buildctl "$IMAGE" "${args[@]}"
   }
 fi
 
@@ -153,7 +160,11 @@ n=0
 builds=()
 for f in "$RUN"/llb/*.llb; do
   if [ "$n" -ge "$BUILDS" ]; then break; fi
-  bctl --addr "$addr" build --no-cache <"$f" >"$RUN/build-$n.log" 2>&1 &
+  # Export the result. Exit 0 says a build ran; it says nothing about what
+  # came back, and a distributed buildkit that returns the wrong bytes is
+  # worse than a slow one. The exported tree is what gets hashed below.
+  bctl --addr "$addr" build --no-cache \
+    --output "type=local,dest=$RUN/out-$n" <"$f" >"$RUN/build-$n.log" 2>&1 &
   builds+=($!)
   n=$((n + 1))
 done
@@ -178,6 +189,26 @@ if [ -z "$NOPROXY" ]; then
   kill -INT "$proxy_pid" 2>/dev/null || true
   sleep 2
   grep -E '^\[wire\]|^\[proxy\] adopted' "$RUN/proxy.log" || true
+fi
+
+# The identity of the result, per build. Written to a file so a proxied run
+# and a NOPROXY run can be diffed - a distributed build that is one byte
+# different from a local one has broken cache identity (principle 4) even
+# when every exit code is zero.
+say "output digests"
+: >"$RUN/digests.txt"
+for i in $(seq 0 $((BUILDS - 1))); do
+  d=$(find "$RUN/out-$i" -type f -exec shasum -a 256 {} + 2>/dev/null |
+    sed "s|$RUN/out-$i||" | sort | shasum -a 256 | cut -d' ' -f1)
+  echo "build $i: $d" | tee -a "$RUN/digests.txt"
+done
+if [ -n "${EXPECT:-}" ]; then
+  if diff -u "$EXPECT" "$RUN/digests.txt"; then
+    echo "◈ outputs identical to $EXPECT"
+  else
+    echo "✗ outputs DIFFER from $EXPECT"
+    fail=1
+  fi
 fi
 
 say "per-daemon cache (work leaves a mark where it ran)"

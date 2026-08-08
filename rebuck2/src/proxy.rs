@@ -348,6 +348,33 @@
 //! solve that needs it and amortised to nothing across a real build. On a
 //! real fleet that is paid once against a machine's worth of parallelism.
 //!
+//! # The bytes are the same, which nothing had checked
+//!
+//! Every measurement up to here read exit codes. A distributed buildkit that
+//! returns the wrong bytes is worse than a slow one, and identity is what
+//! buildkit matches on (principle 4) - a result one byte off a local build
+//! poisons every cache downstream of it while every log line says success.
+//!
+//! `scripts/fleet.sh` now exports each result and hashes it. Baseline on one
+//! daemon with no proxy, then the same four builds through the fleet:
+//!
+//! ```text
+//! build 0: 7d2d122a...   build 1: e37f56da...
+//! build 2: ccaca3f5...   build 3: 5f1f6a93...
+//! outputs identical to base/digests.txt
+//! ```
+//!
+//! Builds 2 and 3 were the dispatched ones: rewritten, mirrored, built on
+//! another daemon, pushed to a registry, imported back, exported to the
+//! client - and byte-identical to having built them at home.
+//!
+//! Getting a result out at all took two corrections worth keeping. Exporting
+//! the ROOTFS to a local directory fails on `lchownat proc: permission
+//! denied`, so the fixture writes to a scratch mount instead. And the rootfs
+//! mount must still declare `output: 0` even though nothing wants it,
+//! because on an LLB mount `output` also decides writability - with `-1`,
+//! runc cannot create `/etc/resolv.conf` and the command never runs.
+//!
 //! # 100% dispatch, on a client that is not earthly
 //!
 //! Four plain-LLB builds through the proxy, two stock buildkitds:

@@ -992,18 +992,40 @@ mod tests {
                             format!(
                                 "i=0; while [ $i -lt 90 ]; do dd if=/dev/zero bs=1M \
                                  count=20 2>/dev/null | sha256sum >/dev/null; \
-                                 i=$((i+1)); done; echo task-{i} > /out"
+                                 i=$((i+1)); done; echo task-{i} > /result/task"
                             ),
                         ],
                         cwd: "/".into(),
                         ..Default::default()
                     }),
-                    mounts: vec![pb::Mount {
-                        input: 0,
-                        dest: "/".into(),
-                        output: 0,
-                        ..Default::default()
-                    }],
+                    // The result is a SCRATCH mount, not the rootfs.
+                    //
+                    // Exporting the rootfs to a local directory fails on
+                    // `lchownat proc: permission denied` and leaves a
+                    // half-written tree, which reads as a dispatch bug and is
+                    // not one. It is also 13MB of alpine per build to hash
+                    // for a one-line answer.
+                    //
+                    // The rootfs still declares `output: 0` even though
+                    // nothing wants it: on a mount, `output` also decides
+                    // WRITABILITY, and `-1` makes runc fail before the
+                    // command runs - it cannot create /etc/resolv.conf in a
+                    // read-only rootfs. So the interesting output is index 1,
+                    // and the terminal op below must say so.
+                    mounts: vec![
+                        pb::Mount {
+                            input: 0,
+                            dest: "/".into(),
+                            output: 0,
+                            ..Default::default()
+                        },
+                        pb::Mount {
+                            input: -1,
+                            dest: "/result".into(),
+                            output: 1,
+                            ..Default::default()
+                        },
+                    ],
                     ..Default::default()
                 })),
                 platform: Some(plat.clone()),
@@ -1013,7 +1035,10 @@ mod tests {
             let term = pb::Op {
                 inputs: vec![pb::Input {
                     digest: dg(&exec_b),
-                    index: 0,
+                    // Index 1: the scratch result. Index 0 is the rootfs,
+                    // which exists only because runc needs somewhere to
+                    // write.
+                    index: 1,
                 }],
                 ..Default::default()
             };
