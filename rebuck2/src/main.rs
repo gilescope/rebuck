@@ -180,6 +180,20 @@ async fn main() -> Result<()> {
         // instead of the daemon:
         //   rebuck2 buildkit-proxy --listen 127.0.0.1:1234 \
         //     --upstream http://127.0.0.1:1235
+        // The peer-to-peer OCI mirror on its own, for a worker that lends a
+        // buildkitd but runs no driver. Principle 6's mechanism needs
+        // somewhere to publish to and pull from.
+        "registry" => {
+            let store_root: std::path::PathBuf = args
+                .opt("--store")
+                .map(Into::into)
+                .unwrap_or_else(|| default_store("registry"));
+            let store = Arc::new(store::Store::new(store_root)?);
+            let bind = args
+                .opt("--bind")
+                .unwrap_or_else(|| "127.0.0.1:5000".into());
+            registry::serve(bind.parse()?, store).await
+        }
         "buildkit-proxy" => {
             let listen = args
                 .opt("--listen")

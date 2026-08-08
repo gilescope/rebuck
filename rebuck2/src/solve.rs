@@ -416,6 +416,210 @@ mod tests {
         .expect("the rewritten graph must solve");
     }
 
+    /// The whole point, end to end: a `COPY`-bearing build made
+    /// dispatchable by publishing its context as content.
+    ///
+    /// The context has one holder and reaches a builder by filesync, so a
+    /// peer cannot have it (measured: 32 MiB of context is 32 MiB through
+    /// the proxy). Principle 9's answer for an origin is fetch once into the
+    /// fleet and serve peer to peer. This does exactly that and checks the
+    /// builder really got OUR bytes.
+    ///
+    ///   cargo test --bin rebuck2 a_published_context -- --ignored --nocapture
+    ///
+    /// Needs the mirror, and a daemon told it may pull from it over http:
+    ///   rebuck2 registry --store /tmp/ctx/store --bind 0.0.0.0:15000
+    ///   docker run -d --privileged -p 11234:1234 \
+    ///     -v .../buildkitd.toml:/etc/buildkit/buildkitd.toml:ro \
+    ///     moby/buildkit --addr tcp://0.0.0.0:1234
+    #[tokio::test]
+    #[ignore]
+    async fn a_published_context_reaches_a_peer() {
+        use prost::Message;
+        const MIRROR: &str = "host.docker.internal:15000";
+        let plat = pb::Platform {
+            os: "linux".into(),
+            architecture: std::env::consts::ARCH.replace("aarch64", "arm64"),
+            ..Default::default()
+        };
+        let dg = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
+        let marker = format!("published-context-{}", std::process::id());
+        let mut c = connect("http://127.0.0.1:11234").await.expect("dial");
+
+        // 1. Publish a context AS CONTENT. A FileOp writes the marker, so
+        //    the bytes originate in the graph rather than from a filesync -
+        //    which is the point: this stands in for context the proxy
+        //    received from the client and is now republishing.
+        let mkfile = pb::Op {
+            op: Some(pb::op::Op::File(pb::FileOp {
+                actions: vec![pb::FileAction {
+                    input: -1,
+                    secondary_input: -1,
+                    output: 0,
+                    action: Some(pb::file_action::Action::Mkfile(pb::FileActionMkFile {
+                        path: "/ctx-marker".into(),
+                        mode: 0o644,
+                        data: marker.clone().into_bytes(),
+                        ..Default::default()
+                    })),
+                }],
+            })),
+            platform: Some(plat.clone()),
+            ..Default::default()
+        };
+        let mk_b = mkfile.encode_to_vec();
+        let term = pb::Op {
+            inputs: vec![pb::Input {
+                digest: dg(&mk_b),
+                index: 0,
+            }],
+            ..Default::default()
+        };
+        let ctx_def = pb::Definition {
+            metadata: [(dg(&mk_b), pb::OpMetadata::default())]
+                .into_iter()
+                .collect(),
+            def: vec![mk_b, term.encode_to_vec()],
+            ..Default::default()
+        };
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("name".to_owned(), format!("{MIRROR}/rebuck2/ctx:probe"));
+        attrs.insert("push".to_owned(), "true".to_owned());
+        attrs.insert("registry.insecure".to_owned(), "true".to_owned());
+        c.solve(control::SolveRequest {
+            r#ref: format!("publish-ctx-{}", std::process::id()),
+            definition: Some(ctx_def),
+            exporters: vec![control::Exporter {
+                r#type: "image".into(),
+                attrs,
+            }],
+            ..Default::default()
+        })
+        .await
+        .expect("publishing the context into the mirror");
+
+        // 2. A build whose context is LOCAL - undispatchable as it stands.
+        //
+        // Shaped like a real COPY: the rootfs is an ordinary image and the
+        // context is MOUNTED beside it. An earlier version made the context
+        // the whole rootfs, which has no shell - and runc reports a missing
+        // binary as "exit code: 1", which reads exactly like a command that
+        // ran and failed. Two iterations were spent on that.
+        let base = pb::Op {
+            op: Some(pb::op::Op::Source(pb::SourceOp {
+                identifier: "docker-image://docker.io/library/alpine:3.20".into(),
+                ..Default::default()
+            })),
+            platform: Some(plat.clone()),
+            ..Default::default()
+        };
+        let base_b = base.encode_to_vec();
+        let local_src = pb::Op {
+            op: Some(pb::op::Op::Source(pb::SourceOp {
+                identifier: "local://context".into(),
+                ..Default::default()
+            })),
+            platform: Some(plat.clone()),
+            ..Default::default()
+        };
+        let src_b = local_src.encode_to_vec();
+        let exec = pb::Op {
+            inputs: vec![
+                pb::Input {
+                    digest: dg(&base_b),
+                    index: 0,
+                },
+                pb::Input {
+                    digest: dg(&src_b),
+                    index: 0,
+                },
+            ],
+            op: Some(pb::op::Op::Exec(pb::ExecOp {
+                meta: Some(pb::Meta {
+                    // Checks the CONTENTS, not just the path: presence would
+                    // pass on any image that happened to have the file.
+                    args: vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        format!("grep -q {marker} /ctx/ctx-marker"),
+                    ],
+                    cwd: "/".into(),
+                    ..Default::default()
+                }),
+                mounts: vec![
+                    pb::Mount {
+                        input: 0,
+                        dest: "/".into(),
+                        output: 0,
+                        ..Default::default()
+                    },
+                    pb::Mount {
+                        input: 1,
+                        dest: "/ctx".into(),
+                        output: -1,
+                        readonly: true,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            })),
+            platform: Some(plat),
+            ..Default::default()
+        };
+        let exec_b = exec.encode_to_vec();
+        let term2 = pb::Op {
+            inputs: vec![pb::Input {
+                digest: dg(&exec_b),
+                index: 0,
+            }],
+            ..Default::default()
+        };
+        let before = pb::Definition {
+            metadata: [&base_b, &src_b, &exec_b]
+                .iter()
+                .map(|b| (dg(b), pb::OpMetadata::default()))
+                .collect(),
+            def: vec![base_b, src_b, exec_b, term2.encode_to_vec()],
+            ..Default::default()
+        };
+        let cut = crate::dispatch::analyse(&before, 1)
+            .cuts
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(cut.frontier.local, 1, "undispatchable: the client's disk");
+        assert!(!cut.frontier.is_free());
+
+        // 3. Rewrite it to fetch the published context, and build it on a
+        //    daemon that has never spoken to a client.
+        let after = crate::dispatch::rewrite_local_sources(&before, &|_| {
+            Some(format!("docker-image://{MIRROR}/rebuck2/ctx:probe"))
+        });
+        let cut = crate::dispatch::analyse(&after, 1)
+            .cuts
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(cut.frontier.local, 0);
+        assert_eq!(
+            cut.frontier.registry, 2,
+            "alpine, and our published context"
+        );
+        assert!(
+            cut.frontier.is_free(),
+            "now dispatchable: {:?}",
+            cut.frontier
+        );
+
+        c.solve(control::SolveRequest {
+            r#ref: format!("use-ctx-{}", std::process::id()),
+            definition: Some(after),
+            ..Default::default()
+        })
+        .await
+        .expect("the peer must build from the published context");
+    }
+
     /// Emit a sample LLB Definition in the wire form `buildctl build` reads
     /// on stdin. A fixture generator, not an assertion:
     ///   cargo test --bin rebuck2 write_sample_llb -- --ignored
