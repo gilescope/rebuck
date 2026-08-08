@@ -33,6 +33,10 @@ RUN=${RUN:-${TMPDIR:-/tmp}/rebuck2-fleet}
 BASE_PORT=${BASE_PORT:-18372}
 REG_PORT=${REG_PORT:-15000}
 PROXY_PORT=${PROXY_PORT:-11234}
+# CPU quota for the LAST daemon, e.g. SLOW=0.25. A real fleet is never
+# uniform, and placement that ignores capacity is invisible until one machine
+# is slower than the rest.
+SLOW=${SLOW:-}
 
 crate=$(cd "$(dirname "$0")/.." && pwd)
 rm -rf "$RUN"
@@ -42,8 +46,8 @@ pids=()
 containers=()
 # shellcheck disable=SC2329  # invoked by the EXIT trap, not by name
 cleanup() {
-  for p in "${pids[@]:-}"; do kill "$p" 2>/dev/null || true; done
-  for c in "${containers[@]:-}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+  for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
+  for c in "${containers[@]}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
 }
 trap cleanup EXIT
 
@@ -114,7 +118,17 @@ for i in $(seq 0 $((DAEMONS - 1))); do
   port=$((BASE_PORT + i))
   name="rebuck2-fleet-$i"
   docker rm -f "$name" >/dev/null 2>&1 || true
+  limit=()
+  if [ -n "$SLOW" ] && [ "$i" -eq $((DAEMONS - 1)) ]; then
+    limit=(--cpus "$SLOW")
+    say "daemon $i is the SLOW one (--cpus $SLOW)"
+  fi
+  # `"${limit[@]}"`, NOT `"${limit[@]:-}"`: the `:-` form expands an empty
+  # array to one EMPTY ARGUMENT, and docker reads that as the image name and
+  # fails with "invalid reference format". Bash 5 handles an empty `[@]` under
+  # `set -u` correctly on its own.
   docker run -d --name "$name" --privileged \
+    "${limit[@]}" \
     -p "$BIND:$port:8372" \
     -v "$RUN/buildkitd.toml:/etc/buildkit/buildkitd.toml:ro" \
     --add-host host.docker.internal:host-gateway \
@@ -145,7 +159,7 @@ else
   say "proxy on $addr -> daemon 0 plus $((${#peers[@]} / 2)) peer(s)"
   REBUCK2_MIRROR="host.docker.internal:$REG_PORT" \
     "$bin" buildkit-proxy --listen "$BIND:$PROXY_PORT" \
-    --upstream "http://127.0.0.1:$BASE_PORT" "${peers[@]:-}" >"$RUN/proxy.log" 2>&1 &
+    --upstream "http://127.0.0.1:$BASE_PORT" "${peers[@]}" >"$RUN/proxy.log" 2>&1 &
   proxy_pid=$!
   pids+=("$proxy_pid")
   for _ in $(seq 1 30); do

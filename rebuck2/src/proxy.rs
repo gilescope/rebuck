@@ -348,6 +348,39 @@
 //! solve that needs it and amortised to nothing across a real build. On a
 //! real fleet that is paid once against a machine's worth of parallelism.
 //!
+//! # One slow machine costs the whole build, and load-awareness does not fix it
+//!
+//! Three daemons, six builds, the last daemon held to a quarter of a CPU
+//! (`SLOW=0.25 DAEMONS=3 BUILDS=6 scripts/fleet.sh`):
+//!
+//! ```text
+//! uniform fleet : wall  12s
+//! one slow peer : wall 164s   build ms [10549, 10581, 10972, 10973, 162953, 162976]
+//! ```
+//!
+//! Two of six solves landed on a machine four times slower, and the build
+//! waits for them. Placement gave it an equal share because placement had no
+//! idea it was slow.
+//!
+//! `least_loaded` was written for this and DOES NOT FIX IT, which is worth
+//! saying plainly rather than shipping it as a win. Six solves of a fan-out
+//! arrive at once, so every peer's outstanding count is zero at the moment
+//! each is placed, and least-loaded degenerates to exactly round robin. It
+//! earns its place for the other shape - solves arriving spread across a
+//! long build, where a busy peer is visibly busy - and it is never worse.
+//! But load is not capacity.
+//!
+//! Slot limits do not fix it either, and the arithmetic says why before the
+//! experiment does: any placement that gives the slow machine even one of
+//! these tasks waits 163s for it. The fix has to be a peer that can REFUSE
+//! (principle 12 - refusal is backpressure) or a placer that knows roughly
+//! how long the work takes and roughly how fast each machine is (principle
+//! 13 - coarse estimates). That is what `bank::timings` is for, and it is
+//! not wired to placement yet.
+//!
+//! The outputs were byte-identical anyway: a starved peer returns correct
+//! bytes slowly, which is the failure mode to prefer.
+//!
 //! # The bytes are the same, which nothing had checked
 //!
 //! Every measurement up to here read exit codes. A distributed buildkit that
@@ -616,6 +649,13 @@ pub struct Proxy {
     /// minted a ref must serve every later call naming it, or the eleventh
     /// call of a working-looking build fails with "ref not found".
     ref_home: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    /// Adoptions currently in flight on each AWAY peer, indexed by peer.
+    ///
+    /// Index 0 is unused and always zero: peer 0 never adopts. Kept aligned
+    /// with `peers` so a peer index means the same thing everywhere - an
+    /// off-by-one here would silently overload one machine and starve
+    /// another, which looks like a slow fleet, not a bug.
+    outstanding: std::sync::Arc<Vec<std::sync::atomic::AtomicUsize>>,
     /// Round-robin cursor for placing new solves.
     next_peer: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -631,6 +671,7 @@ impl Proxy {
             sessions: Default::default(),
             published: Default::default(),
             peers: Default::default(),
+            outstanding: Default::default(),
             next_peer: Default::default(),
             ref_home: Default::default(),
         })
@@ -642,11 +683,21 @@ impl Proxy {
 
     /// Whose turn it is next, over the WHOLE fleet.
     fn next_turn(&self) -> usize {
-        turn(
-            self.next_peer
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            self.peers.len(),
-        )
+        let cursor = self
+            .next_peer
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let t = turn(cursor, self.peers.len());
+        if t == 0 {
+            return 0;
+        }
+        // Away. WHICH away is a separate question with better information
+        // behind it - see `least_loaded`. Indices 1.. only, offset back into
+        // fleet space.
+        let load: Vec<usize> = self.outstanding[1..]
+            .iter()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .collect();
+        1 + least_loaded(&load, cursor)
     }
 
     /// The gateway rides the same channel, because the client's does.
@@ -669,6 +720,11 @@ impl Proxy {
             });
         }
         println!("[proxy] {} daemon(s) in the fleet", peers.len());
+        self.outstanding = std::sync::Arc::new(
+            (0..peers.len())
+                .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                .collect(),
+        );
         self.peers = std::sync::Arc::new(peers);
         Ok(self)
     }
@@ -939,6 +995,33 @@ fn trace(wire: &std::sync::Mutex<Wire>, call: &str) {
 fn turn(cursor: usize, peers: usize) -> usize {
     debug_assert!(peers > 0, "a fleet with no peers has no turns");
     cursor % peers.max(1)
+}
+
+/// Which away peer, given how much each is already holding.
+///
+/// `turn` decides home-or-away and this decides WHICH away, because the two
+/// questions have different amounts of information behind them. Outstanding
+/// adoptions are known exactly - the future is held across
+/// `build_and_publish`, so the count is incremented before and decremented
+/// after. Peer 0's occupancy is not knowable from here at all: its work is
+/// done by the daemon being proxied and its gateway solve returns lazily in
+/// about a millisecond, so counting it would show peer 0 permanently idle and
+/// hand it everything.
+///
+/// The scan starts at `cursor` so that EQUAL loads round-robin instead of
+/// piling on the lowest index - which is also why this degrades to exactly
+/// `turn`'s behaviour when every peer is idle, and only diverges when one
+/// genuinely is busier. Never worse than round robin, better whenever solves
+/// arrive spread out over a build rather than all at once.
+fn least_loaded(load: &[usize], cursor: usize) -> usize {
+    debug_assert!(!load.is_empty(), "no away peers to choose between");
+    let n = load.len().max(1);
+    // `min_by_key` keeps the FIRST minimum, and the scan starts at the
+    // cursor, so a tie goes to the peer after the last one picked.
+    (0..n)
+        .map(|i| (cursor + i) % n)
+        .min_by_key(|&i| load.get(i).copied().unwrap_or(usize::MAX))
+        .unwrap_or(0)
 }
 
 /// One gateway Solve, characterised.
@@ -1555,6 +1638,10 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                     // count-and-continue, which is how a check becomes
                     // decoration.
                     let adopted = if local_clear && bases_clear {
+                        // Held across the await, so the count is exact -
+                        // this is the whole reason `least_loaded` can be
+                        // trusted where peer 0's occupancy cannot.
+                        self.outstanding[peer].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let t = std::time::Instant::now();
                         let r = crate::solve::build_and_publish(
                             &addr,
@@ -1563,6 +1650,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         )
                         .await;
                         t_adopt = t.elapsed().as_millis() as u64;
+                        self.outstanding[peer].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                         Some(r)
                     } else {
                         let why = match (local_clear, bases_clear) {
@@ -1845,6 +1933,44 @@ mod tests {
                 "uneven over {peers} peers: {seen:?}"
             );
         }
+    }
+
+    /// Equal load must round-robin, not pile on peer 1.
+    ///
+    /// `min_by_key` keeps the first minimum, so scanning from 0 would send
+    /// every away solve to the same machine and the extra peers would sit
+    /// idle - the offloading bug again, one level down. Starting the scan at
+    /// the cursor is what prevents it.
+    #[test]
+    fn an_idle_fleet_still_takes_turns() {
+        let idle = [0usize, 0, 0];
+        let picks: Vec<usize> = (0..6).map(|c| super::least_loaded(&idle, c)).collect();
+        assert_eq!(picks, vec![0, 1, 2, 0, 1, 2]);
+    }
+
+    /// A busy peer is skipped even when it is its turn.
+    #[test]
+    fn a_loaded_peer_is_passed_over() {
+        // Peer 1 holds three adoptions; peers 0 and 2 hold none.
+        let load = [0usize, 3, 0];
+        for cursor in 0..6 {
+            assert_ne!(
+                super::least_loaded(&load, cursor),
+                1,
+                "cursor {cursor} chose the loaded peer"
+            );
+        }
+        // And it comes back into rotation once it drains.
+        assert_eq!(super::least_loaded(&[0, 0, 0], 1), 1);
+    }
+
+    /// The whole fleet busy is not a reason to pick nobody, and not a reason
+    /// to always pick the same one.
+    #[test]
+    fn a_uniformly_busy_fleet_still_rotates() {
+        let load = [2usize, 2, 2];
+        let picks: Vec<usize> = (0..3).map(|c| super::least_loaded(&load, c)).collect();
+        assert_eq!(picks, vec![0, 1, 2]);
     }
 
     /// The peer's build is not overhead.
