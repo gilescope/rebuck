@@ -32,6 +32,16 @@
 //! and taking whichever finishes first. It trades the very work this module
 //! exists to save, so it should be driven by measurements rather than instinct.
 
+// Unreferenced by the proxy, kept for the DRIVER line.
+//
+// This module belongs to the sibling product - a driver arbitrating offers
+// between workers - which the distributed-buildkit path outgrew rather than
+// replaced. `-D warnings` in CI makes "unused here" indistinguishable from
+// "unused", and deleting another line's work to quiet a lint would be
+// vandalism dressed as tidying. Allowed at the module, so anything genuinely
+// dead in the PROXY path still fails the build.
+#![allow(dead_code)]
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};

@@ -1407,6 +1407,7 @@ impl Driver {
     /// A driver with a throwaway store, for tests that need one to hang a
     /// router off. Not `cfg(test)`: the registry's tests are in another
     /// module and would not see it.
+    #[allow(dead_code)] // test helper for the driver line
     pub fn for_test() -> Arc<Self> {
         let dir = tempfile::tempdir().unwrap().keep();
         Driver::new(

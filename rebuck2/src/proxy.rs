@@ -104,6 +104,21 @@ pub struct Peer {
     pub addr: String,
 }
 
+/// One in-flight publish per key, shared by every solve that wants it.
+type Published = std::sync::Arc<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            (String, String),
+            std::sync::Arc<tokio::sync::OnceCell<Option<String>>>,
+        >,
+    >,
+>;
+
+/// build id -> (where it went, graph key, whether it held a home slot).
+type Went = std::sync::Arc<
+    std::sync::Mutex<std::collections::HashMap<String, (Option<usize>, String, bool)>>,
+>;
+
 #[derive(Clone)]
 pub struct Proxy {
     /// ONE channel for the whole proxy, cloned per call.
@@ -144,23 +159,14 @@ pub struct Proxy {
     ///
     /// A `OnceCell` per key is the shape that is neither: the first caller
     /// publishes, the rest AWAIT the same result and then have it.
-    published: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<
-                (String, String),
-                std::sync::Arc<tokio::sync::OnceCell<Option<String>>>,
-            >,
-        >,
-    >,
+    published: Published,
     /// Extra daemons this proxy may route work to. Peer 0 is always the
     /// upstream above - the one holding the client's session.
     peers: std::sync::Arc<Vec<Peer>>,
     /// build id -> where its work went. Written by the gateway solve, read by
     /// `Control.Solve` when it finishes, because only the gateway knows the
     /// placement and only Control knows what the client actually waited.
-    went: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<String, (Option<usize>, String, bool)>>,
-    >,
+    went: Went,
     /// When to start offering work again after the shared mirror was found
     /// dead. `None` means it is believed healthy.
     ///
@@ -921,8 +927,8 @@ const WEIGHT_CAP: usize = 8;
 /// 16: 8  wall 15s   home 15228ms  away 15506ms  ratio 1.02
 /// ```
 ///
-/// - so a ratio above one says the away side is the straggler and the share
-/// should move home, and the balance point is ratio 1. Shares therefore go as
+/// A ratio above one says the away side is the straggler and the share
+/// should move home; the balance point is ratio 1. Shares therefore go as
 /// the INVERSE of service time, which needs no core counts and no declared
 /// capacity: an operator guessing from cores got 21s, and this arithmetic on
 /// the 12:12 numbers gives 3:2, which is next to the 16:8 that measured best.
@@ -963,10 +969,9 @@ fn turn(cursor: usize, weights: &[usize]) -> usize {
     // is principle 13: a coarse estimate an operator can state is worth more
     // than a exact one nobody can obtain.
     let total: usize = weights.iter().sum();
-    if total == 0 {
+    let Some(mut at) = cursor.checked_rem(total) else {
         return 0;
-    }
-    let mut at = cursor % total;
+    };
     for (i, &w) in weights.iter().enumerate() {
         if at < w {
             return i;
@@ -1395,11 +1400,7 @@ impl Wire {
         println!(
             "[wire] repeated ops   : {} ({}% of all ops seen again in a later solve)",
             self.repeated_ops,
-            if self.ops > 0 {
-                self.repeated_ops * 100 / self.ops
-            } else {
-                0
-            }
+            (self.repeated_ops * 100).checked_div(self.ops).unwrap_or(0)
         );
 
         // The distinction that decides what the repetition MEANS. A client

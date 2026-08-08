@@ -130,7 +130,6 @@ pub async fn publish_context(
             attrs: [("local.session".to_owned(), session.to_owned())]
                 .into_iter()
                 .collect(),
-            ..Default::default()
         })),
         ..Default::default()
     };
@@ -595,7 +594,6 @@ mod tests {
                 attrs: [("local.session".to_owned(), "stale-session-id".to_owned())]
                     .into_iter()
                     .collect(),
-                ..Default::default()
             })),
             platform: Some(plat.clone()),
             ..Default::default()
@@ -1174,7 +1172,6 @@ mod tests {
                     attrs: [("local.unique".to_owned(), format!("build-{i}"))]
                         .into_iter()
                         .collect(),
-                    ..Default::default()
                 })),
                 platform: plat.clone(),
                 ..Default::default()

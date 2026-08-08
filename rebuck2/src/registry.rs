@@ -984,6 +984,7 @@ async fn stats_handle<S: RegistryStore>(State(reg): State<Arc<Reg<S>>>) -> Respo
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
+#[allow(dead_code)] // superseded by router_with_upstream; kept as the plain-serve entry
 pub fn router<S: RegistryStore>(store: Arc<S>) -> Router {
     router_with_upstream(store, None)
 }
@@ -1016,6 +1017,7 @@ pub fn router_with_upstream<S: RegistryStore>(
         .with_state(reg)
 }
 
+#[allow(dead_code)] // superseded by serve_with_upstream; kept as the plain-serve entry
 pub async fn serve<S: RegistryStore>(addr: SocketAddr, store: Arc<S>) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("[registry] OCI v2 on http://{}", listener.local_addr()?);

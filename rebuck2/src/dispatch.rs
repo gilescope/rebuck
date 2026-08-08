@@ -72,6 +72,7 @@ pub struct Verdict {
 }
 
 impl Verdict {
+    #[allow(dead_code)] // the unconditional form; the proxy uses dispatchable_with
     pub fn dispatchable(&self) -> bool {
         self.dispatchable_with(false)
     }
@@ -235,6 +236,7 @@ impl Load {
 
 /// What a worker should pick up next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // driver line, not the proxy - see lease.rs
 pub enum Next {
     /// A peer is blocked on this. Always first.
     Peer(u64),
@@ -272,6 +274,7 @@ pub fn consider(load: Load, v: &Verdict, my_platform: &str) -> Result<(), Refusa
 }
 
 /// Which pending item to start. Principle 12: finishing beats starting.
+#[allow(dead_code)] // driver line, not the proxy - see lease.rs
 pub fn next_work(load: Load, peer: &[u64], driver: &[u64]) -> Next {
     // Start nothing when full. Completions set makespan, starts do not - a
     // fleet that always accepts converges on every machine being 90%
@@ -298,6 +301,7 @@ pub fn next_work(load: Load, peer: &[u64], driver: &[u64]) -> Next {
 /// vertices (58% of one shard's execs are `echo`/`test`/`diff`/`mkdir`) and
 /// an order below the stem at ~94s - so being wrong by a factor of two
 /// changes no decision.
+#[allow(dead_code)] // driver line, not the proxy - see lease.rs
 pub const STALL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A peer we could offer this subtree to.
@@ -313,6 +317,7 @@ pub struct Candidate {
 /// `est_p90` is the timing store's answer for this target, when it has one.
 /// A first build has none, and the fallback is the stall itself - which is
 /// why no cold-start path has to be maintained separately.
+#[allow(dead_code)] // driver line, not the proxy - see lease.rs
 pub fn worth_offering(
     est_p90: Option<std::time::Duration>,
     running_for: std::time::Duration,
@@ -394,6 +399,7 @@ impl Placement {
     }
 
     /// Is an offer currently outstanding with someone?
+    #[allow(dead_code)] // driver line, not the proxy - see lease.rs
     pub fn outstanding(&self) -> Option<u64> {
         self.outstanding
     }
