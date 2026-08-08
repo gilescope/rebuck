@@ -46,6 +46,35 @@ identically for the answer to be right. It is off by default because it is
 the one thing here that moves a user's credential off their machine, and no
 amount of scheduling benefit makes that a decision to take on their behalf.
 
+Lifted per GRAPH, not per capability. Being able to serve secrets in general
+is the wrong question: an earthly build mounts `earthly_debugger_settings`,
+whose value earthly generates per build and keeps in its own internal store -
+no environment holds it, and earthly's own provider refuses it by name. So
+the check is "can we serve every secret THIS graph asks for", all or none:
+
+```text
+proxy can resolve it     placed {home: 4, peer1: 4}
+proxy cannot (client can)  placed {}   excluded: Secret x8
+```
+
+Without that, lifting on the general capability would offer eleven solves in
+twelve that are certain to fail, and fail-open would rebuild each at home
+having paid for the trip.
+
+Two bugs on the way, both the same shape as ever. The first version of the
+unresolvable test set the variable to an EMPTY string, and `env::var` returns
+`Ok("")` for that - so the check called it resolvable, the test dispatched
+anyway, and it looked like the feature was broken when the test was. Empty is
+now treated as unset in both the check and the provider: a variable holding
+nothing is a provisioning mistake, and serving it turns that mistake into a
+build failure on someone else's machine.
+
+And a correction: serving `sshforward` would NOT unlock earthly's two socket
+mounts, which I claimed it would. `earthly_interactive` is served by a
+handler inside the earthly process (`build_cmd.go:476`) rather than by an ssh
+agent, so forwarding ours satisfies nothing. Only proxying the client's own
+session reaches it.
+
 Still excluded, deliberately: cache mounts, ssh sockets and host binds. Each
 needs a different service, and lifting them together would be assuming three
 things from evidence about one.

@@ -276,7 +276,12 @@ else
   addr="tcp://127.0.0.1:$PROXY_PORT"
   # peers holds --peer and its value, so its length is twice the count.
   say "proxy on $addr -> daemon 0 plus $((${#peers[@]} / 2)) peer(s)"
-  rebuck2_probe="${rebuck2_probe:-}" \
+  # UNRESOLVABLE=1 keeps the secret from the PROXY while leaving it with the
+  # client. That is the earthly shape: a secret the build legitimately uses
+  # and nothing outside the client process can produce.
+  proxy_secret="${rebuck2_probe:-}"
+  if [ -n "${UNRESOLVABLE:-}" ]; then proxy_secret=""; fi
+  rebuck2_probe="$proxy_secret" \
     REBUCK2_MIRROR="$MIRROR_HOST:$REG_PORT" \
     "$bin" buildkit-proxy --listen "$BIND:$PROXY_PORT" \
     --upstream "http://127.0.0.1:$BASE_PORT" "${peers[@]}" >"$RUN/proxy.log" 2>&1 &

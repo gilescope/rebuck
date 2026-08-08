@@ -93,6 +93,34 @@ impl Verdict {
     }
 }
 
+/// Every secret id this graph mounts, in op order.
+///
+/// Needed before dispatch, not after: lifting the Secret exclusion because
+/// we *can* serve secrets, without checking we can serve THESE secrets,
+/// offers work that is certain to fail. On an earthly build that is eleven
+/// doomed round trips - the debugger's secret is generated per build and
+/// kept in earthly's own internal store, so nothing outside that process can
+/// resolve it.
+pub fn secret_ids(def: &pb::Definition) -> Vec<String> {
+    use prost::Message;
+    let mut out = Vec::new();
+    for bytes in &def.def {
+        let Some(pb::op::Op::Exec(e)) = pb::Op::decode(bytes.as_slice()).ok().and_then(|o| o.op)
+        else {
+            continue;
+        };
+        for m in &e.mounts {
+            if let Some(so) = &m.secret_opt {
+                out.push(so.id.clone());
+            }
+        }
+        for se in &e.secretenv {
+            out.push(se.id.clone());
+        }
+    }
+    out
+}
+
 /// `os/arch[/variant]`, as buildkit itself writes a platform.
 fn plat_str(p: &pb::Platform) -> String {
     let base = format!("{}/{}", p.os, p.architecture);

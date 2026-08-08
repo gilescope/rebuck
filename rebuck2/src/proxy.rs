@@ -806,6 +806,32 @@ fn serving_secrets() -> bool {
     std::env::var("REBUCK2_SERVE_SECRETS").as_deref() == Ok("1")
 }
 
+/// Can we serve every secret THIS graph asks for?
+///
+/// Being able to serve secrets in general is not the question. An earthly
+/// build mounts `earthly_debugger_settings`, whose value earthly generates
+/// per build and keeps in its own internal store - no environment holds it,
+/// and earthly's own provider refuses it by name. Lifting the exclusion on
+/// the general capability would offer eleven solves in twelve that are
+/// certain to fail on the peer, and fail-open would rebuild every one at
+/// home having paid for the trip.
+///
+/// So: all of them, or none.
+fn can_serve_secrets(def: &bollard_buildkit_proto::pb::Definition) -> bool {
+    if !serving_secrets() {
+        return false;
+    }
+    // An EMPTY value is not a resolved secret. `env::var` returns Ok("") for
+    // a variable set to nothing, so the first version of this check called
+    // an unset-in-practice secret resolvable, served the peer an empty
+    // string, and let the build fail there instead of staying home.
+    let resolves = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty()).is_some();
+    crate::dispatch::secret_ids(def).iter().all(|id| {
+        let name = buildkit_session::EnvSecrets::var_for(id);
+        resolves(&name) || resolves(&name.to_uppercase())
+    })
+}
+
 /// A graph's identity, for remembering how long it took.
 ///
 /// The same bytes `solve::build_and_publish` tags the adopted image with, so
@@ -1811,7 +1837,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 // touches source identifiers, so the original graph gives
                 // the same verdict for nothing.
                 let verdict = crate::dispatch::inspect(&def);
-                let allowed = verdict.dispatchable_with(serving_secrets());
+                let allowed = verdict.dispatchable_with(can_serve_secrets(&def));
                 if !allowed {
                     // Name the secret, not just its kind. A build that
                     // declares none can still be full of them: a frontend

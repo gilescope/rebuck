@@ -495,8 +495,12 @@ impl bollard_buildkit_proto::moby::buildkit::secrets::v1::secrets_server::Secret
     > {
         let id = req.get_ref().id.clone();
         let name = Self::var_for(&id);
-        let found = std::env::var(&name).or_else(|_| std::env::var(name.to_uppercase()));
-        match found {
+        // Empty is not set. A variable that exists and holds nothing is a
+        // provisioning mistake, and serving it turns that mistake into a
+        // build failure on someone else's machine.
+        let pick = |n: &str| std::env::var(n).ok().filter(|v| !v.is_empty());
+        let found = pick(&name).or_else(|| pick(&name.to_uppercase()));
+        match found.ok_or(()) {
             // The VALUE is never logged, here or anywhere. The id is enough
             // to debug with and is already in the graph.
             Ok(v) => Ok(tonic::Response::new(
@@ -504,7 +508,7 @@ impl bollard_buildkit_proto::moby::buildkit::secrets::v1::secrets_server::Secret
                     data: v.into_bytes(),
                 },
             )),
-            Err(_) => {
+            Err(()) => {
                 println!("[session] no environment secret for {name:?} (id {id:?})");
                 Err(tonic::Status::not_found(name))
             }
