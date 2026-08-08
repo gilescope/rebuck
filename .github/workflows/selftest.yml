@@ -7,7 +7,12 @@ name: selftest
 # build must be served from cache — proving cross-run reuse, the whole point.
 
 on:
+  # A branch push and its PR are the same change: a bare `push:` fires on every
+  # branch, so every in-repo PR ran twice (e.g. 446a66b, 38s apart). Keep both
+  # CONTEXTS - pre-merge on the PR, post-merge on main, where the merge result
+  # is a commit nothing tested before - without the duplicate.
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 

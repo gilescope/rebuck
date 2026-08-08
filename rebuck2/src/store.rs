@@ -48,6 +48,25 @@ pub struct Store {
     pub read_bytes: std::sync::atomic::AtomicU64,
 }
 
+/// A store key in its one legal spelling: 64 lowercase hex characters.
+///
+/// The store is content-addressed BY FILENAME, so spelling is identity. Hex is
+/// case-insensitive as a number but a filename is not - except on APFS and
+/// NTFS, where it is. That split is the bug: `AB..` and `ab..` are one blob on
+/// a mac or windows worker and two on a linux one, so the same fleet disagrees
+/// about whether a blob exists.
+///
+/// One predicate, used at every door, is the only way that stays true. REAPI
+/// input is normalised to this in `rpc::dig`; anything arriving as a filename -
+/// a blob unpacked from a downloaded bank segment, which crosses a trust
+/// boundary - is checked against it here.
+pub fn is_canonical_digest(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
 /// Hash-verify every CAS blob under `dir` (filename IS the content
 /// sha256), deleting mismatches. Native replacement for the shell
 /// verify-cas: one sequential msys hasher took 31min over 95k blobs on
@@ -70,6 +89,20 @@ pub fn verify_cas(dir: &std::path::Path) -> anyhow::Result<(u64, u64)> {
                 continue;
             }
             let name = f.file_name().to_string_lossy().into_owned();
+            // Name the real fault. A non-canonical spelling would fail the
+            // digest compare below anyway, but "DIGEST MISMATCH" would send
+            // the reader hunting for corruption instead of a producer that
+            // emitted the wrong case.
+            if !is_canonical_digest(&name) {
+                eprintln!(
+                    "verify-store: NON-CANONICAL NAME - deleting {name} \
+                     (store keys are 64 lowercase hex; this one is not, and would \
+                     resolve differently on case-insensitive vs case-sensitive workers)"
+                );
+                let _ = std::fs::remove_file(&p);
+                bad += 1;
+                continue;
+            }
             let bytes = std::fs::read(&p)?;
             if sha256_hex(&bytes) == name {
                 ok += 1;
@@ -726,5 +759,53 @@ mod tests {
                 t.await.unwrap().expect("concurrent put must not race");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod canonical_digest_tests {
+    use super::*;
+
+    /// The one legal spelling of a store key. A blob unpacked from a downloaded
+    /// bank segment is an untrusted filename crossing a trust boundary, and the
+    /// fleet is heterogeneous: `AB..` and `ab..` are one file on a mac or
+    /// windows worker and two on a linux one.
+    #[test]
+    fn only_64_lowercase_hex_is_a_canonical_key() {
+        let good = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(is_canonical_digest(good));
+        assert!(
+            !is_canonical_digest(&good.to_ascii_uppercase()),
+            "uppercase must not be canonical - it is the same number and a different filename"
+        );
+        assert!(!is_canonical_digest(&good[..63]), "too short");
+        assert!(!is_canonical_digest(&format!("{good}a")), "too long");
+        assert!(!is_canonical_digest(&good.replace('b', "z")), "not hex");
+        assert!(!is_canonical_digest(""), "empty");
+    }
+
+    /// An uppercase-named blob does not survive verify, so it can never shadow
+    /// its canonical twin on a case-insensitive worker.
+    ///
+    /// Honest scope: this pins the OUTCOME, not the canonical check. Without
+    /// that check the file fails the digest compare and is deleted anyway - the
+    /// check only changes the reported cause from "DIGEST MISMATCH" (which
+    /// sends a reader hunting corruption) to the mis-casing producer that is
+    /// actually at fault. Mutation-checked: removing the check leaves this test
+    /// passing. The predicate above is what guards the rule.
+    #[test]
+    fn a_non_canonical_blob_does_not_survive_verify() {
+        let dir = tempfile::tempdir().unwrap();
+        let cas = dir.path().join("cas").join("ba");
+        std::fs::create_dir_all(&cas).unwrap();
+        let upper = "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD";
+        std::fs::write(cas.join(upper), b"abc").unwrap();
+
+        let (ok, bad) = verify_cas(dir.path()).unwrap();
+        assert_eq!((ok, bad), (0, 1), "the uppercase name must be rejected");
+        assert!(
+            !cas.join(upper).exists(),
+            "a rejected blob must be removed, not left to shadow its canonical twin"
+        );
     }
 }
