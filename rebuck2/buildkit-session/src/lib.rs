@@ -269,14 +269,38 @@ pub async fn serve_secrets<S>(
 where
     S: bollard_buildkit_proto::moby::buildkit::secrets::v1::secrets_server::Secrets,
 {
+    serve(channel, secrets, false).await
+}
+
+/// Serve secrets, and optionally this process's ssh agent.
+///
+/// One function rather than two because the ADVERTISED METHODS and the
+/// services must agree: a method advertised but not served makes the daemon
+/// call something that is not there, and a service served but not advertised
+/// is never called at all. Both failures look like "no active sessions" from
+/// the build, which is the least informative error in this system.
+pub async fn serve<S>(
+    channel: tonic::transport::Channel,
+    secrets: S,
+    forward_agent: bool,
+) -> anyhow::Result<(String, tokio::task::JoinHandle<()>)>
+where
+    S: bollard_buildkit_proto::moby::buildkit::secrets::v1::secrets_server::Secrets,
+{
     use bollard_buildkit_proto::moby::buildkit::secrets::v1::secrets_server::SecretsServer;
+    use bollard_buildkit_proto::moby::sshforward::v1::ssh_server::SshServer;
 
     let uuid = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::mpsc::channel::<Frame>(64);
     let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
 
+    let mut methods = vec!["/moby.buildkit.secrets.v1.Secrets/GetSecret"];
+    if forward_agent {
+        methods.push("/moby.sshforward.v1.SSH/CheckAgent");
+        methods.push("/moby.sshforward.v1.SSH/ForwardAgent");
+    }
     let mut req = tonic::Request::new(outbound);
-    for (k, v) in session_headers(&uuid, &["/moby.buildkit.secrets.v1.Secrets/GetSecret"]) {
+    for (k, v) in session_headers(&uuid, &methods) {
         req.metadata_mut().append(k, v.parse()?);
     }
 
@@ -293,8 +317,14 @@ where
     let transport = Transport::new(reader, FrameWriter { tx });
 
     let task = tokio::spawn(async move {
-        let served = tonic::transport::Server::builder()
-            .add_service(SecretsServer::new(secrets))
+        // Registered only when advertised: an advertised method with no
+        // service behind it is a call into nothing.
+        let mut router =
+            tonic::transport::Server::builder().add_service(SecretsServer::new(secrets));
+        if forward_agent {
+            router = router.add_service(SshServer::new(AgentForward));
+        }
+        let served = router
             .serve_with_incoming(futures::stream::once(async {
                 Ok::<_, std::io::Error>(transport)
             }))
@@ -332,6 +362,142 @@ mod e2e {
             } else {
                 Err(tonic::Status::not_found(asked.clone()))
             }
+        }
+    }
+
+    /// The agent, forwarded to a daemon that has none of its own.
+    ///
+    /// `ssh-add -l` inside the exec talks to a socket buildkit created,
+    /// which is wired back through the session to this process's agent. A
+    /// non-zero exit means no agent answered; exit 0 means it did and listed
+    /// keys. Either way the point is that something on the other end of the
+    /// socket replied.
+    ///
+    /// ```text
+    /// BUILDKIT=tcp://127.0.0.1:18372 cargo test -p buildkit-session \
+    ///   the_daemon_reaches_our_ssh_agent -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore]
+    async fn the_daemon_reaches_our_ssh_agent() {
+        use bollard_buildkit_proto::pb;
+        use prost::Message;
+
+        let addr = std::env::var("BUILDKIT").expect("set BUILDKIT=tcp://host:port");
+        let channel = tonic::transport::Endpoint::new(addr.replace("tcp://", "http://"))
+            .unwrap()
+            .connect()
+            .await
+            .expect("dial buildkitd");
+        let (session, _task) = serve(
+            channel.clone(),
+            One {
+                id: String::new(),
+                value: vec![],
+            },
+            true,
+        )
+        .await
+        .expect("open session");
+
+        let dg = |b: &[u8]| {
+            use sha2::{Digest, Sha256};
+            format!("sha256:{:x}", Sha256::digest(b))
+        };
+        let src = pb::Op {
+            op: Some(pb::op::Op::Source(pb::SourceOp {
+                identifier: "docker-image://docker.io/library/alpine:3.20".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let src_b = src.encode_to_vec();
+        let exec = pb::Op {
+            inputs: vec![pb::Input {
+                digest: dg(&src_b),
+                index: 0,
+            }],
+            op: Some(pb::op::Op::Exec(pb::ExecOp {
+                meta: Some(pb::Meta {
+                    args: vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        // Not just "a socket exists" - the agent must
+                        // ANSWER. ssh-add exits 2 when it cannot reach one,
+                        // 1 when it reaches an agent holding no keys, 0 when
+                        // it lists some. Anything but 2 proves the far end
+                        // of that socket is our agent and not a dead file.
+                        "apk add --no-cache openssh-client >/dev/null 2>&1; \
+                         ssh-add -l; test $? -ne 2"
+                            .into(),
+                    ],
+                    env: vec!["SSH_AUTH_SOCK=/run/ssh-agent.sock".into()],
+                    cwd: "/".into(),
+                    ..Default::default()
+                }),
+                mounts: vec![
+                    pb::Mount {
+                        input: 0,
+                        dest: "/".into(),
+                        output: 0,
+                        ..Default::default()
+                    },
+                    pb::Mount {
+                        input: -1,
+                        dest: "/run/ssh-agent.sock".into(),
+                        output: -1,
+                        mount_type: pb::MountType::Ssh as i32,
+                        ssh_opt: Some(pb::SshOpt {
+                            mode: 0o600,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let exec_b = exec.encode_to_vec();
+        let term = pb::Op {
+            inputs: vec![pb::Input {
+                digest: dg(&exec_b),
+                index: 0,
+            }],
+            ..Default::default()
+        };
+        // `ignore_cache` on the exec, or this probe tests nothing after the
+        // first run. Measured the hard way: with the agent removed it still
+        // reported success, in 0.19s, because buildkit served the cached
+        // result of the previous run. A probe that passes when the thing it
+        // probes is absent is worse than no probe.
+        let def = pb::Definition {
+            metadata: [(&src_b, false), (&exec_b, true)]
+                .iter()
+                .map(|(b, ignore)| {
+                    (
+                        dg(b),
+                        pb::OpMetadata {
+                            ignore_cache: *ignore,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+            def: vec![src_b, exec_b, term.encode_to_vec()],
+            ..Default::default()
+        };
+        let out = control::control_client::ControlClient::new(channel)
+            .solve(control::SolveRequest {
+                r#ref: format!("ssh-probe-{}", std::process::id()),
+                definition: Some(def),
+                session,
+                ..Default::default()
+            })
+            .await;
+        match out {
+            Ok(_) => println!("RESULT: the daemon got a working agent socket from us"),
+            Err(e) => println!("RESULT: no agent reached the build - {}", e.message()),
         }
     }
 
@@ -513,5 +679,88 @@ impl bollard_buildkit_proto::moby::buildkit::secrets::v1::secrets_server::Secret
                 Err(tonic::Status::not_found(name))
             }
         }
+    }
+}
+
+/// Forward this process's ssh agent to a daemon that asks for one.
+///
+/// The sharpest thing in this crate. A secret is a VALUE - handing one over
+/// gives the peer that string and nothing more. An agent is a CAPABILITY:
+/// for as long as the build runs, whoever holds the socket can sign with
+/// your key, and nothing in the protocol constrains what they sign. Off
+/// unless explicitly asked for, and worth a second thought even then.
+///
+/// `SSH_AUTH_SOCK` is read at call time rather than cached, so unsetting it
+/// stops the forwarding rather than being ignored.
+#[derive(Debug, Default, Clone)]
+pub struct AgentForward;
+
+#[tonic::async_trait]
+impl bollard_buildkit_proto::moby::sshforward::v1::ssh_server::Ssh for AgentForward {
+    async fn check_agent(
+        &self,
+        _: tonic::Request<bollard_buildkit_proto::moby::sshforward::v1::CheckAgentRequest>,
+    ) -> Result<
+        tonic::Response<bollard_buildkit_proto::moby::sshforward::v1::CheckAgentResponse>,
+        tonic::Status,
+    > {
+        match std::env::var("SSH_AUTH_SOCK") {
+            Ok(p) if !p.is_empty() => Ok(tonic::Response::new(Default::default())),
+            _ => Err(tonic::Status::not_found("no SSH_AUTH_SOCK")),
+        }
+    }
+
+    type ForwardAgentStream = std::pin::Pin<
+        Box<
+            dyn futures::Stream<
+                    Item = Result<
+                        bollard_buildkit_proto::moby::sshforward::v1::BytesMessage,
+                        tonic::Status,
+                    >,
+                > + Send,
+        >,
+    >;
+
+    async fn forward_agent(
+        &self,
+        req: tonic::Request<
+            tonic::Streaming<bollard_buildkit_proto::moby::sshforward::v1::BytesMessage>,
+        >,
+    ) -> Result<tonic::Response<Self::ForwardAgentStream>, tonic::Status> {
+        use bollard_buildkit_proto::moby::sshforward::v1::BytesMessage as Ssh;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let path = std::env::var("SSH_AUTH_SOCK")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| tonic::Status::not_found("no SSH_AUTH_SOCK"))?;
+        let sock = tokio::net::UnixStream::connect(&path)
+            .await
+            .map_err(|e| tonic::Status::unavailable(format!("{path}: {e}")))?;
+        let (mut rd, mut wr) = tokio::io::split(sock);
+
+        // Daemon -> agent. Its own task: the two directions of an agent
+        // conversation are not lockstep, and serialising them deadlocks on
+        // the first reply that arrives before the next request is sent.
+        let mut inbound = req.into_inner();
+        tokio::spawn(async move {
+            while let Ok(Some(msg)) = inbound.message().await {
+                if wr.write_all(&msg.data).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Agent -> daemon.
+        let out = async_stream::stream! {
+            let mut buf = vec![0u8; 8 * 1024];
+            loop {
+                match rd.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => yield Ok(Ssh { data: buf[..n].to_vec() }),
+                }
+            }
+        };
+        Ok(tonic::Response::new(Box::pin(out)))
     }
 }

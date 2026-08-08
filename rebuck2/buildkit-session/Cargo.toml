@@ -7,13 +7,14 @@ description = "Serve BuildKit session attachables (secrets, auth, ssh) to a daem
 
 [dependencies]
 anyhow = "1"
+async-stream = "0.3"
 bollard-buildkit-proto = "0.8"
 bytes = "1"
 futures = "0.3"
 hyper = "1"
 hyper-util = { version = "0.1", features = ["tokio"] }
 prost = "0.14"
-tokio = { version = "1", features = ["macros", "rt", "io-util", "sync"] }
+tokio = { version = "1", features = ["macros", "rt", "io-util", "sync", "net"] }
 tokio-stream = "0.1"
 tokio-util = { version = "0.7", features = ["io"] }
 tonic = "0.14"
