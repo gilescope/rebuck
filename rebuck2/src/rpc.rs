@@ -566,6 +566,66 @@ pub fn router(
         )
 }
 
+/// How long the self-check waits for its own server to answer. Generous for a
+/// loaded CI box; four hours short of the outage it exists to prevent.
+const SELF_CHECK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Prove a client can complete a REAPI round trip against `addr` before the
+/// driver tells anyone it is ready.
+///
+/// A bound socket is not a serving one: a client connects (the kernel accepts
+/// into the backlog), sends a request, and waits - forever, if nothing ever
+/// answers. That is what stranded buck2-fixups run 31157521034, with buck2 on
+/// `[re_action_cache]` for four hours against a driver logging `ac_ok=0
+/// ac_fail=0`. Neither side had a deadline, so neither side could notice.
+///
+/// A server-side request timeout cannot cover this - it only fires on requests
+/// that arrive - and it would have to be long enough for `Execute` to run a
+/// whole compile, which makes it useless for an AC lookup. Checking the round
+/// trip once, at startup, costs one RPC and converts a silent hang into a loud
+/// startup failure.
+pub async fn self_check(addr: std::net::SocketAddr) -> anyhow::Result<()> {
+    self_check_within(addr, SELF_CHECK).await
+}
+
+/// [`self_check`] with an explicit budget, so tests can assert the give-up
+/// behaviour without waiting out the production timeout.
+pub async fn self_check_within(
+    addr: std::net::SocketAddr,
+    budget: std::time::Duration,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let endpoint = format!("http://{addr}");
+    let mut client = tokio::time::timeout(
+        budget,
+        re::capabilities_client::CapabilitiesClient::connect(endpoint.clone()),
+    )
+    .await
+    .with_context(|| format!("REAPI self-check: no connection to {endpoint} within {budget:?}"))?
+    .with_context(|| format!("REAPI self-check: connecting to {endpoint}"))?;
+
+    let caps = tokio::time::timeout(
+        budget,
+        client.get_capabilities(Request::new(re::GetCapabilitiesRequest::default())),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "REAPI self-check: {endpoint} accepted a connection but did not answer \
+             GetCapabilities within {budget:?} - the socket is bound but not serving, \
+             which is the shape that hangs buck2 indefinitely"
+        )
+    })?
+    .with_context(|| format!("REAPI self-check: GetCapabilities against {endpoint}"))?;
+
+    anyhow::ensure!(
+        caps.into_inner().cache_capabilities.is_some(),
+        "REAPI self-check: {endpoint} answered without cache_capabilities - a client \
+         cannot decide to use the cache"
+    );
+    Ok(())
+}
+
 fn no_digest() -> Status {
     Status::invalid_argument("missing action_digest")
 }
@@ -898,5 +958,42 @@ mod tests {
         assert_eq!(instanced.hash, ABC);
         assert_eq!(upload.hash, ABC);
         assert_eq!((bare.size, instanced.size, upload.size), (3, 3, 3));
+    }
+
+    /// The self-check must pass against a genuinely serving router.
+    #[tokio::test]
+    async fn self_check_passes_against_a_serving_router() {
+        let (addr, _s, _d) = serve_rig().await;
+        let sock: std::net::SocketAddr = addr.trim_start_matches("http://").parse().unwrap();
+        self_check(sock).await.expect("a serving router passes");
+    }
+
+    /// The outage shape, reproduced: a socket that is BOUND but never serves.
+    /// The kernel accepts the connection into the backlog, so a client thinks
+    /// it has connected and then waits for an answer that never comes. This is
+    /// what four hours of `[re_action_cache]` looked like. The self-check must
+    /// give up and say so, rather than inherit the hang.
+    #[tokio::test]
+    async fn self_check_refuses_a_bound_but_silent_port() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sock = listener.local_addr().unwrap();
+        // Hold the listener without ever accepting: connections queue in the
+        // backlog and no bytes are ever answered.
+        let _held = listener;
+
+        // A short injected budget: the point is that the check GIVES UP, not
+        // how long production waits. The outer bound is generously larger, so
+        // a self-check that hangs fails here instead of stalling the suite.
+        let budget = Duration::from_millis(300);
+        let verdict =
+            tokio::time::timeout(Duration::from_secs(10), self_check_within(sock, budget)).await;
+        let err = verdict
+            .expect("self_check must return, not hang")
+            .expect_err("a silent port must not pass the self-check");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("self-check"),
+            "the error should name itself so a CI log reader knows what failed, got {msg:?}"
+        );
     }
 }

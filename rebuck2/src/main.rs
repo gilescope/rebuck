@@ -305,10 +305,21 @@ async fn run_driver(mut args: Args) -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding REAPI listener on {addr}"))?;
-    println!("[driver] REAPI listening on grpc://{addr}");
-    rpc::router(d.clone(), store.clone(), rpc_stats.clone())
-        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+    let server = tokio::spawn(
+        rpc::router(d.clone(), store.clone(), rpc_stats.clone())
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+    );
+
+    // A bound socket is not a serving one. Prove a client can round-trip
+    // before anything downstream is released against this address: the build
+    // legs start on the line below, and a leg that dials a bound-but-silent
+    // port waits forever rather than failing.
+    rpc::self_check(addr).await?;
+    println!("[driver] REAPI listening on grpc://{addr} (round-trip verified)");
+
+    server
         .await
+        .context("gRPC server task")?
         .context("gRPC server")?;
 
     mesh.abort();
