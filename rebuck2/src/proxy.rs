@@ -203,6 +203,34 @@
 //! everything except step 2 is right: peers, ref affinity, portability
 //! rewriting and placement all stand.
 //!
+//! # MEASURED: a sessionless peer cannot reach Docker Hub
+//!
+//! Adoption works - a peer builds a portable graph through its own
+//! `Control.Solve` and publishes the result - but the peer then tried to
+//! pull its BASE image and said:
+//!
+//! ```text
+//! error="no active sessions" host=registry-1.docker.io
+//! panic: invalid memory address or nil pointer dereference
+//!   solver/llbsolver.(*resultProxy).wrapError bridge.go:288
+//! ```
+//!
+//! Registry auth travels over the session, and a peer has none - that was
+//! the whole point of rewriting `local://` away. So a graph is only truly
+//! portable when EVERY source is something the peer can fetch unauthenticated,
+//! and `docker-image://docker.io/...` is not that, even for a public image.
+//!
+//! Principle 9 says this too, and says it about exactly this: the origin
+//! registry is a fallback, not a data path; fetch once into the fleet and
+//! serve peer to peer. The rewrite has to cover base images as well as
+//! contexts - both become references into the mirror, and then a peer needs
+//! no session, no credentials and no upstream at all.
+//!
+//! Also worth knowing: this buildkit PANICS rather than returning the
+//! error, so the failure arrives as a dead daemon rather than a failed
+//! build. A fleet must treat a peer that stops answering as a decline, not
+//! wait on it.
+//!
 //! # What "transparent" has to mean
 //!
 //! All nine methods, including the streams. `Session` in particular is
@@ -912,42 +940,46 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
             self.publish_contexts(mirror, def, &meta).await;
         }
 
-        // Place the work. A graph is only movable once nothing in it needs
-        // the client's disk - so a `local://` source is rewritten to the
-        // context we published, and if we could not publish it the graph
-        // stays on peer 0, which is the only daemon with the session.
+        // Place the work by ADOPTION, not forwarding. A peer cannot accept
+        // this gateway solve - jobs are daemon-local - so the peer builds
+        // the portable graph through its own Control.Solve and publishes
+        // the result, and the client's solve is then answered here with a
+        // graph that merely imports it. Peer 0 fetches content instead of
+        // building, and the ref it returns is its own.
         let mut req = req;
-        let mut peer = 0usize;
         if self.peers.len() > 1 {
             if let (Some(mirror), Some(def)) = (&self.mirror, req.definition.clone()) {
                 let session = self.session_for(&meta);
-                let moved = self.make_portable(&def, &session, mirror);
-                if crate::dispatch::analyse(&moved, 1)
+                let portable = self.make_portable(&def, &session, mirror);
+                let movable = crate::dispatch::analyse(&portable, 1)
                     .cuts
                     .first()
-                    .is_none_or(|c| c.frontier.local == 0)
-                {
-                    peer = self
+                    .is_none_or(|c| c.frontier.local == 0);
+                if movable {
+                    let peer = 1 + self
                         .next_peer
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                        % self.peers.len();
-                    req.definition = Some(moved);
+                        % (self.peers.len() - 1);
+                    let addr = self.peers[peer].addr.clone();
+                    match crate::solve::build_and_publish(&addr, &mirror.registry, portable).await {
+                        Ok(reference) => {
+                            println!("[proxy] adopted from peer {peer}: {reference}");
+                            self.wire.lock().expect("wire").routed += 1;
+                            req.definition = Some(crate::dispatch::import_graph(&reference));
+                        }
+                        // Fail open: build it here, exactly as we would
+                        // have without a fleet.
+                        Err(e) => println!("[proxy] peer {peer} could not take it: {e:#}"),
+                    }
                 }
             }
         }
-        if peer != 0 {
-            println!("[proxy] solve -> peer {peer} ({})", self.peers[peer].addr);
-            self.wire.lock().expect("wire").routed += 1;
-        }
-        // No session to strip: the GATEWAY SolveRequest has no session
-        // field - that lives on Control.Solve, and a routed graph names
-        // only content, so the peer needs no filesync at all.
-        let out = self
-            .gw_of(peer)
-            .solve(Request::from_parts(meta, ext, req))
-            .await?;
+
+        // Always peer 0: it holds the client's job, and after adoption the
+        // graph is a fetch rather than a build.
+        let out = self.gw().solve(Request::from_parts(meta, ext, req)).await?;
         let out = out.into_inner();
-        self.remember(&out.result, peer);
+        self.remember(&out.result, 0);
         Ok(Response::new(out))
     }
 

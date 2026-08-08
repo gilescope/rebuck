@@ -190,6 +190,57 @@ pub async fn publish_context(
     Ok(format!("docker-image://{name}"))
 }
 
+/// Build a portable graph on a peer and publish the result.
+///
+/// Returns the image reference the requester should import. This is the
+/// first half of adoption: the peer does the work and puts the answer
+/// somewhere content-addressed, because its own refs and jobs cannot leave
+/// it.
+///
+/// The tag is derived from the GRAPH, so the same work adopted twice names
+/// the same image - which makes a repeat a registry hit rather than a
+/// second build.
+pub async fn build_and_publish(
+    peer_addr: &str,
+    registry: &str,
+    def: pb::Definition,
+) -> anyhow::Result<String> {
+    use prost::Message;
+    let mut bytes: Vec<u8> = Vec::new();
+    for op in &def.def {
+        bytes.extend_from_slice(op);
+    }
+    let tag = &crate::store::sha256_hex(&bytes)[..32];
+    let name = format!("{registry}/rebuck2/adopted:{tag}");
+
+    let mut attrs = HashMap::new();
+    attrs.insert("name".to_owned(), name.clone());
+    attrs.insert("push".to_owned(), "true".to_owned());
+    attrs.insert("registry.insecure".to_owned(), "true".to_owned());
+
+    let mut c = connect(peer_addr).await?;
+    c.solve(control::SolveRequest {
+        r#ref: format!(
+            "rebuck2-adopt.{}.{}",
+            std::process::id(),
+            SOLVE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ),
+        definition: Some(def),
+        // Both forms: an older daemon reads only the deprecated one and
+        // would otherwise export nothing while reporting success.
+        exporter_deprecated: "image".to_owned(),
+        exporter_attrs_deprecated: attrs.clone(),
+        exporters: vec![control::Exporter {
+            r#type: "image".to_owned(),
+            attrs,
+        }],
+        ..Default::default()
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("peer solve: {} {}", e.code(), e.message()))?;
+    Ok(format!("docker-image://{name}"))
+}
+
 /// Build an offered subtree and publish it where a peer can fetch it.
 ///
 /// Returns the ref the requester pulls. Everything here is I/O: the dial,

@@ -586,6 +586,42 @@ pub fn rewrite_local_sources(
     }
 }
 
+/// A graph that is nothing but "fetch this image".
+///
+/// The other half of adoption. A peer builds the real work and publishes
+/// it; the daemon holding the client's job is then handed THIS, so it
+/// fetches content instead of building and returns a ref of its own -
+/// which is what makes the client's later `read_dir` and `return` work,
+/// since refs and jobs are both daemon-local.
+///
+/// Liveness never requires keeping your OWN bytes, only some bytes
+/// (principle 3). Here it does not even require building them.
+pub fn import_graph(reference: &str) -> pb::Definition {
+    let src = pb::Op {
+        op: Some(pb::op::Op::Source(pb::SourceOp {
+            identifier: reference.to_owned(),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let src_b = src.encode_to_vec();
+    let digest = format!("sha256:{}", crate::store::sha256_hex(&src_b));
+    // LLB needs its terminal op: no `op` of its own, one input naming the
+    // result. Without it buildkit solves nothing and calls that success.
+    let term = pb::Op {
+        inputs: vec![pb::Input {
+            digest: digest.clone(),
+            index: 0,
+        }],
+        ..Default::default()
+    };
+    pb::Definition {
+        metadata: [(digest, pb::OpMetadata::default())].into_iter().collect(),
+        def: vec![src_b, term.encode_to_vec()],
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1179,6 +1215,38 @@ mod tests {
         let top = analyse(&partial, 1).cuts.first().cloned().unwrap();
         assert_eq!(top.frontier.local, 1, "the unmapped one survives");
         assert!(!top.frontier.is_free());
+    }
+
+    #[test]
+    fn an_import_graph_fetches_instead_of_building() {
+        let d = import_graph("docker-image://mesh.local/rebuck2/adopted:abc");
+        // Two ops: the source and LLB's terminal. Omitting the terminal
+        // makes buildkit solve nothing and report success, which is the
+        // most misleading answer available.
+        assert_eq!(d.def.len(), 2);
+        assert_eq!(d.metadata.len(), 1, "the source is described");
+
+        let a = analyse(&d, 1);
+        let top = a.cuts.first().expect("a cut");
+        assert_eq!(top.ops, 2, "the terminal reaches the source");
+        assert_eq!(
+            top.frontier,
+            Frontier {
+                registry: 1,
+                local: 0,
+                other: 0
+            }
+        );
+        assert!(
+            top.frontier.is_free(),
+            "an adopted result must itself be free to travel, or adoption \
+             just moves the problem one machine along"
+        );
+
+        // Nothing to execute: an import that carried an exec would be
+        // building, not adopting.
+        assert!(inspect(&d).dispatchable());
+        assert_eq!(inspect(&d).exclusions, vec![]);
     }
 
     #[test]
