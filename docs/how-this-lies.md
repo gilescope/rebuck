@@ -71,6 +71,11 @@ conclusion.
 not throughput once transfer dominates, and the "informed" weight measured
 WORSE than a flat split - 21s against 18s.
 
+**Instance:** counting orphaned BLOBS to size the mirror's garbage. 60 of 75
+were unreachable, which reads as 80% waste and an obvious case for a gc. By
+bytes it was 0.6%: the base image is one shared 4MB object and the orphans
+are kilobytes of metadata. The stand-in argued for the opposite conclusion.
+
 **Countermeasure:** measure the quantity, or leave the knob at its default.
 
 ## 7. A feedback signal the controller moves
