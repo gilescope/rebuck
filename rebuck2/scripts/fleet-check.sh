@@ -247,29 +247,35 @@ check "nothing is offered to the peer" "$(placed "$out" 1)" ""
 present "and the refusal names the secret" "$out" 'excluded: Secret'
 
 echo
-echo "== a PRIVILEGED exec, with every lift switched on"
-# The three lifts are scheduling knobs. Privileged exec is not one, and never
-# gets a knob: no session service makes a peer's `--privileged` mean what
-# this machine's would have meant.
+echo "== the privileges that are never lifted, with every lift switched on"
+# The three lifts are scheduling knobs. These two are not, and never get one:
+# no session service makes a peer's `--privileged` mean what this machine's
+# would have meant, and host networking means THIS host's network.
 #
-# All three enabled at once, because the risk is not that the flag for this
-# exists - there is none - but that one of the others widens to cover it. The
-# wiring from env var to Allow to verdict is exactly where that would happen,
-# and a unit test at either end sees none of it.
+# All three lifts enabled at once, because the risk is not a missing flag -
+# there is none - but an existing one WIDENING to cover these. That would
+# happen in the wiring from env var to Allow to verdict, which a unit test at
+# either end never touches.
 #
-# Both halves of the entitlement are granted (daemon at launch, client per
-# build), so the build genuinely works at home. Without them every build
+# Both halves of each entitlement are granted (daemon at launch, client per
+# build), so the builds genuinely work at home. Without them every build
 # fails with "insecure is not allowed" and the scenario proves only that a
 # broken build does not travel.
-out=$(run DAEMONS=2 INSECURE=1 \
-  REBUCK2_PEER_CACHE_MOUNTS=1 REBUCK2_SERVE_SECRETS=1 REBUCK2_FORWARD_AGENT=1 || true)
-echo "$out" | grep -E '^wall|placed|not routed' | tr -s ' ' | sed 's/^/  /'
-guard "the build still works, at home" "$out" && check "the build still works, at home" "$(count "$out" '^failed  : 0')" 1 || true
-guard "and no peer is offered it" "$out" && check "and no peer is offered it" "$(placed "$out" 1)" "" || true
-# `placed: {}` is also what a broken fleet gives. The reason has to be the
-# privilege - and the control is the ordinary fanout scenario above, same
-# fleet and same knobs, which does dispatch.
-present "because it is privileged, not because the fleet is broken" "$out" 'excluded: Insecure'
+for priv in INSECURE:Insecure HOSTNET:HostNetwork; do
+  knob=${priv%%:*}
+  want=${priv##*:}
+  out=$(run DAEMONS=2 "$knob=1" \
+    REBUCK2_PEER_CACHE_MOUNTS=1 REBUCK2_SERVE_SECRETS=1 REBUCK2_FORWARD_AGENT=1 || true)
+  echo "$out" | grep -E 'not routed' | tr -s ' ' | sed 's/^/  /'
+  guard "$want: still works, at home" "$out" &&
+    check "$want: still works, at home" "$(count "$out" '^failed  : 0')" 1 || true
+  guard "$want: and no peer is offered it" "$out" &&
+    check "$want: and no peer is offered it" "$(placed "$out" 1)" "" || true
+  # `placed: {}` is also what a broken fleet gives. The reason has to be the
+  # privilege - and the control is the ordinary fanout scenario above, same
+  # fleet and same lifts, which does dispatch.
+  present "$want: for the privilege, not a broken fleet" "$out" "excluded: $want"
+done
 
 echo
 echo "== a fleet that is silently doing nothing"

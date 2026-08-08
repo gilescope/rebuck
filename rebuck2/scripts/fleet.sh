@@ -72,6 +72,10 @@ SECRET=${SECRET:-}
 # privileged exec is a trust decision and no session service makes the peer's
 # `--privileged` mean what this machine's would have meant.
 INSECURE=${INSECURE:-}
+# Same fixture, asking for HOST NETWORKING instead. Excluded for the same
+# reason: host networking means THIS host's network, and a peer honouring it
+# would silently mean a different one.
+HOSTNET=${HOSTNET:-}
 # LLB whose exec mounts a CACHE. Excluded from dispatch until a peer was
 # allowed its own, which is what REBUCK2_PEER_CACHE_MOUNTS=1 permits.
 CACHE=${CACHE:-}
@@ -204,6 +208,10 @@ fixture=write_fanout_llb
 if [ -n "$CACHE" ]; then fixture=write_cache_llb; fi
 if [ -n "$SSHM" ]; then fixture=write_ssh_llb; fi
 if [ -n "$INSECURE" ]; then fixture=write_insecure_llb; fi
+if [ -n "$HOSTNET" ]; then
+  fixture=write_insecure_llb
+  export REBUCK2_LLB_HOSTNET=1
+fi
 if [ -n "$SECRET" ]; then
   fixture=write_secret_llb
   export rebuck2_probe=the-value
@@ -281,7 +289,8 @@ for i in $(seq 0 $((DAEMONS - 1))); do
     -v "$RUN/buildkitd.toml:/etc/buildkit/buildkitd.toml:ro" \
     --add-host host.docker.internal:host-gateway \
     "$IMAGE" \
-    ${INSECURE:+--allow-insecure-entitlement security.insecure} >/dev/null
+    ${INSECURE:+--allow-insecure-entitlement security.insecure} \
+    ${HOSTNET:+--allow-insecure-entitlement network.host} >/dev/null
   containers+=("$name")
   say "daemon $i on 127.0.0.1:$port ($name)"
   # `if`, not `[ ] &&`: a false test is the loop body's last command, and
@@ -376,6 +385,9 @@ for round in $(seq 1 "$ROUNDS"); do
       # ones need the proxy to serve a second session to the peer.
       bctl --addr "$addr" build --no-cache \
         --secret id=rebuck2_probe,env=rebuck2_probe \
+        --output "type=local,dest=$RUN/out-$n" <"$f" >"$RUN/build-$n.log" 2>&1 &
+    elif [ -n "$HOSTNET" ]; then
+      bctl --addr "$addr" build --no-cache --allow network.host \
         --output "type=local,dest=$RUN/out-$n" <"$f" >"$RUN/build-$n.log" 2>&1 &
     elif [ -n "$INSECURE" ]; then
       # The daemon needs the entitlement too, granted at launch. Without

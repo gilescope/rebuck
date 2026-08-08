@@ -1286,6 +1286,10 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(90);
+        // Which privilege to ask for. Both are excluded for the same reason
+        // and differ only in the field they set, so one fixture covers both
+        // rather than eighty near-identical lines twice.
+        let host_net = std::env::var("REBUCK2_LLB_HOSTNET").is_ok();
         for i in 0..n {
             let base = pb::Op {
                 op: Some(pb::op::Op::Source(pb::SourceOp {
@@ -1316,7 +1320,16 @@ mod tests {
                         ..Default::default()
                     }),
                     // The whole point of the fixture.
-                    security: pb::SecurityMode::Insecure as i32,
+                    security: if host_net {
+                        pb::SecurityMode::Sandbox as i32
+                    } else {
+                        pb::SecurityMode::Insecure as i32
+                    },
+                    network: if host_net {
+                        pb::NetMode::Host as i32
+                    } else {
+                        pb::NetMode::Unset as i32
+                    },
                     mounts: vec![
                         pb::Mount {
                             input: 0,
