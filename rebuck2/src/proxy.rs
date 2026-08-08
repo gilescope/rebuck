@@ -85,6 +85,54 @@
 //! instrument works - and that a summary percentage was one decomposition
 //! away from being a wrong answer.
 //!
+//! # Second measurement: shape decides everything
+//!
+//! The first Earthfile was a CHAIN (`test` -> `build` -> `deps`), which is
+//! the worst case and was mistaken for a general result. A fan-out - four
+//! independent targets over one shared base, with a `COPY` from context -
+//! says something quite different:
+//!
+//! ```text
+//! gateway solves : 12      distinct graphs: 12 of 12 (0 RESENDS)
+//! ops per solve  : min 4 median 5 max 17
+//! overlap/solve  : [(0,4), (1,5), (1,5), (1,5), (1,5), (1,17), ...]
+//! sources        : 12 registry, 12 local
+//! repeated ops   : 13 (13%)
+//! ```
+//!
+//! **Each independent target arrives as its OWN gateway Solve, sharing
+//! exactly one op with everything before it** - the common base. Overlap
+//! falls from 39% on the chain to 13% here, and no graph is re-sent.
+//!
+//! So overlap is a property of the BUILD SHAPE, not of the client. A chain
+//! yields cumulative graphs and nothing worth routing; a fan-out yields
+//! independent units on a plate. Real multi-target repos - the ones dispatch
+//! exists for - are fan-outs.
+//!
+//! That is strong for routing whole Solves, and it is the third verdict this
+//! measurement has produced on the same question. Worth stating plainly: the
+//! first two were drawn from one toy graph, and the honest lesson is that a
+//! single build shape cannot price a mechanism.
+//!
+//! # The local context is the real obstacle, not the frontier
+//!
+//! Every cut here reports a NON-free frontier, because `COPY shared.txt`
+//! puts a `local://` source in every graph. That matters more for one
+//! mechanism than the other:
+//!
+//! - For subtree dispatch it is fatal to the cheap case: there is no
+//!   free-frontier subtree to hand over.
+//! - For per-Solve routing it is a DATA PATH problem. Route a Solve to
+//!   another daemon and that daemon needs the build context, which only the
+//!   client has, and which reaches it over the session we are proxying.
+//!
+//! The second is a principle 6 tension and should be named rather than
+//! discovered later: the coordinator is supposed to arbitrate and carry
+//! nothing, but the build context has exactly one holder and it is talking
+//! to us. Either we relay it (and are on the data path for context, though
+//! not for layers), or the peer gets its own session to the client, which
+//! the client has no reason to offer.
+//!
 //! # Pointing earthly at a proxy, which is not obvious
 //!
 //! Earthly MANAGES buildkitd when it thinks the address is local, and
