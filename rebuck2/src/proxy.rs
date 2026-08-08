@@ -406,6 +406,31 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # What was deleted, and what was kept
+//!
+//! Ref affinity is gone. `ref_home`, `home_of`, `gw_of` and `remember`
+//! existed to route each gateway call to the daemon that minted the ref it
+//! names - the right design when a solve might be answered anywhere. Adoption
+//! made it moot: the peer builds and publishes, and the client's solve is
+//! always answered on peer 0 with an import, so every ref belongs to peer 0
+//! by construction. The map was still being written on every result and read
+//! by nothing.
+//!
+//! `relay` went with it. Its comment was worth keeping and is worth
+//! repeating here, because the lesson outlives the function: buildkit
+//! associates a session by REQUEST HEADERS, so forwarding a stream without
+//! them leaves the daemon holding a session it cannot match to a build, and
+//! the frontend's filesync comes back `Unimplemented` - an error naming
+//! nothing to do with metadata. Every forwarding path preserves metadata for
+//! that reason.
+//!
+//! What was NOT deleted, though clippy reports it: `dispatch::next_work`,
+//! `worth_offering`, `STALL`, and the whole of `lease` and parts of `driver`.
+//! Those belong to the sibling product line - a driver arbitrating offers
+//! between workers - not to this proxy. They are unreferenced HERE, which is
+//! not the same as unused, and deleting another line's work because this one
+//! outgrew it would be vandalism dressed as tidying.
+//!
 //! # Stop offering while the shared thing is down
 //!
 //! Per-peer memory cannot express "no peer is at fault and every peer is
@@ -1188,7 +1213,6 @@ pub struct Peer {
     /// still usable; it is simply never preferred as native).
     platforms: Vec<String>,
     pub addr: String,
-    channel: Chan,
 }
 
 #[derive(Clone)]
@@ -1242,13 +1266,6 @@ pub struct Proxy {
     /// Extra daemons this proxy may route work to. Peer 0 is always the
     /// upstream above - the one holding the client's session.
     peers: std::sync::Arc<Vec<Peer>>,
-    /// ref -> peer index.
-    ///
-    /// A gateway result is a REF and a ref is daemon-local. Measured on a
-    /// real build: eleven `read_dir` calls follow eleven solves. So whatever
-    /// minted a ref must serve every later call naming it, or the eleventh
-    /// call of a working-looking build fails with "ref not found".
-    ref_home: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
     /// build id -> where its work went. Written by the gateway solve, read by
     /// `Control.Solve` when it finishes, because only the gateway knows the
     /// placement and only Control knows what the client actually waited.
@@ -1311,7 +1328,6 @@ impl Proxy {
             home_inflight: Default::default(),
             mirror_down_until: Default::default(),
             next_peer: Default::default(),
-            ref_home: Default::default(),
         })
     }
 
@@ -1592,7 +1608,6 @@ impl Proxy {
                 .unwrap_or(1),
             platforms: platforms_of(self.channel.clone()).await,
             addr: "upstream".into(),
-            channel: self.channel.clone(),
         }];
         for a in addrs {
             // `http://host:port*2` - twice the share. Split from the RIGHT
@@ -1606,9 +1621,8 @@ impl Proxy {
                 .await?;
             peers.push(Peer {
                 weight: weight.max(1),
-                platforms: platforms_of(channel.clone()).await,
+                platforms: platforms_of(channel).await,
                 addr: url,
-                channel,
             });
         }
         for (i, p) in peers.iter().enumerate() {
@@ -1633,56 +1647,6 @@ impl Proxy {
         self.peers = std::sync::Arc::new(peers);
         Ok(self)
     }
-
-    fn gw_of(&self, i: usize) -> GwClient {
-        match self.peers.get(i) {
-            Some(p) => gw::llb_bridge_client::LlbBridgeClient::new(p.channel.clone()),
-            None => self.gw(),
-        }
-    }
-
-    /// Where a ref lives. Unknown refs go to peer 0, which is where every
-    /// call went before there was a fleet.
-    fn home_of(&self, r: &str) -> usize {
-        self.ref_home
-            .lock()
-            .expect("ref_home")
-            .get(r)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Remember which daemon minted the refs in a result.
-    fn remember(&self, result: &Option<gw::Result>, peer: usize) {
-        let Some(inner) = result.as_ref().and_then(|r| r.result.as_ref()) else {
-            return;
-        };
-        let mut map = self.ref_home.lock().expect("ref_home");
-        match inner {
-            gw::result::Result::Ref(r) => {
-                map.insert(r.id.clone(), peer);
-            }
-            gw::result::Result::Refs(m) => {
-                for r in m.refs.values() {
-                    map.insert(r.id.clone(), peer);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Re-wrap a payload in a Request carrying the ORIGINAL metadata.
-///
-/// Load-bearing, and its absence is invisible until it is not: buildkit
-/// associates a session by headers on the request (the session UUID among
-/// them). Forward the stream without them and the daemon accepts the
-/// session, cannot match it to the build, and the frontend's filesync call
-/// comes back Unimplemented - an error that names nothing to do with
-/// metadata. Measured, by breaking it.
-fn relay<T, U>(from: Request<T>, payload: U) -> Request<U> {
-    let (meta, ext, _) = from.into_parts();
-    Request::from_parts(meta, ext, payload)
 }
 
 /// Say what this graph offers a dispatcher, and nothing else.
@@ -3249,7 +3213,6 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
             answer,
         });
         let out = out.into_inner();
-        self.remember(&out.result, 0);
         Ok(Response::new(out))
     }
 
