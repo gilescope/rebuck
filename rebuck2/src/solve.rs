@@ -953,11 +953,17 @@ mod tests {
     #[ignore]
     fn write_context_llb() {
         use prost::Message;
-        let plat = pb::Platform {
-            os: "linux".into(),
-            architecture: std::env::consts::ARCH.replace("aarch64", "arm64"),
-            ..Default::default()
-        };
+        // Omitted when REBUCK2_LLB_PLATFORM=any. A graph that pins a platform
+        // can only run natively on machines of that architecture, so a
+        // mixed-architecture fleet has nothing to gain from it - correct, and
+        // useless for measuring whether a SECOND MACHINE adds capacity. An
+        // unpinned graph genuinely runs anywhere.
+        let plat =
+            (std::env::var("REBUCK2_LLB_PLATFORM").as_deref() != Ok("any")).then(|| pb::Platform {
+                os: "linux".into(),
+                architecture: std::env::consts::ARCH.replace("aarch64", "arm64"),
+                ..Default::default()
+            });
         let dg = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
         let out = std::env::var("REBUCK2_LLB_OUT")
             .map(std::path::PathBuf::from)
@@ -972,7 +978,7 @@ mod tests {
                     identifier: "docker-image://docker.io/library/alpine:3.20".into(),
                     ..Default::default()
                 })),
-                platform: Some(plat.clone()),
+                platform: plat.clone(),
                 ..Default::default()
             };
             let base_b = base.encode_to_vec();
@@ -994,7 +1000,7 @@ mod tests {
                         .collect(),
                     ..Default::default()
                 })),
-                platform: Some(plat.clone()),
+                platform: plat.clone(),
                 ..Default::default()
             };
             let ctx_b = ctx.encode_to_vec();
@@ -1059,7 +1065,7 @@ mod tests {
                     ],
                     ..Default::default()
                 })),
-                platform: Some(plat.clone()),
+                platform: plat.clone(),
                 ..Default::default()
             };
             let exec_b = exec.encode_to_vec();
@@ -1092,11 +1098,17 @@ mod tests {
     #[ignore]
     fn write_fanout_llb() {
         use prost::Message;
-        let plat = pb::Platform {
-            os: "linux".into(),
-            architecture: std::env::consts::ARCH.replace("aarch64", "arm64"),
-            ..Default::default()
-        };
+        // Omitted when REBUCK2_LLB_PLATFORM=any. A graph that pins a platform
+        // can only run natively on machines of that architecture, so a
+        // mixed-architecture fleet has nothing to gain from it - correct, and
+        // useless for measuring whether a SECOND MACHINE adds capacity. An
+        // unpinned graph genuinely runs anywhere.
+        let plat =
+            (std::env::var("REBUCK2_LLB_PLATFORM").as_deref() != Ok("any")).then(|| pb::Platform {
+                os: "linux".into(),
+                architecture: std::env::consts::ARCH.replace("aarch64", "arm64"),
+                ..Default::default()
+            });
         let dg = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
         // Where and how many, so `scripts/fleet.sh` can vary the fan-out
         // without editing this file.
@@ -1113,7 +1125,7 @@ mod tests {
                     identifier: "docker-image://docker.io/library/alpine:3.20".into(),
                     ..Default::default()
                 })),
-                platform: Some(plat.clone()),
+                platform: plat.clone(),
                 ..Default::default()
             };
             let src_b = src.encode_to_vec();
@@ -1172,7 +1184,7 @@ mod tests {
                     ],
                     ..Default::default()
                 })),
-                platform: Some(plat.clone()),
+                platform: plat.clone(),
                 ..Default::default()
             };
             let exec_b = exec.encode_to_vec();

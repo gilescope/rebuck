@@ -406,6 +406,48 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # A SECOND MACHINE, and what it refuted
+//!
+//! Everything above ran several daemons on one host, which can measure
+//! overhead and placement but never capacity - the fleet had no more CPU than
+//! the single daemon did. One daemon on this arm64 host, one on a 32-core x86
+//! box across the LAN, mirror named by an address both can reach:
+//!
+//! ```text
+//! peer 0 upstream            native linux/arm64
+//! peer 1 192.168.1.137:18400 native linux/amd64
+//! peer 1 could not take it: exit code: 255
+//!   sources=["docker-image://192.168.1.91:15000/rebuck2/base:45ee4c56..."]
+//! wall 16s (baseline 10s), all six outputs correct
+//! ```
+//!
+//! The plumbing works: the remote peer was reached, and it PULLED the base
+//! image from this machine's mirror over the LAN. What fails is the image
+//! itself. `make_portable` mirrors `alpine:3.20` as resolved HERE, so the
+//! mirror holds the arm64 variant and the portable graph names a
+//! single-architecture base. An x86 peer pulls it and dies with `exit code:
+//! 255` - a binary it cannot execute - after six seconds of downloading.
+//! Fail-open recovered every build; the cost was time and an alarming log.
+//!
+//! This refutes what the multi-arch section below concluded. "Emulation is
+//! legal and merely 5-10x slower, so deprioritise rather than refuse" is true
+//! of a peer resolving a manifest LIST for itself, and false of a peer handed
+//! a single-architecture copy. Until the mirror carries manifest lists, a
+//! peer that is not native cannot build the graph at all, so:
+//!
+//! - an unpinned graph is read as pinned to whatever peer 0 resolved it as,
+//!   because that is what the mirrored base actually is; and
+//! - a fleet with no native away peer builds at HOME rather than offering.
+//!
+//! With both, the cross-architecture fleet places `{home: 6}`, wastes
+//! nothing, and matches the single-machine baseline. Real speedup across
+//! machines needs the mirror to carry manifest lists - that is the next
+//! thing, and it was invisible from one host.
+//!
+//! Worth recording: the x86 box's docker0 firewall, which stops ITS
+//! containers reaching ITS host services, did not bite. The mirror lives on
+//! the other machine, so the traffic is ordinary LAN traffic.
+//!
 //! # The context path finally ran, and the fixture was the bug
 //!
 //! Every fixture until now sourced only from `docker-image://`, so
@@ -894,13 +936,28 @@ impl Proxy {
                 .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
                 .collect()
         };
-        // An unpinned graph is native everywhere: there is nothing to emulate.
-        let native: Vec<bool> = match want {
-            crate::dispatch::Platform::Pinned(p) => self.peers[1..]
+        // An unpinned graph is NOT native everywhere, however much it looks
+        // it. Measured across two real machines: an arm64 host mirrors
+        // `alpine:3.20` and gets the arm64 image, because that is what
+        // resolving it here means. The portable graph then names a
+        // single-architecture base, and an x86 peer that pulls it dies with
+        // `exit code: 255` - a binary it cannot run - after six seconds of
+        // pulling. Fail-open recovered every build, so the only cost was time
+        // and a frightening log line.
+        //
+        // Until the mirror carries a manifest LIST, the honest reading of an
+        // unpinned graph is "pinned to whatever peer 0 resolved it as".
+        let pinned = match want {
+            crate::dispatch::Platform::Pinned(p) => Some(p.clone()),
+            crate::dispatch::Platform::Any => self.peers[0].platforms.first().cloned(),
+            crate::dispatch::Platform::Conflict(_) => None,
+        };
+        let native: Vec<bool> = match &pinned {
+            Some(p) => self.peers[1..]
                 .iter()
                 .map(|peer| native_for(&peer.platforms, p))
                 .collect(),
-            _ => vec![true; self.peers.len().saturating_sub(1)],
+            None => vec![true; self.peers.len().saturating_sub(1)],
         };
         place(
             cursor,
@@ -1427,6 +1484,18 @@ fn place(
     // (principle 5). Without this a two-daemon fleet whose only peer is bad
     // would offer to it, wait out the bound, and take it back - every solve.
     if !strikes.is_empty() && strikes.iter().all(|&s| s > 0) {
+        return None;
+    }
+    // No away peer can run this natively: home, not "slowly somewhere".
+    //
+    // This started as a BIAS, on the reasoning that emulation is legal and
+    // merely five to ten times slower. Two real machines refuted it. The base
+    // image in the mirror is single-architecture - an arm64 host resolving
+    // `alpine:3.20` mirrors the arm64 image - so a peer of another
+    // architecture does not run it slowly, it fails with `exit code: 255`
+    // after pulling. Emulation would need the mirror to carry a manifest
+    // LIST, which it does not yet.
+    if !native.is_empty() && !native.iter().any(|&n| n) {
         return None;
     }
     /// What an emulated peer is discounted by. Larger than STRIKE_WEIGHT
@@ -2456,13 +2525,16 @@ mod tests {
             away.iter().all(|&p| p == 2),
             "emulated peer chosen: {away:?}"
         );
-        // Nobody native: the work still goes out rather than being refused.
+        // Nobody native: HOME. This asserted the opposite until two real
+        // machines were involved - emulation is not merely slow here, because
+        // the mirrored base is single-architecture and a foreign peer fails
+        // with `exit code: 255` after pulling it.
         let away: Vec<usize> = (0..8)
             .filter_map(|c| super::place(c, 3, &[0, 0], &[0, 0], &[false, false]))
             .collect();
         assert!(
-            !away.is_empty(),
-            "a fleet with no native peer refused work it could do"
+            away.is_empty(),
+            "offered an arm64 base to a peer that cannot execute it: {away:?}"
         );
     }
 

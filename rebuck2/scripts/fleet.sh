@@ -56,6 +56,16 @@ DOCKERFILE=${DOCKERFILE:-}
 # LLB that reads a real build CONTEXT from the client's disk. The only mode
 # that exercises context publishing, which every other run reports as 0.
 CONTEXT=${CONTEXT:-}
+# A peer on ANOTHER MACHINE. Everything else here runs several daemons on one
+# host, which can measure overhead and placement but never capacity: the fleet
+# has no more CPU than the single daemon did.
+#   REMOTE=user@host  (or just host)
+# The mirror must then be named by an address BOTH machines can reach, so all
+# daemons are given the same LAN address rather than host.docker.internal -
+# the mirror name is baked into the rewritten graph, so it has to be one name.
+REMOTE=${REMOTE:-}
+MIRROR_HOST=${MIRROR_HOST:-host.docker.internal}
+REMOTE_PORT=${REMOTE_PORT:-18400}
 
 crate=$(cd "$(dirname "$0")/.." && pwd)
 rm -rf "$RUN"
@@ -67,6 +77,9 @@ containers=()
 cleanup() {
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
   for c in "${containers[@]}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+  if [ -n "${REMOTE:-}" ]; then
+    SSH_AUTH_SOCK="" ssh "$REMOTE" "docker rm -f rebuck2-fleet-remote" >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
 
@@ -159,7 +172,7 @@ root = "/var/lib/buildkit"
 [worker.oci]
   enabled = true
   max-parallelism = 20
-[registry."host.docker.internal:$REG_PORT"]
+[registry."$MIRROR_HOST:$REG_PORT"]
   http = true
   insecure = true
 TOML
@@ -200,6 +213,22 @@ for i in $(seq 0 $((DAEMONS - 1))); do
   if [ "$i" -gt 0 ]; then peers+=(--peer "http://127.0.0.1:$port"); fi
 done
 
+if [ -n "$REMOTE" ]; then
+  say "remote daemon on $REMOTE:$REMOTE_PORT"
+  # SSH_AUTH_SOCK is cleared because a GPG agent holding the socket refuses
+  # ED25519 signing and the connection dies with a misleading auth error.
+  scp -q "$RUN/buildkitd.toml" "$REMOTE:/tmp/rebuck2-buildkitd.toml"
+  # shellcheck disable=SC2029  # client-side expansion is intended: the port
+  # and image are this harness's choice, not the remote host's.
+  SSH_AUTH_SOCK="" ssh "$REMOTE" "docker rm -f rebuck2-fleet-remote >/dev/null 2>&1;
+    docker run -d --name rebuck2-fleet-remote --privileged \
+      -p 0.0.0.0:$REMOTE_PORT:8372 \
+      -v /tmp/rebuck2-buildkitd.toml:/etc/buildkit/buildkitd.toml:ro \
+      $IMAGE" >/dev/null
+  remote_host=${REMOTE##*@}
+  peers+=(--peer "http://$remote_host:$REMOTE_PORT")
+fi
+
 # Daemons are not ready when `docker run` returns; ListWorkers is the only
 # honest readiness signal.
 for i in $(seq 0 $((DAEMONS - 1))); do
@@ -217,7 +246,7 @@ else
   addr="tcp://127.0.0.1:$PROXY_PORT"
   # peers holds --peer and its value, so its length is twice the count.
   say "proxy on $addr -> daemon 0 plus $((${#peers[@]} / 2)) peer(s)"
-  REBUCK2_MIRROR="host.docker.internal:$REG_PORT" \
+  REBUCK2_MIRROR="$MIRROR_HOST:$REG_PORT" \
     "$bin" buildkit-proxy --listen "$BIND:$PROXY_PORT" \
     --upstream "http://127.0.0.1:$BASE_PORT" "${peers[@]}" >"$RUN/proxy.log" 2>&1 &
   proxy_pid=$!
