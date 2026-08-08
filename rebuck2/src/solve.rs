@@ -285,6 +285,137 @@ mod tests {
         .expect("solve");
     }
 
+    /// The digest cascade, against a real solver.
+    ///
+    /// `rewrite_local_sources` rebuilds every op whose bytes changed and
+    /// relinks its consumers. The unit tests check the graph still hangs
+    /// together; only buildkit can say whether it is still VALID LLB - a
+    /// mis-linked input is a graph that decodes fine and solves to the
+    /// wrong thing, or to nothing.
+    ///
+    ///   docker run -d --privileged -p 11234:1234 moby/buildkit \
+    ///     --addr tcp://0.0.0.0:1234
+    ///   cargo test --bin rebuck2 a_rewritten_graph -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn a_rewritten_graph_still_solves() {
+        use prost::Message;
+        let plat = pb::Platform {
+            os: "linux".into(),
+            architecture: std::env::consts::ARCH.replace("aarch64", "arm64"),
+            ..Default::default()
+        };
+        let dg = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
+
+        // A graph rooted at a LOCAL source, which is what a `COPY`-bearing
+        // build actually sends and what cannot be dispatched as-is.
+        let src = pb::Op {
+            op: Some(pb::op::Op::Source(pb::SourceOp {
+                identifier: "local://context".into(),
+                attrs: [("local.session".to_owned(), "stale-session-id".to_owned())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            })),
+            platform: Some(plat.clone()),
+            ..Default::default()
+        };
+        let src_b = src.encode_to_vec();
+        let exec = pb::Op {
+            inputs: vec![pb::Input {
+                digest: dg(&src_b),
+                index: 0,
+            }],
+            op: Some(pb::op::Op::Exec(pb::ExecOp {
+                meta: Some(pb::Meta {
+                    args: vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "test -f /etc/alpine-release".into(),
+                    ],
+                    cwd: "/".into(),
+                    ..Default::default()
+                }),
+                mounts: vec![pb::Mount {
+                    input: 0,
+                    dest: "/".into(),
+                    output: 0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+            platform: Some(plat),
+            ..Default::default()
+        };
+        let exec_b = exec.encode_to_vec();
+        let term = pb::Op {
+            inputs: vec![pb::Input {
+                digest: dg(&exec_b),
+                index: 0,
+            }],
+            ..Default::default()
+        };
+        let before = pb::Definition {
+            metadata: [&src_b, &exec_b]
+                .iter()
+                .map(|b| (dg(b), pb::OpMetadata::default()))
+                .collect(),
+            def: vec![src_b, exec_b, term.encode_to_vec()],
+            ..Default::default()
+        };
+
+        // Undispatchable as it stands: the frontier is the client's disk.
+        let v = crate::dispatch::inspect(&before);
+        assert!(v.dispatchable(), "no hazard, just a local frontier");
+        let a = crate::dispatch::analyse(&before, 1);
+        assert_eq!(a.cuts.first().unwrap().frontier.local, 1);
+
+        // Point it at content any peer can fetch. Alpine stands in for a
+        // published context: the question here is whether the REWRITE
+        // produces valid LLB, not where the bytes came from.
+        let after = crate::dispatch::rewrite_local_sources(&before, &|_| {
+            Some("docker-image://docker.io/library/alpine:3.20".to_owned())
+        });
+        let a = crate::dispatch::analyse(&after, 1);
+        assert_eq!(a.cuts.first().unwrap().frontier.local, 0);
+        assert!(
+            a.cuts.first().unwrap().frontier.is_free(),
+            "now dispatchable"
+        );
+
+        let mut c = connect("http://127.0.0.1:11234").await.expect("dial");
+
+        // FIRST the negative, or this test has no teeth. The un-rewritten
+        // graph must FAIL: there is no session, so `local://context` has no
+        // filesync to resolve through. If this passes, the positive below
+        // proves nothing - it would be solving something that succeeds
+        // whatever we do to it.
+        let unrewritten = c
+            .solve(control::SolveRequest {
+                r#ref: format!("norewrite-{}", std::process::id()),
+                definition: Some(before),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            unrewritten.is_err(),
+            "a local:// graph solved with no session - the positive case \
+             below would then prove nothing"
+        );
+
+        // And now the solver agrees the rewrite is a graph. The exec asserts
+        // it can SEE the substituted content, so a mis-linked input fails
+        // here rather than silently building nothing: /etc/alpine-release
+        // exists only if the rewritten source really became the rootfs.
+        c.solve(control::SolveRequest {
+            r#ref: format!("rewrite-{}", std::process::id()),
+            definition: Some(after),
+            ..Default::default()
+        })
+        .await
+        .expect("the rewritten graph must solve");
+    }
+
     /// Emit a sample LLB Definition in the wire form `buildctl build` reads
     /// on stdin. A fixture generator, not an assertion:
     ///   cargo test --bin rebuck2 write_sample_llb -- --ignored
