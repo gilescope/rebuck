@@ -226,6 +226,20 @@ pub struct Proxy {
     /// the session has to be remembered from the first and looked up by the
     /// second - which is also how buildkit itself associates them.
     sessions: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// (session, local name) -> published ref. A context is published ONCE
+    /// per build, not once per gateway solve: it is content-addressed so a
+    /// repeat is correct, but it is a full filesync and an image push for
+    /// an answer we already have.
+    /// `None` = publication IN FLIGHT, `Some` = done.
+    ///
+    /// The in-flight state is load-bearing. Gateway solves run
+    /// CONCURRENTLY, so a plain "is it there yet" check is check-then-act:
+    /// eleven of twelve solves read an empty map before the first insert
+    /// landed and each did the whole filesync and push again. Claiming the
+    /// key under the same lock is what makes it once.
+    published: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<(String, String), Option<String>>>,
+    >,
 }
 
 impl Proxy {
@@ -237,6 +251,7 @@ impl Proxy {
             wire: Default::default(),
             mirror: None,
             sessions: Default::default(),
+            published: Default::default(),
         })
     }
 
@@ -436,6 +451,18 @@ impl control::control_server::Control for Proxy {
     }
 }
 
+/// Every gateway call, in order.
+///
+/// Before routing solves to different daemons, the question that decides
+/// whether that is even possible: a gateway result is a REF, and a ref is
+/// daemon-local. If the client only ever asks "did it work", refs never
+/// leave the daemon that made them and routing is free. If it reads files
+/// from them, or hands one solve's ref to another, then a ref that lives on
+/// the wrong machine is a broken build.
+fn trace(wire: &std::sync::Mutex<Wire>, call: &str) {
+    wire.lock().expect("wire").calls.push(call.to_owned());
+}
+
 /// One gateway Solve, characterised.
 ///
 /// Deliberately NOT "how many cuts could mechanism A take" - that prices one
@@ -480,6 +507,8 @@ pub struct Wire {
     pub session_to_client: std::sync::atomic::AtomicU64,
     /// Build contexts turned into content a peer can pull.
     pub contexts_published: u64,
+    /// Gateway calls in arrival order.
+    pub calls: Vec<String>,
 }
 
 impl Wire {
@@ -578,6 +607,12 @@ impl Wire {
             .session_to_client
             .load(std::sync::atomic::Ordering::Relaxed);
         println!("[wire] contexts published: {}", self.contexts_published);
+        let mut counts: std::collections::BTreeMap<&str, usize> = Default::default();
+        for c in &self.calls {
+            *counts.entry(c.as_str()).or_default() += 1;
+        }
+        println!("[wire] gateway calls  : {counts:?}");
+        println!("[wire] call order     : {}", self.calls.join(" "));
         println!(
             "[wire] session bytes  : {} KiB client->daemon, {} KiB daemon->client",
             up / 1024,
@@ -626,14 +661,37 @@ impl Proxy {
             }
         }
         for name in names {
+            let key = (session.clone(), name.clone());
+            {
+                let mut map = self.published.lock().expect("published");
+                match map.get(&key) {
+                    Some(Some(had)) => {
+                        println!("[proxy] context {name:?} already published as {had}");
+                        continue;
+                    }
+                    Some(None) => continue, // someone else is doing it
+                    None => {
+                        map.insert(key.clone(), None);
+                    }
+                }
+            }
             match crate::solve::publish_context(&mirror.buildkit, &mirror.registry, &session, &name)
                 .await
             {
                 Ok(reference) => {
                     println!("[proxy] context {name:?} published as {reference}");
                     self.wire.lock().expect("wire").contexts_published += 1;
+                    self.published
+                        .lock()
+                        .expect("published")
+                        .insert(key, Some(reference));
                 }
-                Err(e) => println!("[proxy] context {name:?} not published: {e:#}"),
+                Err(e) => {
+                    // Release the claim: a failure must not make the
+                    // context permanently unpublishable for this build.
+                    self.published.lock().expect("published").remove(&key);
+                    println!("[proxy] context {name:?} not published: {e:#}");
+                }
             }
         }
     }
@@ -695,6 +753,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         request: Request<gw::SolveRequest>,
     ) -> Result<Response<gw::SolveResponse>, Status> {
         let (meta, ext, req) = request.into_parts();
+        trace(&self.wire, "solve");
         report_gateway(&self.wire, &req);
         // Publish any build context this graph needs, so the subtree stops
         // being pinned to the one machine holding the client's disk. The
@@ -710,6 +769,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         &self,
         request: Request<gw::ResolveImageConfigRequest>,
     ) -> Result<Response<gw::ResolveImageConfigResponse>, Status> {
+        trace(&self.wire, "resolve_image_config");
         let (meta, ext, req) = request.into_parts();
         self.gw()
             .resolve_image_config(Request::from_parts(meta, ext, req))
@@ -719,6 +779,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         &self,
         request: Request<gw::ResolveSourceMetaRequest>,
     ) -> Result<Response<gw::ResolveSourceMetaResponse>, Status> {
+        trace(&self.wire, "resolve_source_meta");
         let (meta, ext, req) = request.into_parts();
         self.gw()
             .resolve_source_meta(Request::from_parts(meta, ext, req))
@@ -728,6 +789,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         &self,
         request: Request<gw::ReadFileRequest>,
     ) -> Result<Response<gw::ReadFileResponse>, Status> {
+        trace(&self.wire, "read_file");
         let (meta, ext, req) = request.into_parts();
         self.gw()
             .read_file(Request::from_parts(meta, ext, req))
@@ -737,6 +799,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         &self,
         request: Request<gw::ReadDirRequest>,
     ) -> Result<Response<gw::ReadDirResponse>, Status> {
+        trace(&self.wire, "read_dir");
         let (meta, ext, req) = request.into_parts();
         self.gw()
             .read_dir(Request::from_parts(meta, ext, req))
@@ -746,6 +809,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         &self,
         request: Request<gw::StatFileRequest>,
     ) -> Result<Response<gw::StatFileResponse>, Status> {
+        trace(&self.wire, "stat_file");
         let (meta, ext, req) = request.into_parts();
         self.gw()
             .stat_file(Request::from_parts(meta, ext, req))
@@ -755,6 +819,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         &self,
         request: Request<gw::EvaluateRequest>,
     ) -> Result<Response<gw::EvaluateResponse>, Status> {
+        trace(&self.wire, "evaluate");
         let (meta, ext, req) = request.into_parts();
         self.gw()
             .evaluate(Request::from_parts(meta, ext, req))
@@ -764,6 +829,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         &self,
         request: Request<gw::PingRequest>,
     ) -> Result<Response<gw::PongResponse>, Status> {
+        trace(&self.wire, "ping");
         let (meta, ext, req) = request.into_parts();
         self.gw().ping(Request::from_parts(meta, ext, req)).await
     }
@@ -771,6 +837,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         &self,
         request: Request<gw::InputsRequest>,
     ) -> Result<Response<gw::InputsResponse>, Status> {
+        trace(&self.wire, "inputs");
         let (meta, ext, req) = request.into_parts();
         self.gw().inputs(Request::from_parts(meta, ext, req)).await
     }
@@ -778,6 +845,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         &self,
         request: Request<gw::NewContainerRequest>,
     ) -> Result<Response<gw::NewContainerResponse>, Status> {
+        trace(&self.wire, "new_container");
         let (meta, ext, req) = request.into_parts();
         self.gw()
             .new_container(Request::from_parts(meta, ext, req))
@@ -787,6 +855,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         &self,
         request: Request<gw::ReleaseContainerRequest>,
     ) -> Result<Response<gw::ReleaseContainerResponse>, Status> {
+        trace(&self.wire, "release_container");
         let (meta, ext, req) = request.into_parts();
         self.gw()
             .release_container(Request::from_parts(meta, ext, req))
@@ -796,6 +865,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         &self,
         request: Request<gw::ReadFileRequest>,
     ) -> Result<Response<gw::ReadFileResponse>, Status> {
+        trace(&self.wire, "read_file_container");
         let (meta, ext, req) = request.into_parts();
         self.gw()
             .read_file_container(Request::from_parts(meta, ext, req))
@@ -805,6 +875,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         &self,
         request: Request<gw::ReadDirRequest>,
     ) -> Result<Response<gw::ReadDirResponse>, Status> {
+        trace(&self.wire, "read_dir_container");
         let (meta, ext, req) = request.into_parts();
         self.gw()
             .read_dir_container(Request::from_parts(meta, ext, req))
@@ -814,6 +885,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         &self,
         request: Request<gw::StatFileRequest>,
     ) -> Result<Response<gw::StatFileResponse>, Status> {
+        trace(&self.wire, "stat_file_container");
         let (meta, ext, req) = request.into_parts();
         self.gw()
             .stat_file_container(Request::from_parts(meta, ext, req))
@@ -823,6 +895,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         &self,
         request: Request<gw::WarnRequest>,
     ) -> Result<Response<gw::WarnResponse>, Status> {
+        trace(&self.wire, "warn");
         let (meta, ext, req) = request.into_parts();
         self.gw().warn(Request::from_parts(meta, ext, req)).await
     }
@@ -832,6 +905,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         &self,
         request: Request<gw::ReturnRequest>,
     ) -> Result<Response<gw::ReturnResponse>, Status> {
+        trace(&self.wire, "return");
         let (meta, ext, req) = request.into_parts();
         self.gw()
             .r#return(Request::from_parts(meta, ext, req))
