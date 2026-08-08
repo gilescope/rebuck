@@ -1307,6 +1307,12 @@ pub struct Wire {
     pub contexts_published: u64,
     /// Gateway calls in arrival order.
     pub calls: Vec<String>,
+    /// The last thing a peer said when it refused, verbatim.
+    ///
+    /// Kept so the report can DIAGNOSE rather than tally. A fleet that
+    /// placed nothing looks exactly like a fleet with nothing to place, and
+    /// the difference is usually sitting in this string.
+    pub last_refusal: Option<String>,
     /// Solves placed on a peer other than the upstream.
     pub routed: u64,
     /// Client-visible build times, split by where the work went.
@@ -1365,6 +1371,44 @@ pub struct Wire {
 }
 
 impl Wire {
+    /// Say so when the fleet did nothing, and guess why.
+    ///
+    /// Added after following this project's own quickstart and getting a
+    /// working build out of a fleet that placed not one solve. Publishing is
+    /// told to be insecure per-solve so the mirror fills and the log looks
+    /// healthy; pulling is governed by daemon config alone, so every peer
+    /// refuses and dispatch quietly falls back to home. The build succeeds.
+    /// Nothing draws attention to the fleet being idle.
+    ///
+    /// A tally cannot fix that - the reader has to already suspect something.
+    /// So the proxy says it.
+    fn diagnose(&self) {
+        // `routed`, not `placed`. Placement counts DECISIONS: a solve sent to
+        // a peer that then refused it is placed and NOT routed, which is
+        // exactly the case this note exists for. Checking placements missed
+        // the very misconfiguration it was written from.
+        if self.routed == 0 && self.solves > 0 {
+            println!(
+                "[wire] NOTE: no solve completed on a peer. This fleet did no distributed work."
+            );
+            if let Some((why, n)) = self.rejected.iter().max_by_key(|(_, n)| **n) {
+                println!("[wire]   most common reason: {why} (x{n})");
+            }
+        }
+        let Some(r) = &self.last_refusal else { return };
+        if r.contains("server gave HTTP response to HTTPS client") {
+            println!(
+                "[wire] LIKELY CAUSE: a peer cannot PULL from the mirror over plain HTTP.\n\
+                 [wire]   Publishing is told to be insecure per-solve, so the mirror filled and\n\
+                 [wire]   the log looked fine; pulling needs daemon config. Add to every\n\
+                 [wire]   buildkitd's /etc/buildkit/buildkitd.toml:\n\
+                 [wire]     [registry.\"<REBUCK2_MIRROR>\"]\n\
+                 [wire]       http = true\n\
+                 [wire]       insecure = true"
+            );
+        }
+    }
+
     fn observe(&mut self, def: &bollard_buildkit_proto::pb::Definition) {
         use prost::Message;
         self.solves += 1;
@@ -1464,6 +1508,7 @@ impl Wire {
         println!("[wire] solves routed  : {} to other daemons", self.routed);
         println!("[wire] built at home  : {} (peer 0's own share)", self.home);
         println!("[wire] placed         : {:?} (0 = home)", self.placed);
+        self.diagnose();
         if let (Some(&first), Some(&last)) = (self.arrivals.first(), self.arrivals.last()) {
             println!(
                 "[wire] arrivals       : {} solves spread over {}ms (first {first}, last {last})",
@@ -2172,6 +2217,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                             println!(
                                 "[proxy] peer {peer} could not take it: {e:#} | sources={srcs:?}"
                             );
+                            self.wire.lock().expect("wire").last_refusal = Some(format!("{e:#}"));
                             // Count the FAILURES too. `routed` counts only
                             // successes, so a fleet attempting twelve
                             // adoptions and completing one looked identical
