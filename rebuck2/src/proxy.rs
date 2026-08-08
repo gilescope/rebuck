@@ -406,6 +406,42 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # The optimal split belongs to the WORKLOAD, not the fleet
+//!
+//! Two machines, twenty-four builds, the split swept at three build sizes.
+//! `work` is the fixture's inner loop count and scales compute per build;
+//! transfer cost per dispatched build is roughly constant.
+//!
+//! ```text
+//! work   no fleet   12:12   16:8   20:4   22:2
+//!   20        8s      12s    10s     7s     7s
+//!   90       24s      18s    15s    18s      -
+//!  250       64s      32s    33s    40s      -
+//! ```
+//!
+//! Three things fall out, and the first is the one that matters:
+//!
+//! 1. At `work=20` THE FLEET HURTS. An even split takes 12s against 8s for
+//!    not having a fleet at all - a 50% slowdown - and only by barely using
+//!    the peer (22:2) does it draw level. Every dispatched build pays a
+//!    constant transfer, and when the build is shorter than the transfer,
+//!    shipping it is a loss.
+//! 2. At `work=250` the fleet is worth 2x (64s -> 32s) and the optimum is at
+//!    or beyond an even split, because the transfer has amortised away.
+//! 3. The optimal dispatched SHARE rises monotonically with build size: ~8%,
+//!    33%, >=50%.
+//!
+//! So a fleet-wide weight - declared, derived, or swept for - is answering
+//! the wrong question. The 20:4 that is optimal for small builds costs 40s
+//! against 32s on large ones, 25% worse. There is no single number, because
+//! the number is a property of the work.
+//!
+//! The decision belongs PER SUBTREE: dispatch when the estimated compute
+//! exceeds the transfer cost, keep it at home when it does not. That is what
+//! `dispatch::worth_offering(est_p90, running_for)` was written for, and what
+//! `bank::timings` estimates durations for - both still unwired, which is now
+//! the largest gap between what this system knows and what it does.
+//!
 //! # The balance condition is real; feeding it back is unstable
 //!
 //! The sweep left an obvious question: can the optimum be found rather than

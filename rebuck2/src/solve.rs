@@ -999,6 +999,14 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(4);
+        // How much work each build does. The optimal home:away split is not a
+        // property of the machines alone - transfer cost is roughly constant
+        // per dispatched build while compute scales with this, so a bigger
+        // build makes dispatch relatively cheaper.
+        let work: usize = std::env::var("REBUCK2_LLB_WORK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90);
         for i in 0..n {
             let base = pb::Op {
                 op: Some(pb::op::Op::Source(pb::SourceOp {
@@ -1058,7 +1066,7 @@ mod tests {
                             // context that only differs in CONTENT does not
                             // change the graph that names it.
                             format!(
-                                "i=0; while [ $i -lt 90 ]; do dd if=/dev/zero bs=1M \
+                                "i=0; while [ $i -lt {work} ]; do dd if=/dev/zero bs=1M \
                                  count=20 2>/dev/null | sha256sum >/dev/null; \
                                  i=$((i+1)); done; mkdir -p /result; \
                                  cp /ctx/marker /result/task  # {i}"
@@ -1146,6 +1154,14 @@ mod tests {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(4);
+        // How much work each build does. The optimal home:away split is not a
+        // property of the machines alone - transfer cost is roughly constant
+        // per dispatched build while compute scales with this, so a bigger
+        // build makes dispatch relatively cheaper.
+        let work: usize = std::env::var("REBUCK2_LLB_WORK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90);
         for i in 0..n {
             let src = pb::Op {
                 op: Some(pb::op::Op::Source(pb::SourceOp {
@@ -1173,7 +1189,7 @@ mod tests {
                             // fast as four daemons, so a fleet would look
                             // free when it is not.
                             format!(
-                                "i=0; while [ $i -lt 90 ]; do dd if=/dev/zero bs=1M \
+                                "i=0; while [ $i -lt {work} ]; do dd if=/dev/zero bs=1M \
                                  count=20 2>/dev/null | sha256sum >/dev/null; \
                                  i=$((i+1)); done; echo task-{i} > /result/task"
                             ),
