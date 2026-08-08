@@ -11,6 +11,13 @@ a third of the file, and a chronological log rather than documentation. The
 code kept the invariants a maintainer needs; the reasoning and the numbers are
 here.
 
+Most of these claims are now mechanically checked. `rebuck2/scripts/fleet-check.sh`
+runs the structural ones - where work was placed, whether the bytes match,
+whether a build survived something being destroyed - and asserts them. It
+deliberately does not assert wall clock: those numbers move for reasons that
+have nothing to do with this code, and a suite that fails on a busy laptop
+gets switched off.
+
 Recurring theme, stated once so the sections below do not each have to: nearly
 every wrong turn recorded here was a plausible cause accepted without a
 control. The ones that cost most were a metric that improved for an unrelated
