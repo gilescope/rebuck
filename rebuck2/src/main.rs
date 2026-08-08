@@ -23,8 +23,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use bazel_remote_apis::build::bazel::remote::execution::v2 as re;
-use bazel_remote_apis::google::bytestream as bs;
 
 fn usage() -> ! {
     eprintln!(
@@ -300,46 +298,16 @@ async fn run_driver(mut args: Args) -> Result<()> {
         });
     }
 
-    let addr = format!("127.0.0.1:{grpc_port}").parse()?;
+    // Bind BEFORE announcing. The driver action gates the build legs on this
+    // line, so printing it ahead of the bind makes it a claim rather than a
+    // fact - and a leg released against an unbound port waits forever.
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{grpc_port}").parse()?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("binding REAPI listener on {addr}"))?;
     println!("[driver] REAPI listening on grpc://{addr}");
-    let max = 256 * 1024 * 1024; // rustc rlibs can be chunky
-    tonic::transport::Server::builder()
-        .add_service(
-            re::capabilities_server::CapabilitiesServer::new(rpc::Caps)
-                .max_decoding_message_size(max),
-        )
-        .add_service(
-            re::content_addressable_storage_server::ContentAddressableStorageServer::new(
-                rpc::Cas {
-                    driver: d.clone(),
-                    stats: rpc_stats.clone(),
-                },
-            )
-            .max_decoding_message_size(max),
-        )
-        .add_service(
-            bs::byte_stream_server::ByteStreamServer::new(rpc::ByteStreamSvc {
-                driver: d.clone(),
-                stats: rpc_stats.clone(),
-            })
-            .max_decoding_message_size(max),
-        )
-        .add_service(
-            re::action_cache_server::ActionCacheServer::new(rpc::Ac {
-                store: store.clone(),
-                stats: rpc_stats.clone(),
-                driver: d.clone(),
-            })
-            .max_decoding_message_size(max),
-        )
-        .add_service(
-            re::execution_server::ExecutionServer::new(rpc::Exec {
-                driver: d.clone(),
-                stats: rpc_stats.clone(),
-            })
-            .max_decoding_message_size(max),
-        )
-        .serve(addr)
+    rpc::router(d.clone(), store.clone(), rpc_stats.clone())
+        .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
         .await
         .context("gRPC server")?;
 
