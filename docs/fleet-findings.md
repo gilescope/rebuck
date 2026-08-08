@@ -18,6 +18,31 @@ deliberately does not assert wall clock: those numbers move for reasons that
 have nothing to do with this code, and a suite that fails on a busy laptop
 gets switched off.
 
+## An ssh mount travels too, and it is the sharpest one
+
+`RUN --mount=type=ssh` is stock buildkit and common in builds that clone
+private repos, so unlike the host bind this exclusion is worth lifting.
+Same shape as secrets: serve `moby.sshforward.v1.SSH` over the session we
+already open, backed by this process's `SSH_AUTH_SOCK`.
+
+```text
+REBUCK2_FORWARD_AGENT=1   placed {peer1: 4}   failed 0
+unset (the control)       placed {}   excluded: SshAgent x4
+```
+
+The exec runs `ssh-add -l; test $? -ne 2`, so a build reaching no agent
+fails rather than passing quietly. Finishing means the peer talked to our
+agent.
+
+Two conditions gate it, because either alone is a lie: the operator has to
+ask, AND there has to be an agent. Advertising the service with no socket
+behind it makes the peer wait on a call that cannot succeed.
+
+And it deserves more hesitation than a secret. A secret is a VALUE - handing
+one over gives the peer that string and nothing else. An agent is a
+CAPABILITY: while the build runs, whoever holds the socket can sign anything
+they like with your key, and nothing in the protocol constrains what.
+
 ## A cache mount need not ground one either
 
 Excluded because it is daemon-local state. True, and not the point: a cache

@@ -310,6 +310,7 @@ pub async fn build_and_publish(
     registry: &str,
     def: pb::Definition,
     serve_secrets: bool,
+    forward_agent: bool,
 ) -> anyhow::Result<String> {
     let mut bytes: Vec<u8> = Vec::new();
     for op in &def.def {
@@ -336,12 +337,12 @@ pub async fn build_and_publish(
     // Opt-in, because it means a secret this machine holds is handed to
     // another machine. That is a trust decision and it is not ours to make
     // quietly.
-    let session = if serve_secrets {
+    let session = if serve_secrets || forward_agent {
         let channel = tonic::transport::Endpoint::new(peer_addr.to_owned())?
             .connect()
             .await?;
         let (id, task) =
-            buildkit_session::serve_secrets(channel, buildkit_session::EnvSecrets).await?;
+            buildkit_session::serve(channel, buildkit_session::EnvSecrets, forward_agent).await?;
         // Held until the solve returns, then dropped - the session outliving
         // the build it serves is a secret left reachable for no reason.
         Some((id, task))
@@ -998,6 +999,105 @@ mod tests {
                 Err(e) => e.message().to_string(),
             }
         );
+    }
+
+    /// Emit N builds whose exec mounts an SSH AGENT.
+    ///
+    /// The exec requires the agent to ANSWER, not merely for a socket to
+    /// exist: `ssh-add` exits 2 when it cannot reach one. A dead socket
+    /// therefore fails the build rather than passing quietly.
+    #[test]
+    #[ignore]
+    fn write_ssh_llb() {
+        use prost::Message;
+        let dg = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
+        let out = std::env::var("REBUCK2_LLB_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let n: usize = std::env::var("REBUCK2_LLB_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        for i in 0..n {
+            let base = pb::Op {
+                op: Some(pb::op::Op::Source(pb::SourceOp {
+                    identifier: "docker-image://docker.io/library/alpine:3.20".into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let base_b = base.encode_to_vec();
+            let exec = pb::Op {
+                inputs: vec![pb::Input {
+                    digest: dg(&base_b),
+                    index: 0,
+                }],
+                op: Some(pb::op::Op::Exec(pb::ExecOp {
+                    meta: Some(pb::Meta {
+                        args: vec![
+                            "/bin/sh".into(),
+                            "-c".into(),
+                            format!(
+                                "apk add --no-cache openssh-client >/dev/null 2>&1; \
+                                 ssh-add -l; test $? -ne 2; mkdir -p /result; \
+                                 echo task-{i} > /result/task"
+                            ),
+                        ],
+                        env: vec!["SSH_AUTH_SOCK=/run/ssh-agent.sock".into()],
+                        cwd: "/".into(),
+                        ..Default::default()
+                    }),
+                    mounts: vec![
+                        pb::Mount {
+                            input: 0,
+                            dest: "/".into(),
+                            output: 0,
+                            ..Default::default()
+                        },
+                        pb::Mount {
+                            input: -1,
+                            dest: "/run/ssh-agent.sock".into(),
+                            output: -1,
+                            mount_type: pb::MountType::Ssh as i32,
+                            ssh_opt: Some(pb::SshOpt {
+                                mode: 0o600,
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                        pb::Mount {
+                            input: -1,
+                            dest: "/result".into(),
+                            output: 1,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let exec_b = exec.encode_to_vec();
+            let term = pb::Op {
+                inputs: vec![pb::Input {
+                    digest: dg(&exec_b),
+                    index: 1,
+                }],
+                ..Default::default()
+            };
+            let def = pb::Definition {
+                metadata: [&base_b, &exec_b]
+                    .iter()
+                    .map(|b| (dg(b), pb::OpMetadata::default()))
+                    .collect(),
+                def: vec![base_b, exec_b, term.encode_to_vec()],
+                ..Default::default()
+            };
+            std::fs::write(
+                out.join(format!("rebuck2-fanout-{i}.llb")),
+                def.encode_to_vec(),
+            )
+            .unwrap();
+        }
     }
 
     /// Emit N builds whose exec mounts a CACHE.

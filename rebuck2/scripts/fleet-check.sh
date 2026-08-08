@@ -148,6 +148,28 @@ check "and its colder cache changes nothing" \
   "$(echo "$out" | grep -c 'outputs identical')" 1
 
 echo
+echo "== a graph with an SSH AGENT mount"
+# Needs a real agent on this machine, which CI does not have. Skipped rather
+# than failed, and skipped for a stated reason: no agent is a property of the
+# machine, not of the code.
+if [ -z "${SSH_AUTH_SOCK:-}" ]; then
+  printf '  \033[33mSKIP\033[0m no SSH_AUTH_SOCK on this machine\n'
+  skipped=$((skipped + 1))
+else
+  # HOME_SLOTS=0 forces every build away: the client cannot forward its own
+  # agent into a borrowed buildctl container on every platform, so home
+  # builds are not the thing under test here - dispatch is.
+  out=$(run SSHM=1 DAEMONS=2 REBUCK2_HOME_SLOTS=0)
+  check "excluded while the flag is off" "$(placed "$out" 1)" ""
+  out=$(run SSHM=1 DAEMONS=2 REBUCK2_HOME_SLOTS=0 REBUCK2_FORWARD_AGENT=1)
+  echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
+  # The exec runs `ssh-add -l; test $? -ne 2`, so a build that reaches no
+  # agent fails. Finishing means the peer talked to ours.
+  check "every build finishes" "$(echo "$out" | grep -c '^failed  : 0')" 1
+  check "the peer takes it with the flag on" "$(placed "$out" 1)" "$builds"
+fi
+
+echo
 echo "== a foreign-architecture peer, on a PINNED graph"
 # Needs emulation for the foreign platform, which a bare CI runner does not
 # have until someone installs binfmt. Skipped rather than failed: a suite

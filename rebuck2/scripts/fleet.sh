@@ -62,6 +62,8 @@ SECRET=${SECRET:-}
 # LLB whose exec mounts a CACHE. Excluded from dispatch until a peer was
 # allowed its own, which is what REBUCK2_PEER_CACHE_MOUNTS=1 permits.
 CACHE=${CACHE:-}
+# LLB whose exec mounts an SSH AGENT. Needs a real agent on this machine.
+SSHM=${SSHM:-}
 # A peer on ANOTHER MACHINE. Everything else here runs several daemons on one
 # host, which can measure overhead and placement but never capacity: the fleet
 # has no more CPU than the single daemon did.
@@ -136,6 +138,13 @@ if command -v buildctl >/dev/null 2>&1; then
 else
   BIND=0.0.0.0
   echo "note: no host buildctl; publishing daemons on $BIND so a borrowed one can reach them"
+  # An array, because the two halves of `-v path:path` must stay two
+  # arguments and shellcheck is right that unquoted expansion to achieve
+  # that is a trap waiting for a path with a space in it.
+  agent_mount=()
+  if [ -n "${SSH_AUTH_SOCK:-}" ]; then
+    agent_mount=(-v "$SSH_AUTH_SOCK:$SSH_AUTH_SOCK")
+  fi
   bctl() {
     local args=()
     for a in "$@"; do args+=("${a//127.0.0.1/host.docker.internal}"); done
@@ -143,6 +152,8 @@ else
     # the host and not inside a container that is about to be deleted.
     docker run --rm -i --add-host host.docker.internal:host-gateway \
       -e "rebuck2_probe=${rebuck2_probe:-}" \
+      -e "SSH_AUTH_SOCK=${SSH_AUTH_SOCK:-}" \
+      "${agent_mount[@]}" \
       -v "$RUN:$RUN" --entrypoint buildctl "$IMAGE" "${args[@]}"
   }
 fi
@@ -178,6 +189,7 @@ fi
 say "generate llb"
 fixture=write_fanout_llb
 if [ -n "$CACHE" ]; then fixture=write_cache_llb; fi
+if [ -n "$SSHM" ]; then fixture=write_ssh_llb; fi
 if [ -n "$SECRET" ]; then
   fixture=write_secret_llb
   export rebuck2_probe=the-value
@@ -327,6 +339,12 @@ for round in $(seq 1 "$ROUNDS"); do
     elif [ -n "$CONTEXT" ]; then
       bctl --addr "$addr" build --no-cache \
         --local "context=$RUN/ctx/$n" \
+        --output "type=local,dest=$RUN/out-$n" <"$f" >"$RUN/build-$n.log" 2>&1 &
+    elif [ -n "$SSHM" ]; then
+      # The CLIENT forwards its own agent for the home builds, exactly as it
+      # always could; only the dispatched ones need the proxy to forward one
+      # to the peer.
+      bctl --addr "$addr" build --no-cache --ssh default \
         --output "type=local,dest=$RUN/out-$n" <"$f" >"$RUN/build-$n.log" 2>&1 &
     elif [ -n "$SECRET" ]; then
       # The CLIENT serves the secret too. Home builds resolve it through the

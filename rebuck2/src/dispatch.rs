@@ -58,6 +58,22 @@ pub enum Platform {
     Conflict(BTreeSet<String>),
 }
 
+/// Which hazards the caller can neutralise, and therefore tolerate.
+///
+/// A struct rather than positional bools. Three of them read
+/// `dispatchable_when(true, false, true)` at the call site, and this project
+/// has already shipped one bug from a boolean that meant something other
+/// than the reader assumed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Allow {
+    /// We can answer `GetSecret` for every secret this graph names.
+    pub secrets: bool,
+    /// The peer may use its own cache mount instead of ours.
+    pub caches: bool,
+    /// We can forward an ssh agent to the peer.
+    pub agent: bool,
+}
+
 /// What inspecting a `Definition` concluded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
@@ -87,7 +103,10 @@ impl Verdict {
     /// different service, and lifting them together would be assuming three
     /// things from evidence about one.
     pub fn dispatchable_with(&self, serving_secrets: bool) -> bool {
-        self.dispatchable_when(serving_secrets, false)
+        self.dispatchable_when(Allow {
+            secrets: serving_secrets,
+            ..Default::default()
+        })
     }
 
     /// A cache mount is scratch space, and a peer has its own.
@@ -103,10 +122,15 @@ impl Verdict {
     /// So a peer builds with its own, colder, cache mount and produces the
     /// same bytes. Off by default anyway, because "already broken" is a
     /// reason to allow it, not a reason to assume nobody depends on it.
-    pub fn dispatchable_when(&self, serving_secrets: bool, local_caches: bool) -> bool {
+    pub fn dispatchable_when(&self, allow: Allow) -> bool {
         let blocked = self.exclusions.iter().any(|(_, e)| match e {
-            Exclusion::Secret => !serving_secrets,
-            Exclusion::CacheMount => !local_caches,
+            Exclusion::Secret => !allow.secrets,
+            Exclusion::CacheMount => !allow.caches,
+            Exclusion::SshAgent => !allow.agent,
+            // Insecure exec and host networking are never lifted. Granting a
+            // privilege is a trust decision, not a scheduling one, and there
+            // is no session service that makes a peer's `--privileged` mean
+            // what the client's would have meant.
             _ => true,
         });
         !blocked && !matches!(self.platform, Platform::Conflict(_))

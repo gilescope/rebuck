@@ -471,6 +471,7 @@ impl Proxy {
             registry,
             portable.clone(),
             serving_secrets(),
+            forwarding_agent(),
         ));
         loop {
             tokio::select! {
@@ -810,6 +811,23 @@ fn trace(wire: &std::sync::Mutex<Wire>, call: &str) {
 /// benefit makes that a decision to take on their behalf.
 fn serving_secrets() -> bool {
     std::env::var("REBUCK2_SERVE_SECRETS").as_deref() == Ok("1")
+}
+
+/// May we forward this machine's ssh agent to a peer?
+///
+/// Two conditions, because either alone is a lie: the operator has to ask,
+/// and there has to be an agent to forward. Advertising the service with no
+/// socket behind it makes the peer wait on a call that cannot succeed.
+///
+/// The sharpest permission here. A secret is a value; an agent is a
+/// capability that signs whatever it is asked to, for as long as the build
+/// runs.
+fn forwarding_agent() -> bool {
+    std::env::var("REBUCK2_FORWARD_AGENT").as_deref() == Ok("1")
+        && std::env::var("SSH_AUTH_SOCK")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_some()
 }
 
 /// May a peer build with its own cache mount instead of ours?
@@ -1848,7 +1866,11 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 // touches source identifiers, so the original graph gives
                 // the same verdict for nothing.
                 let verdict = crate::dispatch::inspect(&def);
-                let allowed = verdict.dispatchable_when(can_serve_secrets(&def), local_caches());
+                let allowed = verdict.dispatchable_when(crate::dispatch::Allow {
+                    secrets: can_serve_secrets(&def),
+                    caches: local_caches(),
+                    agent: forwarding_agent(),
+                });
                 if !allowed {
                     // Name the secret, not just its kind. A build that
                     // declares none can still be full of them: a frontend
