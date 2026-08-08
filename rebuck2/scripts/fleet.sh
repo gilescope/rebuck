@@ -66,6 +66,9 @@ CONTEXT=${CONTEXT:-}
 REMOTE=${REMOTE:-}
 MIRROR_HOST=${MIRROR_HOST:-host.docker.internal}
 REMOTE_PORT=${REMOTE_PORT:-18400}
+# The remote's share, relative to this machine. Buildkit does not report core
+# counts, so somebody has to say. 2 means "twice the turns".
+REMOTE_WEIGHT=${REMOTE_WEIGHT:-1}
 
 crate=$(cd "$(dirname "$0")/.." && pwd)
 rm -rf "$RUN"
@@ -226,7 +229,7 @@ if [ -n "$REMOTE" ]; then
       -v /tmp/rebuck2-buildkitd.toml:/etc/buildkit/buildkitd.toml:ro \
       $IMAGE" >/dev/null
   remote_host=${REMOTE##*@}
-  peers+=(--peer "http://$remote_host:$REMOTE_PORT")
+  peers+=(--peer "http://$remote_host:$REMOTE_PORT*$REMOTE_WEIGHT")
 fi
 
 # Daemons are not ready when `docker run` returns; ListWorkers is the only

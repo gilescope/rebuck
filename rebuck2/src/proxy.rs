@@ -406,6 +406,37 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # Capacity cannot be guessed from cores, and the guess made it WORSE
+//!
+//! The 50/50 split of the previous result looked like the obvious waste: the
+//! peer has 32 cores against this machine's 16, so it should take twice the
+//! work. Placement was made weighted to allow exactly that, and then measured.
+//! Twenty-four builds, the split swept:
+//!
+//! ```text
+//! home:peer   wall
+//!  24: 0      24s    no fleet at all
+//!   8:16      21s    peer weighted 2x, "because it has twice the cores"
+//!  12:12      18s    flat
+//!  16: 8      15s    <- best
+//!  18: 6      16s
+//!  20: 4      18s
+//! ```
+//!
+//! There is an interior optimum and the informed-looking guess sits on the
+//! WRONG SIDE of it - worse than the flat split it was meant to improve, and
+//! only three seconds better than not having a fleet. Sending more work to
+//! the bigger machine costs more, because every dispatched build pays a push
+//! and a pull across the LAN and a local build pays neither. Cores measure
+//! what a machine can compute; they say nothing about what it costs to give
+//! it something to compute.
+//!
+//! So the weighting mechanism stays - it is what makes the optimum reachable
+//! at all - and the DEFAULT stays 1. A weight is a statement about observed
+//! end-to-end throughput, not about hardware, and setting it from a core
+//! count is worse than leaving it alone. Deriving it from measurement is the
+//! next thing; the sweep above is what it has to beat.
+//!
 //! # It is faster on two machines: 24s -> 18s
 //!
 //! The measurement this whole thing existed to make, and which one host could
@@ -849,6 +880,11 @@ pub struct Mirror {
 /// One upstream daemon.
 #[derive(Clone)]
 pub struct Peer {
+    /// Relative share of work, declared by the operator as `url*N`. Buildkit
+    /// does not report capacity - `ListWorkers` gives platforms, snapshotter,
+    /// executor and gc policy, and nothing about cores - so this is the only
+    /// place it can come from.
+    weight: usize,
     /// What this daemon says it can run, in ITS order - first is native.
     /// Empty if it would not say (a daemon that cannot answer ListWorkers is
     /// still usable; it is simply never preferred as native).
@@ -996,9 +1032,10 @@ impl Proxy {
                 .collect(),
             None => vec![true; self.peers.len().saturating_sub(1)],
         };
+        let weights: Vec<usize> = self.peers.iter().map(|p| p.weight).collect();
         place(
             cursor,
-            self.peers.len(),
+            &weights,
             &read(&self.outstanding[1..]),
             &read(&self.strikes[1..]),
             &native,
@@ -1077,25 +1114,39 @@ impl Proxy {
     /// Add daemons to route to. Peer 0 is always this proxy's upstream.
     pub async fn with_peers(mut self, addrs: &[String]) -> anyhow::Result<Self> {
         let mut peers = vec![Peer {
+            // Peer 0's own share. `REBUCK2_HOME_WEIGHT` because it has no
+            // `--peer` flag to carry a `*N`.
+            weight: std::env::var("REBUCK2_HOME_WEIGHT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1),
             platforms: platforms_of(self.channel.clone()).await,
             addr: "upstream".into(),
             channel: self.channel.clone(),
         }];
         for a in addrs {
-            let channel = tonic::transport::Endpoint::new(a.clone())?
+            // `http://host:port*2` - twice the share. Split from the RIGHT
+            // because a URL will not contain `*`.
+            let (url, weight) = match a.rsplit_once('*') {
+                Some((u, w)) => (u.to_owned(), w.parse().unwrap_or(1usize)),
+                None => (a.clone(), 1usize),
+            };
+            let channel = tonic::transport::Endpoint::new(url.clone())?
                 .connect()
                 .await?;
             peers.push(Peer {
+                weight: weight.max(1),
                 platforms: platforms_of(channel.clone()).await,
-                addr: a.clone(),
+                addr: url,
                 channel,
             });
         }
         for (i, p) in peers.iter().enumerate() {
             println!(
-                "[proxy] peer {i} {} native {}",
+                "[proxy] peer {i} {} native {} weight {}",
                 p.addr,
-                p.platforms.first().map(String::as_str).unwrap_or("unknown")
+                p.platforms.first().map(String::as_str).unwrap_or("unknown"),
+                p.weight
             );
         }
         println!("[proxy] {} daemon(s) in the fleet", peers.len());
@@ -1376,9 +1427,30 @@ fn trace(wire: &std::sync::Mutex<Wire>, call: &str) {
 ///
 /// Peer 0 takes its turn and the graph is built in place, which is the
 /// round-trip skipped rather than paid.
-fn turn(cursor: usize, peers: usize) -> usize {
-    debug_assert!(peers > 0, "a fleet with no peers has no turns");
-    cursor % peers.max(1)
+fn turn(cursor: usize, weights: &[usize]) -> usize {
+    debug_assert!(!weights.is_empty(), "a fleet with no peers has no turns");
+    // Weighted, because machines are not interchangeable and buildkit will
+    // not say so: `ListWorkers` reports platforms, snapshotter, executor and
+    // gc policy, and nothing at all about how many cores are behind them.
+    // Measured on two real machines - a flat split sent half the work to a
+    // 32-core box and half to a 16-core one, which is the visible waste in
+    // the 24s -> 18s result.
+    //
+    // A weight of 2 means "twice as many turns", nothing more precise. That
+    // is principle 13: a coarse estimate an operator can state is worth more
+    // than a exact one nobody can obtain.
+    let total: usize = weights.iter().sum();
+    if total == 0 {
+        return 0;
+    }
+    let mut at = cursor % total;
+    for (i, &w) in weights.iter().enumerate() {
+        if at < w {
+            return i;
+        }
+        at -= w;
+    }
+    0
 }
 
 /// How an attempt to place a solve on a peer ended.
@@ -1497,7 +1569,9 @@ fn native_for(worker_platforms: &[String], want: &str) -> bool {
 /// by the caller.
 fn place(
     cursor: usize,
-    peers: usize,
+    // One per peer INCLUDING peer 0, so home takes a share proportional to
+    // its own capacity rather than a flat 1/n.
+    weights: &[usize],
     load: &[usize],
     strikes: &[usize],
     // `true` where the away peer can build the wanted platform natively.
@@ -1512,7 +1586,7 @@ fn place(
     /// peers holding four jobs each, and a fleet that banned machines
     /// outright would shrink itself on one bad minute.
     const STRIKE_WEIGHT: usize = 3;
-    if peers <= 1 || turn(cursor, peers) == 0 {
+    if weights.len() <= 1 || turn(cursor, weights) == 0 {
         return None;
     }
     debug_assert_eq!(load.len(), strikes.len(), "away peers counted twice over");
@@ -1540,11 +1614,20 @@ fn place(
     /// observation - but finite, so a fleet with no native peer still builds
     /// rather than refusing work it can do slowly.
     const EMULATED_WEIGHT: usize = 8;
+    /// Fixed-point, so load can be divided by capacity in integers: four
+    /// jobs on a weight-2 machine scores the same as two on a weight-1.
+    const SCALE: usize = 1024;
     let effective: Vec<usize> = load
         .iter()
         .zip(strikes)
         .zip(native)
-        .map(|((&l, &s), &n)| l + s * STRIKE_WEIGHT + usize::from(!n) * EMULATED_WEIGHT)
+        .zip(&weights[1..])
+        .map(|(((&l, &s), &n), &w)| {
+            // Load is normalised by capacity; the penalties are NOT. A strike
+            // says the machine misbehaved and a foreign architecture says it
+            // must emulate - neither is something a bigger machine absorbs.
+            l * SCALE / w.max(1) + (s * STRIKE_WEIGHT + usize::from(!n) * EMULATED_WEIGHT) * SCALE
+        })
         .collect();
     Some(1 + least_loaded(&effective, cursor))
 }
@@ -2548,7 +2631,7 @@ mod tests {
         for peers in 1..6usize {
             let mut seen = vec![0usize; peers];
             for cursor in 0..peers * 3 {
-                seen[turn(cursor, peers)] += 1;
+                seen[turn(cursor, &vec![1usize; peers])] += 1;
             }
             assert_eq!(seen[0], 3, "peer 0 skipped in a fleet of {peers}");
             assert!(
@@ -2576,7 +2659,7 @@ mod tests {
         assert!(super::native_for(&x86, "linux/amd64"));
         // Peer 1 emulates, peer 2 is native: every away turn goes to peer 2.
         let away: Vec<usize> = (0..8)
-            .filter_map(|c| super::place(c, 3, &[0, 0], &[0, 0], &[false, true]))
+            .filter_map(|c| super::place(c, &[1, 1, 1], &[0, 0], &[0, 0], &[false, true]))
             .collect();
         assert!(!away.is_empty());
         assert!(
@@ -2588,7 +2671,7 @@ mod tests {
         // the mirrored base is single-architecture and a foreign peer fails
         // with `exit code: 255` after pulling it.
         let away: Vec<usize> = (0..8)
-            .filter_map(|c| super::place(c, 3, &[0, 0], &[0, 0], &[false, false]))
+            .filter_map(|c| super::place(c, &[1, 1, 1], &[0, 0], &[0, 0], &[false, false]))
             .collect();
         assert!(
             away.is_empty(),
@@ -2611,7 +2694,7 @@ mod tests {
         let load = [0usize, 0];
         let strikes = [0usize, 1];
         let away: Vec<usize> = (0..12)
-            .filter_map(|c| super::place(c, 3, &load, &strikes, &[true, true]))
+            .filter_map(|c| super::place(c, &[1, 1, 1], &load, &strikes, &[true, true]))
             .collect();
         assert!(!away.is_empty(), "no away turns at all");
         assert!(
@@ -2625,7 +2708,7 @@ mod tests {
     #[test]
     fn a_struck_peer_still_beats_a_swamped_one() {
         let away: Vec<usize> = (0..6)
-            .filter_map(|c| super::place(c, 3, &[9, 0], &[0, 1], &[true, true]))
+            .filter_map(|c| super::place(c, &[1, 1, 1], &[9, 0], &[0, 1], &[true, true]))
             .collect();
         assert!(
             away.iter().all(|&p| p == 2),
@@ -2641,9 +2724,9 @@ mod tests {
     #[test]
     fn a_wholly_struck_fleet_builds_at_home() {
         for cursor in 0..8 {
-            assert_eq!(super::place(cursor, 2, &[0], &[1], &[true]), None);
+            assert_eq!(super::place(cursor, &[1, 1], &[0], &[1], &[true]), None);
             assert_eq!(
-                super::place(cursor, 3, &[0, 0], &[2, 1], &[true, true]),
+                super::place(cursor, &[1, 1, 1], &[0, 0], &[2, 1], &[true, true]),
                 None
             );
         }
@@ -2652,8 +2735,8 @@ mod tests {
     /// A lone daemon has nowhere to send anything.
     #[test]
     fn a_fleet_of_one_never_dispatches() {
-        assert_eq!(super::place(0, 1, &[], &[], &[]), None);
-        assert_eq!(super::place(7, 1, &[], &[], &[]), None);
+        assert_eq!(super::place(0, &[1], &[], &[], &[]), None);
+        assert_eq!(super::place(7, &[1], &[], &[], &[]), None);
     }
 
     /// With nothing observed, nothing is slow.
@@ -2694,6 +2777,39 @@ mod tests {
             super::hedge_after(&[80, 90, 100]),
             Some(std::time::Duration::from_secs(5)),
             "270ms would abandon peers over scheduling noise"
+        );
+    }
+
+    /// A declared weight buys proportionally more turns.
+    ///
+    /// Buildkit will not say how big a machine is, so an operator saying
+    /// "twice the share" is the only capacity signal there is. Measured on
+    /// two real machines: a flat split sent half the work to a 32-core box
+    /// and half to a 16-core one.
+    #[test]
+    fn a_heavier_peer_takes_proportionally_more() {
+        // home 1, peer1 2, peer2 1 - six turns is one whole cycle.
+        let w = [1usize, 2, 1];
+        let picks: Vec<usize> = (0..8).map(|c| super::turn(c, &w)).collect();
+        assert_eq!(picks, vec![0, 1, 1, 2, 0, 1, 1, 2]);
+    }
+
+    /// Load is compared PER UNIT of capacity, so a big machine holding four
+    /// jobs is no busier than a small one holding two.
+    #[test]
+    fn load_is_measured_against_capacity() {
+        // peer 1 has weight 2 and holds 3; peer 2 has weight 1 and holds 2.
+        // 3/2 > 2/1 is false, so peer 1 is the less loaded of the two.
+        let away: Vec<usize> = (0..4)
+            .filter_map(|c| super::place(c, &[0, 2, 1], &[3, 2], &[0, 0], &[true, true]))
+            .collect();
+        assert!(
+            !away.is_empty(),
+            "home weight 0 should send everything away"
+        );
+        assert!(
+            away.iter().all(|&p| p == 1),
+            "the roomier machine was passed over: {away:?}"
         );
     }
 
@@ -2766,7 +2882,7 @@ mod tests {
     #[test]
     fn a_wrapped_cursor_still_names_a_peer() {
         for peers in 1..6usize {
-            assert!(turn(usize::MAX, peers) < peers);
+            assert!(turn(usize::MAX, &vec![1usize; peers]) < peers);
         }
     }
 }
