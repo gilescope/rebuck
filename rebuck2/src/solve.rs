@@ -977,7 +977,15 @@ mod tests {
                         args: vec![
                             "/bin/sh".into(),
                             "-c".into(),
-                            format!("sleep 2 && echo task-{i} > /out"),
+                            // CPU-bound, not sleeping. A sleep measures
+                            // nothing: one daemon serves four sleeps as
+                            // fast as four daemons, so a fleet would look
+                            // free when it is not.
+                            format!(
+                                "i=0; while [ $i -lt 90 ]; do dd if=/dev/zero bs=1M \
+                                 count=20 2>/dev/null | sha256sum >/dev/null; \
+                                 i=$((i+1)); done; echo task-{i} > /out"
+                            ),
                         ],
                         cwd: "/".into(),
                         ..Default::default()

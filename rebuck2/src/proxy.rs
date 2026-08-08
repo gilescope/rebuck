@@ -257,6 +257,39 @@
 //! working: an unportable graph is not a dispatch failure, it is a graph
 //! that stays home.
 //!
+//! # The dispatch TAX is nil. The SPEEDUP is unmeasured, and cannot be
+//! measured here
+//!
+//! Four concurrent CPU-bound builds (each hashing ~1.8 GB), same work both
+//! ways:
+//!
+//! ```text
+//! one daemon, no proxy : 10s
+//! two daemons, proxied : 10s   (4 of 4 solves routed)
+//! ```
+//!
+//! So the machinery is FREE at this scale: publishing a context, mirroring
+//! a base image, rewriting a graph, solving on a peer, publishing the
+//! result and importing it costs nothing measurable against the work
+//! itself. That is worth knowing - a tax of 3x would have made capacity
+//! irrelevant.
+//!
+//! It is not a speedup, and no arrangement of this machine could show one.
+//! Both daemons are containers on one host sharing one CPU, so the fleet
+//! has no capacity the single daemon lacked; 10s versus 10s is the correct
+//! answer, not a disappointing one. Measuring speed needs a second
+//! MACHINE.
+//!
+//! Note before anyone reaches for the x86 box for that: its docker0
+//! firewall stops containers reaching host services, which is precisely how
+//! a peer would reach the mirror. That does not fail loudly - it would zero
+//! the measurement while looking like a slow fleet.
+//!
+//! A sleep-based workload was tried first and is useless for this: one
+//! daemon serves four sleeps as fast as four daemons, so the fleet looks
+//! free because nothing is contended. The work has to be CPU-bound before
+//! either number means anything.
+//!
 //! # 100% dispatch, on a client that is not earthly
 //!
 //! Four plain-LLB builds through the proxy, two stock buildkitds:
