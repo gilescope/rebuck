@@ -406,6 +406,34 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # Stop offering while the shared thing is down
+//!
+//! Per-peer memory cannot express "no peer is at fault and every peer is
+//! unusable", so a healthy peer behind a dead registry kept being offered
+//! doomed adoptions - eight per round, each waiting out a push it could never
+//! complete. A fleet-wide breaker fixes that:
+//!
+//! ```text
+//! registry dies   round 1  placed {home: 16, peer1: 8}   8 refused, breaker arms
+//!                 round 2  placed {home: 24, peer1: 0}   "mirror down, not offering": 24
+//!                 wall 27s then 24s - the no-fleet baseline
+//! healthy fleet            placed {home: 16, peer1: 8}   wall 22s, unchanged
+//! ```
+//!
+//! Round one still offers eight, and cannot do otherwise: all eight are
+//! placed within 393ms, before the first refusal returns. The breaker earns
+//! its place on everything after.
+//!
+//! Recovery is optimistic rather than polled - the state simply expires after
+//! fifteen seconds and the next solve is offered normally. If the mirror is
+//! still dead that solve refuses, re-probes and re-arms: one wasted adoption
+//! per cooldown instead of one per solve, and nothing in the background
+//! poking a service nobody is using.
+//!
+//! Refusing to offer is not a risk here, which is why the breaker can be
+//! blunt: building at home is the fail-open answer already, so a false
+//! positive costs the fleet and nothing else.
+//!
 //! # Telling a bad peer from a bad network
 //!
 //! Both failures below look identical from the placement side - a refusal -
@@ -1227,6 +1255,14 @@ pub struct Proxy {
     went: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, (Option<usize>, String, bool)>>,
     >,
+    /// When to start offering work again after the shared mirror was found
+    /// dead. `None` means it is believed healthy.
+    ///
+    /// Per-peer memory cannot express this: no peer is at fault, and every
+    /// peer is unusable. Measured with the registry killed - the healthy peer
+    /// was offered eight more doomed adoptions in the next round, each
+    /// waiting out a push it could never complete.
+    mirror_down_until: std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// Builds currently running at home, so dispatch can wait until the
     /// local machine is actually full. Incremented when a solve is placed
     /// home, decremented when the client's `Control.Solve` for it returns -
@@ -1273,6 +1309,7 @@ impl Proxy {
             went: Default::default(),
             seen_ms: Default::default(),
             home_inflight: Default::default(),
+            mirror_down_until: Default::default(),
             next_peer: Default::default(),
             ref_home: Default::default(),
         })
@@ -1280,6 +1317,27 @@ impl Proxy {
 
     fn client(&self) -> Client {
         self.client.clone()
+    }
+
+    /// Has the mirror been found dead recently enough to stop trying?
+    ///
+    /// Optimistic on expiry: the state simply clears and the next solve is
+    /// offered normally. If the mirror is still dead that solve refuses,
+    /// re-probes and re-arms - one wasted adoption per cooldown instead of
+    /// one per solve, and no background polling of a thing nobody is using.
+    fn mirror_believed_down(&self) -> bool {
+        /// Long enough that a restart is not hammered, short enough that a
+        /// recovered mirror is back in service within one build.
+        const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15);
+        let mut g = self.mirror_down_until.lock().expect("mirror_down_until");
+        match *g {
+            Some(t) if t.elapsed() < COOLDOWN => true,
+            Some(_) => {
+                *g = None;
+                false
+            }
+            None => false,
+        }
     }
 
     /// Is the shared mirror answering?
@@ -1315,6 +1373,8 @@ impl Proxy {
             Ok(_) => true,
             Err(e) => {
                 println!("[proxy] mirror {addr} is not answering: {e}");
+                *self.mirror_down_until.lock().expect("mirror_down_until") =
+                    Some(std::time::Instant::now());
                 false
             }
         }
@@ -2912,6 +2972,19 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 // hold up - see `worth_shipping`.
                 let worth = std::env::var("REBUCK2_GATE").as_deref() != Ok("1")
                     || worth_shipping(self.estimate(&key), self.overhead_ms());
+                // Nothing can be adopted while the mirror is down, whoever
+                // owns the fault. Building at home IS the fail-open answer,
+                // so refusing to offer costs nothing beyond the fleet.
+                let mirror_down = self.mirror_believed_down();
+                if allowed && worth && mirror_down {
+                    *self
+                        .wire
+                        .lock()
+                        .expect("wire")
+                        .rejected
+                        .entry("mirror down, not offering".to_owned())
+                        .or_default() += 1;
+                }
                 if allowed && !worth {
                     *self
                         .wire
@@ -2965,7 +3038,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         .entry("home has room".to_owned())
                         .or_default() += 1;
                 }
-                let peer = if allowed && worth && saturated {
+                let peer = if allowed && worth && saturated && !mirror_down {
                     // Home is full: this only chooses which peer.
                     self.next_place(&verdict.platform, false)
                 } else {
