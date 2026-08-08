@@ -53,21 +53,37 @@
 //! ops per solve  : min 3 median 9 max 9
 //! sources        : 6 registry, 0 local, 0 other
 //! platforms      : {"linux/arm64"}
-//! repeated ops   : 31 (73% of all ops seen again in a later solve)
+//! repeated ops   : 31 (73% seen again in a later solve)
+//! distinct graphs: 3 of 6 solves (3 identical RESENDS)
+//! overlap/solve  : [(0,3), (2,6), (5,9), (9,9), (6,6), (9,9)]
 //! ```
 //!
-//! **73% repetition is the finding, and it prices a mechanism.** Routing
-//! whole gateway Solves to different daemons - the cheap option, because the
-//! client has already subdivided for us - would have each daemon rebuild the
-//! ops the others already did. The Solves are not disjoint units of work;
-//! they nest, each extending the last. Per-Solve routing therefore needs a
-//! shared cache to be anything other than a duplication engine, and with one
-//! it starts to look like the dedup line rather than a new mechanism.
+//! **The 73% is not what it looks like, and the first reading of it here was
+//! wrong.** Half the solves are byte-identical RESENDS of a graph already
+//! sent - the client driving the API, not work being shared. Read as
+//! overlap it says routing whole Solves would duplicate three quarters of
+//! the build, which would have been a conclusion drawn from an artefact.
 //!
-//! Caveats, honestly: three targets is not a shard, and this Earthfile has
-//! no `COPY` from the build context, which is why `local` sources are zero.
-//! A real repo will not look like that. The instrument works, which is what
-//! this run establishes; the numbers want a real workload.
+//! What the three DISTINCT graphs show is nesting: 3 ops, then 6 of which 2
+//! are already seen, then 9 of which 5 are. Each solve extends the last, so
+//! genuine overlap is 7 of 18 ops - about 39%, not 73%.
+//!
+//! Nesting is a sharper result than repetition would have been, and it
+//! points the other way from the first note:
+//!
+//! - **Per-Solve routing is worse than the raw number suggested.** The
+//!   graphs are not merely overlapping, they are cumulative - the last
+//!   solve CONTAINS the earlier ones. Handing solve #3 to another machine
+//!   asks it to rebuild everything solve #2 just did.
+//! - **The natural unit is the INCREMENT between successive solves**, which
+//!   is a subtree. The client hands us its subdivision already, one layer at
+//!   a time; we do not have to infer a cut, only diff.
+//!
+//! Caveats: three targets is not a shard, and this Earthfile has no `COPY`
+//! from the build context, which is why `local` sources are zero. A real
+//! repo will not look like that. What this run establishes is that the
+//! instrument works - and that a summary percentage was one decomposition
+//! away from being a wrong answer.
 //!
 //! # Pointing earthly at a proxy, which is not obvious
 //!
@@ -319,6 +335,17 @@ pub struct Wire {
     /// Graph digests seen, to measure how much two Solves share.
     seen_ops: std::collections::BTreeSet<String>,
     pub repeated_ops: u64,
+    /// Digest of each Solve's whole op set, in order.
+    ///
+    /// Repetition means two very different things and the summary number
+    /// cannot tell them apart: a client RE-SENDING an identical graph is an
+    /// artefact of how it drives the API, while two graphs that genuinely
+    /// share a prefix is shared work a fleet could exploit. Counting
+    /// identical resends separately is the difference between a finding and
+    /// a misreading.
+    graph_ids: Vec<String>,
+    /// Per solve: how many of its ops were already seen.
+    pub overlap_per_solve: Vec<(usize, usize)>,
 }
 
 impl Wire {
@@ -327,12 +354,22 @@ impl Wire {
         self.solves += 1;
         self.ops += def.def.len() as u64;
         self.per_solve.push(def.def.len());
+        let mut ids: Vec<String> = def
+            .def
+            .iter()
+            .map(|b| crate::store::sha256_hex(b))
+            .collect();
+        ids.sort();
+        self.graph_ids
+            .push(crate::store::sha256_hex(ids.join("").as_bytes()));
+        let mut already = 0usize;
         for bytes in &def.def {
             let digest = crate::store::sha256_hex(bytes);
             if !self.seen_ops.insert(digest) {
                 // The same op in two Solves. High overlap means routing
                 // whole Solves duplicates work that dispatch would share.
                 self.repeated_ops += 1;
+                already += 1;
             }
             let Ok(op) = bollard_buildkit_proto::pb::Op::decode(bytes.as_slice()) else {
                 continue;
@@ -349,6 +386,7 @@ impl Wire {
                 }
             }
         }
+        self.overlap_per_solve.push((already, def.def.len()));
     }
 
     /// The characterisation, as one block. Printed on shutdown because the
@@ -380,6 +418,31 @@ impl Wire {
                 0
             }
         );
+
+        // The distinction that decides what the repetition MEANS. A client
+        // RE-SENDING an identical graph is an artefact of how it drives the
+        // API; two graphs sharing a prefix is work a fleet could share. The
+        // summary percentage cannot tell them apart, and reading one as the
+        // other is how a measurement becomes a wrong conclusion.
+        let mut uniq = self.graph_ids.clone();
+        uniq.sort();
+        uniq.dedup();
+        let resends = self.graph_ids.len().saturating_sub(uniq.len());
+        println!(
+            "[wire] distinct graphs: {} of {} solves ({resends} identical RESENDS)",
+            uniq.len(),
+            self.graph_ids.len(),
+        );
+        println!(
+            "[wire] overlap/solve  : {:?} (already-seen / total)",
+            self.overlap_per_solve
+        );
+        if resends > 0 {
+            println!(
+                "[wire] NOTE: {resends} solve(s) re-sent a graph already seen - that is the \
+                 client driving the API, not shared work."
+            );
+        }
     }
 }
 
