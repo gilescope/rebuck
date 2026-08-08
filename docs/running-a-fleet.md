@@ -26,6 +26,30 @@ is baked into every rewritten graph, so all daemons must resolve the same
 string: on one host that is `host.docker.internal:15000`, across machines a
 LAN address.
 
+### Every daemon must trust the mirror
+
+The mirror has no TLS. Each buildkitd therefore needs, in
+`/etc/buildkit/buildkitd.toml`:
+
+```toml
+[registry."<the same addr as REBUCK2_MIRROR>"]
+  http = true
+  insecure = true
+```
+
+**This is not optional and its absence is silent.** Publishing is told to be
+insecure per-solve, so the mirror fills up and the log says
+`base ... mirrored as ...`; but a PULL is governed by daemon config alone, so
+every peer then fails with
+
+```text
+Head "https://<mirror>/v2/...": http: server gave HTTP response to HTTPS client
+```
+
+Dispatch falls back to building at home, the build SUCCEEDS, and a fleet that
+placed nothing looks exactly like a fleet that had nothing to place. Check
+`placed` in the report before believing otherwise.
+
 ## Which clients this can distribute
 
 The rule is about where the graph is BUILT, not which tool builds it.
