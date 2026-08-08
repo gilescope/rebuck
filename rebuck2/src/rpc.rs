@@ -46,6 +46,13 @@ pub struct RpcStats {
     pub blob_read_bytes: AtomicU64,
     /// Bytes accepted via `BatchUpdateBlobs` + `ByteStream::Write` combined.
     pub blob_write_bytes: AtomicU64,
+    /// TCP connections accepted on the REAPI port, ever.
+    ///
+    /// The one number that separates "buck2 never dialled us" from "buck2
+    /// dialled and we never answered". Every other counter here reads zero in
+    /// both worlds, which is how run 31157521034 stayed ambiguous for four
+    /// hours: `ac_ok=0 ac_fail=0` says nothing failed, not that nothing came.
+    pub conns: AtomicU64,
 }
 
 type OpStream = Pin<Box<dyn Stream<Item = Result<Operation, Status>> + Send + 'static>>;
@@ -566,6 +573,23 @@ pub fn router(
         )
 }
 
+/// Wrap a listener so every accepted connection bumps [`RpcStats::conns`].
+///
+/// Lives here rather than at the call site so a test can prove the counter
+/// actually counts - a diagnostic that silently reads zero is worse than none,
+/// because it argues for the wrong diagnosis.
+pub fn counting_incoming(
+    listener: tokio::net::TcpListener,
+    stats: Arc<RpcStats>,
+) -> impl futures::Stream<Item = std::io::Result<tokio::net::TcpStream>> {
+    use futures::StreamExt as _;
+    tokio_stream::wrappers::TcpListenerStream::new(listener).inspect(move |conn| {
+        if conn.is_ok() {
+            stats.conns.fetch_add(1, Relaxed);
+        }
+    })
+}
+
 /// How long the self-check waits for its own server to answer. Generous for a
 /// loaded CI box; four hours short of the outage it exists to prevent.
 const SELF_CHECK: std::time::Duration = std::time::Duration::from_secs(30);
@@ -994,6 +1018,34 @@ mod tests {
         assert!(
             msg.contains("self-check"),
             "the error should name itself so a CI log reader knows what failed, got {msg:?}"
+        );
+    }
+
+    /// The connection counter must actually count. A diagnostic stuck at zero
+    /// is worse than none: it argues for "buck2 never dialled us" when buck2
+    /// did, and sends the next reader to the wrong half of the problem.
+    #[tokio::test]
+    async fn accepted_connections_are_counted() {
+        let ac = rig();
+        let stats = Arc::new(RpcStats::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = router(ac.driver.clone(), ac.store.clone(), stats.clone());
+        let incoming = counting_incoming(listener, stats.clone());
+        tokio::spawn(async move { router.serve_with_incoming(incoming).await });
+
+        assert_eq!(stats.conns.load(Relaxed), 0, "nothing dialled yet");
+
+        let mut c = re::capabilities_client::CapabilitiesClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+        c.get_capabilities(Request::new(re::GetCapabilitiesRequest::default()))
+            .await
+            .unwrap();
+
+        assert!(
+            stats.conns.load(Relaxed) >= 1,
+            "a client connected and completed a request, but conns stayed at 0"
         );
     }
 }
