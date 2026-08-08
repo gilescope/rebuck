@@ -183,6 +183,8 @@ async fn main() -> Result<()> {
                 store.disable_clone();
             }
             let cfg = worker::WorkerCfg {
+                buildkit_addr: args.opt("--buildkit-addr"),
+                registry_addr: args.opt("--registry-addr"),
                 session: args.opt("--session").unwrap_or_else(default_session),
                 slots: args
                     .opt("--slots")

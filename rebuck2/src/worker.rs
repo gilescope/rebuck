@@ -24,6 +24,13 @@ use crate::store::Store;
 pub struct WorkerCfg {
     pub session: String,
     pub slots: usize,
+    /// gRPC address of a buildkitd this worker may drive, and the loopback
+    /// mirror to publish results into. Both absent = this worker declines
+    /// every subtree offered to it, which is the correct answer rather than
+    /// a degraded one: the requester then builds it itself, exactly as it
+    /// would have without dispatch at all.
+    pub buildkit_addr: Option<String>,
+    pub registry_addr: Option<String>,
     pub scratch: std::path::PathBuf,
     pub connect_wait: Duration,
     /// Path to a JSON EndpointAddr for the driver (CI run artifact).
@@ -257,20 +264,16 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
         };
         let (job, action) = match msg {
             D2W::Run { job, action } => (job, action),
-            // The offer is live and the answer is always no - for now, and
-            // safely. Building a subtree needs a buildkitd this worker does
-            // not yet drive, and declining IS the protocol working: the
-            // requester builds it itself, which is what it would have done
-            // anyway. Fail open, never fail wrong.
-            D2W::Lead { job, .. } => {
-                let _ = mesh::send_frame(
-                    &mut *ctrl_send.lock().await,
-                    &W2D::Decline {
-                        job,
-                        why: "no buildkit side on this worker yet".into(),
-                    },
-                )
-                .await;
+            // An OFFER. Every refusal below is the protocol working, not a
+            // failure: the requester builds it itself, exactly as it would
+            // have without dispatch. Fail open, never fail wrong.
+            D2W::Lead {
+                job,
+                subtree,
+                frontier,
+            } => {
+                let reply = lead_reply(&cfg, &slots, job, &subtree, &frontier).await;
+                let _ = mesh::send_frame(&mut *ctrl_send.lock().await, &reply).await;
                 continue;
             }
             D2W::Ping { vitals } => {
@@ -422,6 +425,72 @@ async fn serve_get(
 /// Cacheability is the strict subset of the driver's rule (rpc.rs): exit
 /// 0 and not do_not_cache. `--cache-failures` dedupes failures WITHIN a
 /// lap on the driver; a banked failure row replays forever.
+/// Decide on an offered subtree and, if we take it, build it.
+///
+/// Split out of the control loop so the decision chain is readable in one
+/// place: the checks run in the order `dispatch::consider` defines, and the
+/// build only happens after all of them pass.
+async fn lead_reply(
+    cfg: &WorkerCfg,
+    slots: &Arc<Semaphore>,
+    job: u64,
+    subtree: &[u8],
+    frontier: &[Dig],
+) -> W2D {
+    use prost::Message;
+
+    let decline = |why: String| W2D::Decline { job, why };
+
+    // Configured to build at all? Absent daemon is a decline, not an error:
+    // this worker simply lends CPU to REAPI actions and nothing else.
+    let (Some(bk), Some(reg)) = (&cfg.buildkit_addr, &cfg.registry_addr) else {
+        return decline("no buildkitd configured on this worker".into());
+    };
+
+    let Ok(def) = bollard_buildkit_proto::pb::Definition::decode(subtree) else {
+        return decline("subtree is not a buildkit Definition".into());
+    };
+
+    // Re-check what the offerer already checked. One pass over the ops, and
+    // a bug on their side cannot ship us a secret or a cache mount.
+    let verdict = crate::dispatch::inspect(&def);
+    let load = crate::dispatch::Load {
+        slots: cfg.slots,
+        peer: 0,
+        driver: cfg.slots - slots.available_permits(),
+    };
+    let me = format!("{}/{}", std::env::consts::OS, arch());
+    if let Err(why) = crate::dispatch::consider(load, &verdict, &me) {
+        return decline(format!("{why:?}"));
+    }
+
+    // Hold a slot for the duration, so this worker's load is honest while
+    // it builds and the next offer is declined rather than over-committed.
+    let Ok(_permit) = slots.acquire().await else {
+        return decline("worker shutting down".into());
+    };
+    println!(
+        "[worker] leading subtree job {job}: {} ops, {} frontier blobs",
+        verdict.ops,
+        frontier.len()
+    );
+    match crate::solve::build_subtree(bk, reg, job, def).await {
+        Ok(image_ref) => W2D::Led { job, image_ref },
+        // A failed subtree is the requester's to rebuild. Reporting it as a
+        // decline rather than swallowing it is what stops them waiting.
+        Err(e) => decline(format!("build failed: {e:#}")),
+    }
+}
+
+/// `std::env::consts::ARCH` in the spelling buildkit platforms use.
+fn arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    }
+}
+
 async fn record_local_ac(store: &Store, action_hash: &str, outcome: &exec::Outcome) {
     if outcome.do_not_cache || outcome.action_result.exit_code != 0 {
         return;

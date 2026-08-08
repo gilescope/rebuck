@@ -612,6 +612,13 @@ impl Driver {
                     return Ok(()); // clean disconnect
                 };
                 match msg {
+                    // The subtree built somewhere else and is fetchable from
+                    // the builder's mirror. The driver is told WHERE, and
+                    // holds no bytes: principle 6, and the test for it is
+                    // to look at this machine's disk afterwards.
+                    W2D::Led { job, image_ref } => {
+                        println!("[driver] subtree job {job} built at {image_ref}");
+                    }
                     // Refusal is not a failure - it is how the driver learns
                     // the fleet is saturated without asking (principle 12).
                     // The job stays ours to place elsewhere or build here.

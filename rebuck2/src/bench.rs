@@ -324,6 +324,8 @@ pub async fn fleet(cfg: FleetCfg) -> Result<FleetMetrics> {
     for (w, wstore) in wstores.iter().enumerate() {
         let wstore = wstore.clone();
         let cfgw = worker::WorkerCfg {
+            buildkit_addr: None,
+            registry_addr: None,
             session: session.clone(),
             slots: 8,
             scratch: root.join(format!("w{w}-exec")),

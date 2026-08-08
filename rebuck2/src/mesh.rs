@@ -141,6 +141,17 @@ pub enum W2D {
         job: u64,
         why: String,
     },
+    /// A subtree was built and published. `image_ref` is what the requester
+    /// pulls - from the BUILDER's mirror, not from the driver, which is
+    /// principle 6 in one field.
+    ///
+    /// Not `Done`: that carries a REAPI `ActionResult`, and a subtree's
+    /// result is an image. Squeezing one into the other would make the
+    /// fleet's reply type mean two things.
+    Led {
+        job: u64,
+        image_ref: String,
+    },
 }
 
 /// Driver → worker, on the control stream.
