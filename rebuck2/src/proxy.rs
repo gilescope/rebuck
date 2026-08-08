@@ -406,6 +406,46 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # Dispatching on saturation: three accounting bugs, and an unexplained split
+//!
+//! Work is now shipped only once the local machine is FULL - `home_slots`
+//! against builds currently running at home. The core count is a legitimate
+//! input here, unlike in the peer weights below: "is this machine full" is a
+//! count against a count, where "how fast is this machine" was a throughput
+//! that core counts proved uncorrelated with.
+//!
+//! Getting the counter right took three fixes, each found by measurement
+//! rather than reading:
+//!
+//! 1. Load-then-increment is check-then-act. Twenty-four concurrent gateway
+//!    solves all read 15 before any increment landed, and the report said so:
+//!    `home peak 20 of 16 slots`. Now a slot is CLAIMED with `fetch_update`.
+//! 2. An excluded solve claimed a slot and never released it, because only
+//!    dispatchable solves were being recorded. Eleven solves in twelve are
+//!    excluded on an earthly build, so the counter would have drifted up
+//!    until the fleet believed home was permanently full.
+//! 3. A saturated solve with nowhere to go still builds at home, and was
+//!    releasing a slot it had never been granted - handing back capacity that
+//!    did not exist. Only a solve that actually held one releases one.
+//!
+//! With all three fixed the peak is exactly 16 of 16, so the gate does open.
+//! What is NOT explained is the split it produces:
+//!
+//! ```text
+//! work    saturation gate     best hand-swept
+//!   20    7-10s   {20, 4}     7s   at 22:2
+//!   90    16s     {20, 4}     15s  at 16:8
+//!  250    39-40s  {20, 4}     32s  at 12:12
+//! ```
+//!
+//! Twenty home and four away at every size, when sixteen slots should give
+//! sixteen and eight. Four slots are being released before the last solves
+//! are placed, and the prime suspect is the harness rather than the proxy:
+//! each `buildctl` is a container start, so clients may not arrive as
+//! simultaneously as "twenty-four in parallel" suggests. That is unmeasured,
+//! and until it is measured the gate's behaviour at large build sizes - 40s
+//! against a hand-swept 32s - is not something to claim as an improvement.
+//!
 //! # Build size was a proxy for SATURATION, and wiring the gate proved it
 //!
 //! The sweep below argued for a per-subtree rule: ship a subtree only if it
@@ -1055,8 +1095,14 @@ pub struct Proxy {
     /// `Control.Solve` when it finishes, because only the gateway knows the
     /// placement and only Control knows what the client actually waited.
     went: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<String, (Option<usize>, String)>>,
+        std::sync::Mutex<std::collections::HashMap<String, (Option<usize>, String, bool)>>,
     >,
+    /// Builds currently running at home, so dispatch can wait until the
+    /// local machine is actually full. Incremented when a solve is placed
+    /// home, decremented when the client's `Control.Solve` for it returns -
+    /// the gateway solve is lazy and returns in a millisecond, so it cannot
+    /// mark the end of anything.
+    home_inflight: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// graph key -> observed client-visible durations. The estimate that
     /// decides whether a subtree is worth shipping.
     seen_ms: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u64>>>>,
@@ -1096,6 +1142,7 @@ impl Proxy {
             strikes: Default::default(),
             went: Default::default(),
             seen_ms: Default::default(),
+            home_inflight: Default::default(),
             next_peer: Default::default(),
             ref_home: Default::default(),
         })
@@ -1471,13 +1518,27 @@ impl control::control_server::Control for Proxy {
         let mut w = self.wire.lock().expect("wire");
         w.control_solves.push(ms);
         match &went {
-            Some((Some(_), _)) => w.away_ms.push(ms),
-            Some((None, _)) => w.home_ms.push(ms),
+            Some((Some(_), _, _)) => w.away_ms.push(ms),
+            Some((None, _, held)) if !held => w.home_ms.push(ms),
+            Some((None, _, _)) => {
+                w.home_ms.push(ms);
+                // Only a solve that actually HELD a slot releases one.
+                // Releasing on every home build frees slots that were never
+                // taken - a saturated solve with nowhere to go still builds
+                // at home, and was handing back capacity it never had, so the
+                // gate reopened immediately and only four builds in
+                // twenty-four ever found home full.
+                let _ = self.home_inflight.fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |n| Some(n.saturating_sub(1)),
+                );
+            }
             // Never placed - excluded, no fleet, no mirror. Neither bucket.
             None => {}
         }
         drop(w);
-        if let Some((_, key)) = went {
+        if let Some((_, key, _)) = went {
             self.seen_ms
                 .lock()
                 .expect("seen_ms")
@@ -1687,6 +1748,27 @@ fn worth_shipping(est_ms: Option<u64>, overhead_ms: u64) -> bool {
         None => true,
         Some(est) => est > overhead_ms.saturating_mul(MARGIN),
     }
+}
+
+/// How much work this machine can run at once.
+///
+/// The local core count, and using it here is not the mistake made earlier
+/// with peer weights. "Is this machine FULL" and "how FAST is this machine"
+/// are different questions: the first is a count of things running against a
+/// count of things that can run, and the second is a throughput that core
+/// counts turned out to be uncorrelated with once transfer dominated.
+///
+/// Overridable, because the daemon's own `max-parallelism` is not queryable
+/// through the API and may not match the host.
+fn home_slots() -> usize {
+    std::env::var("REBUCK2_HOME_SLOTS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        })
 }
 
 /// How many completed builds before a side's mean means anything.
@@ -2066,6 +2148,12 @@ pub struct Wire {
     /// because the zero is the finding: neither gateway call is where the
     /// time is, so the next person does not have to re-measure it.
     pub returns: Vec<u64>,
+    /// The most builds ever running at home at once, against the slot count
+    /// that gates dispatch. If this never reaches the limit, the gate never
+    /// opens and the fleet is idle for a reason that has nothing to do with
+    /// placement.
+    pub peak_home: usize,
+    pub slots: usize,
     /// Where each solve was placed: key 0 is home, 1.. are peers.
     ///
     /// Added because "round 2 was fast" is not evidence of avoidance - a
@@ -2193,6 +2281,16 @@ impl Wire {
         println!("[wire] solves routed  : {} to other daemons", self.routed);
         println!("[wire] built at home  : {} (peer 0's own share)", self.home);
         println!("[wire] placed         : {:?} (0 = home)", self.placed);
+        println!(
+            "[wire] home peak      : {} of {} slots{}",
+            self.peak_home,
+            self.slots,
+            if self.slots > 0 && self.peak_home < self.slots {
+                " - never saturated, so dispatch never opened"
+            } else {
+                ""
+            }
+        );
         let mean = |v: &[u64]| -> u64 {
             if v.is_empty() {
                 0
@@ -2620,11 +2718,61 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         .entry("not worth shipping".to_owned())
                         .or_default() += 1;
                 }
-                let peer = if allowed && worth {
+                // Only ship once the local machine is FULL.
+                //
+                // This is what build size was standing in for. Twenty-four
+                // short builds fit in sixteen cores, so dispatching any of
+                // them added a transfer and relieved nothing: 12s split
+                // evenly against 8s with no fleet at all. Bigger builds
+                // saturate sooner, which is why the sweep looked like a size
+                // effect.
+                //
+                // Unlike the peer weights, the core count here is honest: the
+                // question is "is this machine full", not "how fast is it".
+                let slots = home_slots();
+                // CLAIM a slot rather than reading the counter and then
+                // taking one. Load-then-increment is check-then-act:
+                // twenty-four concurrent gateway solves all read 15 before
+                // any of the increments land, and the measurement showed it -
+                // "home peak 20 of 16 slots", four builds past a limit that
+                // was supposed to be exact.
+                let claimed = self
+                    .home_inflight
+                    .fetch_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |n| (n < slots).then_some(n + 1),
+                    )
+                    .is_ok();
+                let saturated = !claimed;
+                {
+                    let mut w = self.wire.lock().expect("wire");
+                    w.peak_home = w.peak_home.max(
+                        self.home_inflight
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                    w.slots = slots;
+                }
+                if allowed && worth && !saturated {
+                    *self
+                        .wire
+                        .lock()
+                        .expect("wire")
+                        .rejected
+                        .entry("home has room".to_owned())
+                        .or_default() += 1;
+                }
+                let peer = if allowed && worth && saturated {
                     self.next_place(&verdict.platform)
                 } else {
                     None
                 };
+                // The slot was claimed above. Hand it back if the work is
+                // leaving after all.
+                if peer.is_some() && claimed {
+                    self.home_inflight
+                        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 if allowed {
                     *self
                         .wire
@@ -2633,15 +2781,21 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         .placed
                         .entry(peer.unwrap_or(0))
                         .or_default() += 1;
-                    if let Some(id) = meta
-                        .get("buildkit-controlapi-buildid")
-                        .and_then(|v| v.to_str().ok())
-                    {
-                        self.went
-                            .lock()
-                            .expect("went")
-                            .insert(id.to_owned(), (peer, key.clone()));
-                    }
+                }
+                // Recorded for EVERY solve, not just the dispatchable ones.
+                // An excluded solve still runs at home and still holds a
+                // slot, and pairing the claim with the release is what stops
+                // the counter drifting up until the fleet thinks home is
+                // permanently full - which is exactly the earthly case, where
+                // eleven solves in twelve are excluded.
+                if let Some(id) = meta
+                    .get("buildkit-controlapi-buildid")
+                    .and_then(|v| v.to_str().ok())
+                {
+                    self.went
+                        .lock()
+                        .expect("went")
+                        .insert(id.to_owned(), (peer, key.clone(), claimed));
                 }
                 if allowed && peer.is_none() {
                     // Peer 0's turn. It already holds the job, the session
