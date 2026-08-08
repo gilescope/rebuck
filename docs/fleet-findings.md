@@ -18,6 +18,28 @@ deliberately does not assert wall clock: those numbers move for reasons that
 have nothing to do with this code, and a suite that fails on a busy laptop
 gets switched off.
 
+## Both lifts work across a real network
+
+Verified locally first, which proves the wiring and not the topology. With
+the peer on the other machine and everything forced away from home:
+
+```text
+secret   placed {peer1: 6}   failed 0
+ssh      placed {peer1: 4}   failed 0
+```
+
+Each exec asserts the thing it needs - the secret's VALUE, and that
+`ssh-add` can reach an agent - so finishing means the remote machine really
+got them, not that it started.
+
+Worth being plain about what the second line is. An ssh agent on this
+laptop was used by a build running on a different computer, over a
+connection this laptop opened outbound. That is a genuinely useful
+capability and a genuinely large amount of trust: for the length of that
+build, the other machine could have asked the agent to sign anything at
+all. It is off by default and it should stay a decision someone makes
+deliberately, per fleet, knowing who runs the peers.
+
 ## An ssh mount travels too, and it is the sharpest one
 
 `RUN --mount=type=ssh` is stock buildkit and common in builds that clone
