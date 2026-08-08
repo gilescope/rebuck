@@ -406,6 +406,33 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # Telling a bad peer from a bad network
+//!
+//! Both failures below look identical from the placement side - a refusal -
+//! and they call for opposite responses. Asking the mirror whether it is
+//! alive separates them, and the two runs are now different:
+//!
+//! ```text
+//! registry dies  placed {home: 32, peer1: 16}   "mirror down, peer not blamed": 16
+//! peer dies      placed {home: 40, peer1:  8}   "peer 1 refused": 8, then nothing
+//! ```
+//!
+//! The dead peer is struck and gets nothing in round two. The healthy peer
+//! behind a dead registry keeps its turns, because it did nothing wrong and
+//! will work the moment the mirror returns.
+//!
+//! The probe had to be aimed correctly to say anything at all. The mirror is
+//! named for the DAEMONS - `host.docker.internal:15000` - and that name only
+//! exists inside a container. Asked from the host it fails to resolve, so the
+//! first version answered "dead" every time and nobody was ever blamed,
+//! including a peer that really had died. Substituting loopback is exact
+//! rather than clever: that hostname means "the machine this proxy is on".
+//!
+//! Still wasteful in one direction: with the registry down, the peer keeps
+//! being offered work it cannot complete - eight more in round two. Correct
+//! but not clever; a fleet-wide "the shared thing is down" state would stop
+//! offering at all, and that is a different mechanism from per-peer memory.
+//!
 //! # Killing the REGISTRY mid-build
 //!
 //! The mirror is the one thing the whole fleet shares - published contexts,
@@ -1253,6 +1280,44 @@ impl Proxy {
 
     fn client(&self) -> Client {
         self.client.clone()
+    }
+
+    /// Is the shared mirror answering?
+    ///
+    /// The discriminator between "this peer is bad" and "the thing between us
+    /// is bad". Killing the registry mid-build produced eight refusals and
+    /// struck a machine that had done nothing wrong: the two ends of a
+    /// two-party protocol cannot tell a third party's failure apart from each
+    /// other's without asking someone.
+    ///
+    /// `/v2/` is the registry API root, and any answer at all - including a
+    /// 401 - means something is listening. Only a transport failure counts as
+    /// dead, so a mirror that is up but unhappy still leaves the peer
+    /// accountable.
+    async fn mirror_alive(&self) -> bool {
+        let Some(m) = &self.mirror else {
+            return false;
+        };
+        // The mirror is named for the DAEMONS, and `host.docker.internal` is
+        // a name only a container has - the proxy runs on the host, where it
+        // does not resolve. Probing it unresolved answered "dead" every time,
+        // so no peer was ever blamed for anything, including its own death.
+        // The substitution is exact rather than clever: that hostname means
+        // "the machine this proxy is on", so loopback is the same place.
+        let addr = m.registry.replace("host.docker.internal", "127.0.0.1");
+        let url = format!("http://{addr}/v2/");
+        match reqwest::Client::new()
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                println!("[proxy] mirror {addr} is not answering: {e}");
+                false
+            }
+        }
     }
 
     /// What this graph has cost before, as a median.
@@ -3076,7 +3141,23 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                             // The build still finished with the right bytes -
                             // fail-open works - but it paid for the same
                             // discovery eight times.
-                            self.strikes[peer].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            //
+                            // Only if the peer is the one that failed, though.
+                            // Killing the REGISTRY produced the same eight
+                            // refusals and struck a machine that had done
+                            // nothing wrong.
+                            if self.mirror_alive().await {
+                                self.strikes[peer]
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            } else {
+                                *self
+                                    .wire
+                                    .lock()
+                                    .expect("wire")
+                                    .rejected
+                                    .entry("mirror down, peer not blamed".to_owned())
+                                    .or_default() += 1;
+                            }
                         }
                     }
                 }
