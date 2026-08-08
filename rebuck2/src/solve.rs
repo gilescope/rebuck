@@ -940,6 +940,150 @@ mod tests {
         );
     }
 
+    /// Emit N plain-LLB builds that read a LOCAL build context.
+    ///
+    /// Every other fixture sources only from `docker-image://`, so
+    /// `contexts published: 0` in every run and the context-publishing path -
+    /// the thing that unpins a subtree from the machine holding the client's
+    /// disk - had never once executed. A Dockerfile build would exercise it
+    /// and cannot: a named frontend's graph never crosses the proxy.
+    ///
+    ///   cargo test --bin rebuck2 write_context_llb -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn write_context_llb() {
+        use prost::Message;
+        let plat = pb::Platform {
+            os: "linux".into(),
+            architecture: std::env::consts::ARCH.replace("aarch64", "arm64"),
+            ..Default::default()
+        };
+        let dg = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
+        let out = std::env::var("REBUCK2_LLB_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let n: usize = std::env::var("REBUCK2_LLB_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        for i in 0..n {
+            let base = pb::Op {
+                op: Some(pb::op::Op::Source(pb::SourceOp {
+                    identifier: "docker-image://docker.io/library/alpine:3.20".into(),
+                    ..Default::default()
+                })),
+                platform: Some(plat.clone()),
+                ..Default::default()
+            };
+            let base_b = base.encode_to_vec();
+            // The client's disk. Nothing a peer can reach, which is the whole
+            // point: it has to become content before the graph can travel.
+            let ctx = pb::Op {
+                op: Some(pb::op::Op::Source(pb::SourceOp {
+                    identifier: "local://context".into(),
+                    // Without an attr that distinguishes them, all N local
+                    // source vertices are one vertex, and buildkit syncs the
+                    // FIRST client's directory and hands it to every other
+                    // build - distinct graphs, distinct contexts, and every
+                    // output still `task-0`. `local.unique` exists for
+                    // exactly this; real clients set it, and `publish_context`
+                    // in this file already sets `local.session` for the same
+                    // reason.
+                    attrs: [("local.unique".to_owned(), format!("build-{i}"))]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                })),
+                platform: Some(plat.clone()),
+                ..Default::default()
+            };
+            let ctx_b = ctx.encode_to_vec();
+            let exec = pb::Op {
+                inputs: vec![
+                    pb::Input {
+                        digest: dg(&base_b),
+                        index: 0,
+                    },
+                    pb::Input {
+                        digest: dg(&ctx_b),
+                        index: 0,
+                    },
+                ],
+                op: Some(pb::op::Op::Exec(pb::ExecOp {
+                    meta: Some(pb::Meta {
+                        args: vec![
+                            "/bin/sh".into(),
+                            "-c".into(),
+                            // `# {i}` makes the GRAPH distinct per build.
+                            // Without it all N graphs are byte-identical, and
+                            // buildkit correctly treats identical vertices as
+                            // one build: four solves, one execution, and every
+                            // client gets build 0's bytes. Verified with no
+                            // proxy and one daemon, so it is buildkit's
+                            // single-flight and not a dispatch bug - but it
+                            // makes the fixture measure nothing, because a
+                            // context that only differs in CONTENT does not
+                            // change the graph that names it.
+                            format!(
+                                "i=0; while [ $i -lt 90 ]; do dd if=/dev/zero bs=1M \
+                                 count=20 2>/dev/null | sha256sum >/dev/null; \
+                                 i=$((i+1)); done; mkdir -p /result; \
+                                 cp /ctx/marker /result/task  # {i}"
+                            ),
+                        ],
+                        cwd: "/".into(),
+                        ..Default::default()
+                    }),
+                    mounts: vec![
+                        pb::Mount {
+                            input: 0,
+                            dest: "/".into(),
+                            output: 0,
+                            ..Default::default()
+                        },
+                        // Read-only, so `output: -1` is right here - unlike on
+                        // the rootfs, where it stops runc writing resolv.conf.
+                        pb::Mount {
+                            input: 1,
+                            dest: "/ctx".into(),
+                            output: -1,
+                            readonly: true,
+                            ..Default::default()
+                        },
+                        pb::Mount {
+                            input: -1,
+                            dest: "/result".into(),
+                            output: 1,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                })),
+                platform: Some(plat.clone()),
+                ..Default::default()
+            };
+            let exec_b = exec.encode_to_vec();
+            let term = pb::Op {
+                inputs: vec![pb::Input {
+                    digest: dg(&exec_b),
+                    index: 1,
+                }],
+                ..Default::default()
+            };
+            let def = pb::Definition {
+                metadata: [&base_b, &ctx_b, &exec_b]
+                    .iter()
+                    .map(|b| (dg(b), pb::OpMetadata::default()))
+                    .collect(),
+                def: vec![base_b, ctx_b, exec_b, term.encode_to_vec()],
+                ..Default::default()
+            };
+            let path = out.join(format!("rebuck2-fanout-{i}.llb"));
+            std::fs::write(&path, def.encode_to_vec()).unwrap();
+            println!("[fixture] {}", path.display());
+        }
+    }
+
     /// Emit N distinct plain-LLB builds - no frontend, no secrets, no host
     /// binds. What a client that is not earthly sends.
     ///

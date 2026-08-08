@@ -406,6 +406,42 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # The context path finally ran, and the fixture was the bug
+//!
+//! Every fixture until now sourced only from `docker-image://`, so
+//! `contexts published: 0` in every single run: the machinery that unpins a
+//! subtree from the machine holding the client's disk had never executed. A
+//! fixture with a real `local://context`:
+//!
+//! ```text
+//! sources 4 registry, 4 local    contexts published: 4
+//! placed {home: 2, peer1: 2}     outputs identical to baseline
+//! ```
+//!
+//! Files on the client's disk became content in the mirror, and a peer with
+//! no session and no access to that disk built from them. That is the whole
+//! claim of the design, executed for the first time.
+//!
+//! Getting there cost two fixture bugs, both of which produced WRONG BYTES
+//! while every exit code stayed zero - and both of which would have read as
+//! dispatch corrupting results:
+//!
+//! 1. All N graphs were byte-identical, because a context that differs only
+//!    in CONTENT does not change the graph that names it. Buildkit correctly
+//!    treats identical vertices as one build: four solves, one execution,
+//!    every client handed build 0's bytes.
+//! 2. With the graphs made distinct, the LOCAL SOURCE vertex was still
+//!    identical across builds - so buildkit synced the first client's
+//!    directory and served it to all four. Distinct graphs, distinct
+//!    directories, every output still `task-0`. `local.unique` exists for
+//!    exactly this, and `solve::publish_context` had been setting
+//!    `local.session` for the same reason all along.
+//!
+//! What settled both in one command was running the fixture with NO proxy on
+//! ONE daemon. All four outputs were still `task-0`, so nothing about
+//! dispatch was involved. Reaching for the baseline first turned a
+//! "distributed builds return wrong bytes" panic into a fixture fix.
+//!
 //! # A Dockerfile build dispatches NOTHING, and cannot
 //!
 //! The claim "any project that speaks buildkit can use this" needed a client

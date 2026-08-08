@@ -53,6 +53,9 @@ ROUNDS=${ROUNDS:-1}
 # every LLB run reports "contexts published: 0", so that whole path was
 # untested.
 DOCKERFILE=${DOCKERFILE:-}
+# LLB that reads a real build CONTEXT from the client's disk. The only mode
+# that exercises context publishing, which every other run reports as 0.
+CONTEXT=${CONTEXT:-}
 
 crate=$(cd "$(dirname "$0")/.." && pwd)
 rm -rf "$RUN"
@@ -126,8 +129,16 @@ DF
 fi
 
 say "generate llb"
+fixture=write_fanout_llb
+if [ -n "$CONTEXT" ]; then
+  fixture=write_context_llb
+  for i in $(seq 0 $((BUILDS - 1))); do
+    mkdir -p "$RUN/ctx/$i"
+    echo "task-$i" >"$RUN/ctx/$i/marker"
+  done
+fi
 (cd "$crate" && REBUCK2_LLB_OUT="$RUN/llb" REBUCK2_LLB_N="$BUILDS" \
-  cargo test --quiet --bin rebuck2 write_fanout_llb -- --ignored >/dev/null)
+  cargo test --quiet --bin rebuck2 "$fixture" -- --ignored >/dev/null)
 printf "%s\n" "$RUN"/llb/*.llb
 
 say "daemons: $IMAGE on $PLATFORM"
@@ -235,6 +246,10 @@ for round in $(seq 1 "$ROUNDS"); do
         --frontend dockerfile.v0 \
         --local "context=$RUN/ctx/$n" --local "dockerfile=$RUN/ctx/$n" \
         --output "type=local,dest=$RUN/out-$n" >"$RUN/build-$n.log" 2>&1 &
+    elif [ -n "$CONTEXT" ]; then
+      bctl --addr "$addr" build --no-cache \
+        --local "context=$RUN/ctx/$n" \
+        --output "type=local,dest=$RUN/out-$n" <"$f" >"$RUN/build-$n.log" 2>&1 &
     else
       bctl --addr "$addr" build --no-cache \
         --output "type=local,dest=$RUN/out-$n" <"$f" >"$RUN/build-$n.log" 2>&1 &
