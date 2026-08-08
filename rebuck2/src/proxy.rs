@@ -406,6 +406,38 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # Killing a peer mid-build
+//!
+//! Fail-open is principle 5 and had never been tested by actually breaking
+//! something. Twenty-four builds, two daemons, the peer destroyed four
+//! seconds in while holding eight of them:
+//!
+//! ```text
+//! wall 24s (baseline with no fleet: 24s)   failed 0
+//! placed {home: 16, peer1: 8}   not routed {"peer 1 refused": 8}
+//! outputs identical to the single-machine baseline
+//! ```
+//!
+//! Every build finished and every byte matched. The fleet's contribution
+//! vanished and nothing else did, which is exactly what fail-open should look
+//! like: back to the baseline, not below it.
+//!
+//! It also showed a gap. The dead peer was offered work eight times, each
+//! offer waiting out a transport error, because only SLOWNESS was remembered
+//! - a take-back struck a peer and an outright refusal did not. Refusals now
+//! strike too, and the report names the machine.
+//!
+//! That does not reduce the eight, and the reason is the one that keeps
+//! recurring here: all eight are placed within 393ms, before the first
+//! refusal comes back. No memory can act on a fan-out that is decided before
+//! any of it returns. What it does fix is everything after - a second round
+//! through the same proxy offers the dead peer NOTHING:
+//!
+//! ```text
+//! round 1  placed {home: 16, peer1: 8}   8 refused
+//! round 2  placed {home: 24, peer1: 0}
+//! ```
+//!
 //! # Dispatching on saturation, and the suspect that was wrong
 //!
 //! Work ships only once the local machine is FULL - `home_slots` against
@@ -3008,8 +3040,17 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                                 .lock()
                                 .expect("wire")
                                 .rejected
-                                .entry("peer refused".to_owned())
+                                .entry(format!("peer {peer} refused"))
                                 .or_default() += 1;
+                            // A refusal strikes, exactly as a take-back does.
+                            // Measured by killing a peer mid-build: it was
+                            // offered work eight more times, each offer
+                            // waiting out a transport error, because only
+                            // slowness was remembered and failure was not.
+                            // The build still finished with the right bytes -
+                            // fail-open works - but it paid for the same
+                            // discovery eight times.
+                            self.strikes[peer].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                     }
                 }

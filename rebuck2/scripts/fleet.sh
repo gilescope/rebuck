@@ -69,6 +69,11 @@ REMOTE_PORT=${REMOTE_PORT:-18400}
 # The remote's share, relative to this machine. Buildkit does not report core
 # counts, so somebody has to say. 2 means "twice the turns".
 REMOTE_WEIGHT=${REMOTE_WEIGHT:-1}
+# Kill the LAST daemon this many seconds into the build. Fail-open is a
+# stated principle and had never been tested by actually breaking something:
+# a build must still finish, with the right bytes, when a peer dies holding
+# work.
+KILL_AFTER=${KILL_AFTER:-}
 
 crate=$(cd "$(dirname "$0")/.." && pwd)
 rm -rf "$RUN"
@@ -289,6 +294,12 @@ for round in $(seq 1 "$ROUNDS"); do
     builds+=($!)
     n=$((n + 1))
   done
+  if [ -n "$KILL_AFTER" ]; then
+    victim="rebuck2-fleet-$((DAEMONS - 1))"
+    ( sleep "$KILL_AFTER"
+      echo "=== killing $victim mid-build"
+      docker rm -f "$victim" >/dev/null 2>&1 || true ) &
+  fi
   # Wait on the BUILD pids only. A bare `wait` also waits on the registry and
   # the proxy, neither of which ever exits, so the harness hangs forever
   # having already finished the measurement.
