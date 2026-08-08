@@ -23,6 +23,7 @@ base="${TMPDIR:-/tmp}/rebuck2-check-base"
 pass=0
 fail=0
 skipped=0
+started=$SECONDS
 IMAGE_PROBE=${IMAGE:-moby/buildkit:latest}
 ok() {
   printf '  \033[32mPASS\033[0m %s\n' "$1"
@@ -406,5 +407,8 @@ if [ -n "${REMOTE:-}" ]; then
 fi
 
 echo
-printf '\n%s passed, %s failed, %s skipped\n' "$pass" "$fail" "$skipped"
+# Elapsed is reported so the CI timeout is set from evidence rather than
+# from whatever the suite happened to cost the day the workflow was written.
+printf '\n%s passed, %s failed, %s skipped in %sm%ss\n' \
+  "$pass" "$fail" "$skipped" "$(((SECONDS - started) / 60))" "$(((SECONDS - started) % 60))"
 [ "$fail" -eq 0 ]

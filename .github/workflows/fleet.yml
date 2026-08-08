@@ -14,6 +14,19 @@ name: fleet
 #
 # Local daemons only. The cross-machine numbers need a second box and are not
 # checked here; `REMOTE=` does that when someone has one.
+#
+# Two things here are expected to be the first to give trouble on a runner,
+# recorded so the next person does not rediscover them:
+#
+#   - SLOTS is 8 on a four-core machine. The assertions are arithmetic on the
+#     slot count so they stay correct, but three daemons, a registry, a proxy
+#     and twelve concurrent buildctl clients will contend.
+#   - the straggler scenario is timing-derived. It caps one daemon at 0.15 CPU
+#     and needs that to overshoot three times the observed median; under
+#     contention the median rises too, which narrows the margin.
+#
+# Neither is a reason to weaken an assertion. If one flakes, the fix is to
+# make the property observable, not to widen the grep - see docs/how-this-lies.md.
 
 on:
   push:
@@ -26,9 +39,15 @@ permissions:
 jobs:
   fleet-check:
     runs-on: ubuntu-latest
-    # Twelve builds against a two-daemon fleet, six scenarios. Generous
-    # because the failure scenarios wait out a bound on purpose.
-    timeout-minutes: 25
+    # Measured 5m11s for 53 checks on a warm developer machine. A runner has
+    # four cores, pulls the buildkit image cold and installs binfmt first, and
+    # several scenarios wait out a bound on purpose rather than racing.
+    #
+    # Set well above the estimate deliberately: a timeout that trips is
+    # indistinguishable from a hang, and the suite prints its own elapsed time
+    # on every run, so this number can be tightened from evidence instead of
+    # being defended by guesswork.
+    timeout-minutes: 45
     permissions:
       contents: read
     steps:
