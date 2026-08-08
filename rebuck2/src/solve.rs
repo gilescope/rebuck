@@ -1000,6 +1000,114 @@ mod tests {
         );
     }
 
+    /// Emit N builds whose exec mounts a CACHE.
+    ///
+    /// The output must NOT depend on what is in the cache - that is the
+    /// contract that makes a cache mount safe to have at all, and the thing
+    /// dispatch relies on. It writes a marker into the cache and derives its
+    /// result from the graph, so a cold peer and a warm home produce the same
+    /// bytes.
+    ///
+    ///   cargo test --bin rebuck2 write_cache_llb -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn write_cache_llb() {
+        use prost::Message;
+        let dg = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
+        let out = std::env::var("REBUCK2_LLB_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let n: usize = std::env::var("REBUCK2_LLB_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let work: usize = std::env::var("REBUCK2_LLB_WORK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90);
+        for i in 0..n {
+            let base = pb::Op {
+                op: Some(pb::op::Op::Source(pb::SourceOp {
+                    identifier: "docker-image://docker.io/library/alpine:3.20".into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let base_b = base.encode_to_vec();
+            let exec = pb::Op {
+                inputs: vec![pb::Input {
+                    digest: dg(&base_b),
+                    index: 0,
+                }],
+                op: Some(pb::op::Op::Exec(pb::ExecOp {
+                    meta: Some(pb::Meta {
+                        args: vec![
+                            "/bin/sh".into(),
+                            "-c".into(),
+                            format!(
+                                "echo warm >> /cache/hits; \
+                                 i=0; while [ $i -lt {work} ]; do dd if=/dev/zero bs=1M \
+                                 count=20 2>/dev/null | sha256sum >/dev/null; \
+                                 i=$((i+1)); done; mkdir -p /result; \
+                                 echo task-{i} > /result/task"
+                            ),
+                        ],
+                        cwd: "/".into(),
+                        ..Default::default()
+                    }),
+                    mounts: vec![
+                        pb::Mount {
+                            input: 0,
+                            dest: "/".into(),
+                            output: 0,
+                            ..Default::default()
+                        },
+                        pb::Mount {
+                            input: -1,
+                            dest: "/cache".into(),
+                            output: -1,
+                            mount_type: pb::MountType::Cache as i32,
+                            cache_opt: Some(pb::CacheOpt {
+                                id: "rebuck2-probe-cache".into(),
+                                sharing: pb::CacheSharingOpt::Shared as i32,
+                            }),
+                            ..Default::default()
+                        },
+                        pb::Mount {
+                            input: -1,
+                            dest: "/result".into(),
+                            output: 1,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let exec_b = exec.encode_to_vec();
+            let term = pb::Op {
+                inputs: vec![pb::Input {
+                    digest: dg(&exec_b),
+                    index: 1,
+                }],
+                ..Default::default()
+            };
+            let def = pb::Definition {
+                metadata: [&base_b, &exec_b]
+                    .iter()
+                    .map(|b| (dg(b), pb::OpMetadata::default()))
+                    .collect(),
+                def: vec![base_b, exec_b, term.encode_to_vec()],
+                ..Default::default()
+            };
+            std::fs::write(
+                out.join(format!("rebuck2-fanout-{i}.llb")),
+                def.encode_to_vec(),
+            )
+            .unwrap();
+        }
+    }
+
     /// Emit N builds whose exec mounts a SECRET.
     ///
     /// The shape that was undispatchable by construction until a peer could

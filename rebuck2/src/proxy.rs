@@ -812,6 +812,16 @@ fn serving_secrets() -> bool {
     std::env::var("REBUCK2_SERVE_SECRETS").as_deref() == Ok("1")
 }
 
+/// May a peer build with its own cache mount instead of ours?
+///
+/// See `Verdict::dispatchable_when` for why this is defensible at all. Off
+/// by default: a cache mount whose contents a build depends on is already
+/// broken, and being right about that is not the same as being entitled to
+/// prove it on someone's CI.
+fn local_caches() -> bool {
+    std::env::var("REBUCK2_PEER_CACHE_MOUNTS").as_deref() == Ok("1")
+}
+
 /// Can we serve every secret THIS graph asks for?
 ///
 /// Being able to serve secrets in general is not the question. An earthly
@@ -1838,7 +1848,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 // touches source identifiers, so the original graph gives
                 // the same verdict for nothing.
                 let verdict = crate::dispatch::inspect(&def);
-                let allowed = verdict.dispatchable_with(can_serve_secrets(&def));
+                let allowed = verdict.dispatchable_when(can_serve_secrets(&def), local_caches());
                 if !allowed {
                     // Name the secret, not just its kind. A build that
                     // declares none can still be full of them: a frontend

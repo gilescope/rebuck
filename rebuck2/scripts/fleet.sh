@@ -59,6 +59,9 @@ CONTEXT=${CONTEXT:-}
 # LLB whose exec mounts a SECRET. Undispatchable by construction until a peer
 # could be handed a session, so this is the fixture that proves it can.
 SECRET=${SECRET:-}
+# LLB whose exec mounts a CACHE. Excluded from dispatch until a peer was
+# allowed its own, which is what REBUCK2_PEER_CACHE_MOUNTS=1 permits.
+CACHE=${CACHE:-}
 # A peer on ANOTHER MACHINE. Everything else here runs several daemons on one
 # host, which can measure overhead and placement but never capacity: the fleet
 # has no more CPU than the single daemon did.
@@ -174,6 +177,7 @@ fi
 
 say "generate llb"
 fixture=write_fanout_llb
+if [ -n "$CACHE" ]; then fixture=write_cache_llb; fi
 if [ -n "$SECRET" ]; then
   fixture=write_secret_llb
   export rebuck2_probe=the-value

@@ -77,7 +77,8 @@ impl Verdict {
         self.dispatchable_with(false)
     }
 
-    /// `serving_secrets` lifts the Secret exclusion, and ONLY that one.
+    /// `serving_secrets` lifts the Secret exclusion; `local_caches` lifts
+    /// CacheMount. Nothing else, ever, from either.
     ///
     /// A secret was fatal because a peer solves with no session and has
     /// nobody to ask. With `buildkit_session` we can attach one and answer
@@ -86,10 +87,28 @@ impl Verdict {
     /// different service, and lifting them together would be assuming three
     /// things from evidence about one.
     pub fn dispatchable_with(&self, serving_secrets: bool) -> bool {
-        let blocked = self
-            .exclusions
-            .iter()
-            .any(|(_, e)| !(serving_secrets && matches!(e, Exclusion::Secret)));
+        self.dispatchable_when(serving_secrets, false)
+    }
+
+    /// A cache mount is scratch space, and a peer has its own.
+    ///
+    /// It was excluded because it is daemon-local state, which is true and
+    /// turns out not to be the point. A cache mount is not shared between
+    /// daemons even without a fleet - it is not in the cache key, it is
+    /// dropped by gc, and it does not survive a daemon restart. A build whose
+    /// OUTPUT depends on what is in one is already non-reproducible on a
+    /// single machine; dispatch does not make that worse, it just finds it
+    /// sooner.
+    ///
+    /// So a peer builds with its own, colder, cache mount and produces the
+    /// same bytes. Off by default anyway, because "already broken" is a
+    /// reason to allow it, not a reason to assume nobody depends on it.
+    pub fn dispatchable_when(&self, serving_secrets: bool, local_caches: bool) -> bool {
+        let blocked = self.exclusions.iter().any(|(_, e)| match e {
+            Exclusion::Secret => !serving_secrets,
+            Exclusion::CacheMount => !local_caches,
+            _ => true,
+        });
         !blocked && !matches!(self.platform, Platform::Conflict(_))
     }
 }

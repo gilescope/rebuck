@@ -18,6 +18,27 @@ deliberately does not assert wall clock: those numbers move for reasons that
 have nothing to do with this code, and a suite that fails on a busy laptop
 gets switched off.
 
+## A cache mount need not ground one either
+
+Excluded because it is daemon-local state. True, and not the point: a cache
+mount is not shared between daemons even without a fleet. It is not in the
+cache key, gc drops it, and it does not survive a restart. A build whose
+OUTPUT depends on what is in one is already non-reproducible on a single
+machine - dispatch does not make that worse, it finds it sooner.
+
+So a peer builds with its own, colder cache mount:
+
+```text
+REBUCK2_PEER_CACHE_MOUNTS=1   placed {home: 4, peer1: 4}   outputs identical
+unset (the control)           placed {}   excluded: CacheMount x8
+```
+
+Byte-identical to a one-machine baseline, which is the assertion that
+matters: the colder cache changed nothing, exactly as the contract says.
+
+Off by default anyway. "Already broken" is a reason to allow it, not a
+reason to assume nobody depends on it.
+
 ## A secret no longer grounds a subtree
 
 The oldest exclusion, and the one that capped earthly at 1 solve in 12. A

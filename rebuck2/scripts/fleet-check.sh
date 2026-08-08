@@ -132,6 +132,22 @@ check "and the refusal names the secret" \
   "$(echo "$out" | grep -c 'excluded: Secret')" 1
 
 echo
+echo "== a graph with a CACHE MOUNT"
+# The peer builds with its own, colder cache mount. The claim is that this
+# changes nothing about the output, which is the same contract that makes a
+# cache mount safe on one machine - so the digests are the assertion.
+cachebase="${TMPDIR:-/tmp}/rebuck2-check-cache"
+out=$(run CACHE=1 NOPROXY=1 DAEMONS=1 RUN="$cachebase")
+check "cache baseline succeeds" "$(echo "$out" | grep -c '^failed  : 0')" 1
+out=$(run CACHE=1 DAEMONS=2 EXPECT="$cachebase/digests.txt")
+check "excluded while the flag is off" "$(placed "$out" 1)" ""
+out=$(run CACHE=1 DAEMONS=2 REBUCK2_PEER_CACHE_MOUNTS=1 EXPECT="$cachebase/digests.txt")
+echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
+check "the peer takes it with the flag on" "$(placed "$out" 1)" "$((builds - slots))"
+check "and its colder cache changes nothing" \
+  "$(echo "$out" | grep -c 'outputs identical')" 1
+
+echo
 echo "== a foreign-architecture peer, on a PINNED graph"
 # Needs emulation for the foreign platform, which a bare CI runner does not
 # have until someone installs binfmt. Skipped rather than failed: a suite
