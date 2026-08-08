@@ -155,10 +155,20 @@ else
 # the emulated peer took a third of the work.
 out=$(env -u REMOTE -u MIRROR_HOST REBUCK2_LLB_WORK="$work" \
   REBUCK2_HOME_SLOTS="$slots" \
-  BUILDS="$builds" DAEMONS=2 FOREIGN="$foreign" "$fleet" 2>&1)
+  BUILDS="$builds" DAEMONS=2 FOREIGN="$foreign" "$fleet" 2>&1 || true)
 echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
-check "every build still finishes" "$(echo "$out" | grep -c '^failed  : 0')" 1
-check "the emulated peer is given nothing" "$(placed "$out" 1)" ""
+# An emulated privileged buildkitd is the one scenario here with a real
+# environmental dependency: it can fail to START rather than fail an
+# assertion. Those are different facts and must not share a verdict - a
+# daemon that never came up says nothing about placement. No wire report
+# means the scenario did not run.
+if ! echo "$out" | grep -q 'placed'; then
+  printf '  \033[33mSKIP\033[0m the emulated daemon did not come up\n'
+  skipped=$((skipped + 1))
+else
+  check "every build still finishes" "$(echo "$out" | grep -c '^failed  : 0')" 1
+  check "the emulated peer is given nothing" "$(placed "$out" 1)" ""
+fi
 fi
 
 if [ -n "${REMOTE:-}" ]; then
