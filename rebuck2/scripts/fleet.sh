@@ -48,6 +48,11 @@ SLOW=${SLOW:-}
 # only ever measure a cold fleet: every solve of a fan-out is placed before
 # any of them has finished, so nothing learned during a round can affect it.
 ROUNDS=${ROUNDS:-1}
+# Build a Dockerfile instead of raw LLB. The canonical client for any project
+# that is not earthbuild, and the only shape that exercises a build CONTEXT -
+# every LLB run reports "contexts published: 0", so that whole path was
+# untested.
+DOCKERFILE=${DOCKERFILE:-}
 
 crate=$(cd "$(dirname "$0")/.." && pwd)
 rm -rf "$RUN"
@@ -100,6 +105,26 @@ bin="$crate/target/debug/rebuck2"
 # where a fleet can win and a single daemon cannot fake it. A sleep-based
 # workload measures nothing - one daemon serves four sleeps as fast as four
 # daemons do, so the fleet looks free when it is not.
+if [ -n "$DOCKERFILE" ]; then
+  say "generate dockerfile context"
+  mkdir -p "$RUN/ctx"
+  # One file per build so the builds differ, as the LLB fixtures do. Same
+  # CPU-bound shape: a fleet cannot fake parallelism on it.
+  for i in $(seq 0 $((BUILDS - 1))); do
+    mkdir -p "$RUN/ctx/$i"
+    echo "task-$i" >"$RUN/ctx/$i/marker"
+    cat >"$RUN/ctx/$i/Dockerfile" <<DF
+FROM alpine:3.20
+COPY marker /marker
+RUN i=0; while [ \$i -lt 90 ]; do dd if=/dev/zero bs=1M count=20 2>/dev/null | sha256sum >/dev/null; i=\$((i+1)); done
+RUN mkdir -p /result && cp /marker /result/task
+FROM scratch
+COPY --from=0 /result /
+DF
+  done
+  ls "$RUN/ctx"
+fi
+
 say "generate llb"
 (cd "$crate" && REBUCK2_LLB_OUT="$RUN/llb" REBUCK2_LLB_N="$BUILDS" \
   cargo test --quiet --bin rebuck2 write_fanout_llb -- --ignored >/dev/null)
@@ -205,8 +230,15 @@ for round in $(seq 1 "$ROUNDS"); do
     # came back, and a distributed buildkit that returns the wrong bytes is
     # worse than a slow one. The exported tree is what gets hashed below.
     rm -rf "$RUN/out-$n"
-    bctl --addr "$addr" build --no-cache \
-      --output "type=local,dest=$RUN/out-$n" <"$f" >"$RUN/build-$n.log" 2>&1 &
+    if [ -n "$DOCKERFILE" ]; then
+      bctl --addr "$addr" build --no-cache \
+        --frontend dockerfile.v0 \
+        --local "context=$RUN/ctx/$n" --local "dockerfile=$RUN/ctx/$n" \
+        --output "type=local,dest=$RUN/out-$n" >"$RUN/build-$n.log" 2>&1 &
+    else
+      bctl --addr "$addr" build --no-cache \
+        --output "type=local,dest=$RUN/out-$n" <"$f" >"$RUN/build-$n.log" 2>&1 &
+    fi
     builds+=($!)
     n=$((n + 1))
   done
@@ -230,7 +262,7 @@ if [ -z "$NOPROXY" ]; then
   # everything with SIGTERM.
   kill -INT "$proxy_pid" 2>/dev/null || true
   sleep 2
-  grep -E '^\[wire\]|^\[proxy\] (adopted|peer|taking)' "$RUN/proxy.log" || true
+  grep -E '^\[wire\]|^\[proxy\] +(adopted|peer|taking|frontend|what)' "$RUN/proxy.log" || true
 fi
 
 # The identity of the result, per build. Written to a file so a proxied run

@@ -406,6 +406,49 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # A Dockerfile build dispatches NOTHING, and cannot
+//!
+//! The claim "any project that speaks buildkit can use this" needed a client
+//! that is not earthbuild and not a hand-written graph. `buildctl build
+//! --frontend dockerfile.v0` is that client, and it dispatches zero percent:
+//!
+//! ```text
+//! solve <id>: NO definition on the wire (frontend="")
+//! gateway solve with no definition: frontend="dockerfile.v0" opts=["no-cache"]
+//! placed {}   routed 0
+//! ```
+//!
+//! This is structural, not a bug to fix. Naming a frontend asks the DAEMON to
+//! resolve it; the daemon runs that frontend as its own gateway client, the
+//! frontend generates LLB against the daemon's internal bridge, and none of it
+//! crosses the proxy. There is no wire to cut because the graph is never on a
+//! wire.
+//!
+//! So the product line is narrower and sharper than "any buildkit client":
+//!
+//! | client                              | dispatches |
+//! | ----------------------------------- | ---------- |
+//! | earthbuild (builds its own graph)   | yes        |
+//! | `buildctl build < graph.llb`        | yes        |
+//! | anything driving the gateway w/ LLB | yes        |
+//! | `--frontend dockerfile.v0`          | no         |
+//! | `docker build` / `buildx`           | no         |
+//!
+//! The rule is not about the tool, it is about WHERE the graph is built: a
+//! client that constructs LLB itself can be distributed, and a client that
+//! asks the daemon to construct it cannot. Making `docker build` work means
+//! running the dockerfile frontend client-side, which is a change to the
+//! client, not to this proxy.
+//!
+//! The proxy now says this rather than reporting "no definition" - a number
+//! that is true and gives the reader nothing to do. Kept as a harness mode
+//! (`DOCKERFILE=1`) so the message stays honest.
+//!
+//! Worth noting what is still untested: every LLB fixture here sources from
+//! `docker-image://`, so `contexts published: 0` in every run, and the
+//! context-publishing path has never actually run. The Dockerfile mode was
+//! meant to exercise it and cannot, for the reason above.
+//!
 //! # Native multi-arch, and why a platform FILTER would have done nothing
 //!
 //! Placement ignored platform entirely, in a system whose stated first job is
@@ -1805,6 +1848,32 @@ impl Proxy {
 /// What the gateway's Solve offers a dispatcher. THIS is the graph.
 fn report_gateway(wire: &std::sync::Mutex<Wire>, req: &gw::SolveRequest) {
     let Some(def) = &req.definition else {
+        // Say WHY nothing can be dispatched, not merely that nothing was.
+        // "no definition" is true and useless; a user who points `docker
+        // build` at this proxy and sees an even split of nothing deserves the
+        // reason and the remedy.
+        let mut w = wire.lock().expect("wire");
+        if req.frontend.is_empty() {
+            *w.rejected.entry("no definition".to_owned()).or_default() += 1;
+            return;
+        }
+        let key = format!("frontend runs in the daemon: {}", req.frontend);
+        let first = !w.rejected.contains_key(&key);
+        *w.rejected.entry(key).or_default() += 1;
+        drop(w);
+        if first {
+            println!(
+                "[proxy] frontend {:?} is resolved INSIDE the daemon, so the LLB it \
+                 generates never crosses this proxy and no part of it can be placed \
+                 on a peer.\n\
+                 [proxy]   what dispatches: clients that build the graph themselves \
+                 and send it - earthbuild, `buildctl build < graph.llb`, anything \
+                 driving the gateway with a Definition.\n\
+                 [proxy]   what does not: `--frontend <name>`, because the daemon \
+                 runs that frontend as its own gateway client and never asks us.",
+                req.frontend
+            );
+        }
         return;
     };
     let a = crate::dispatch::analyse(def, MIN_CUT_OPS);
