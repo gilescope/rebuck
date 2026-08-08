@@ -207,16 +207,33 @@ pub async fn mirror_image(
     registry: &str,
     session: &str,
     reference: &str,
+    // Which variant to fetch, as `os/arch`. The mirroring daemon resolves
+    // the reference for THIS platform, not for its own.
+    platform: Option<&str>,
 ) -> anyhow::Result<String> {
     use prost::Message;
     // A one-op graph: fetch it, export it. No exec, so nothing is built -
     // this is a copy with extra steps, and the extra steps are what let the
     // daemon with the credentials do the fetching.
+    //
+    // The platform is not cosmetic. Without it an arm64 daemon mirroring
+    // `alpine:3.20` puts the ARM64 image in the mirror, and an x86 peer
+    // handed that graph pulls it and dies with `exit code: 255` on a binary
+    // it cannot execute. Measured across two real machines; invisible on one.
+    let plat = platform.and_then(|p| {
+        let (os, architecture) = p.split_once('/')?;
+        Some(pb::Platform {
+            os: os.to_owned(),
+            architecture: architecture.to_owned(),
+            ..Default::default()
+        })
+    });
     let src = pb::Op {
         op: Some(pb::op::Op::Source(pb::SourceOp {
             identifier: reference.to_owned(),
             ..Default::default()
         })),
+        platform: plat,
         ..Default::default()
     };
     let src_b = src.encode_to_vec();
@@ -234,7 +251,17 @@ pub async fn mirror_image(
         ..Default::default()
     };
 
-    let tag = &crate::store::sha256_hex(reference.as_bytes())[..32];
+    // The platform is IN THE TAG. Two architectures of one image are two
+    // different blobs, and a tag that named only the reference would have the
+    // second overwrite the first - or worse, be reused by a peer of the wrong
+    // architecture and fail as described above.
+    let tag = format!(
+        "{}{}",
+        &crate::store::sha256_hex(reference.as_bytes())[..32],
+        platform
+            .map(|p| format!("-{}", p.replace('/', "-")))
+            .unwrap_or_default()
+    );
     let name = format!("{registry}/rebuck2/base:{tag}");
     let mut attrs = HashMap::new();
     attrs.insert("name".to_owned(), name.clone());

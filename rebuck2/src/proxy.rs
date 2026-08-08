@@ -406,6 +406,39 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # It is faster on two machines: 24s -> 18s
+//!
+//! The measurement this whole thing existed to make, and which one host could
+//! never produce. Twenty-four CPU-bound builds against sixteen local cores,
+//! then the same twenty-four with a 32-core x86 box across the LAN:
+//!
+//! ```text
+//! one machine  : wall 24s
+//! two machines : wall 18s   placed {home: 12, peer1: 12}
+//! outputs identical to the single-machine baseline
+//! ```
+//!
+//! Twelve builds executed on another physical machine, across an
+//! ARCHITECTURE boundary, and every byte came back the same.
+//!
+//! 1.33x rather than 2x, and the reasons are known rather than guessed: each
+//! dispatched build pays a push and a pull over the LAN, twenty-four builds
+//! on sixteen cores is only mildly oversubscribed, and a flat 50/50 split
+//! ignores that the peer has twice the cores and adds latency. Capacity-aware
+//! placement is the next thing worth measuring, and it is now measurable.
+//!
+//! What made it work is that base images are mirrored FOR THE PEER
+//! (`solve::mirror_image`'s `platform`, and the architecture in the tag).
+//! Before that the mirror held whatever this host resolved, and the previous
+//! section is the record of the x86 peer dying on an arm64 binary.
+//!
+//! One bug in the middle, of a shape worth naming: the mirror wrote under the
+//! key `base:linux/amd64` and the rewrite read under `base`. The image was
+//! copied correctly, the lookup found nothing, the graph kept naming
+//! docker.io, and the solve was then refused as "base unmirrored" - the log
+//! printing `base ... mirrored as ...` and `base unmirrored` one after the
+//! other. A success and a failure that never meet.
+//!
 //! # A SECOND MACHINE, and what it refuted
 //!
 //! Everything above ran several daemons on one host, which can measure
@@ -945,11 +978,15 @@ impl Proxy {
         // pulling. Fail-open recovered every build, so the only cost was time
         // and a frightening log line.
         //
-        // Until the mirror carries a manifest LIST, the honest reading of an
-        // unpinned graph is "pinned to whatever peer 0 resolved it as".
+        // That was true while the mirror held one architecture, and it is not
+        // true now: the base is mirrored FOR THE PEER (`make_portable`'s
+        // `target`), so an unpinned graph is native on every peer - each
+        // builds for itself against a base fetched for itself. The fallback
+        // to peer 0's architecture stays deleted rather than commented out;
+        // the reason it existed is gone.
         let pinned = match want {
             crate::dispatch::Platform::Pinned(p) => Some(p.clone()),
-            crate::dispatch::Platform::Any => self.peers[0].platforms.first().cloned(),
+            crate::dispatch::Platform::Any => None,
             crate::dispatch::Platform::Conflict(_) => None,
         };
         let native: Vec<bool> = match &pinned {
@@ -1831,6 +1868,9 @@ impl Proxy {
         def: &bollard_buildkit_proto::pb::Definition,
         session: &str,
         mirror: &Mirror,
+        // The architecture the graph is going TO. Base images are mirrored
+        // for it, not for ours - see `solve::mirror_image`.
+        target: Option<&str>,
     ) -> bollard_buildkit_proto::pb::Definition {
         let out = crate::dispatch::rewrite_local_sources(def, &|name| {
             // Not published: leave it alone. The graph stays pinned to peer
@@ -1858,12 +1898,21 @@ impl Proxy {
             }
         }
         for r in refs {
-            let key = ("base".to_owned(), r.clone());
+            // The target architecture is part of the key as well as the tag:
+            // one OnceCell per (image, architecture), or the first peer to
+            // ask would settle the answer for every other architecture.
+            let key = (format!("base:{}", target.unwrap_or("default")), r.clone());
             let cell = self.cell(&key);
             let full = format!("docker-image://{r}");
             cell.get_or_init(|| async {
-                match crate::solve::mirror_image(&mirror.buildkit, &mirror.registry, session, &full)
-                    .await
+                match crate::solve::mirror_image(
+                    &mirror.buildkit,
+                    &mirror.registry,
+                    session,
+                    &full,
+                    target,
+                )
+                .await
                 {
                     Ok(reference) => {
                         println!("[proxy] base {r} mirrored as {reference}");
@@ -1881,8 +1930,14 @@ impl Proxy {
         // The FULL reference, scheme included: the rewrite replaces the
         // identifier wholesale, and buildkit rejects a bare
         // `host:port/name:tag` with "invalid".
+        // The SAME key the mirror wrote under, architecture included. Writing
+        // under `base:linux/amd64` and reading under `base` mirrors the image
+        // correctly, finds nothing, leaves the graph naming docker.io, and
+        // then rejects it as "base unmirrored" - a success and a failure that
+        // never meet, with both printed.
+        let key_ns = format!("base:{}", target.unwrap_or("default"));
         crate::dispatch::rewrite_registry_sources(&out, &|r| {
-            self.resolved(&("base".to_owned(), r.to_owned()))
+            self.resolved(&(key_ns.clone(), r.to_owned()))
         })
     }
 
@@ -2167,7 +2222,10 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                     // a solve that stays home buys nothing at all.
                     let session = self.session_for(&meta);
                     let t = std::time::Instant::now();
-                    let portable = self.make_portable(&def, &session, mirror).await;
+                    let target = self.peers[peer].platforms.first().cloned();
+                    let portable = self
+                        .make_portable(&def, &session, mirror, target.as_deref())
+                        .await;
                     t_portable = t.elapsed().as_millis() as u64;
                     // Portable means EVERY source is something a sessionless
                     // peer can fetch: nothing local, and every image already
