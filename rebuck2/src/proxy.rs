@@ -193,6 +193,15 @@ type Chan = tonic::transport::Channel;
 type Client = control::control_client::ControlClient<Chan>;
 type GwClient = gw::llb_bridge_client::LlbBridgeClient<Chan>;
 
+/// Where a peer can pull content from, and which daemon to ask for it.
+#[derive(Clone)]
+pub struct Mirror {
+    /// Address a PEER would use, e.g. `host.docker.internal:15000`.
+    pub registry: String,
+    /// The upstream daemon, which holds the client's session.
+    pub buildkit: String,
+}
+
 #[derive(Clone)]
 pub struct Proxy {
     /// ONE channel for the whole proxy, cloned per call.
@@ -207,6 +216,16 @@ pub struct Proxy {
     client: Client,
     channel: Chan,
     pub wire: std::sync::Arc<std::sync::Mutex<Wire>>,
+    /// Set to publish build contexts as content. Absent = observe only.
+    pub mirror: Option<Mirror>,
+    /// buildID -> session id.
+    ///
+    /// The two facts arrive on different calls and neither carries both.
+    /// `Control.Solve` has the session in its BODY; the gateway solves that
+    /// follow carry only `buildkit-controlapi-buildid` in their headers. So
+    /// the session has to be remembered from the first and looked up by the
+    /// second - which is also how buildkit itself associates them.
+    sessions: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl Proxy {
@@ -216,6 +235,8 @@ impl Proxy {
             client: control::control_client::ControlClient::new(channel.clone()),
             channel,
             wire: Default::default(),
+            mirror: None,
+            sessions: Default::default(),
         })
     }
 
@@ -271,9 +292,24 @@ impl control::control_server::Control for Proxy {
         &self,
         request: Request<control::SolveRequest>,
     ) -> Result<Response<control::SolveResponse>, Status> {
-        let req = request.into_inner();
+        let (meta, ext, req) = request.into_parts();
         report(&req);
-        self.client().solve(req).await
+
+        // Remember the session against this build, for the gateway solves
+        // that follow. Only this call knows both.
+        // The build id is the `ref` FIELD here, and arrives as the
+        // `buildkit-controlapi-buildid` HEADER on the gateway solves that
+        // follow. Same value, different place - looking for the header on
+        // this call finds nothing.
+        if !req.r#ref.is_empty() && !req.session.is_empty() {
+            self.sessions
+                .lock()
+                .expect("sessions")
+                .insert(req.r#ref.clone(), req.session.clone());
+        }
+        self.client()
+            .solve(Request::from_parts(meta, ext, req))
+            .await
     }
 
     async fn disk_usage(
@@ -442,6 +478,8 @@ pub struct Wire {
     /// if it is the repository it is the coordinator back on the data path.
     pub session_to_daemon: std::sync::atomic::AtomicU64,
     pub session_to_client: std::sync::atomic::AtomicU64,
+    /// Build contexts turned into content a peer can pull.
+    pub contexts_published: u64,
 }
 
 impl Wire {
@@ -539,6 +577,7 @@ impl Wire {
         let down = self
             .session_to_client
             .load(std::sync::atomic::Ordering::Relaxed);
+        println!("[wire] contexts published: {}", self.contexts_published);
         println!(
             "[wire] session bytes  : {} KiB client->daemon, {} KiB daemon->client",
             up / 1024,
@@ -549,6 +588,53 @@ impl Wire {
                 "[wire] NOTE: {resends} solve(s) re-sent a graph already seen - that is the \
                  client driving the API, not shared work."
             );
+        }
+    }
+}
+
+impl Proxy {
+    /// Materialise every `local://` source this graph names.
+    ///
+    /// Best effort by construction: a context we fail to publish leaves that
+    /// subtree undispatchable, which is where it already was. It must never
+    /// fail the build - the client asked for a build, not for dispatch.
+    async fn publish_contexts(
+        &self,
+        mirror: &Mirror,
+        def: &bollard_buildkit_proto::pb::Definition,
+        meta: &tonic::metadata::MetadataMap,
+    ) {
+        use prost::Message;
+        // The session id rides the request headers; without it the daemon
+        // has no filesync to resolve `local://` through.
+        let session = meta
+            .get("buildkit-controlapi-buildid")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|b| self.sessions.lock().expect("sessions").get(b).cloned());
+        let Some(session) = session else {
+            println!("[proxy] gateway solve with no known session - not publishing");
+            return;
+        };
+        let mut names: std::collections::BTreeSet<String> = Default::default();
+        for bytes in &def.def {
+            if let Ok(op) = bollard_buildkit_proto::pb::Op::decode(bytes.as_slice()) {
+                if let Some(bollard_buildkit_proto::pb::op::Op::Source(src)) = &op.op {
+                    if let Some(n) = src.identifier.strip_prefix("local://") {
+                        names.insert(n.to_owned());
+                    }
+                }
+            }
+        }
+        for name in names {
+            match crate::solve::publish_context(&mirror.buildkit, &mirror.registry, &session, &name)
+                .await
+            {
+                Ok(reference) => {
+                    println!("[proxy] context {name:?} published as {reference}");
+                    self.wire.lock().expect("wire").contexts_published += 1;
+                }
+                Err(e) => println!("[proxy] context {name:?} not published: {e:#}"),
+            }
         }
     }
 }
@@ -574,7 +660,11 @@ fn report_gateway(wire: &std::sync::Mutex<Wire>, req: &gw::SolveRequest) {
 /// Serve the Control service on `addr`, forwarding to `upstream`.
 pub async fn serve(addr: std::net::SocketAddr, upstream: String) -> anyhow::Result<()> {
     println!("[proxy] buildkit control on {addr} -> {upstream}");
-    let proxy = Proxy::connect(upstream).await?;
+    let mut proxy = Proxy::connect(upstream.clone()).await?;
+    proxy.mirror = std::env::var("REBUCK2_MIRROR").ok().map(|registry| Mirror {
+        registry,
+        buildkit: upstream,
+    });
     // The characterisation is about the BUILD, so it prints when we are
     // asked to stop rather than per Solve.
     let wire = proxy.wire.clone();
@@ -606,6 +696,13 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
     ) -> Result<Response<gw::SolveResponse>, Status> {
         let (meta, ext, req) = request.into_parts();
         report_gateway(&self.wire, &req);
+        // Publish any build context this graph needs, so the subtree stops
+        // being pinned to the one machine holding the client's disk. The
+        // build itself is untouched and still goes upstream: publishing is
+        // preparation for dispatch, not dispatch.
+        if let (Some(mirror), Some(def)) = (&self.mirror, &req.definition) {
+            self.publish_contexts(mirror, def, &meta).await;
+        }
         self.gw().solve(Request::from_parts(meta, ext, req)).await
     }
 

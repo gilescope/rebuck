@@ -101,6 +101,95 @@ pub async fn connect(
     Ok(control::control_client::ControlClient::connect(addr.to_owned()).await?)
 }
 
+/// Materialise a client's build context as an image a peer can pull.
+///
+/// The context reaches a daemon by filesync over the client's session, and
+/// only that daemon can ask for it. So we do not intercept the bytes - which
+/// would mean demultiplexing a gRPC connection tunnelled inside the session
+/// stream - we ask the daemon that already has the session to hand the
+/// context back to us as content.
+///
+/// The trick is `session`: passing the CLIENT's session id makes the daemon
+/// resolve `local://` through the filesync the client is already serving.
+/// The graph is one source op and a terminal, exported straight to the
+/// mirror.
+///
+/// Principle 9, with the client as the origin: fetch once into the fleet,
+/// then serve peer to peer.
+pub async fn publish_context(
+    bk_addr: &str,
+    registry: &str,
+    session: &str,
+    local_name: &str,
+) -> anyhow::Result<String> {
+    use prost::Message;
+
+    let src = pb::Op {
+        op: Some(pb::op::Op::Source(pb::SourceOp {
+            identifier: format!("local://{local_name}"),
+            attrs: [("local.session".to_owned(), session.to_owned())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let src_b = src.encode_to_vec();
+    let term = pb::Op {
+        inputs: vec![pb::Input {
+            digest: format!("sha256:{}", crate::store::sha256_hex(&src_b)),
+            index: 0,
+        }],
+        ..Default::default()
+    };
+    let def = pb::Definition {
+        metadata: [(
+            format!("sha256:{}", crate::store::sha256_hex(&src_b)),
+            pb::OpMetadata::default(),
+        )]
+        .into_iter()
+        .collect(),
+        def: vec![src_b, term.encode_to_vec()],
+        ..Default::default()
+    };
+
+    // Named by the session, so two concurrent builds do not publish over
+    // each other, and a rebuild of the same context is the same ref.
+    let name = format!("{registry}/rebuck2/context:{session}-{local_name}");
+    let mut attrs = HashMap::new();
+    attrs.insert("name".to_owned(), name.clone());
+    attrs.insert("push".to_owned(), "true".to_owned());
+    attrs.insert("registry.insecure".to_owned(), "true".to_owned());
+
+    let mut c = connect(bk_addr).await?;
+    c.solve(control::SolveRequest {
+        r#ref: format!(
+            "rebuck2-ctx.{}.{}",
+            std::process::id(),
+            SOLVE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ),
+        definition: Some(def),
+        // The client's session, not ours: it is the only one with the files.
+        session: session.to_owned(),
+        // BOTH forms. `exporters` is the current field; older daemons -
+        // earthbuild ships a v0.8.17-era buildkitd - read only
+        // `exporter_deprecated`, IGNORE the plural silently, and return a
+        // successful solve having exported nothing. A push that no-ops
+        // while reporting success is the worst possible failure mode, and
+        // it cost an iteration to find.
+        exporter_deprecated: "image".to_owned(),
+        exporter_attrs_deprecated: attrs.clone(),
+        exporters: vec![control::Exporter {
+            r#type: "image".to_owned(),
+            attrs,
+        }],
+        ..Default::default()
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("publish context: {} {}", e.code(), e.message()))?;
+    Ok(format!("docker-image://{name}"))
+}
+
 /// Build an offered subtree and publish it where a peer can fetch it.
 ///
 /// Returns the ref the requester pulls. Everything here is I/O: the dial,
