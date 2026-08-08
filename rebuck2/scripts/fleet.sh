@@ -106,6 +106,15 @@ trap cleanup EXIT
 
 say() { printf '\n=== %s\n' "$*"; }
 
+# sha256, wherever it lives. macOS ships `shasum`, Linux ships `sha256sum`,
+# and a harness that only runs on the machine it was written on cannot be the
+# thing CI uses to check the claims.
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256() { sha256sum; }
+else
+  sha256() { shasum -a 256; }
+fi
+
 # buildctl, from wherever it can be had. The buildkit image ships it, so a
 # host without it is not a blocker - but `--network host` on Docker Desktop
 # does NOT reach the host's loopback, so borrowed buildctl must dial
@@ -372,8 +381,9 @@ fi
 say "output digests"
 : >"$RUN/digests.txt"
 for i in $(seq 0 $((BUILDS - 1))); do
-  d=$(find "$RUN/out-$i" -type f -exec shasum -a 256 {} + 2>/dev/null |
-    sed "s|$RUN/out-$i||" | sort | shasum -a 256 | cut -d' ' -f1)
+  d=$(find "$RUN/out-$i" -type f -exec sh -c 'for f; do sha256sum "$f" 2>/dev/null \
+    || shasum -a 256 "$f"; done' _ {} + 2>/dev/null |
+    sed "s|$RUN/out-$i||" | sort | sha256 | cut -d' ' -f1)
   echo "build $i: $d" | tee -a "$RUN/digests.txt"
 done
 if [ -n "${EXPECT:-}" ]; then

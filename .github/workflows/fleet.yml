@@ -1,0 +1,72 @@
+name: fleet
+
+# The distributed buildkit, on a real runner.
+#
+# Everything else in CI exercises the buck2 driver line. Nothing touched the
+# fleet until this: every claim in docs/fleet-findings.md rested on someone
+# running scripts/fleet-check.sh by hand, which is the same as not being
+# checked.
+#
+# The suite asserts STRUCTURE - where work was placed, whether the bytes match
+# a one-machine baseline, whether a build survived a peer or the registry
+# being destroyed - and only reports timings. Wall clock on a shared runner
+# says nothing, and a job that fails on a busy machine gets switched off.
+#
+# Local daemons only. The cross-machine numbers need a second box and are not
+# checked here; `REMOTE=` does that when someone has one.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fleet-check:
+    runs-on: ubuntu-latest
+    # Twelve builds against a two-daemon fleet, six scenarios. Generous
+    # because the failure scenarios wait out a bound on purpose.
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: rebuck2
+
+      # binfmt, so the foreign-architecture scenario runs instead of skipping
+      # itself. Without it the suite still passes - it probes and skips - but
+      # it passes having tested one thing fewer, which is the quiet kind of
+      # green this whole project keeps arguing against.
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          platforms: arm64
+
+      - name: fleet check
+        working-directory: rebuck2
+        # WORK is small so the builds are short: this proves placement and
+        # correctness, not throughput, and a runner has too few cores to say
+        # anything about throughput anyway.
+        env:
+          WORK: "20"
+          BUILDS: "12"
+          SLOTS: "8"
+        run: ./scripts/fleet-check.sh
+
+      - name: what the fleet did
+        if: always()
+        # The proxy's own report, kept even when the job fails - `placed` is
+        # the only honest evidence of distribution, and a failure is exactly
+        # when someone wants to read it.
+        run: |
+          for f in "${TMPDIR:-/tmp}"/rebuck2-*/proxy.log; do
+            [ -f "$f" ] || continue
+            echo "=== $f"
+            grep -E '^\[wire\]|^\[proxy\]' "$f" || true
+          done
