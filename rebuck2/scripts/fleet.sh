@@ -224,10 +224,18 @@ root = "/var/lib/buildkit"
 [worker.oci]
   enabled = true
   max-parallelism = 20
+TOML
+# NO_REGISTRY_TRUST=1 leaves this stanza out, which is the single most
+# likely misconfiguration and the one that fails SILENTLY: publishing is
+# insecure per-solve so the mirror fills, pulling is not, so every peer
+# refuses and the build quietly falls back to home.
+if [ -z "${NO_REGISTRY_TRUST:-}" ]; then
+  cat >>"$RUN/buildkitd.toml" <<TOML
 [registry."$MIRROR_HOST:$REG_PORT"]
   http = true
   insecure = true
 TOML
+fi
 
 peers=()
 for i in $(seq 0 $((DAEMONS - 1))); do

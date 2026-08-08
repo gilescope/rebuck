@@ -34,6 +34,13 @@ no() {
 }
 check() { if [ "$2" = "$3" ]; then ok "$1"; else no "$1 (want $3, got $2)"; fi; }
 
+# Presence, not count. Counting occurrences of a message makes an assertion
+# brittle to unrelated output: adding the idle-fleet diagnosis, which quotes
+# the most common rejection reason, turned one "excluded: Secret" line into
+# two and failed a test about something else entirely.
+present() { if echo "$2" | grep -q "$3"; then ok "$1"; else no "$1 (no match for: $3)"; fi; }
+absent() { if echo "$2" | grep -q "$3"; then no "$1 (unexpected: $3)"; else ok "$1"; fi; }
+
 run() {
   # Everything shares one work size and slot count so the expected placement
   # is arithmetic rather than a guess.
@@ -67,18 +74,18 @@ echo
 echo "== two daemons: saturation places the surplus away"
 out=$(run DAEMONS=2 EXPECT="$base/digests.txt")
 echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
-check "outputs identical to baseline" \
-  "$(echo "$out" | grep -c 'outputs identical')" 1
+present "outputs identical to baseline" "$out" 'outputs identical'
 check "home takes exactly its slots" \
   "$(echo "$out" | grep -o '{0: [0-9]*' | grep -o '[0-9]*$')" "$slots"
 check "the rest goes to the peer" "$(placed "$out" 1)" "$((builds - slots))"
+absent "and a healthy fleet says nothing alarming" "$out" 'no solve completed on a peer'
 
 echo
 echo "== a peer destroyed mid-build"
 out=$(run DAEMONS=2 KILL_AFTER=2 EXPECT="$base/digests.txt")
 echo "$out" | grep -E '^wall' | tr -s ' ' | sed 's/^/  /'
 check "every build still finishes" "$(echo "$out" | grep -c '^failed  : 0')" 1
-check "outputs still identical" "$(echo "$out" | grep -c 'outputs identical')" 1
+present "outputs still identical" "$out" 'outputs identical'
 
 echo
 echo "== the registry destroyed mid-build"
@@ -86,8 +93,7 @@ out=$(run DAEMONS=2 KILL_REGISTRY_AFTER=2 EXPECT="$base/digests.txt")
 echo "$out" | grep -E '^wall' | tr -s ' ' | sed 's/^/  /'
 check "every build still finishes" "$(echo "$out" | grep -c '^failed  : 0')" 1
 check "outputs still identical" "$(echo "$out" | grep -c 'outputs identical')" 1
-check "the peer is not blamed for it" \
-  "$(echo "$out" | grep -c 'peer not blamed')" 1
+present "the peer is not blamed for it" "$out" 'peer not blamed'
 
 echo
 echo "== a build context leaves the client's machine"
@@ -100,8 +106,7 @@ out=$(run CONTEXT=1 NOPROXY=1 DAEMONS=1 RUN="$ctxbase")
 check "context baseline succeeds" "$(echo "$out" | grep -c '^failed  : 0')" 1
 out=$(run CONTEXT=1 DAEMONS=2 EXPECT="$ctxbase/digests.txt")
 echo "$out" | grep -E '^wall|contexts published|placed' | tr -s ' ' | sed 's/^/  /'
-check "outputs identical to the context baseline" \
-  "$(echo "$out" | grep -c 'outputs identical')" 1
+present "outputs identical to the context baseline" "$out" 'outputs identical'
 check "every context was published" \
   "$(echo "$out" | grep -o 'contexts published: [0-9]*' | grep -o '[0-9]*$')" \
   "$builds"
@@ -128,8 +133,17 @@ out=$(run SECRET=1 UNRESOLVABLE=1 DAEMONS=2 REBUCK2_SERVE_SECRETS=1)
 echo "$out" | grep -E '^wall|placed|not routed' | tr -s ' ' | sed 's/^/  /'
 check "every build still finishes" "$(echo "$out" | grep -c '^failed  : 0')" 1
 check "nothing is offered to the peer" "$(placed "$out" 1)" ""
-check "and the refusal names the secret" \
-  "$(echo "$out" | grep -c 'excluded: Secret')" 1
+present "and the refusal names the secret" "$out" 'excluded: Secret'
+
+echo
+echo "== a fleet that is silently doing nothing"
+# The failure that reads as success: daemons that will not pull from an HTTP
+# mirror. Every peer refuses, dispatch falls back home, the BUILD SUCCEEDS.
+# The proxy has to say so, because nothing else will.
+out=$(run NO_REGISTRY_TRUST=1 DAEMONS=2)
+check "the build still succeeds" "$(echo "$out" | grep -c '^failed  : 0')" 1
+present "but the proxy says the fleet did nothing" "$out" 'no solve completed on a peer'
+present "and names the likely cause" "$out" 'cannot PULL from the mirror'
 
 echo
 echo "== a graph with a CACHE MOUNT"
@@ -144,8 +158,7 @@ check "excluded while the flag is off" "$(placed "$out" 1)" ""
 out=$(run CACHE=1 DAEMONS=2 REBUCK2_PEER_CACHE_MOUNTS=1 EXPECT="$cachebase/digests.txt")
 echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
 check "the peer takes it with the flag on" "$(placed "$out" 1)" "$((builds - slots))"
-check "and its colder cache changes nothing" \
-  "$(echo "$out" | grep -c 'outputs identical')" 1
+present "and its colder cache changes nothing" "$out" 'outputs identical'
 
 echo
 echo "== a graph with an SSH AGENT mount"
@@ -222,8 +235,7 @@ if [ -n "${REMOTE:-}" ]; then
     EXPECT="$base/digests.txt" "$fleet" 2>&1)
   echo "$out" | grep -E '^wall|placed|proxy\] peer [0-9]' | tr -s ' ' | sed 's/^/  /'
   check "every build finishes" "$(echo "$out" | grep -c '^failed  : 0')" 1
-  check "outputs identical across the network" \
-    "$(echo "$out" | grep -c 'outputs identical')" 1
+  present "outputs identical across the network" "$out" 'outputs identical'
   check "the remote peer took the surplus" "$(placed "$out" 1)" "$((builds - slots))"
 fi
 
