@@ -353,15 +353,25 @@ pub struct Proxy {
     /// per build, not once per gateway solve: it is content-addressed so a
     /// repeat is correct, but it is a full filesync and an image push for
     /// an answer we already have.
-    /// `None` = publication IN FLIGHT, `Some` = done.
+    /// One cell per thing-we-publish, so concurrent solves SHARE the work
+    /// instead of racing or skipping it.
     ///
-    /// The in-flight state is load-bearing. Gateway solves run
-    /// CONCURRENTLY, so a plain "is it there yet" check is check-then-act:
-    /// eleven of twelve solves read an empty map before the first insert
-    /// landed and each did the whole filesync and push again. Claiming the
-    /// key under the same lock is what makes it once.
+    /// This started as a plain map and was wrong twice, in opposite
+    /// directions. First it was check-then-act, so eleven of twelve
+    /// concurrent solves each redid the whole filesync and push. Then
+    /// in-flight entries were SKIPPED, which made it publish once - and
+    /// left every solve that skipped holding a graph that was still
+    /// unportable, so it stayed home. One routed solve out of twelve.
+    ///
+    /// A `OnceCell` per key is the shape that is neither: the first caller
+    /// publishes, the rest AWAIT the same result and then have it.
     published: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<(String, String), Option<String>>>,
+        std::sync::Mutex<
+            std::collections::HashMap<
+                (String, String),
+                std::sync::Arc<tokio::sync::OnceCell<Option<String>>>,
+            >,
+        >,
     >,
     /// Extra daemons this proxy may route work to. Peer 0 is always the
     /// upstream above - the one holding the client's session.
@@ -825,6 +835,28 @@ impl Wire {
 }
 
 impl Proxy {
+    /// The cell for a key, created if absent.
+    fn cell(
+        &self,
+        key: &(String, String),
+    ) -> std::sync::Arc<tokio::sync::OnceCell<Option<String>>> {
+        self.published
+            .lock()
+            .expect("published")
+            .entry(key.clone())
+            .or_default()
+            .clone()
+    }
+
+    /// What a key resolved to, if it has resolved and succeeded.
+    fn resolved(&self, key: &(String, String)) -> Option<String> {
+        self.published
+            .lock()
+            .expect("published")
+            .get(key)
+            .and_then(|c| c.get().cloned().flatten())
+    }
+
     /// The session behind this gateway call, if we learned one.
     fn session_for(&self, meta: &tonic::metadata::MetadataMap) -> String {
         meta.get("buildkit-controlapi-buildid")
@@ -841,15 +873,11 @@ impl Proxy {
         session: &str,
         mirror: &Mirror,
     ) -> bollard_buildkit_proto::pb::Definition {
-        let published = self.published.lock().expect("published").clone();
         let out = crate::dispatch::rewrite_local_sources(def, &|name| {
-            match published.get(&(session.to_owned(), name.to_owned())) {
-                Some(Some(reference)) => Some(reference.clone()),
-                // Not published: leave it alone. The graph stays pinned to
-                // peer 0, which is correct, rather than pointing a peer at
-                // content nobody has.
-                _ => None,
-            }
+            // Not published: leave it alone. The graph stays pinned to peer
+            // 0, which is correct, rather than pointing a peer at content
+            // nobody has.
+            self.resolved(&(session.to_owned(), name.to_owned()))
         });
 
         // And the BASE images. A sessionless peer has no registry auth, so
@@ -872,43 +900,30 @@ impl Proxy {
         }
         for r in refs {
             let key = ("base".to_owned(), r.clone());
-            {
-                let mut map = self.published.lock().expect("published");
-                match map.get(&key) {
-                    Some(Some(_)) => continue,
-                    Some(None) => continue,
-                    None => {
-                        map.insert(key.clone(), None);
+            let cell = self.cell(&key);
+            let full = format!("docker-image://{r}");
+            cell.get_or_init(|| async {
+                match crate::solve::mirror_image(&mirror.buildkit, &mirror.registry, session, &full)
+                    .await
+                {
+                    Ok(reference) => {
+                        println!("[proxy] base {r} mirrored as {reference}");
+                        Some(reference)
+                    }
+                    Err(e) => {
+                        println!("[proxy] base {r} not mirrored: {e:#}");
+                        None
                     }
                 }
-            }
-            let full = format!("docker-image://{r}");
-            match crate::solve::mirror_image(&mirror.buildkit, &mirror.registry, &full).await {
-                Ok(reference) => {
-                    println!("[proxy] base {r} mirrored as {reference}");
-                    self.published
-                        .lock()
-                        .expect("published")
-                        .insert(key, Some(reference));
-                }
-                Err(e) => {
-                    self.published.lock().expect("published").remove(&key);
-                    println!("[proxy] base {r} not mirrored: {e:#}");
-                }
-            }
+            })
+            .await;
         }
 
-        let mirrored = self.published.lock().expect("published").clone();
+        // The FULL reference, scheme included: the rewrite replaces the
+        // identifier wholesale, and buildkit rejects a bare
+        // `host:port/name:tag` with "invalid".
         crate::dispatch::rewrite_registry_sources(&out, &|r| {
-            match mirrored.get(&("base".to_owned(), r.to_owned())) {
-                // The FULL reference, scheme included: the rewrite replaces
-                // the identifier wholesale, and buildkit rejects a bare
-                // `host:port/name:tag` with "invalid". Trimming the scheme
-                // here produced exactly that, on a graph that was otherwise
-                // perfectly portable.
-                Some(Some(reference)) => Some(reference.clone()),
-                _ => None,
-            }
+            self.resolved(&("base".to_owned(), r.to_owned()))
         })
     }
 
@@ -946,37 +961,32 @@ impl Proxy {
         }
         for name in names {
             let key = (session.clone(), name.clone());
-            {
-                let mut map = self.published.lock().expect("published");
-                match map.get(&key) {
-                    Some(Some(had)) => {
-                        println!("[proxy] context {name:?} already published as {had}");
-                        continue;
-                    }
-                    Some(None) => continue, // someone else is doing it
-                    None => {
-                        map.insert(key.clone(), None);
-                    }
-                }
-            }
-            match crate::solve::publish_context(&mirror.buildkit, &mirror.registry, &session, &name)
+            let cell = self.cell(&key);
+            cell.get_or_init(|| async {
+                match crate::solve::publish_context(
+                    &mirror.buildkit,
+                    &mirror.registry,
+                    &session,
+                    &name,
+                )
                 .await
-            {
-                Ok(reference) => {
-                    println!("[proxy] context {name:?} published as {reference}");
-                    self.wire.lock().expect("wire").contexts_published += 1;
-                    self.published
-                        .lock()
-                        .expect("published")
-                        .insert(key, Some(reference));
+                {
+                    Ok(reference) => {
+                        println!("[proxy] context {name:?} published as {reference}");
+                        self.wire.lock().expect("wire").contexts_published += 1;
+                        Some(reference)
+                    }
+                    // Remembered for this build rather than retried per
+                    // solve: eleven solves each re-attempting a publish
+                    // that cannot work is eleven times the wait for the
+                    // same answer.
+                    Err(e) => {
+                        println!("[proxy] context {name:?} not published: {e:#}");
+                        None
+                    }
                 }
-                Err(e) => {
-                    // Release the claim: a failure must not make the
-                    // context permanently unpublishable for this build.
-                    self.published.lock().expect("published").remove(&key);
-                    println!("[proxy] context {name:?} not published: {e:#}");
-                }
-            }
+            })
+            .await;
         }
     }
 }

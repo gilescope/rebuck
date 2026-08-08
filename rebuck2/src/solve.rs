@@ -200,11 +200,12 @@ pub async fn publish_context(
 /// buildkit falls through to the origin and dies there.
 ///
 /// So the base image is copied the same way the context is: by the daemon
-/// that DOES have credentials, once, into the mirror. Principle 9 as
+/// that DOES have the session, once, into the mirror. Principle 9 as
 /// written - the origin registry is a fallback, not a data path.
 pub async fn mirror_image(
     bk_addr: &str,
     registry: &str,
+    session: &str,
     reference: &str,
 ) -> anyhow::Result<String> {
     use prost::Message;
@@ -248,6 +249,13 @@ pub async fn mirror_image(
             SOLVE_SEQ.fetch_add(1, Ordering::Relaxed)
         ),
         definition: Some(def),
+        // The CLIENT's session, for the same reason the context needs it.
+        // Registry auth travels over the session, and buildkit cannot do
+        // even an ANONYMOUS Docker Hub pull without it - the token comes
+        // from the session's auth service. A warm cache hid this once:
+        // the copy succeeded because the image was already local, and
+        // failed the moment it actually had to fetch.
+        session: session.to_owned(),
         exporter_deprecated: "image".to_owned(),
         exporter_attrs_deprecated: attrs.clone(),
         exporters: vec![control::Exporter {
