@@ -136,6 +136,37 @@ privilege is a trust decision, and no session service makes a peer's
 The last two are opt-in experiments that did not work, kept with their
 measurements rather than deleted, so nobody re-derives them.
 
+## The mirror grows and nothing prunes it
+
+Known gap, stated plainly because the failure arrives weeks after the
+decision to run this.
+
+The mirror keeps one copy of each base image per architecture, plus **every
+adopted result, forever**. Measured: six small dispatched builds left 7 tags
+and 4.1MB, most of it the one shared alpine base. The per-build cost is the
+exported result, so a fleet doing a hundred real builds a day accumulates at
+whatever those results weigh.
+
+There is no gc, no size cap and no expiry. When the disk fills, pushes fail,
+peers refuse, and the fleet goes idle - the report will say it did no
+distributed work, but it will blame the peer rather than the disk.
+
+Until that is fixed, treat the store as something you watch:
+
+```sh
+du -sh <the --store path>
+```
+
+and delete it when convenient. Losing it costs nothing but re-mirroring: the
+content is a cache, and every tag in it is derivable from a graph someone
+still has.
+
+Not fixed in this pass on purpose. Evicting blobs correctly means walking
+tags to manifests to blobs and removing only what nothing references; doing
+it approximately means a mirror that serves images with missing layers,
+which is silent corruption and the one failure this design works hardest to
+avoid.
+
 ## Reading the report
 
 `SIGINT` the proxy and it prints what the build looked like. The line that
