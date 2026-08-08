@@ -406,6 +406,40 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # The exogenous signal exists, and it is the wrong signal
+//!
+//! Every timing that could rank peers was endogenous - load a peer and its
+//! service time rises, which is what made the feedback controller chase
+//! itself. One measurement is not: a peer's duration sampled while it holds
+//! NOTHING ELSE. Placement cannot move that by deciding differently.
+//!
+//! It works, and it says the peers are the same:
+//!
+//! ```text
+//! peer solo ms: {1: 9088, 2: 9055}
+//!   peer 1  a second daemon on THIS machine
+//!   peer 2  the remote 32-core box
+//! ```
+//!
+//! And the fleet says they are not. At identical placement, the same two
+//! peers gave 22s and 16s. The difference is CO-LOCATION: peer 1 competes
+//! with home's sixteen builds for the same sixteen cores, peer 2 does not.
+//! Uncontended speed cannot see that, because uncontended is exactly the
+//! condition under which it does not happen.
+//!
+//! So the only clean signal available measures the wrong property. What
+//! distinguishes peers here is capacity under load, and capacity under load
+//! is endogenous by nature - it exists only when something is loading it.
+//! That is a fact about the problem rather than a gap in the implementation,
+//! and it is why the saturation gate, which needs no peer ranking at all,
+//! has outperformed every attempt to rank them.
+//!
+//! The sampler is kept because it cost little and disproved something. It
+//! also needed its own bug fixed first: the "still alone at the end" check
+//! read the counter AFTER giving the slot back, so it asked whether the peer
+//! was empty - always true - and recorded nothing from two builds that were
+//! genuinely alone. `fetch_sub` returns the previous value; use that.
+//!
 //! # What a dispatch actually costs: 0.1s, plus one base image
 //!
 //! Three iterations blamed three different things for the cost of shipping a
@@ -1424,6 +1458,20 @@ pub struct Proxy {
     /// What completed adoptions have cost, in ms. The basis for calling one
     /// slow - see `hedge_after`.
     adopted_ms: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    /// Per-peer durations sampled ONLY while that peer held nothing else.
+    ///
+    /// The exogenous signal. Every other timing here is moved by the thing it
+    /// is meant to inform - load a peer and its service time rises, which is
+    /// what made the feedback controller chase itself. An uncontended sample
+    /// is not: it says how fast this machine is on one build, and placement
+    /// cannot change that by deciding differently.
+    ///
+    /// It measures SPEED, not capacity. A 32-core box and a 4-core box can
+    /// agree on one build and differ wildly on eight. Worth having anyway:
+    /// measured with no contention at all, the remote peer built in 8.8s
+    /// against this machine's 10s, so on this pair speed is the thing that
+    /// turned out to matter.
+    solo_ms: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<usize, Vec<u64>>>>,
     /// How many times each peer has been taken back from, indexed by peer.
     ///
     /// Never reset. Within one proxy's life a machine that was four times
@@ -1453,6 +1501,7 @@ impl Proxy {
             published: Default::default(),
             peers: Default::default(),
             adopted_ms: Default::default(),
+            solo_ms: Default::default(),
             outstanding: Default::default(),
             strikes: Default::default(),
             went: Default::default(),
@@ -2930,9 +2979,25 @@ pub async fn serve(
     // The characterisation is about the BUILD, so it prints when we are
     // asked to stop rather than per Solve.
     let wire = proxy.wire.clone();
+    let solo = proxy.solo_ms.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         wire.lock().expect("wire").report();
+        let solo = solo.lock().expect("solo_ms");
+        let medians: std::collections::BTreeMap<usize, u64> = solo
+            .iter()
+            .map(|(p, v)| {
+                let mut v = v.clone();
+                v.sort_unstable();
+                (*p, v[v.len() / 2])
+            })
+            .collect();
+        println!(
+            "[wire] peer solo ms   : {medians:?} (uncontended, n={:?})",
+            solo.iter()
+                .map(|(p, v)| (*p, v.len()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        );
         std::process::exit(0);
     });
     tonic::transport::Server::builder()
@@ -3228,18 +3293,43 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         // Held across the await, so the count is exact -
                         // this is the whole reason `least_loaded` can be
                         // trusted where peer 0's occupancy cannot.
-                        self.outstanding[peer].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // `fetch_add` returns the PREVIOUS value, so zero
+                        // means this adoption has the peer to itself and its
+                        // duration is a clean speed sample.
+                        let alone = self.outstanding[peer]
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            == 0;
                         let t = std::time::Instant::now();
                         let r = self
                             .adopt_or_take_back(peer, &addr, &mirror.registry, &portable, t)
                             .await;
                         t_adopt = t.elapsed().as_millis() as u64;
-                        self.outstanding[peer].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        // Read the count BEFORE giving the slot back.
+                        // `fetch_sub` returns the previous value, so 1 means
+                        // this adoption was still the only one - checking
+                        // after the decrement asked whether the peer was
+                        // empty, which it always is, and produced no samples
+                        // at all from two builds that were genuinely alone.
+                        let still_alone = self.outstanding[peer]
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
+                            == 1;
                         // Only a COMPLETED adoption tells us what normal
                         // costs. Recording a take-back would fold our own
                         // impatience into the threshold that produced it.
                         if matches!(r, Adoption::Done(_)) {
                             self.adopted_ms.lock().expect("adopted_ms").push(t_adopt);
+                            // Still alone at the END as well as the start:
+                            // a second adoption arriving mid-build makes the
+                            // sample contended, and a contended sample is the
+                            // endogenous number this exists to avoid.
+                            if alone && still_alone {
+                                self.solo_ms
+                                    .lock()
+                                    .expect("solo_ms")
+                                    .entry(peer)
+                                    .or_default()
+                                    .push(t_adopt);
+                            }
                         }
                         r
                     } else {
