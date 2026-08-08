@@ -307,7 +307,12 @@ mod tests {
         let worker_root = tempfile::tempdir().unwrap().keep();
         let driver_root = tempfile::tempdir().unwrap().keep();
         let worker_store = Arc::new(Store::new(worker_root.clone()).unwrap());
-        let driver_store = Arc::new(Store::new(driver_root.clone()).unwrap());
+        // Constructed, not merely named: `Store::new` creates cas/, so the
+        // emptiness assertion below is about a store that EXISTS and holds
+        // nothing. Against a path that was never created, dir_bytes would
+        // return 0 and the test would pass vacuously.
+        let _driver_store = Arc::new(Store::new(driver_root.clone()).unwrap());
+        assert!(driver_root.join("cas").is_dir());
 
         // 0.0.0.0 so the daemon, which is in a container, can reach it.
         let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();

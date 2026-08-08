@@ -264,6 +264,18 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
         };
         let (job, action) = match msg {
             D2W::Run { job, action } => (job, action),
+            // Answers to a subtree WE offered. Both are terminal, and both
+            // are normal: a peer built it and named where, or nobody took
+            // it and we build it ourselves - which is what we would have
+            // done without dispatch at all.
+            D2W::Placed { job, image_ref } => {
+                println!("[worker] subtree {job} placed, pull from {image_ref}");
+                continue;
+            }
+            D2W::Unplaced { job, why } => {
+                println!("[worker] subtree {job} unplaced ({why}) - building it here");
+                continue;
+            }
             // An OFFER. Every refusal below is the protocol working, not a
             // failure: the requester builds it itself, exactly as it would
             // have without dispatch. Fail open, never fail wrong.

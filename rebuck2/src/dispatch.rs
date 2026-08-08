@@ -301,6 +301,60 @@ pub fn offer_order(v: &Verdict, cands: &[Candidate]) -> Vec<u64> {
     able.into_iter().map(|c| c.id).collect()
 }
 
+/// One offered subtree, tracked through the fleet until someone takes it.
+///
+/// The driver ARBITRATES: it offers to one peer at a time, in
+/// [`offer_order`], and moves on when refused. It never assigns, and it
+/// never broadcasts - two peers building the same subtree is the duplicate
+/// work the fleet exists to avoid, and principle 3 would then have to throw
+/// one result away.
+///
+/// Exhausting the candidates is not a failure. It means the requester
+/// builds it itself, which is what it would have done without dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Placement {
+    order: Vec<u64>,
+    next: usize,
+    /// Who is currently holding the offer, if anyone.
+    outstanding: Option<u64>,
+}
+
+impl Placement {
+    pub fn new(v: &Verdict, cands: &[Candidate]) -> Self {
+        Placement {
+            order: offer_order(v, cands),
+            next: 0,
+            outstanding: None,
+        }
+    }
+
+    /// Offer to the next peer. `None` = nobody left; build it yourself.
+    pub fn offer(&mut self) -> Option<u64> {
+        let who = self.order.get(self.next).copied();
+        self.next += 1;
+        self.outstanding = who;
+        who
+    }
+
+    /// That peer said no. Returns the next to try, if any.
+    ///
+    /// Ignores a reply from anyone who is not the current holder. Replies
+    /// race: a stale decline from a peer we already gave up on would
+    /// otherwise skip the one currently holding the offer, leaving the
+    /// subtree placed nowhere while we believe it placed.
+    pub fn declined(&mut self, who: u64) -> Option<u64> {
+        if self.outstanding != Some(who) {
+            return self.outstanding;
+        }
+        self.offer()
+    }
+
+    /// Is an offer currently outstanding with someone?
+    pub fn outstanding(&self) -> Option<u64> {
+        self.outstanding
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,6 +681,80 @@ mod tests {
             ],
         );
         assert_eq!(got, vec![2, 9]);
+    }
+
+    #[test]
+    fn a_subtree_is_offered_to_one_peer_at_a_time() {
+        let c = |id, l: Load| Candidate {
+            id,
+            platform: "linux/arm64".into(),
+            load: l,
+        };
+        let v = ok_verdict();
+        let mut p = Placement::new(
+            &v,
+            &[
+                c(1, load(4, 2, 0)),
+                c(2, load(4, 0, 0)),
+                c(3, load(4, 1, 0)),
+            ],
+        );
+
+        // Emptiest first, and ONE at a time. Broadcasting would have two
+        // peers build the same subtree - the duplicate work the fleet
+        // exists to avoid, and principle 3 would throw one result away.
+        assert_eq!(p.offer(), Some(2));
+        assert_eq!(p.outstanding(), Some(2));
+
+        // A refusal moves to the next, and the refuser is not asked again.
+        assert_eq!(p.declined(2), Some(3));
+        assert_eq!(p.outstanding(), Some(3));
+        assert_eq!(p.declined(3), Some(1));
+        assert_eq!(p.declined(1), None, "nobody left");
+        assert_eq!(p.outstanding(), None);
+
+        // Exhausted is not a failure: the requester builds it, which is
+        // what it would have done without dispatch at all.
+        assert_eq!(p.offer(), None, "and it stays exhausted");
+    }
+
+    #[test]
+    fn a_decline_from_someone_else_does_not_move_us_on() {
+        // Replies race. A stale decline from a peer we already gave up on
+        // must not skip the peer currently holding the offer - that would
+        // leave the subtree placed nowhere while we believe it is placed.
+        let c = |id| Candidate {
+            id,
+            platform: "linux/arm64".into(),
+            load: load(4, 0, 0),
+        };
+        let mut p = Placement::new(&ok_verdict(), &[c(1), c(2), c(3)]);
+        assert_eq!(p.offer(), Some(1));
+        assert_eq!(p.declined(1), Some(2));
+
+        // 1 declining again, or a reply arriving late, changes nothing.
+        assert_eq!(p.declined(1), Some(2));
+        assert_eq!(p.outstanding(), Some(2), "2 still holds it");
+        assert_eq!(p.declined(99), Some(2), "a stranger cannot move us on");
+    }
+
+    #[test]
+    fn an_unplaceable_subtree_is_offered_to_nobody() {
+        let c = |id| Candidate {
+            id,
+            platform: "linux/arm64".into(),
+            load: load(8, 0, 0),
+        };
+        // Undispatchable: no fleet, however idle, may be offered it.
+        let bad = inspect(&def(vec![with_exec(plain(), |e| {
+            e.mounts = vec![mount(pb::MountType::Cache)]
+        })]));
+        let mut p = Placement::new(&bad, &[c(1), c(2)]);
+        assert_eq!(p.offer(), None);
+
+        // An empty fleet is the same answer by a different route.
+        let mut p = Placement::new(&ok_verdict(), &[]);
+        assert_eq!(p.offer(), None);
     }
 
     #[test]

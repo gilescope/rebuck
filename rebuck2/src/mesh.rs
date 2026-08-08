@@ -152,6 +152,13 @@ pub enum W2D {
         job: u64,
         image_ref: String,
     },
+    /// "Place this for me." A worker that has subdivided its tree asks the
+    /// driver to find a peer for one branch. The driver arbitrates; the
+    /// subtree and its result never pass through it.
+    Offer {
+        subtree: Vec<u8>,
+        frontier: Vec<Dig>,
+    },
 }
 
 /// Driver → worker, on the control stream.
@@ -199,6 +206,18 @@ pub enum D2W {
         job: u64,
         subtree: Vec<u8>,
         frontier: Vec<Dig>,
+    },
+    /// Your offered subtree was built by a peer; pull it from there.
+    Placed {
+        job: u64,
+        image_ref: String,
+    },
+    /// Nobody took it. Build it yourself - which is what you would have
+    /// done without dispatch, so this is the normal ending and not an
+    /// error. `why` is for the log, not for a decision.
+    Unplaced {
+        job: u64,
+        why: String,
     },
 }
 

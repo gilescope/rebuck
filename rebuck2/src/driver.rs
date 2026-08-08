@@ -275,12 +275,23 @@ const MAX_ATTEMPTS: u32 = 3;
 /// second worker — otherwise every action in a small build runs twice.
 const SPECULATE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// One subtree in flight: who wants it, what it is, and how far down the
+/// candidate list we have got.
+struct Subtree {
+    requester: u64,
+    subtree: Vec<u8>,
+    frontier: Vec<Dig>,
+    placement: crate::dispatch::Placement,
+}
+
 pub struct Driver {
     pub store: Arc<Store>,
     /// Cross-machine single-flight. One per driver: it is the fleet's single
     /// coordinator, so there is no consensus problem to solve, only a
     /// liveness one.
     leases: crate::lease::Leases,
+    /// Subtrees offered by one worker and being placed with another.
+    subtrees: Mutex<std::collections::HashMap<u64, Subtree>>,
     cfg: DriverCfg,
     jobs: Mutex<HashMap<u64, Job>>,
     workers: Mutex<Vec<WorkerConn>>,
@@ -354,6 +365,7 @@ impl Driver {
             .unwrap_or(4);
         Arc::new(Self {
             leases: crate::lease::Leases::default(),
+            subtrees: Mutex::new(std::collections::HashMap::new()),
             store,
             cfg,
             jobs: Mutex::new(HashMap::new()),
@@ -612,18 +624,27 @@ impl Driver {
                     return Ok(()); // clean disconnect
                 };
                 match msg {
+                    // A worker has subdivided and wants a peer for a branch.
+                    // We arbitrate and carry nothing: the subtree bytes go
+                    // straight back out in a Lead, and the result never
+                    // comes near this machine.
+                    W2D::Offer { subtree, frontier } => {
+                        self.place_subtree(worker_id, subtree, frontier).await;
+                    }
                     // The subtree built somewhere else and is fetchable from
                     // the builder's mirror. The driver is told WHERE, and
                     // holds no bytes: principle 6, and the test for it is
                     // to look at this machine's disk afterwards.
                     W2D::Led { job, image_ref } => {
                         println!("[driver] subtree job {job} built at {image_ref}");
+                        self.subtree_built(job, image_ref).await;
                     }
                     // Refusal is not a failure - it is how the driver learns
                     // the fleet is saturated without asking (principle 12).
                     // The job stays ours to place elsewhere or build here.
                     W2D::Decline { job, why } => {
                         println!("[driver] worker declined subtree job {job}: {why}");
+                        self.subtree_declined(job, worker_id, &why).await;
                     }
                     W2D::Done {
                         job,
@@ -1252,6 +1273,135 @@ impl Driver {
             return self.store.get(d).await;
         }
         Ok(None)
+    }
+
+    /// Arbitrate one offered subtree: choose a peer, offer, and remember
+    /// who is holding it so a decline can move on.
+    ///
+    /// The driver carries NOTHING. The subtree bytes it received go
+    /// straight back out in the `Lead`, and the result travels from the
+    /// builder's mirror to the requester without touching this machine.
+    /// That is principle 6, and the test for it is to look at this
+    /// machine's disk after a dispatched build.
+    async fn place_subtree(self: &Arc<Self>, requester: u64, subtree: Vec<u8>, frontier: Vec<Dig>) {
+        use prost::Message;
+
+        let job = self.next_job.fetch_add(1, Ordering::Relaxed);
+        let Ok(def) = bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice()) else {
+            self.tell(
+                requester,
+                D2W::Unplaced {
+                    job,
+                    why: "subtree is not a buildkit Definition".into(),
+                },
+            )
+            .await;
+            return;
+        };
+        let verdict = crate::dispatch::inspect(&def);
+
+        let candidates: Vec<crate::dispatch::Candidate> = {
+            let ws = self.workers.lock().await;
+            ws.iter()
+                // Never offer a worker its own subtree back. It asked us
+                // precisely because it is blocked on this branch.
+                .filter(|w| w.id != requester)
+                .map(|w| crate::dispatch::Candidate {
+                    id: w.id,
+                    platform: format!("{}/{}", w.os, w.arch),
+                    load: crate::dispatch::Load {
+                        slots: w.slots as usize,
+                        peer: 0,
+                        driver: w.inflight.load(Ordering::Relaxed) as usize,
+                    },
+                })
+                .collect()
+        };
+
+        let mut placement = crate::dispatch::Placement::new(&verdict, &candidates);
+        let Some(first) = placement.offer() else {
+            self.tell(
+                requester,
+                D2W::Unplaced {
+                    job,
+                    why: "no peer can take it".into(),
+                },
+            )
+            .await;
+            return;
+        };
+        self.subtrees.lock().await.insert(
+            job,
+            Subtree {
+                requester,
+                subtree: subtree.clone(),
+                frontier: frontier.clone(),
+                placement,
+            },
+        );
+        self.tell(
+            first,
+            D2W::Lead {
+                job,
+                subtree,
+                frontier,
+            },
+        )
+        .await;
+    }
+
+    /// Send one frame to one worker, if it is still connected. A worker
+    /// that has gone costs us the offer, not the build.
+    async fn tell(self: &Arc<Self>, worker: u64, msg: D2W) {
+        let ws = self.workers.lock().await;
+        if let Some(w) = ws.iter().find(|w| w.id == worker) {
+            let _ = w.tx.send(msg);
+        }
+    }
+
+    /// A peer refused an offered subtree: try the next, or hand it back.
+    async fn subtree_declined(self: &Arc<Self>, job: u64, who: u64, why: &str) {
+        let (requester, next, subtree, frontier) = {
+            let mut map = self.subtrees.lock().await;
+            let Some(st) = map.get_mut(&job) else { return };
+            let next = st.placement.declined(who);
+            (st.requester, next, st.subtree.clone(), st.frontier.clone())
+        };
+        match next {
+            Some(peer) if peer != who => {
+                self.tell(
+                    peer,
+                    D2W::Lead {
+                        job,
+                        subtree,
+                        frontier,
+                    },
+                )
+                .await;
+            }
+            Some(_) => {}
+            None => {
+                self.subtrees.lock().await.remove(&job);
+                self.tell(
+                    requester,
+                    D2W::Unplaced {
+                        job,
+                        why: why.to_owned(),
+                    },
+                )
+                .await;
+            }
+        }
+    }
+
+    /// A peer built it. Tell the requester where, and forget the placement -
+    /// the two of them settle the bytes between themselves.
+    async fn subtree_built(self: &Arc<Self>, job: u64, image_ref: String) {
+        let Some(st) = self.subtrees.lock().await.remove(&job) else {
+            return;
+        };
+        self.tell(st.requester, D2W::Placed { job, image_ref })
+            .await;
     }
 
     /// A driver with a throwaway store, for tests that need one to hang a
