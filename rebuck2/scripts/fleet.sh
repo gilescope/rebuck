@@ -66,6 +66,10 @@ CONTEXT=${CONTEXT:-}
 REMOTE=${REMOTE:-}
 MIRROR_HOST=${MIRROR_HOST:-host.docker.internal}
 REMOTE_PORT=${REMOTE_PORT:-18400}
+# How many daemons to start on the remote host. More than one gives
+# `least_loaded` an actual choice between away peers - with a single one it is
+# trivially the answer and its ranking has never been exercised for real.
+REMOTE_DAEMONS=${REMOTE_DAEMONS:-1}
 # The remote's share, relative to this machine. Buildkit does not report core
 # counts, so somebody has to say. 2 means "twice the turns".
 REMOTE_WEIGHT=${REMOTE_WEIGHT:-1}
@@ -90,7 +94,9 @@ cleanup() {
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
   for c in "${containers[@]}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
   if [ -n "${REMOTE:-}" ]; then
-    SSH_AUTH_SOCK="" ssh "$REMOTE" "docker rm -f rebuck2-fleet-remote" >/dev/null 2>&1 || true
+    SSH_AUTH_SOCK="" ssh "$REMOTE" \
+      "docker ps -aq --filter name=rebuck2-fleet-remote | xargs -r docker rm -f" \
+      >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
@@ -227,19 +233,22 @@ for i in $(seq 0 $((DAEMONS - 1))); do
 done
 
 if [ -n "$REMOTE" ]; then
-  say "remote daemon on $REMOTE:$REMOTE_PORT"
   # SSH_AUTH_SOCK is cleared because a GPG agent holding the socket refuses
   # ED25519 signing and the connection dies with a misleading auth error.
   scp -q "$RUN/buildkitd.toml" "$REMOTE:/tmp/rebuck2-buildkitd.toml"
-  # shellcheck disable=SC2029  # client-side expansion is intended: the port
-  # and image are this harness's choice, not the remote host's.
-  SSH_AUTH_SOCK="" ssh "$REMOTE" "docker rm -f rebuck2-fleet-remote >/dev/null 2>&1;
-    docker run -d --name rebuck2-fleet-remote --privileged \
-      -p 0.0.0.0:$REMOTE_PORT:8372 \
-      -v /tmp/rebuck2-buildkitd.toml:/etc/buildkit/buildkitd.toml:ro \
-      $IMAGE" >/dev/null
   remote_host=${REMOTE##*@}
-  peers+=(--peer "http://$remote_host:$REMOTE_PORT*$REMOTE_WEIGHT")
+  for r in $(seq 0 $((REMOTE_DAEMONS - 1))); do
+    rport=$((REMOTE_PORT + r))
+    # shellcheck disable=SC2029  # client-side expansion is intended: the port
+    # and image are this harness's choice, not the remote host's.
+    SSH_AUTH_SOCK="" ssh "$REMOTE" "docker rm -f rebuck2-fleet-remote-$r >/dev/null 2>&1;
+      docker run -d --name rebuck2-fleet-remote-$r --privileged \
+        -p 0.0.0.0:$rport:8372 \
+        -v /tmp/rebuck2-buildkitd.toml:/etc/buildkit/buildkitd.toml:ro \
+        $IMAGE" >/dev/null
+    peers+=(--peer "http://$remote_host:$rport*$REMOTE_WEIGHT")
+    say "remote daemon $r on $remote_host:$rport"
+  done
 fi
 
 # Daemons are not ready when `docker run` returns; ListWorkers is the only

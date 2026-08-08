@@ -406,6 +406,37 @@
 //! chosen before the fleet has said what normal is - with nothing observed,
 //! nothing is slow and the wait is unbounded, exactly as before.
 //!
+//! # Three daemons, two hosts
+//!
+//! Every fleet measurement until now had exactly ONE away peer, which means
+//! `least_loaded` was answering a question with one possible answer. A second
+//! daemon on the remote host gives it a real choice:
+//!
+//! ```text
+//! peer 0 upstream            native linux/arm64
+//! peer 1 192.168.1.137:18400 native linux/amd64
+//! peer 2 192.168.1.137:18401 native linux/amd64
+//! placed {home: 16, peer1: 4, peer2: 4}   wall 15s
+//! ```
+//!
+//! Even, which is what it should be for two identical idle peers, and the
+//! failure it rules out is the one that has already happened once at another
+//! level: `min_by_key` keeps the FIRST minimum, so scanning from zero would
+//! have sent all eight to peer 1 and left peer 2 idle. The unit test for that
+//! now has a hardware witness.
+//!
+//! Wall clock across the whole series, same twenty-four builds:
+//!
+//! ```text
+//! no fleet                        24s
+//! + one remote daemon             19s
+//! + a second remote daemon        15s
+//! ```
+//!
+//! Both remote daemons are on the same 32-core box, so this is capacity, not
+//! a third machine. Three separate HOSTS, and anything across a WAN, remain
+//! untested.
+//!
 //! # What was deleted, and what was kept
 //!
 //! Ref affinity is gone. `ref_home`, `home_of`, `gw_of` and `remember`
