@@ -114,24 +114,43 @@
 //! first two were drawn from one toy graph, and the honest lesson is that a
 //! single build shape cannot price a mechanism.
 //!
-//! # The local context is the real obstacle, not the frontier
+//! # The context is carried by whoever proxies the session. Measured.
 //!
-//! Every cut here reports a NON-free frontier, because `COPY shared.txt`
-//! puts a `local://` source in every graph. That matters more for one
-//! mechanism than the other:
+//! Every cut in the fan-out reports a NON-free frontier, because `COPY` puts
+//! a `local://` source in every graph. The question that matters is what
+//! that costs, and it is not a matter of opinion:
 //!
-//! - For subtree dispatch it is fatal to the cheap case: there is no
-//!   free-frontier subtree to hand over.
-//! - For per-Solve routing it is a DATA PATH problem. Route a Solve to
-//!   another daemon and that daemon needs the build context, which only the
-//!   client has, and which reaches it over the session we are proxying.
+//! | build context | session bytes, client -> daemon |
+//! | ------------- | ------------------------------- |
+//! | 16 bytes | 1 KiB |
+//! | 32 MiB | 32,812 KiB |
 //!
-//! The second is a principle 6 tension and should be named rather than
-//! discovered later: the coordinator is supposed to arbitrate and carry
-//! nothing, but the build context has exactly one holder and it is talking
-//! to us. Either we relay it (and are on the data path for context, though
-//! not for layers), or the peer gets its own session to the client, which
-//! the client has no reason to offer.
+//! The context flows over the session, so it flows through the proxy. A
+//! relaying coordinator IS on the data path for context - not for layers,
+//! which still go peer to peer, but for every byte of the repository a
+//! builder needs. With N peers each needing it, N times.
+//!
+//! **This reconciles the mechanism argument, and not in the direction the
+//! previous measurement suggested.** Per-Solve routing looked strong because
+//! a fan-out hands over independent Solves; but every one of those Solves
+//! wanted the context, so routing any of them moves the repository through
+//! the coordinator. The free-frontier requirement built for subtree dispatch
+//! turns out not to be a nicety - it is the ONLY shape that dispatches
+//! without putting the coordinator on the data path, which is to say it is
+//! what principle 6 actually requires.
+//!
+//! So the options are now concrete rather than architectural taste:
+//!
+//! - dispatch only subtrees whose frontier is registry digests (free, §6
+//!   intact, but a `COPY` anywhere in the chain disqualifies it)
+//! - relay the context and accept being on the data path for it
+//! - give the peer its own session to the client, which the client has no
+//!   reason to offer and no protocol to be asked with
+//! - make the context itself content-addressed and fetchable peer to peer,
+//!   which is the mesh's existing job and the only option that both
+//!   dispatches `COPY`-bearing work and keeps §6
+//!
+//! The last one is worth the most and is not built.
 //!
 //! # Pointing earthly at a proxy, which is not obvious
 //!
@@ -351,13 +370,33 @@ impl control::control_server::Control for Proxy {
         &self,
         request: Request<Streaming<control::BytesMessage>>,
     ) -> Result<Response<Self::SessionStream>, Status> {
+        use std::sync::atomic::Ordering;
         let (meta, ext, stream) = request.into_parts();
-        let inbound = stream.filter_map(|m| futures::future::ready(m.ok()));
+        let up = self.wire.clone();
+        let inbound = stream.filter_map(move |m| {
+            if let Ok(msg) = &m {
+                up.lock()
+                    .expect("wire")
+                    .session_to_daemon
+                    .fetch_add(msg.data.len() as u64, Ordering::Relaxed);
+            }
+            futures::future::ready(m.ok())
+        });
         let s = self
             .client()
             .session(Request::from_parts(meta, ext, inbound))
             .await?;
-        Ok(Response::new(Box::pin(s.into_inner())))
+        let down = self.wire.clone();
+        let out = s.into_inner().map(move |m| {
+            if let Ok(msg) = &m {
+                down.lock()
+                    .expect("wire")
+                    .session_to_client
+                    .fetch_add(msg.data.len() as u64, Ordering::Relaxed);
+            }
+            m
+        });
+        Ok(Response::new(Box::pin(out)))
     }
 }
 
@@ -394,6 +433,15 @@ pub struct Wire {
     graph_ids: Vec<String>,
     /// Per solve: how many of its ops were already seen.
     pub overlap_per_solve: Vec<(usize, usize)>,
+    /// Bytes relayed over the SESSION, both ways.
+    ///
+    /// This is the number that decides whether a coordinator can honour
+    /// principle 6. Layers travel peer to peer, but the build CONTEXT has
+    /// exactly one holder - the client - and it reaches a builder over the
+    /// session we are proxying. If that is kilobytes it is a rounding error;
+    /// if it is the repository it is the coordinator back on the data path.
+    pub session_to_daemon: std::sync::atomic::AtomicU64,
+    pub session_to_client: std::sync::atomic::AtomicU64,
 }
 
 impl Wire {
@@ -484,6 +532,17 @@ impl Wire {
         println!(
             "[wire] overlap/solve  : {:?} (already-seen / total)",
             self.overlap_per_solve
+        );
+        let up = self
+            .session_to_daemon
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let down = self
+            .session_to_client
+            .load(std::sync::atomic::Ordering::Relaxed);
+        println!(
+            "[wire] session bytes  : {} KiB client->daemon, {} KiB daemon->client",
+            up / 1024,
+            down / 1024
         );
         if resends > 0 {
             println!(
