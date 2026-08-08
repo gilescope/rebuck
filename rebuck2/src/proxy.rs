@@ -257,6 +257,33 @@
 //! working: an unportable graph is not a dispatch failure, it is a graph
 //! that stays home.
 //!
+//! # What actually limits dispatch here: SECRETS
+//!
+//! With the exclusion check finally wired into placement, the twelve
+//! solves of a real earthly build resolve as:
+//!
+//! ```text
+//! [wire] solves routed : 1 to other daemons
+//! [wire] not routed    : {"considered": 12, "excluded: Secret": 11}
+//! ```
+//!
+//! Eleven carry a SECRET, and principle 10 has always said what that means:
+//! shipping the spec ships the secret reference, so the subtree does not
+//! travel. They were never dispatchable. What was wrong was WHERE they were
+//! refused - offered to a peer, which then failed with "no active sessions"
+//! because a secret needs the session's service, and the error named the
+//! session rather than the secret.
+//!
+//! The check for this was written early and simply never consulted on the
+//! path that places work. Every diagnosis that followed - the fork, the
+//! capability, the mirror, the auth - was chasing an error message that was
+//! true and irrelevant.
+//!
+//! It also says something about the WORKLOAD rather than the mechanism: for
+//! earthly builds, what limits dispatch is not contexts or base images,
+//! both of which are now solved, but how much of the graph touches secrets.
+//! That is worth measuring on a real repo before optimising anything else.
+//!
 //! # The bind a peer is currently in
 //!
 //! Twelve solves are offered and one completes. The other eleven fail on
@@ -1145,20 +1172,35 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         _ => true,
                     }
                 });
-                let movable = local_clear && bases_clear;
+                // The EXCLUSIONS. This check existed from the start -
+                // principle 10's "one cache mount, secret, ssh agent or
+                // privileged exec anywhere grounds the whole subtree" - and
+                // was never wired into the path that places work. Earthly's
+                // execs carry an SSH SOCKET mount, which needs the
+                // session's sshforward service, so every one of those
+                // solves was offered to a peer that could not possibly take
+                // it and refused with "no active sessions".
+                let verdict = crate::dispatch::inspect(&portable);
+                let allowed = verdict.dispatchable();
+                let movable = local_clear && bases_clear && allowed;
                 if !movable {
-                    let why = match (local_clear, bases_clear) {
-                        (false, false) => "context and base unmirrored",
-                        (false, true) => "context unmirrored",
-                        (true, false) => "base unmirrored",
-                        (true, true) => unreachable!(),
+                    let why = match (local_clear, bases_clear, allowed) {
+                        (_, _, false) => verdict
+                            .exclusions
+                            .first()
+                            .map(|(_, e)| format!("excluded: {e:?}"))
+                            .unwrap_or_else(|| "excluded: platform".to_owned()),
+                        (false, false, _) => "context and base unmirrored".to_owned(),
+                        (false, true, _) => "context unmirrored".to_owned(),
+                        (true, false, _) => "base unmirrored".to_owned(),
+                        (true, true, true) => unreachable!(),
                     };
                     *self
                         .wire
                         .lock()
                         .expect("wire")
                         .rejected
-                        .entry(why.to_owned())
+                        .entry(why)
                         .or_default() += 1;
                 }
                 if movable {
@@ -1167,7 +1209,9 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         % (self.peers.len() - 1);
                     let addr = self.peers[peer].addr.clone();
-                    match crate::solve::build_and_publish(&addr, &mirror.registry, portable).await {
+                    match crate::solve::build_and_publish(&addr, &mirror.registry, portable.clone())
+                        .await
+                    {
                         Ok(reference) => {
                             println!("[proxy] adopted from peer {peer}: {reference}");
                             self.wire.lock().expect("wire").routed += 1;
@@ -1176,7 +1220,25 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         // Fail open: build it here, exactly as we would
                         // have without a fleet.
                         Err(e) => {
-                            println!("[proxy] peer {peer} could not take it: {e:#}");
+                            use prost::Message;
+                            let srcs: Vec<String> = portable
+                                .def
+                                .iter()
+                                .filter_map(|b| {
+                                    match bollard_buildkit_proto::pb::Op::decode(b.as_slice())
+                                        .ok()?
+                                        .op?
+                                    {
+                                        bollard_buildkit_proto::pb::op::Op::Source(s) => {
+                                            Some(s.identifier)
+                                        }
+                                        _ => None,
+                                    }
+                                })
+                                .collect();
+                            println!(
+                                "[proxy] peer {peer} could not take it: {e:#} | sources={srcs:?}"
+                            );
                             // Count the FAILURES too. `routed` counts only
                             // successes, so a fleet attempting twelve
                             // adoptions and completing one looked identical

@@ -839,6 +839,108 @@ mod tests {
         .expect("the peer must build from the published context");
     }
 
+    /// Does earthbuild's buildkitd need a session to SOLVE, or only to
+    /// EXPORT? The answer decides whether a peer needs a session server or
+    /// merely a different way to hand its result over.
+    #[tokio::test]
+    #[ignore]
+    async fn probe_sessionless_solve_vs_export() {
+        let mut c = connect("http://127.0.0.1:11237").await.expect("dial");
+        let def = alpine_exec_definition();
+
+        // A graph whose ONLY source is our insecure mirror. If this needs a
+        // session too, then a peer needs one unconditionally and there is
+        // no way round building a session server.
+        let mirror_only = c
+            .solve(control::SolveRequest {
+                r#ref: format!("mirroronly-{}", std::process::id()),
+                definition: Some(crate::dispatch::import_graph(
+                    "docker-image://host.docker.internal:15000/rebuck2/base:9ae21ebe3a0f58f1bd3d7d62b7bbfe17",
+                )),
+                ..Default::default()
+            })
+            .await;
+        println!(
+            "[probe] sessionless solve, MIRROR-ONLY source -> {}",
+            match &mirror_only {
+                Ok(_) => "OK".to_string(),
+                Err(e) => e.message().to_string(),
+            }
+        );
+
+        // Mirror-only source AND a mirror export - exactly what adoption
+        // does, and the only combination not yet tried.
+        let mut ma = std::collections::HashMap::new();
+        ma.insert(
+            "name".to_owned(),
+            "host.docker.internal:15000/rebuck2/probe:m".to_owned(),
+        );
+        ma.insert("push".to_owned(), "true".to_owned());
+        ma.insert("registry.insecure".to_owned(), "true".to_owned());
+        let both = c
+            .solve(control::SolveRequest {
+                r#ref: format!("both-{}", std::process::id()),
+                definition: Some(crate::dispatch::import_graph(
+                    "docker-image://host.docker.internal:15000/rebuck2/base:9ae21ebe3a0f58f1bd3d7d62b7bbfe17",
+                )),
+                exporter_deprecated: "image".to_owned(),
+                exporter_attrs_deprecated: ma.clone(),
+                exporters: vec![control::Exporter { r#type: "image".into(), attrs: ma }],
+                ..Default::default()
+            })
+            .await;
+        println!(
+            "[probe] MIRROR-only + MIRROR export -> {}",
+            match &both {
+                Ok(_) => "OK".to_string(),
+                Err(e) => e.message().to_string(),
+            }
+        );
+
+        let no_export = c
+            .solve(control::SolveRequest {
+                r#ref: format!("noexp-{}", std::process::id()),
+                definition: Some(def.clone()),
+                ..Default::default()
+            })
+            .await;
+        println!(
+            "[probe] sessionless solve, NO exporter -> {}",
+            match &no_export {
+                Ok(_) => "OK".to_string(),
+                Err(e) => e.message().to_string(),
+            }
+        );
+
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert(
+            "name".to_owned(),
+            "host.docker.internal:15000/rebuck2/probe:x".to_owned(),
+        );
+        attrs.insert("push".to_owned(), "true".to_owned());
+        attrs.insert("registry.insecure".to_owned(), "true".to_owned());
+        let with_export = c
+            .solve(control::SolveRequest {
+                r#ref: format!("exp-{}", std::process::id()),
+                definition: Some(def),
+                exporter_deprecated: "image".to_owned(),
+                exporter_attrs_deprecated: attrs.clone(),
+                exporters: vec![control::Exporter {
+                    r#type: "image".into(),
+                    attrs,
+                }],
+                ..Default::default()
+            })
+            .await;
+        println!(
+            "[probe] sessionless solve, WITH exporter -> {}",
+            match &with_export {
+                Ok(_) => "OK".to_string(),
+                Err(e) => e.message().to_string(),
+            }
+        );
+    }
+
     /// Emit a sample LLB Definition in the wire form `buildctl build` reads
     /// on stdin. A fixture generator, not an assertion:
     ///   cargo test --bin rebuck2 write_sample_llb -- --ignored
