@@ -338,7 +338,9 @@ if [ -z "$NOPROXY" ]; then
   # The wire report prints on SIGINT, so ask for it before the trap kills
   # everything with SIGTERM.
   kill -INT "$proxy_pid" 2>/dev/null || true
+  kill -INT "$reg_pid" 2>/dev/null || true
   sleep 2
+  grep -E "^\[registry\] served" "$RUN/registry.log" || true
   grep -E '^\[wire\]|^\[proxy\] +(adopted|peer|taking|frontend|what)' "$RUN/proxy.log" || true
 fi
 

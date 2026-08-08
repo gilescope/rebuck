@@ -435,17 +435,41 @@
 //!          4  {home:  4, 5, 5, 5, 5}       20s
 //! ```
 //!
-//! Home is not the bottleneck; the wire is. Every dispatched build pays a
-//! push and a pull, a local one pays neither, and that cost does not go away
-//! by spreading it over more machines. This is the same result the split
-//! sweep found on two machines, reached independently with four peers.
+//! Home is not the bottleneck. I wrote "the wire is" and that was wrong;
+//! two further measurements refuted it.
+//!
+//! First, what the mirror actually serves. Eight dispatched builds cost 112
+//! requests - fourteen each, all small:
+//!
+//! ```text
+//! {"GET blob": 20, "GET manifest": 10, "HEAD blob": 18, "HEAD manifest": 19,
+//!  "POST upload": 18, "PUT manifest": 9, "PUT upload": 18}
+//! ```
+//!
+//! Fourteen LAN round trips is tens of milliseconds, not the seconds a
+//! dispatch costs. Second, and decisive: a peer on ANOTHER MACHINE beats a
+//! peer on this one, at identical placement and identical mirror traffic.
+//!
+//! ```text
+//! peer is a second local daemon   {home: 16, peer: 8}   22s
+//! peer is the remote box          {home: 16, peer: 8}   16s
+//! ```
+//!
+//! The remote peer pays LAN transfer the local one does not, and still wins,
+//! because a local peer competes for the same sixteen cores while a remote
+//! one adds capacity. Transfer is cheaper than the contention it avoids.
 //!
 //! So the useful size of a fleet is set by HOW MUCH WORK IS WORTH EXPORTING,
-//! not by how many machines are in it - and that in turn is set by transfer
-//! cost against build size. It also retro-justifies the saturation gate,
-//! which lands near the measured optimum for a reason rather than by luck:
-//! exporting only the local surplus is exporting roughly the amount that is
-//! worth exporting.
+//! and what makes exporting cost anything is still not isolated. The
+//! remaining suspect is per-solve machinery rather than bytes - and note that
+//! part of it lands on PEER 0, which imports every dispatched result while
+//! also building sixteen things. That would explain why pushing more work out
+//! made a four-peer fleet slower without any of it being the network.
+//!
+//! The saturation gate still lands near the measured optimum, and now for a
+//! reason that survives the correction: exporting only the local surplus
+//! keeps peer 0's import load proportional to what it was going to be idle
+//! for anyway.
 //!
 //! # Three daemons, two hosts
 //!

@@ -1023,6 +1023,36 @@ pub async fn serve<S: RegistryStore>(addr: SocketAddr, store: Arc<S>) -> Result<
     Ok(())
 }
 
+/// Every request this mirror served, by shape.
+///
+/// A dispatched build's cost turned out to be the wire rather than the
+/// remote CPU - four peers went SLOWER than two once more work was pushed at
+/// them - and "the wire" is not one thing. Round trips and bytes are
+/// different problems with different fixes, and a tally by shape says which
+/// one this is.
+pub static TRAFFIC: std::sync::Mutex<Option<std::collections::BTreeMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+/// Reduce a request to a shape worth counting.
+///
+/// The digest and repository are deliberately dropped: fifty distinct blob
+/// GETs are one fact, not fifty. What matters is how many round trips a
+/// dispatched build costs and what kind they are.
+fn shape(method: &str, path: &str) -> String {
+    let kind = if path.ends_with("/v2/") || path == "/v2" {
+        "ping"
+    } else if path.contains("/blobs/uploads/") {
+        "upload"
+    } else if path.contains("/blobs/") {
+        "blob"
+    } else if path.contains("/manifests/") {
+        "manifest"
+    } else {
+        "other"
+    };
+    format!("{method} {kind}")
+}
+
 pub async fn serve_with_upstream<S: RegistryStore>(
     addr: SocketAddr,
     store: Arc<S>,
@@ -1037,7 +1067,25 @@ pub async fn serve_with_upstream<S: RegistryStore>(
         "[registry] OCI v2 on http://{}{via}",
         listener.local_addr()?
     );
-    axum::serve(listener, router_with_upstream(store, upstream)).await?;
+    *TRAFFIC.lock().expect("traffic") = Some(Default::default());
+    let app = router_with_upstream(store, upstream).layer(axum::middleware::from_fn(
+        |req: axum::extract::Request, next: axum::middleware::Next| async move {
+            let k = shape(req.method().as_str(), req.uri().path());
+            if let Some(m) = TRAFFIC.lock().expect("traffic").as_mut() {
+                *m.entry(k).or_default() += 1;
+            }
+            next.run(req).await
+        },
+    ));
+    tokio::spawn(async {
+        let _ = tokio::signal::ctrl_c().await;
+        if let Some(m) = TRAFFIC.lock().expect("traffic").as_ref() {
+            let total: u64 = m.values().sum();
+            println!("[registry] served {total} requests: {m:?}");
+        }
+        std::process::exit(0);
+    });
+    axum::serve(listener, app).await?;
     Ok(())
 }
 
