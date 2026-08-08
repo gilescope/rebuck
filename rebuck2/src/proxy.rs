@@ -1307,6 +1307,12 @@ pub struct Wire {
     pub contexts_published: u64,
     /// Gateway calls in arrival order.
     pub calls: Vec<String>,
+    /// The last failure from mirroring a base image, verbatim.
+    ///
+    /// A separate field from `last_refusal` because they accuse different
+    /// machines. A peer refusing is the peer's problem; a push that fails is
+    /// OURS, and blaming the peer for it sends the reader to the wrong host.
+    pub last_mirror_error: Option<String>,
     /// The last thing a peer said when it refused, verbatim.
     ///
     /// Kept so the report can DIAGNOSE rather than tally. A fleet that
@@ -1394,6 +1400,27 @@ impl Wire {
             if let Some((why, n)) = self.rejected.iter().max_by_key(|(_, n)| **n) {
                 println!("[wire]   most common reason: {why} (x{n})");
             }
+        }
+        // Our own push failing is a different accusation from a peer
+        // refusing, and the text arrives on a different path.
+        if let Some(m) = &self.last_mirror_error {
+            let storage = [
+                "Permission denied",
+                "No space left",
+                "os error 13",
+                "os error 28",
+            ]
+            .iter()
+            .any(|p| m.contains(p));
+            if storage {
+                println!(
+                    "[wire] LIKELY CAUSE: the MIRROR could not be written to - check its disk\n\
+                     [wire]   and the permissions on its --store path. This is our registry\n\
+                     [wire]   failing, not a peer: {m}"
+                );
+                return;
+            }
+            println!("[wire]   a base image could not be mirrored: {m}");
         }
         let Some(r) = &self.last_refusal else { return };
         if r.contains("server gave HTTP response to HTTPS client") {
@@ -1665,6 +1692,7 @@ impl Proxy {
                     }
                     Err(e) => {
                         println!("[proxy] base {r} not mirrored: {e:#}");
+                        self.wire.lock().expect("wire").last_mirror_error = Some(format!("{e:#}"));
                         None
                     }
                 }

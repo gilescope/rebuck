@@ -495,11 +495,16 @@ async fn handle<S: RegistryStore>(
         let up = match reg.store.upload_begin().await {
             Ok(u) => u,
             Err(e) => {
+                // Logged, not just returned. This is where an unwritable or
+                // full store first refuses, and the client's view of it is a
+                // 500 buried inside a buildkit push error three processes
+                // away. Whoever owns the disk is reading THIS log.
+                eprintln!("[registry] CANNOT STORE (upload_begin): {e}");
                 return err(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "BLOB_UPLOAD_INVALID",
                     &e.to_string(),
-                )
+                );
             }
         };
         let id = reg.next_upload.fetch_add(1, Ordering::Relaxed);
@@ -569,7 +574,23 @@ async fn handle<S: RegistryStore>(
         let n = up.len();
         let got = match reg.store.upload_finish(up, Some(want)).await {
             Ok(h) => h,
-            Err(e) => return err(StatusCode::BAD_REQUEST, "DIGEST_INVALID", &e.to_string()),
+            // A digest mismatch is the CLIENT sending the wrong bytes. Any
+            // other failure - a full disk, an unwritable store - is OURS, and
+            // calling it DIGEST_INVALID sends the operator to inspect content
+            // that was never the problem. Measured: an unwritable store
+            // reported `DIGEST_INVALID: Permission denied (os error 13)`.
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("digest mismatch") {
+                    return err(StatusCode::BAD_REQUEST, "DIGEST_INVALID", &msg);
+                }
+                eprintln!("[registry] CANNOT STORE {want}: {msg}");
+                return err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "BLOB_UPLOAD_INVALID",
+                    &msg,
+                );
+            }
         };
         reg.bw.uploaded.fetch_add(1, Ordering::Relaxed);
         reg.bw.upload_bytes.fetch_add(n, Ordering::Relaxed);

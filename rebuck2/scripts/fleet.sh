@@ -388,11 +388,23 @@ for round in $(seq 1 "$ROUNDS"); do
   walls+=($(($(date +%s) - start)))
 done
 
+# Docker Hub rate limiting looks exactly like a product failure: builds fail,
+# `failed` is non-zero, and the wire report shows a fleet that did nothing.
+# It is neither. Say so before anyone reads the rest.
+if grep -qE "429 Too Many Requests" "$RUN"/build-*.log 2>/dev/null; then
+  echo
+  echo "!! RATE LIMITED by Docker Hub - these results say nothing about the fleet."
+  echo "!! Every run starts fresh daemons that pull the base image; wait, or"
+  echo "!! authenticate, or point IMAGE/the fixture at a local mirror."
+  ratelimited=1
+fi
+
 say "result"
 echo "daemons : $DAEMONS"
 echo "builds  : $BUILDS"
 echo "wall    : ${walls[*]}s (per round)"
 echo "failed  : $fail"
+echo "ratelimited: ${ratelimited:-0}"
 
 if [ -z "$NOPROXY" ]; then
   # The wire report prints on SIGINT, so ask for it before the trap kills
