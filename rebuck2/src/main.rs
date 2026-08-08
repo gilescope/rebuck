@@ -201,7 +201,12 @@ async fn main() -> Result<()> {
             let upstream = args
                 .opt("--upstream")
                 .unwrap_or_else(|| "http://127.0.0.1:1235".into());
-            proxy::serve(listen.parse()?, upstream).await
+            // Repeatable: --peer http://host:port for each extra daemon.
+            let mut peers = Vec::new();
+            while let Some(p) = args.opt("--peer") {
+                peers.push(p);
+            }
+            proxy::serve(listen.parse()?, upstream, peers).await
         }
         "worker" => {
             let store_root: std::path::PathBuf = args

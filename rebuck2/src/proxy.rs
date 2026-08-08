@@ -170,6 +170,39 @@
 //! its fork has. Stock buildkit gets as far as the build and then says
 //! `exporter "earthly" could not be found`.
 //!
+//! # MEASURED: a gateway Solve cannot simply be routed
+//!
+//! Routing gateway Solves to a second daemon gets a long way and then
+//! fails on something structural:
+//!
+//! ```text
+//! NotFound: forwarding Solve: no such job ow8s6ghu1knxv6jox461m0xmk
+//! ```
+//!
+//! The gateway conversation is scoped to a JOB, created by `Control.Solve`
+//! on one daemon. A peer never saw that call, so it has no such job and
+//! cannot accept a gateway Solve under its id. The build id in the header
+//! is not a name we can forward; it is a handle into one daemon's state.
+//!
+//! Two earlier measurements said the same thing from different angles and
+//! this completes them: refs are daemon-local (eleven `read_dir` calls
+//! follow eleven solves), and now jobs are too.
+//!
+//! **So the peer is reached through `Control.Solve`, not the gateway.** The
+//! shape that works is the one the dedup line already had a name for:
+//!
+//! 1. the proxy solves the portable graph on a peer, via its own
+//!    `Control.Solve`, exporting the result to the mirror
+//! 2. the client's gateway Solve is then answered on peer 0 with a graph
+//!    that merely IMPORTS that image
+//! 3. peer 0 fetches content instead of building, and returns a ref that
+//!    belongs to it - so `read_dir` and `return` work unchanged
+//!
+//! That is adoption, not forwarding, and it is what `adoptLeaderResult`
+//! does for the dedup line. The routing code below is kept because
+//! everything except step 2 is right: peers, ref affinity, portability
+//! rewriting and placement all stand.
+//!
 //! # What "transparent" has to mean
 //!
 //! All nine methods, including the streams. `Session` in particular is
@@ -200,6 +233,13 @@ pub struct Mirror {
     pub registry: String,
     /// The upstream daemon, which holds the client's session.
     pub buildkit: String,
+}
+
+/// One upstream daemon.
+#[derive(Clone)]
+pub struct Peer {
+    pub addr: String,
+    channel: Chan,
 }
 
 #[derive(Clone)]
@@ -240,6 +280,18 @@ pub struct Proxy {
     published: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<(String, String), Option<String>>>,
     >,
+    /// Extra daemons this proxy may route work to. Peer 0 is always the
+    /// upstream above - the one holding the client's session.
+    peers: std::sync::Arc<Vec<Peer>>,
+    /// ref -> peer index.
+    ///
+    /// A gateway result is a REF and a ref is daemon-local. Measured on a
+    /// real build: eleven `read_dir` calls follow eleven solves. So whatever
+    /// minted a ref must serve every later call naming it, or the eleventh
+    /// call of a working-looking build fails with "ref not found".
+    ref_home: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    /// Round-robin cursor for placing new solves.
+    next_peer: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Proxy {
@@ -252,6 +304,9 @@ impl Proxy {
             mirror: None,
             sessions: Default::default(),
             published: Default::default(),
+            peers: Default::default(),
+            next_peer: Default::default(),
+            ref_home: Default::default(),
         })
     }
 
@@ -262,6 +317,62 @@ impl Proxy {
     /// The gateway rides the same channel, because the client's does.
     fn gw(&self) -> GwClient {
         gw::llb_bridge_client::LlbBridgeClient::new(self.channel.clone())
+    }
+
+    /// Add daemons to route to. Peer 0 is always this proxy's upstream.
+    pub async fn with_peers(mut self, addrs: &[String]) -> anyhow::Result<Self> {
+        let mut peers = vec![Peer {
+            addr: "upstream".into(),
+            channel: self.channel.clone(),
+        }];
+        for a in addrs {
+            peers.push(Peer {
+                addr: a.clone(),
+                channel: tonic::transport::Endpoint::new(a.clone())?
+                    .connect()
+                    .await?,
+            });
+        }
+        println!("[proxy] {} daemon(s) in the fleet", peers.len());
+        self.peers = std::sync::Arc::new(peers);
+        Ok(self)
+    }
+
+    fn gw_of(&self, i: usize) -> GwClient {
+        match self.peers.get(i) {
+            Some(p) => gw::llb_bridge_client::LlbBridgeClient::new(p.channel.clone()),
+            None => self.gw(),
+        }
+    }
+
+    /// Where a ref lives. Unknown refs go to peer 0, which is where every
+    /// call went before there was a fleet.
+    fn home_of(&self, r: &str) -> usize {
+        self.ref_home
+            .lock()
+            .expect("ref_home")
+            .get(r)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Remember which daemon minted the refs in a result.
+    fn remember(&self, result: &Option<gw::Result>, peer: usize) {
+        let Some(inner) = result.as_ref().and_then(|r| r.result.as_ref()) else {
+            return;
+        };
+        let mut map = self.ref_home.lock().expect("ref_home");
+        match inner {
+            gw::result::Result::Ref(r) => {
+                map.insert(r.id.clone(), peer);
+            }
+            gw::result::Result::Refs(m) => {
+                for r in m.refs.values() {
+                    map.insert(r.id.clone(), peer);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -509,6 +620,8 @@ pub struct Wire {
     pub contexts_published: u64,
     /// Gateway calls in arrival order.
     pub calls: Vec<String>,
+    /// Solves placed on a peer other than the upstream.
+    pub routed: u64,
 }
 
 impl Wire {
@@ -612,6 +725,7 @@ impl Wire {
             *counts.entry(c.as_str()).or_default() += 1;
         }
         println!("[wire] gateway calls  : {counts:?}");
+        println!("[wire] solves routed  : {} to other daemons", self.routed);
         println!("[wire] call order     : {}", self.calls.join(" "));
         println!(
             "[wire] session bytes  : {} KiB client->daemon, {} KiB daemon->client",
@@ -628,6 +742,34 @@ impl Wire {
 }
 
 impl Proxy {
+    /// The session behind this gateway call, if we learned one.
+    fn session_for(&self, meta: &tonic::metadata::MetadataMap) -> String {
+        meta.get("buildkit-controlapi-buildid")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|b| self.sessions.lock().expect("sessions").get(b).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Swap `local://` sources for the contexts we published, so the graph
+    /// depends on content rather than on one machine's disk.
+    fn make_portable(
+        &self,
+        def: &bollard_buildkit_proto::pb::Definition,
+        session: &str,
+        _mirror: &Mirror,
+    ) -> bollard_buildkit_proto::pb::Definition {
+        let published = self.published.lock().expect("published").clone();
+        crate::dispatch::rewrite_local_sources(def, &|name| {
+            match published.get(&(session.to_owned(), name.to_owned())) {
+                Some(Some(reference)) => Some(reference.clone()),
+                // Not published: leave it alone. The graph stays pinned to
+                // peer 0, which is correct, rather than pointing a peer at
+                // content nobody has.
+                _ => None,
+            }
+        })
+    }
+
     /// Materialise every `local://` source this graph names.
     ///
     /// Best effort by construction: a context we fail to publish leaves that
@@ -716,9 +858,16 @@ fn report_gateway(wire: &std::sync::Mutex<Wire>, req: &gw::SolveRequest) {
 }
 
 /// Serve the Control service on `addr`, forwarding to `upstream`.
-pub async fn serve(addr: std::net::SocketAddr, upstream: String) -> anyhow::Result<()> {
+pub async fn serve(
+    addr: std::net::SocketAddr,
+    upstream: String,
+    peers: Vec<String>,
+) -> anyhow::Result<()> {
     println!("[proxy] buildkit control on {addr} -> {upstream}");
-    let mut proxy = Proxy::connect(upstream.clone()).await?;
+    let mut proxy = Proxy::connect(upstream.clone())
+        .await?
+        .with_peers(&peers)
+        .await?;
     proxy.mirror = std::env::var("REBUCK2_MIRROR").ok().map(|registry| Mirror {
         registry,
         buildkit: upstream,
@@ -762,7 +911,44 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         if let (Some(mirror), Some(def)) = (&self.mirror, &req.definition) {
             self.publish_contexts(mirror, def, &meta).await;
         }
-        self.gw().solve(Request::from_parts(meta, ext, req)).await
+
+        // Place the work. A graph is only movable once nothing in it needs
+        // the client's disk - so a `local://` source is rewritten to the
+        // context we published, and if we could not publish it the graph
+        // stays on peer 0, which is the only daemon with the session.
+        let mut req = req;
+        let mut peer = 0usize;
+        if self.peers.len() > 1 {
+            if let (Some(mirror), Some(def)) = (&self.mirror, req.definition.clone()) {
+                let session = self.session_for(&meta);
+                let moved = self.make_portable(&def, &session, mirror);
+                if crate::dispatch::analyse(&moved, 1)
+                    .cuts
+                    .first()
+                    .is_none_or(|c| c.frontier.local == 0)
+                {
+                    peer = self
+                        .next_peer
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        % self.peers.len();
+                    req.definition = Some(moved);
+                }
+            }
+        }
+        if peer != 0 {
+            println!("[proxy] solve -> peer {peer} ({})", self.peers[peer].addr);
+            self.wire.lock().expect("wire").routed += 1;
+        }
+        // No session to strip: the GATEWAY SolveRequest has no session
+        // field - that lives on Control.Solve, and a routed graph names
+        // only content, so the peer needs no filesync at all.
+        let out = self
+            .gw_of(peer)
+            .solve(Request::from_parts(meta, ext, req))
+            .await?;
+        let out = out.into_inner();
+        self.remember(&out.result, peer);
+        Ok(Response::new(out))
     }
 
     async fn resolve_image_config(
