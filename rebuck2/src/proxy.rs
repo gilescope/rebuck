@@ -231,6 +231,35 @@
 //! build. A fleet must treat a peer that stops answering as a decline, not
 //! wait on it.
 //!
+//! # Where this actually got to
+//!
+//! A real `earthly +all` on a two-daemon fleet, and the whole chain fired:
+//! the context was published as content, the graph was made portable, the
+//! work was OFFERED to a peer through its own `Control.Solve`, and when the
+//! peer died the build fell back and succeeded.
+//!
+//! ```text
+//! [proxy] peer 1 could not take it: peer solve: Unknown error transport error
+//! =========================== Earth Build  SUCCESS ===========================
+//! ```
+//!
+//! That failure is principle 5 doing its job under a real crash rather than
+//! a simulated one: duplicate work is always correct, so a peer that dies
+//! mid-offer costs a retry on the machine that was going to build it
+//! anyway. The client saw a normal build.
+//!
+//! What still does not work is the PEER, not the dispatch. It panics
+//! reaching for Docker Hub because a sessionless daemon has no registry
+//! auth, and declaring our mirror as a `mirrors` entry for `docker.io` in
+//! its config did not divert it. Until a peer can obtain base images with
+//! no credentials, adoption offers work that no peer can complete - so the
+//! fleet is correct, and idle.
+//!
+//! The remaining question is therefore plumbing rather than design: make
+//! the mirror answer for `docker.io` in a way buildkit honours. Everything
+//! above it - portability, publication, placement, adoption, ref affinity,
+//! fail-open - is built and has run.
+//!
 //! # What "transparent" has to mean
 //!
 //! All nine methods, including the streams. `Session` in particular is

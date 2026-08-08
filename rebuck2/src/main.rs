@@ -192,7 +192,13 @@ async fn main() -> Result<()> {
             let bind = args
                 .opt("--bind")
                 .unwrap_or_else(|| "127.0.0.1:5000".into());
-            registry::serve(bind.parse()?, store).await
+            // Pull-through when an origin is configured: a peer with no
+            // credentials and no session can then fetch a public base image
+            // through the mirror instead of Docker Hub. Principle 9 - the
+            // origin registry is a fallback, not a data path.
+            let upstream = registry::HttpUpstream::from_env()
+                .map(|u| std::sync::Arc::new(u) as std::sync::Arc<dyn registry::Upstream>);
+            registry::serve_with_upstream(bind.parse()?, store, upstream).await
         }
         "buildkit-proxy" => {
             let listen = args
