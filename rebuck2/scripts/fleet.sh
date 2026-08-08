@@ -217,7 +217,15 @@ for i in $(seq 0 $((BUILDS - 1))); do
   echo "build $i: $d" | tee -a "$RUN/digests.txt"
 done
 if [ -n "${EXPECT:-}" ]; then
-  if diff -u "$EXPECT" "$RUN/digests.txt"; then
+  # A baseline recorded with a different BUILDS is not a mismatch, it is a
+  # mis-comparison - and it reads identically in a diff. Caught it claiming
+  # "outputs DIFFER" when builds 0-3 were byte-identical and 4-5 simply did
+  # not exist in the baseline.
+  want=$(wc -l <"$EXPECT" | tr -d ' ')
+  if [ "$want" != "$BUILDS" ]; then
+    echo "✗ baseline $EXPECT has $want builds, this run has $BUILDS - re-record it"
+    fail=1
+  elif diff -u "$EXPECT" "$RUN/digests.txt"; then
     echo "◈ outputs identical to $EXPECT"
   else
     echo "✗ outputs DIFFER from $EXPECT"

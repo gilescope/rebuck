@@ -381,6 +381,38 @@
 //! The outputs were byte-identical anyway: a starved peer returns correct
 //! bytes slowly, which is the failure mode to prefer.
 //!
+//! # Taking it back: 164s -> 40s
+//!
+//! Placement cannot fix a straggler, because the placement was CORRECT on
+//! the information available - the peer was idle. The information only
+//! arrives afterwards, when a normal adoption finishes and the straggler does
+//! not. So the wait is bounded, and the bound is re-read while waiting:
+//!
+//! ```text
+//! uniform fleet        : wall  12s
+//! one slow peer        : wall 164s
+//! one slow peer, bound : wall  40s   not routed {"peer too slow": 2}
+//! ```
+//!
+//! Both solves on the quarter-CPU peer were withdrawn after three times the
+//! observed median and built at home. The peer is not cancelled and its work
+//! is not wasted if it lands: the tag is the digest of the graph, so whoever
+//! pushes first wins (principle 3) and a later identical push is a no-op.
+//! Outputs stayed byte-identical against a recorded baseline, including the
+//! builds where home and peer were racing.
+//!
+//! The threshold takes no cold default on purpose. Any number between 9.5s
+//! and 163s "fixes" this fixture, which is precisely why one should not be
+//! chosen before the fleet has said what normal is - with nothing observed,
+//! nothing is slow and the wait is unbounded, exactly as before.
+//!
+//! Two counting bugs surfaced here, both of the same kind - a number that
+//! blames the wrong thing. The take-back arrived at the caller as an `Err`
+//! and was counted as "peer refused", accusing a machine of refusing work it
+//! was still doing. And a baseline recorded with four builds compared against
+//! a six-build run reported "outputs DIFFER" when builds 0-3 were identical
+//! and 4-5 merely did not exist in it.
+//!
 //! # The bytes are the same, which nothing had checked
 //!
 //! Every measurement up to here read exit codes. A distributed buildkit that
@@ -649,6 +681,9 @@ pub struct Proxy {
     /// minted a ref must serve every later call naming it, or the eleventh
     /// call of a working-looking build fails with "ref not found".
     ref_home: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
+    /// What completed adoptions have cost, in ms. The basis for calling one
+    /// slow - see `hedge_after`.
+    adopted_ms: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
     /// Adoptions currently in flight on each AWAY peer, indexed by peer.
     ///
     /// Index 0 is unused and always zero: peer 0 never adopts. Kept aligned
@@ -671,6 +706,7 @@ impl Proxy {
             sessions: Default::default(),
             published: Default::default(),
             peers: Default::default(),
+            adopted_ms: Default::default(),
             outstanding: Default::default(),
             next_peer: Default::default(),
             ref_home: Default::default(),
@@ -698,6 +734,69 @@ impl Proxy {
             .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
             .collect();
         1 + least_loaded(&load, cursor)
+    }
+
+    /// Wait for a peer to build it - but not forever, once the fleet has said
+    /// what "forever" means.
+    ///
+    /// Measured: three daemons, six equal builds, one peer held to a quarter
+    /// of a CPU. It got its fair share and the whole build waited 164s
+    /// instead of 12s. No placement rule fixes that, because the placement
+    /// was correct on the information available - the peer was idle. The
+    /// information only arrives afterwards, when a normal adoption finishes
+    /// and the straggler does not.
+    ///
+    /// So the deadline is re-read while waiting rather than fixed at the
+    /// start: the first completed adoption anywhere in the fleet is what
+    /// makes the straggler measurably abnormal. Abandoning it returns
+    /// `Err`, and the caller's existing fail-open path then builds at home -
+    /// principle 5. The peer is not cancelled and its push is not wasted if
+    /// it lands: the tag is the digest of the graph, so whoever gets there
+    /// first wins (principle 3) and a later identical push is a no-op.
+    async fn adopt_or_take_back(
+        &self,
+        peer: usize,
+        addr: &str,
+        registry: &str,
+        portable: &bollard_buildkit_proto::pb::Definition,
+        started: std::time::Instant,
+    ) -> Adoption {
+        /// How often to re-ask whether this has become abnormal. Coarse on
+        /// purpose: the answer changes on the scale of whole builds.
+        const POLL: std::time::Duration = std::time::Duration::from_millis(250);
+        let mut fut = Box::pin(crate::solve::build_and_publish(
+            addr,
+            registry,
+            portable.clone(),
+        ));
+        loop {
+            tokio::select! {
+                r = &mut fut => return match r {
+                    Ok(reference) => Adoption::Done(reference),
+                    Err(e) => Adoption::Refused(e),
+                },
+                _ = tokio::time::sleep(POLL) => {
+                    let observed = self.adopted_ms.lock().expect("adopted_ms").clone();
+                    let Some(limit) = hedge_after(&observed) else { continue };
+                    if started.elapsed() <= limit {
+                        continue;
+                    }
+                    println!(
+                        "[proxy] taking it back from peer {peer}: {:?} elapsed, normal is {:?}",
+                        started.elapsed(),
+                        limit
+                    );
+                    *self
+                        .wire
+                        .lock()
+                        .expect("wire")
+                        .rejected
+                        .entry("peer too slow".to_owned())
+                        .or_default() += 1;
+                    return Adoption::TookBack;
+                }
+            }
+        }
     }
 
     /// The gateway rides the same channel, because the client's does.
@@ -995,6 +1094,52 @@ fn trace(wire: &std::sync::Mutex<Wire>, call: &str) {
 fn turn(cursor: usize, peers: usize) -> usize {
     debug_assert!(peers > 0, "a fleet with no peers has no turns");
     cursor % peers.max(1)
+}
+
+/// How an attempt to place a solve on a peer ended.
+///
+/// This was `Option<Result<String>>`, and the take-back arrived as an `Err` -
+/// so a solve we withdrew ourselves was counted as "peer refused", blaming a
+/// machine for something it did not do. Three outcomes need three names.
+enum Adoption {
+    /// The peer built it and published it under this reference.
+    Done(String),
+    /// The peer was asked and could not.
+    Refused(anyhow::Error),
+    /// We stopped waiting. Already counted; the peer may still finish.
+    TookBack,
+    /// Never offered - the graph was not portable.
+    NotOffered,
+}
+
+/// A straggler is only abnormal relative to something.
+///
+/// Three times the median of what adoptions have actually cost, floored so a
+/// fleet of half-second subtrees is not hedged on jitter. `None` means no
+/// adoption has completed yet and there is no basis for calling anything
+/// slow - which is deliberately today's behaviour: wait.
+///
+/// This exists because a fixed cold default would be a number invented to
+/// make one measurement look good. The 0.25-CPU peer took 163s against a
+/// normal 9.5s; any threshold between the two "works", and picking one before
+/// the fleet has said what normal is means picking it for the fixture.
+fn hedge_after(observed: &[u64]) -> Option<std::time::Duration> {
+    /// Not two: a peer that is merely on the slow side of normal should
+    /// finish, not be abandoned with the work half done (principle 12 -
+    /// finishing beats starting).
+    const FACTOR: u32 = 3;
+    /// Below this, a "straggler" is scheduling noise.
+    const FLOOR: std::time::Duration = std::time::Duration::from_secs(5);
+    if observed.is_empty() {
+        return None;
+    }
+    let mut v = observed.to_vec();
+    v.sort_unstable();
+    let median = v[v.len() / 2];
+    Some(std::cmp::max(
+        FLOOR,
+        std::time::Duration::from_millis(median) * FACTOR,
+    ))
 }
 
 /// Which away peer, given how much each is already holding.
@@ -1643,15 +1788,18 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         // trusted where peer 0's occupancy cannot.
                         self.outstanding[peer].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let t = std::time::Instant::now();
-                        let r = crate::solve::build_and_publish(
-                            &addr,
-                            &mirror.registry,
-                            portable.clone(),
-                        )
-                        .await;
+                        let r = self
+                            .adopt_or_take_back(peer, &addr, &mirror.registry, &portable, t)
+                            .await;
                         t_adopt = t.elapsed().as_millis() as u64;
                         self.outstanding[peer].fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        Some(r)
+                        // Only a COMPLETED adoption tells us what normal
+                        // costs. Recording a take-back would fold our own
+                        // impatience into the threshold that produced it.
+                        if matches!(r, Adoption::Done(_)) {
+                            self.adopted_ms.lock().expect("adopted_ms").push(t_adopt);
+                        }
+                        r
                     } else {
                         let why = match (local_clear, bases_clear) {
                             (false, false) => "context and base unmirrored",
@@ -1666,21 +1814,21 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                             .rejected
                             .entry(why.to_owned())
                             .or_default() += 1;
-                        None
+                        Adoption::NotOffered
                     };
                     match adopted {
                         // Nothing was offered, so nothing refused. Reporting
                         // "peer refused" here would blame a machine that was
                         // never asked.
-                        None => {}
-                        Some(Ok(reference)) => {
+                        Adoption::NotOffered | Adoption::TookBack => {}
+                        Adoption::Done(reference) => {
                             println!("[proxy] adopted from peer {peer}: {reference}");
                             self.wire.lock().expect("wire").routed += 1;
                             req.definition = Some(crate::dispatch::import_graph(&reference));
                         }
                         // Fail open: build it here, exactly as we would
                         // have without a fleet.
-                        Some(Err(e)) => {
+                        Adoption::Refused(e) => {
                             use prost::Message;
                             let srcs: Vec<String> = portable
                                 .def
@@ -1933,6 +2081,47 @@ mod tests {
                 "uneven over {peers} peers: {seen:?}"
             );
         }
+    }
+
+    /// With nothing observed, nothing is slow.
+    ///
+    /// The alternative - a cold default - is a number chosen to make one
+    /// fixture look good. Any value between 9.5s and 163s "fixes" the slow
+    /// peer measurement, which is exactly why none of them should be picked
+    /// before the fleet has said what normal is.
+    #[test]
+    fn a_cold_fleet_calls_nothing_a_straggler() {
+        assert_eq!(super::hedge_after(&[]), None);
+    }
+
+    /// Three times the median, and the median is not the mean: one 163s
+    /// straggler among normal work must not drag the threshold up to meet
+    /// itself.
+    #[test]
+    fn the_threshold_is_not_moved_by_the_straggler_it_judges() {
+        let normal = [9_400u64, 9_500, 9_600];
+        let with_straggler = [9_400u64, 9_500, 9_600, 163_000];
+        assert_eq!(
+            super::hedge_after(&normal),
+            Some(std::time::Duration::from_millis(28_500))
+        );
+        // Median of the 4-element list is 9600, so the threshold moves by
+        // 300ms, not by two and a half minutes. A mean would have put it at
+        // over four minutes and never fired.
+        assert_eq!(
+            super::hedge_after(&with_straggler),
+            Some(std::time::Duration::from_millis(28_800))
+        );
+    }
+
+    /// Fast work is not hedged on jitter.
+    #[test]
+    fn a_fleet_of_fast_subtrees_has_a_floor() {
+        assert_eq!(
+            super::hedge_after(&[80, 90, 100]),
+            Some(std::time::Duration::from_secs(5)),
+            "270ms would abandon peers over scheduling noise"
+        );
     }
 
     /// Equal load must round-robin, not pile on peer 1.
