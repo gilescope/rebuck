@@ -149,32 +149,30 @@ the disk.
 
 ### What it actually costs
 
-Soaked: 32 builds over 8 rounds, 24 of them adopted, 4 distinct graphs.
+Soaked: 32 builds over 8 rounds, 24 of them adopted, 4 distinct graphs, one
+persistent store.
 
-| | |
-| ------------------------------- | ------------------------------ |
-| base image (alpine, one arch) | 4012 kB, 4 blobs |
-| everything the 24 adoptions added | 304 kB, 71 blobs |
-| of which unreachable from any tag | 23 kB, 60 blobs |
+| | blobs | orphaned |
+| ------------------------------------ | ----- | -------- |
+| before the exporter was made reproducible | 75 | 60 |
+| now | 15 | 0 |
 
-Two things to read off that, and they point in opposite directions.
+**Repeating a build costs nothing.** 24 adoptions of 4 graphs leave exactly
+the 4 results and their shared base. That is not free by default - buildkit
+stamps wall clock into the image config and real mtimes into the layer, so an
+unchanged input used to republish as fresh bytes every time and orphan
+whatever the tag previously named. Both `source-date-epoch` and
+`rewrite-timestamp` are set on every push this fleet makes, which is what
+collapses 75 blobs to 15.
 
-Re-running an **identical** graph still grows the store. The tag is keyed on
-the graph, so it overwrites, but the peer re-exports and the layer is not
-byte-reproducible - so each adoption lands a fresh blob and orphans the one
-the tag used to name. A CI fleet rebuilding the same commit all day does
-accumulate.
+So the store grows with the number of **distinct** results, not with the
+number of builds. A CI fleet rebuilding one commit all day adds nothing after
+the first round.
 
-It accumulates *slowly*, and gc would not be the fix. 60 of 75 blobs are
-garbage - 80% by count, **0.6% by bytes**. Blob count is the wrong instrument
-here: the base image is one shared 4 MB object that no gc would ever remove,
-and the orphans are kilobytes of metadata. Collecting all of them perfectly
-would have saved 23 kB.
-
-That holds for small results, which is what was measured. A build whose
-exported result is hundreds of megabytes inverts it: the per-adoption term
-dominates, and 24 adoptions of one graph cost 24 copies of it. Size the store
-against your **result** size, not against this table.
+It still grows without bound across distinct results, and there is still no
+gc. Size it against your result payload: 24 adoptions of a graph exporting
+300 MB would be one 300 MB copy now, but a hundred distinct such graphs are a
+hundred copies.
 
 Until that is fixed, treat the store as something you watch:
 
