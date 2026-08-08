@@ -4,9 +4,15 @@
 //! SUBTREE, never a vertex, and it comes with three consequences that are
 //! all conservative:
 //!
-//! - **Exclusions propagate upward.** One cache mount, one secret, one
-//!   privileged exec anywhere in the subtree excludes the WHOLE subtree. A
+//! - **The whole definition is the unit.** One cache mount, one secret, one
+//!   privileged exec anywhere in it excludes ALL of it. A
 //!   partially-dispatchable tree is not dispatchable.
+//!
+//!   Not by propagating a verdict up the edges - `inspect` is a linear scan
+//!   and never reads `op.inputs`, because the graph travels or stays as one
+//!   piece and its shape cannot change that answer. Said plainly because
+//!   "propagates upward" reads like a traversal exists to be reused, and
+//!   carving at a seam would have to build one from nothing.
 //! - **Platform is the union of the subtree's constraints.** One linux-only
 //!   vertex pins the tree.
 //! - **Failure granularity is the subtree.** It fails and re-runs as a unit,
@@ -1439,8 +1445,10 @@ mod tests {
 
     #[test]
     fn one_hazard_anywhere_excludes_the_whole_subtree() {
-        // Principle 10: exclusions propagate UPWARD. The hazard is on the
-        // middle op of three, and the verdict is about the tree, not the op.
+        // Principle 10: the verdict is about the tree, not the op. `def`
+        // builds UNLINKED ops, so this is the disconnected case - three
+        // roots, one of them hazardous. Upward propagation through a real
+        // edge is `a_clean_branch_does_not_escape_its_sibling` below.
         for (hazard, why) in [
             (
                 with_exec(plain(), |e| e.mounts = vec![mount(pb::MountType::Cache)]),
@@ -1500,6 +1508,53 @@ mod tests {
         assert_eq!(
             v.exclusions,
             vec![(0, Exclusion::CacheMount), (2, Exclusion::Insecure)]
+        );
+    }
+
+    #[test]
+    fn a_clean_branch_does_not_escape_its_sibling() {
+        // The claim "a partially-dispatchable tree is not dispatchable" was
+        // only ever checked on a forest of unlinked ops. This builds the
+        // shape the sentence is about: one base, two branches, a join.
+        //
+        //        3  join
+        //       / \
+        //  clean 1  2  hazard
+        //       \ /
+        //        0  alpine
+        //
+        // What it establishes is NOT that the hazard propagates along the
+        // edge - `inspect` never reads `op.inputs`, so no traversal happens
+        // and the linked case cannot differ from the unlinked one. It
+        // establishes the thing worth pinning: branch 1 is dispatchable in
+        // isolation and still travels nowhere, because the unit that gets
+        // placed is the whole `Definition` and shape is not consulted.
+        //
+        // Written to go red on purpose. A pass that carves at the seam has
+        // to make edges matter, and this is the test that will notice.
+        let tree = |hazardous: bool| {
+            let branch = if hazardous {
+                with_exec(plain(), |e| e.mounts = vec![mount(pb::MountType::Secret)])
+            } else {
+                plain()
+            };
+            chain(vec![
+                (src("docker-image://docker.io/library/alpine:3.20"), vec![]),
+                (plain(), vec![0]),
+                (branch, vec![0]),
+                (plain(), vec![1, 2]),
+            ])
+        };
+
+        let v = inspect(&tree(true));
+        assert_eq!(v.exclusions, vec![(2, Exclusion::Secret)]);
+        assert!(!v.dispatchable(), "one hazardous branch grounds the join");
+
+        // The control. Same four ops, same edges, hazard removed - so the
+        // discriminating variable is the secret and not the shape.
+        assert!(
+            inspect(&tree(false)).dispatchable(),
+            "the shape alone must not ground it, or the test above proves nothing"
         );
     }
 
