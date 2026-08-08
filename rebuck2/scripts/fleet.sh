@@ -461,6 +461,18 @@ for i in $(seq 0 $((DAEMONS - 1))); do
   bctl --addr "tcp://127.0.0.1:$port" du 2>/dev/null | tail -1 || echo "?"
 done
 
+# What the shared mirror is holding. Reported as a COUNT rather than a size
+# because `du` rounds every 400-byte manifest up to a block and makes the
+# store look an order of magnitude heavier than it is.
+#
+# The number is what makes "repeating a build costs nothing" checkable: run
+# the same builds for more rounds and it must not move. Before the exporter
+# was made reproducible, 8 rounds of 4 builds left 75 blobs where 1 round
+# left 19.
+printf 'store blobs: %s in %s tags\n' \
+  "$(find "$RUN/store/cas" -type f 2>/dev/null | wc -l | tr -d ' ')" \
+  "$(find "$RUN/store/tags" -type f 2>/dev/null | wc -l | tr -d ' ')"
+
 echo
 echo "logs in $RUN"
 exit "$fail"

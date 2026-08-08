@@ -95,6 +95,10 @@ placed() {
     head -1
 }
 
+# Blobs the shared mirror ended up holding. Counted, not sized: `du` rounds
+# each 400-byte manifest up to a block, which flatters and then panics.
+blobs() { echo "$1" | sed -n 's/^store blobs: \([0-9]*\) .*/\1/p' | head -1; }
+
 echo "== baseline (one daemon, no proxy)"
 out=$(run NOPROXY=1 DAEMONS=1 RUN="$base" || true)
 echo "$out" | grep -E '^wall' | tr -s ' '
@@ -116,6 +120,11 @@ out=$(run DAEMONS=2 KILL_AFTER=2 EXPECT="$base/digests.txt" || true)
 echo "$out" | grep -E '^wall' | tr -s ' ' | sed 's/^/  /'
 guard "every build still finishes" "$out" && check "every build still finishes" "$(count "$out" '^failed  : 0')" 1 || true
 present "outputs still identical" "$out" 'outputs identical'
+# The counterpart to the registry scenario below. Here the peer really is
+# the one that failed, so it MUST be struck - otherwise `struck: {}` there
+# proves nothing, being what an unused counter says too.
+guard "and this time the peer IS struck" "$out" &&
+  present "and this time the peer IS struck" "$out" 'struck *: {1:' || true
 
 echo
 echo "== the registry destroyed mid-build"
@@ -123,7 +132,13 @@ out=$(run DAEMONS=2 KILL_REGISTRY_AFTER=2 EXPECT="$base/digests.txt" || true)
 echo "$out" | grep -E '^wall' | tr -s ' ' | sed 's/^/  /'
 guard "every build still finishes" "$out" && check "every build still finishes" "$(count "$out" '^failed  : 0')" 1 || true
 check "outputs still identical" "$(count "$out" 'outputs identical')" 1
-present "the peer is not blamed for it" "$out" 'peer not blamed'
+# The claim is that a dead MIRROR costs no peer its standing. Asserting the
+# message 'peer not blamed' tested one of the two ways that happens and
+# flaked at about 1 in 3: if the registry dies before the base is mirrored,
+# `make_portable` fails first, the graph is never offered, and no peer
+# failure exists to attribute - reported as "base unmirrored" instead. Both
+# are correct, so assert the thing they have in common.
+present "the peer is not blamed for it" "$out" 'struck *: {}'
 
 echo
 echo "== a build context leaves the client's machine"
@@ -174,6 +189,30 @@ out=$(run NO_REGISTRY_TRUST=1 DAEMONS=2 || true)
 check "the build still succeeds" "$(count "$out" '^failed  : 0')" 1
 present "but the proxy says the fleet did nothing" "$out" 'no solve completed on a peer'
 present "and names the likely cause" "$out" 'cannot PULL from the mirror'
+
+echo
+echo "== repeating a build costs the mirror nothing"
+# Buildkit stamps wall clock into the image config and real mtimes into the
+# layer, so an unchanged graph used to republish as fresh bytes, move its
+# tag, and orphan whatever the tag named before. 8 rounds of 4 builds left
+# 75 blobs where 1 round left 19.
+#
+# HOME_SLOTS=0 on BOTH runs, so every build is adopted every round and the
+# two runs see the SAME set of distinct graphs. At the default slot count
+# which builds travel depends on saturation timing, so a later round can
+# adopt a graph an earlier one built at home - the blob count would then
+# differ for a reason that has nothing to do with dedup.
+one=$(run DAEMONS=2 ROUNDS=1 REBUCK2_HOME_SLOTS=0 || true)
+many=$(run DAEMONS=2 ROUNDS=3 REBUCK2_HOME_SLOTS=0 || true)
+b1=$(blobs "$one")
+b3=$(blobs "$many")
+printf '  1 round: %s blobs · 3 rounds: %s blobs\n' "$b1" "$b3"
+guard "three rounds add nothing to the store" "$many" &&
+  check "three rounds add nothing to the store" "$b3" "$b1" || true
+# Vacuous if nothing was published at all - 0 equals 0.
+guard "and there was something in it to begin with" "$one" &&
+  { [ "${b1:-0}" -gt 0 ] && ok "and there was something in it to begin with" ||
+    no "and there was something in it to begin with (store empty)"; } || true
 
 echo
 echo "== a graph with a CACHE MOUNT"

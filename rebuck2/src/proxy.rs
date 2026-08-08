@@ -438,6 +438,24 @@ impl Proxy {
         )
     }
 
+    /// Hold a peer responsible: deprioritise it for the rest of the run, and
+    /// say so in the report.
+    ///
+    /// Both together, always. The counter that steers placement and the
+    /// counter an operator reads used to be set in different places, so a
+    /// peer could be quietly demoted with nothing in the report to explain
+    /// why the fleet had gone lopsided.
+    fn strike(&self, peer: usize) {
+        self.strikes[peer].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *self
+            .wire
+            .lock()
+            .expect("wire")
+            .struck
+            .entry(peer)
+            .or_default() += 1;
+    }
+
     /// Wait for a peer to build it - but not forever, once the fleet has said
     /// what "forever" means.
     ///
@@ -497,7 +515,7 @@ impl Proxy {
                         .rejected
                         .entry(format!("peer {peer} too slow"))
                         .or_default() += 1;
-                    self.strikes[peer].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    self.strike(peer);
                     return Adoption::TookBack;
                 }
             }
@@ -1374,6 +1392,17 @@ pub struct Wire {
     /// outside. Counting the reason is what turns "improve routing" into a
     /// specific thing to fix.
     pub rejected: std::collections::BTreeMap<String, u64>,
+
+    /// Peers struck, counted. A strike is this proxy deciding a machine is
+    /// the problem, and it is the one judgement here that outlives the
+    /// solve that produced it - a struck peer is deprioritised for the rest
+    /// of the run.
+    ///
+    /// Reported because the alternative is inferring it from a rejection
+    /// message, which conflates "the peer failed" with "something the peer
+    /// depended on failed". Kill the shared registry and both produce
+    /// refusals; only one of them should cost a machine its standing.
+    pub struck: std::collections::BTreeMap<usize, u64>,
 }
 
 impl Wire {
@@ -1587,6 +1616,10 @@ impl Wire {
             self.returns
         );
         println!("[wire] not routed     : {:?}", self.rejected);
+        // Always printed, including when empty. "struck: {}" is the evidence
+        // that a dead mirror cost no peer its standing; a line that appears
+        // only on failure cannot say that.
+        println!("[wire] struck         : {:?}", self.struck);
         println!("[wire] call order     : {}", self.calls.join(" "));
         println!(
             "[wire] session bytes  : {} KiB client->daemon, {} KiB daemon->client",
@@ -2272,8 +2305,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                             // refusals and struck a machine that had done
                             // nothing wrong.
                             if self.mirror_alive().await {
-                                self.strikes[peer]
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                self.strike(peer);
                             } else {
                                 *self
                                     .wire
