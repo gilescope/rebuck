@@ -17,6 +17,7 @@ mod github;
 mod lease;
 mod mesh;
 mod norm;
+mod proxy;
 mod registry;
 mod rpc;
 mod solve;
@@ -172,6 +173,20 @@ async fn main() -> Result<()> {
                 );
             }
             Ok(())
+        }
+        // Stand in front of a buildkitd and report what could be
+        // dispatched, forwarding everything unchanged. Point earthly here
+        // instead of the daemon:
+        //   rebuck2 buildkit-proxy --listen 127.0.0.1:1234 \
+        //     --upstream http://127.0.0.1:1235
+        "buildkit-proxy" => {
+            let listen = args
+                .opt("--listen")
+                .unwrap_or_else(|| "127.0.0.1:1234".into());
+            let upstream = args
+                .opt("--upstream")
+                .unwrap_or_else(|| "http://127.0.0.1:1235".into());
+            proxy::serve(listen.parse()?, upstream).await
         }
         "worker" => {
             let store_root: std::path::PathBuf = args

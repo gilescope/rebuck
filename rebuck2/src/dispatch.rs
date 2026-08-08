@@ -20,7 +20,7 @@
 //! correct (principle 5); a subtree shipped to a peer that cannot honour its
 //! mounts is not.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bollard_buildkit_proto::pb;
 use prost::Message;
@@ -352,6 +352,123 @@ impl Placement {
     /// Is an offer currently outstanding with someone?
     pub fn outstanding(&self) -> Option<u64> {
         self.outstanding
+    }
+}
+
+/// What a subtree needs from outside itself.
+///
+/// An LLB subtree is reachability-closed down to its SOURCE ops, so its
+/// frontier is exactly those sources - and their schemes say what the
+/// handover costs. Principle 11's table, read off the graph:
+///
+/// - `docker-image://` — a digest any machine can pull. FREE: the peer
+///   needs nothing from us at all, which is the best possible handover.
+/// - `local://` — the build context, which lives on the invoking machine
+///   and arrives by filesync. This is `LOCALLY` in all but name.
+/// - anything else (`git://`, `http://`) — fetchable, but by whom and at
+///   what cost is not ours to assume.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Frontier {
+    pub registry: usize,
+    pub local: usize,
+    pub other: usize,
+}
+
+impl Frontier {
+    /// Nothing has to travel from us for a peer to build this.
+    pub fn is_free(&self) -> bool {
+        self.local == 0 && self.other == 0 && self.registry > 0
+    }
+}
+
+/// One possible cut, and what it would cost to hand over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cut {
+    /// Index into `Definition.def`.
+    pub root: usize,
+    /// Ops in the subtree rooted here, including the root.
+    pub ops: usize,
+    pub frontier: Frontier,
+}
+
+/// What a whole `Definition` offers a dispatcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Analysis {
+    pub ops: usize,
+    /// Every cut worth naming, largest subtree first.
+    pub cuts: Vec<Cut>,
+}
+
+impl Analysis {
+    /// Cuts a peer could take with no transfer from us.
+    pub fn free_cuts(&self) -> impl Iterator<Item = &Cut> {
+        self.cuts.iter().filter(|c| c.frontier.is_free())
+    }
+}
+
+/// Read a graph and report where it could be cut.
+///
+/// Reports rather than decides: this is the instrument that answers "is
+/// there anything here worth dispatching" before any mechanism is built to
+/// dispatch it.
+pub fn analyse(def: &pb::Definition, min_ops: usize) -> Analysis {
+    // Ops are addressed by the digest of their encoded bytes, which is how
+    // buildkit itself links them - so the index is ours and the digest is
+    // the graph's.
+    let decoded: Vec<Option<pb::Op>> = def
+        .def
+        .iter()
+        .map(|b| pb::Op::decode(b.as_slice()).ok())
+        .collect();
+    let by_digest: BTreeMap<String, usize> = def
+        .def
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (format!("sha256:{}", crate::store::sha256_hex(b)), i))
+        .collect();
+
+    let mut cuts = Vec::new();
+    for root in 0..def.def.len() {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut frontier = Frontier::default();
+        let mut stack = vec![root];
+        while let Some(i) = stack.pop() {
+            if !seen.insert(i) {
+                continue;
+            }
+            // An op we cannot read still COUNTS: shrinking the measured
+            // subtree because a byte string surprised us would make a wide
+            // cut look narrow, which is the wrong direction to be wrong in.
+            let Some(op) = decoded.get(i).and_then(Option::as_ref) else {
+                continue;
+            };
+            if let Some(pb::op::Op::Source(src)) = &op.op {
+                match src.identifier.split_once("://").map(|(s, _)| s) {
+                    Some("docker-image") => frontier.registry += 1,
+                    Some("local") => frontier.local += 1,
+                    _ => frontier.other += 1,
+                }
+            }
+            for input in &op.inputs {
+                if let Some(&j) = by_digest.get(&input.digest) {
+                    stack.push(j);
+                }
+            }
+        }
+        if seen.len() >= min_ops {
+            cuts.push(Cut {
+                root,
+                ops: seen.len(),
+                frontier,
+            });
+        }
+    }
+    // Largest first: the biggest subtree with a free frontier is the one
+    // worth asking about, and a caller reading only the head should get it.
+    cuts.sort_by_key(|c| (std::cmp::Reverse(c.ops), c.root));
+    Analysis {
+        ops: def.def.len(),
+        cuts,
     }
 }
 
@@ -755,6 +872,125 @@ mod tests {
         // An empty fleet is the same answer by a different route.
         let mut p = Placement::new(&ok_verdict(), &[]);
         assert_eq!(p.offer(), None);
+    }
+
+    fn src(id: &str) -> pb::Op {
+        pb::Op {
+            op: Some(OpKind::Source(pb::SourceOp {
+                identifier: id.into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// Wire `op` to depend on the ops at `inputs` (indices into the list
+    /// being built), using the digest convention buildkit itself uses.
+    fn chain(ops: Vec<(pb::Op, Vec<usize>)>) -> pb::Definition {
+        let mut encoded: Vec<Vec<u8>> = Vec::new();
+        for (mut op, inputs) in ops {
+            op.inputs = inputs
+                .iter()
+                .map(|i| pb::Input {
+                    digest: format!("sha256:{}", crate::store::sha256_hex(&encoded[*i])),
+                    index: 0,
+                })
+                .collect();
+            encoded.push(op.encode_to_vec());
+        }
+        pb::Definition {
+            def: encoded,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_registry_rooted_chain_is_the_best_possible_handover() {
+        // FROM alpine -> RUN -> RUN. Everything it needs is a public
+        // digest, so a peer needs NOTHING from us: principle 11's free
+        // seam, read straight off the graph.
+        let d = chain(vec![
+            (src("docker-image://docker.io/library/alpine:3.20"), vec![]),
+            (plain(), vec![0]),
+            (plain(), vec![1]),
+        ]);
+        let a = analyse(&d, 2);
+        assert_eq!(a.ops, 3);
+
+        let top = a.cuts.first().expect("a cut at the top of the chain");
+        assert_eq!(top.root, 2);
+        assert_eq!(top.ops, 3, "the whole chain is reachable from the top");
+        assert_eq!(
+            top.frontier,
+            Frontier {
+                registry: 1,
+                local: 0,
+                other: 0
+            }
+        );
+        assert!(top.frontier.is_free());
+        assert_eq!(a.free_cuts().count(), 2, "the two multi-op subtrees");
+    }
+
+    #[test]
+    fn a_context_rooted_chain_is_not_free_and_that_is_the_point() {
+        // `local://` is the build context - it lives on the invoking
+        // machine and arrives by filesync. This is LOCALLY in all but
+        // name, and a peer cannot serve itself from it.
+        let d = chain(vec![(src("local://context"), vec![]), (plain(), vec![0])]);
+        let a = analyse(&d, 2);
+        let top = a.cuts.first().unwrap();
+        assert_eq!(
+            top.frontier,
+            Frontier {
+                registry: 0,
+                local: 1,
+                other: 0
+            }
+        );
+        assert!(!top.frontier.is_free());
+        assert_eq!(a.free_cuts().count(), 0);
+
+        // A chain that touches BOTH is not free either: one filesync
+        // input is enough to ground the handover.
+        let d = chain(vec![
+            (src("docker-image://alpine:3.20"), vec![]),
+            (src("local://context"), vec![]),
+            (plain(), vec![0, 1]),
+        ]);
+        let top = analyse(&d, 2).cuts.into_iter().next().unwrap();
+        assert_eq!(
+            top.frontier,
+            Frontier {
+                registry: 1,
+                local: 1,
+                other: 0
+            }
+        );
+        assert!(!top.frontier.is_free());
+    }
+
+    #[test]
+    fn tiny_subtrees_are_not_reported_as_opportunities() {
+        // Over half of every shard is milliseconds of work. A cut list
+        // that includes every single-op subtree is a list of things not
+        // worth shipping, and it would bury the ones that are.
+        let d = chain(vec![
+            (src("docker-image://alpine:3.20"), vec![]),
+            (plain(), vec![0]),
+        ]);
+        assert_eq!(analyse(&d, 2).cuts.len(), 1, "only the 2-op subtree");
+        assert_eq!(analyse(&d, 3).cuts.len(), 0, "nothing that big here");
+        assert_eq!(analyse(&pb::Definition::default(), 1).cuts.len(), 0);
+
+        // An unreadable op must not silently shrink a subtree's measured
+        // size - that would make a wide cut look narrow.
+        let mut d = chain(vec![
+            (src("docker-image://alpine:3.20"), vec![]),
+            (plain(), vec![0]),
+        ]);
+        d.def.push(b"not a protobuf".to_vec());
+        assert_eq!(analyse(&d, 2).ops, 3, "the op still counts as present");
     }
 
     #[test]
