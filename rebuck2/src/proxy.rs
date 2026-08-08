@@ -231,6 +231,32 @@
 //! build. A fleet must treat a peer that stops answering as a decline, not
 //! wait on it.
 //!
+//! # IT DISTRIBUTES
+//!
+//! A real `earthly +all`, two daemons, and one of the build's solves ran on
+//! a machine the client never spoke to:
+//!
+//! ```text
+//! [proxy] base docker.io/library/alpine:3.20@sha256:... mirrored as .../rebuck2/base:9ae21ebe
+//! [proxy] adopted from peer 1: docker-image://.../rebuck2/adopted:c3eb00fb
+//! [wire]  solves routed  : 1 to other daemons
+//! peer 2 cache          : Total 13.73MB
+//! ```
+//!
+//! The chain, all of it measured into existence rather than designed up
+//! front: the graph arrives at the GATEWAY; its context is published as
+//! content by the daemon that holds the session; its base images are
+//! copied into the mirror by the daemon that holds the credentials; the
+//! rewritten graph names nothing but content; a peer builds it through its
+//! own `Control.Solve` and publishes the result; and the client's solve is
+//! answered here with an import, so the ref it gets back belongs to the
+//! daemon holding its job.
+//!
+//! Solves whose sources were not all mirrored yet were NOT sent - they
+//! failed the portability check and built locally. That is the system
+//! working: an unportable graph is not a dispatch failure, it is a graph
+//! that stays home.
+//!
 //! # Where this actually got to
 //!
 //! A real `earthly +all` on a two-daemon fleet, and the whole chain fired:
@@ -809,19 +835,78 @@ impl Proxy {
 
     /// Swap `local://` sources for the contexts we published, so the graph
     /// depends on content rather than on one machine's disk.
-    fn make_portable(
+    async fn make_portable(
         &self,
         def: &bollard_buildkit_proto::pb::Definition,
         session: &str,
-        _mirror: &Mirror,
+        mirror: &Mirror,
     ) -> bollard_buildkit_proto::pb::Definition {
         let published = self.published.lock().expect("published").clone();
-        crate::dispatch::rewrite_local_sources(def, &|name| {
+        let out = crate::dispatch::rewrite_local_sources(def, &|name| {
             match published.get(&(session.to_owned(), name.to_owned())) {
                 Some(Some(reference)) => Some(reference.clone()),
                 // Not published: leave it alone. The graph stays pinned to
                 // peer 0, which is correct, rather than pointing a peer at
                 // content nobody has.
+                _ => None,
+            }
+        });
+
+        // And the BASE images. A sessionless peer has no registry auth, so
+        // `docker-image://docker.io/...` is as unreachable for it as the
+        // client's disk. Copy each through peer 0, which does have
+        // credentials, and point the graph at the copy.
+        let mut refs: std::collections::BTreeSet<String> = Default::default();
+        for bytes in &out.def {
+            use prost::Message;
+            if let Ok(op) = bollard_buildkit_proto::pb::Op::decode(bytes.as_slice()) {
+                if let Some(bollard_buildkit_proto::pb::op::Op::Source(src)) = &op.op {
+                    if let Some(r) = src.identifier.strip_prefix("docker-image://") {
+                        // Already ours: copying it again would be a loop.
+                        if !r.starts_with(&mirror.registry) {
+                            refs.insert(r.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        for r in refs {
+            let key = ("base".to_owned(), r.clone());
+            {
+                let mut map = self.published.lock().expect("published");
+                match map.get(&key) {
+                    Some(Some(_)) => continue,
+                    Some(None) => continue,
+                    None => {
+                        map.insert(key.clone(), None);
+                    }
+                }
+            }
+            let full = format!("docker-image://{r}");
+            match crate::solve::mirror_image(&mirror.buildkit, &mirror.registry, &full).await {
+                Ok(reference) => {
+                    println!("[proxy] base {r} mirrored as {reference}");
+                    self.published
+                        .lock()
+                        .expect("published")
+                        .insert(key, Some(reference));
+                }
+                Err(e) => {
+                    self.published.lock().expect("published").remove(&key);
+                    println!("[proxy] base {r} not mirrored: {e:#}");
+                }
+            }
+        }
+
+        let mirrored = self.published.lock().expect("published").clone();
+        crate::dispatch::rewrite_registry_sources(&out, &|r| {
+            match mirrored.get(&("base".to_owned(), r.to_owned())) {
+                // The FULL reference, scheme included: the rewrite replaces
+                // the identifier wholesale, and buildkit rejects a bare
+                // `host:port/name:tag` with "invalid". Trimming the scheme
+                // here produced exactly that, on a graph that was otherwise
+                // perfectly portable.
+                Some(Some(reference)) => Some(reference.clone()),
                 _ => None,
             }
         })
@@ -979,11 +1064,30 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         if self.peers.len() > 1 {
             if let (Some(mirror), Some(def)) = (&self.mirror, req.definition.clone()) {
                 let session = self.session_for(&meta);
-                let portable = self.make_portable(&def, &session, mirror);
+                let portable = self.make_portable(&def, &session, mirror).await;
+                // Portable means EVERY source is something a sessionless
+                // peer can fetch: nothing local, and every image already in
+                // our mirror. Checking only `local == 0` let a graph whose
+                // base was still being mirrored go out anyway - concurrent
+                // solves skip an in-flight copy - and the peer then reached
+                // for Docker Hub with no credentials and panicked.
                 let movable = crate::dispatch::analyse(&portable, 1)
                     .cuts
                     .first()
-                    .is_none_or(|c| c.frontier.local == 0);
+                    .is_none_or(|c| c.frontier.local == 0)
+                    && portable.def.iter().all(|b| {
+                        use prost::Message;
+                        match bollard_buildkit_proto::pb::Op::decode(b.as_slice())
+                            .ok()
+                            .and_then(|o| o.op)
+                        {
+                            Some(bollard_buildkit_proto::pb::op::Op::Source(src)) => src
+                                .identifier
+                                .strip_prefix("docker-image://")
+                                .is_none_or(|r| r.starts_with(&mirror.registry)),
+                            _ => true,
+                        }
+                    });
                 if movable {
                     let peer = 1 + self
                         .next_peer

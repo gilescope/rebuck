@@ -190,6 +190,77 @@ pub async fn publish_context(
     Ok(format!("docker-image://{name}"))
 }
 
+/// Copy a registry image into the mirror, so a peer can fetch it without
+/// credentials.
+///
+/// A sessionless peer cannot pull from Docker Hub - registry auth travels
+/// over the session, and rewriting `local://` away is precisely what leaves
+/// a peer without one. Configuring the mirror as a `mirrors` entry does not
+/// help either: the pull-through serves blobs but 404s a manifest, so
+/// buildkit falls through to the origin and dies there.
+///
+/// So the base image is copied the same way the context is: by the daemon
+/// that DOES have credentials, once, into the mirror. Principle 9 as
+/// written - the origin registry is a fallback, not a data path.
+pub async fn mirror_image(
+    bk_addr: &str,
+    registry: &str,
+    reference: &str,
+) -> anyhow::Result<String> {
+    use prost::Message;
+    // A one-op graph: fetch it, export it. No exec, so nothing is built -
+    // this is a copy with extra steps, and the extra steps are what let the
+    // daemon with the credentials do the fetching.
+    let src = pb::Op {
+        op: Some(pb::op::Op::Source(pb::SourceOp {
+            identifier: reference.to_owned(),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let src_b = src.encode_to_vec();
+    let digest = format!("sha256:{}", crate::store::sha256_hex(&src_b));
+    let term = pb::Op {
+        inputs: vec![pb::Input {
+            digest: digest.clone(),
+            index: 0,
+        }],
+        ..Default::default()
+    };
+    let def = pb::Definition {
+        metadata: [(digest, pb::OpMetadata::default())].into_iter().collect(),
+        def: vec![src_b, term.encode_to_vec()],
+        ..Default::default()
+    };
+
+    let tag = &crate::store::sha256_hex(reference.as_bytes())[..32];
+    let name = format!("{registry}/rebuck2/base:{tag}");
+    let mut attrs = HashMap::new();
+    attrs.insert("name".to_owned(), name.clone());
+    attrs.insert("push".to_owned(), "true".to_owned());
+    attrs.insert("registry.insecure".to_owned(), "true".to_owned());
+
+    let mut c = connect(bk_addr).await?;
+    c.solve(control::SolveRequest {
+        r#ref: format!(
+            "rebuck2-base.{}.{}",
+            std::process::id(),
+            SOLVE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ),
+        definition: Some(def),
+        exporter_deprecated: "image".to_owned(),
+        exporter_attrs_deprecated: attrs.clone(),
+        exporters: vec![control::Exporter {
+            r#type: "image".to_owned(),
+            attrs,
+        }],
+        ..Default::default()
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("mirror {reference}: {} {}", e.code(), e.message()))?;
+    Ok(format!("docker-image://{name}"))
+}
+
 /// Build a portable graph on a peer and publish the result.
 ///
 /// Returns the image reference the requester should import. This is the

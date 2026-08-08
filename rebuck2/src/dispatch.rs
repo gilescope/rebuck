@@ -498,8 +498,29 @@ pub fn analyse(def: &pb::Definition, min_ops: usize) -> Analysis {
 /// `replacement` is asked per local source NAME (`context`, `dockerfile`),
 /// because those are different directories. Returning `None` leaves that
 /// source alone, which keeps the subtree undispatchable rather than wrong.
+/// Rewrite REGISTRY sources too, so a peer needs no upstream at all.
+///
+/// Same cascade as [`rewrite_local_sources`] and the same per-source rule:
+/// each reference is asked for separately, because two different images
+/// rewritten to one identifier would encode identically and collapse.
+pub fn rewrite_registry_sources(
+    def: &pb::Definition,
+    replacement: &dyn Fn(&str) -> Option<String>,
+) -> pb::Definition {
+    rewrite_sources(def, "docker-image://", replacement)
+}
+
 pub fn rewrite_local_sources(
     def: &pb::Definition,
+    replacement: &dyn Fn(&str) -> Option<String>,
+) -> pb::Definition {
+    rewrite_sources(def, "local://", replacement)
+}
+
+/// The cascade, shared by both rewrites.
+fn rewrite_sources(
+    def: &pb::Definition,
+    scheme: &str,
     replacement: &dyn Fn(&str) -> Option<String>,
 ) -> pb::Definition {
     let digest = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
@@ -511,7 +532,7 @@ pub fn rewrite_local_sources(
     let has_local = def.def.iter().any(|b| {
         matches!(
             pb::Op::decode(b.as_slice()).ok().and_then(|o| o.op),
-            Some(pb::op::Op::Source(s)) if s.identifier.starts_with("local://")
+            Some(pb::op::Op::Source(s)) if s.identifier.starts_with(scheme)
         )
     });
     if !has_local {
@@ -539,7 +560,10 @@ pub fn rewrite_local_sources(
             }
         }
         if let Some(pb::op::Op::Source(src)) = &mut op.op {
-            if let Some(name) = src.identifier.strip_prefix("local://") {
+            if let Some(name) = src.identifier.strip_prefix(scheme) {
+                // `replacement` returns a FULL identifier including its
+                // scheme - the identifier is replaced wholesale, and a bare
+                // `host:port/name:tag` is rejected by buildkit as invalid.
                 // Per SOURCE, not one replacement for all of them. Earthly
                 // passes `context` and `dockerfile` separately and they are
                 // different directories; rewriting both to one identifier
