@@ -116,9 +116,26 @@ daemon config the author had set up months earlier.
 **Countermeasure:** run the instructions from an empty directory. A
 quickstart nobody has executed is a hypothesis.
 
+## 11. A symptom standing in for a property with no instrument
+
+The property is real and the test is about the right thing, but nothing
+measures the property directly - so the assertion greps for something that
+usually accompanies it.
+
+**Instance:** "a dead mirror costs no peer its standing" was checked by
+grepping for the message `peer not blamed`. Killing the registry has two
+correct outcomes depending on whether the base was mirrored yet; the other
+one reports `base unmirrored` and never emits that string. Measured at 1 in
+3 - and a flake is worse than a failure, because a flake gets retried.
+
+**Countermeasure:** when a test greps for a symptom, ask what observable the
+property actually has. If the answer is "none", that is the bug. `struck` is
+now reported always, including empty, because a line that appears only on
+failure cannot evidence an absence.
+
 ## The common thread
 
-Nine of these ten produced a GREEN result. Not one announced itself.
+Ten of these eleven produced a GREEN result. Not one announced itself.
 
 The discipline that caught them is the same every time: **find the
 observation that differs between the world where it works and the world where

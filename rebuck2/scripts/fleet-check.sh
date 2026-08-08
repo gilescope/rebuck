@@ -127,6 +127,38 @@ guard "and this time the peer IS struck" "$out" &&
   present "and this time the peer IS struck" "$out" 'struck *: {1:' || true
 
 echo
+echo "== more than one peer"
+# Everything else here runs two daemons, so until now `place` chose between
+# home and a single peer and the multi-peer half - rotation, least-loaded,
+# strike deprioritisation - was only ever exercised by unit tests.
+out=$(run DAEMONS=3 || true)
+echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
+guard "the surplus splits across BOTH peers" "$out" && {
+  p1=$(placed "$out" 1)
+  p2=$(placed "$out" 2)
+  # 12 builds, 8 slots: 8 at home and 4 away, 2 each. Asserting the split
+  # rather than the total, because one peer taking all 4 is also "4 away"
+  # and is the failure this scenario exists to catch.
+  check "the surplus splits across BOTH peers" "${p1:-0}/${p2:-0}" "2/2"
+} || true
+
+echo
+echo "== one peer of two destroyed mid-build"
+# The fleet must route around it rather than collapse back to home, and the
+# machine that died must be the only one that pays for it.
+out=$(run DAEMONS=3 KILL_AFTER=2 REBUCK2_HOME_SLOTS=4 EXPECT="$base/digests.txt" || true)
+echo "$out" | grep -E '^wall|placed|struck' | tr -s ' ' | sed 's/^/  /'
+guard "every build still finishes" "$out" && check "every build still finishes" "$(count "$out" '^failed  : 0')" 1 || true
+check "outputs still identical" "$(count "$out" 'outputs identical')" 1
+guard "the surviving peer keeps taking work" "$out" && {
+  if [ "$(placed "$out" 1)" -gt 0 ]; then ok "the surviving peer keeps taking work"
+  else no "the surviving peer keeps taking work (nothing placed on peer 1)"; fi
+} || true
+# Names the peer, so a run that struck EVERYONE cannot pass this.
+present "and only the dead one is struck" "$out" 'struck *: {2:'
+absent "and only the dead one is struck (peer 1 spared)" "$out" 'struck *: {1:'
+
+echo
 echo "== the registry destroyed mid-build"
 out=$(run DAEMONS=2 KILL_REGISTRY_AFTER=2 EXPECT="$base/digests.txt" || true)
 echo "$out" | grep -E '^wall' | tr -s ' ' | sed 's/^/  /'

@@ -202,3 +202,15 @@ matters is `placed`:
 That is the only honest evidence of distribution. Wall clock moves for
 unrelated reasons, and a control run has twice overturned a conclusion drawn
 from it.
+
+The other line to read when a fleet has gone lopsided:
+
+```text
+[wire] struck         : {1: 4}
+```
+
+A strike is this proxy deciding a machine is the problem, and it is the one
+judgement that outlives the solve that made it - a struck peer stays
+deprioritised for the rest of the run. Printed even when empty, so `{}` is
+evidence rather than silence: a mirror that dies takes the fleet down with it
+but must cost no peer its standing.
