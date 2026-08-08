@@ -19,6 +19,7 @@ mod mesh;
 mod norm;
 mod registry;
 mod rpc;
+mod solve;
 mod store;
 mod worker;
 
