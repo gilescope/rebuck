@@ -106,6 +106,30 @@ check "every context was published" \
 check "the peer still took the surplus" "$(placed "$out" 1)" "$((builds - slots))"
 
 echo
+echo "== a secret-bearing graph"
+# No EXPECT here: the exec itself is the assertion. It runs
+# `test "$(cat /run/secrets/probe)" = the-value`, so a build that gets the
+# wrong secret - or none - exits non-zero and fails. `failed: 0` with work
+# placed away therefore means the peer got the right value, not merely that
+# it started.
+out=$(run SECRET=1 DAEMONS=2 REBUCK2_SERVE_SECRETS=1)
+echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
+check "every build finishes" "$(echo "$out" | grep -c '^failed  : 0')" 1
+check "the peer took the surplus" "$(placed "$out" 1)" "$((builds - slots))"
+
+echo
+echo "== a secret the PROXY cannot resolve"
+# The earthly shape: a secret the client can produce and nothing outside it
+# can. Nothing may be offered, or every dispatched solve fails on the peer
+# and fail-open rebuilds it at home having paid for the trip.
+out=$(run SECRET=1 UNRESOLVABLE=1 DAEMONS=2 REBUCK2_SERVE_SECRETS=1)
+echo "$out" | grep -E '^wall|placed|not routed' | tr -s ' ' | sed 's/^/  /'
+check "every build still finishes" "$(echo "$out" | grep -c '^failed  : 0')" 1
+check "nothing is offered to the peer" "$(placed "$out" 1)" ""
+check "and the refusal names the secret" \
+  "$(echo "$out" | grep -c 'excluded: Secret')" 1
+
+echo
 echo "== a foreign-architecture peer, on a PINNED graph"
 # No REBUCK2_LLB_PLATFORM=any here, and that is the whole scenario. An
 # unpinned graph is native on every peer, because the base is mirrored for
