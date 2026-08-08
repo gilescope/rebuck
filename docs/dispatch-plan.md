@@ -1,4 +1,16 @@
-# Dispatch - distributing one buildkit build, not deduplicating many
+# A distributed BuildKit - one build, many machines
+
+**The product is a buildkitd that distributes a single build across a fleet.**
+Point any buildkit client at it and the client does not change: not earthly,
+not buildx, not buildctl, not dagger. They already speak the wire; we serve
+it.
+
+That framing is newer than most of this document, and it is a widening rather
+than a pivot. Everything below was written for earthbuild's CI, which remains
+the first consumer and the source of every measurement here. But nothing in
+the mechanism is earthly-shaped -- it is written in terms of `pb.Op`, because
+that is what a build actually is -- and the constraint that kept it
+earthly-shaped turned out not to exist.
 
 Successor to the dedup plan (`buildkit-plan.md`, on
 `giles-single-buildkit-with-dist` / PR #7). Its phases P1-P4b are
@@ -12,7 +24,91 @@ The product claims both lines answer to are in
 dispatch harder than they bound dedup: the grid must behave as ONE machine (§1),
 fail open never fail wrong (§5), and the coordinator is never on the data path
 (§6) -- which for dispatch means a subtree's inputs and results travel
-peer-to-peer, never through the driver.
+peer-to-peer, never through the driver. A fourth arrived with the reframing:
+the client must not have to change (§15).
+
+## Why this is possible, and why nobody has done it
+
+Two facts, and the second was measured rather than assumed.
+
+**Nobody ships a distributed buildkit.** The remote-buildkit vendors -- Depot,
+Blacksmith, Namespace, BuildJet -- all sell ONE BIG REMOTE DAEMON. That is a
+faster machine, not a fleet, and it is the shape the next section explains: a
+buildkit solver has global knowledge of exactly one build, so N daemons cannot
+queue across each other. The gap in the market and the structural fact are the
+same fact.
+
+**The whole graph is visible on one connection.** A buildkit client drives its
+build through `LLBBridge`, created with `NewLLBBridgeClient(c.conn)` -- the
+same connection it speaks Control on, as a second service. So the `Definition`
+lands in our hands with no change to the client and no cooperation from the
+frontend.
+
+That was got wrong once, expensively enough to record: `Control.Solve` arrives
+with NO definition, and the obvious conclusion -- that the graph is somewhere
+we cannot reach -- is false. It is on the other service. Three client shapes,
+and only the middle one is invisible:
+
+| client | where the LLB is |
+| ------------------------------ | ------------------------------------ |
+| raw LLB | `Control.Solve`, definition set |
+| frontend by NAME | nowhere -- it runs INSIDE the daemon |
+| client-built LLB (earthly) | `LLBBridge.Solve` |
+
+The invisible case costs nothing: if no graph crosses the wire there is no
+graph to dispatch, and that build was always going to run on one machine.
+
+## The GOAL is settled, the MECHANISM is not
+
+Everything below this section describes one way to distribute a build:
+subdivide the graph, offer subtrees to peers, publish results peer-to-peer.
+It is built and it works (M4). It is not established that it is the right
+one, and this document previously read as though it were.
+
+The candidates, and what would decide between them:
+
+| mechanism | unit of work | biggest doubt |
+| ------------------- | ------------------- | ------------------------------ |
+| **A.** subtree dispatch | a closure we choose | we pick the cuts, so we can pick badly |
+| **B.** gateway-Solve routing | one `LLBBridge.Solve` | enough Solves? balanced? |
+| **C.** N solvers, one lease table | a vertex, claimed | principle 2: coordination is not latency |
+| **D.** shared remote cache | nothing, after the fact | measured: buys cost, not latency |
+
+A needs frontier analysis, offers and a subdivision depth. B needs routing
+and a shared cache. C is the dedup line and is already built. D is what the
+market already sells.
+
+**B deserves more attention than it has had**, and it only became visible
+today: a client drives its build through MANY `LLBBridge.Solve` calls -- for
+earthly, roughly one per target. Those are units the author already declared,
+handed to us with no analysis at all. If a real build makes enough of them,
+and they are not wildly unbalanced, B gets most of A's benefit for a fraction
+of A's machinery: no seam classification, no subdivision depth, no offer
+protocol.
+
+**So the first measurement is not "how many free-frontier cuts are there".**
+That question only matters if A is the answer, and asking it first is how you
+measure the wrong thing convincingly. The mechanism-neutral question is:
+
+> **What does a real build actually look like on the wire?**
+
+Number of gateway Solves, ops per Solve, wall-clock per Solve, platform
+spread, source schemes, how much overlaps between Solves. That
+characterisation prices A, B and C at once, and the proxy that can collect it
+already exists.
+
+## The first thing it should be good at
+
+**Native multi-arch.** `buildx` builds other architectures by emulation, which
+is slow, or by per-arch builders the user wires up and maintains. A fleet with
+real arm64 and amd64 machines does it natively, and principle 10's platform
+union is already the mechanism -- one linux/arm64 vertex pins its subtree to a
+machine that is actually linux/arm64.
+
+This is worth naming as the first target because it is a pain people already
+have, it needs no subdivision heuristics to pay off, and it is the case where
+"behaves as ONE machine" (§1) is most obviously worth more than a faster
+single machine.
 
 ## Why dedup could not win the thing we kept asking it for
 
@@ -21,7 +117,8 @@ wall-clock.** Twelve runners each building the 94s stem *in parallel* costs 94s.
 Twelve runners coordinating means one builds it and eleven BLOCK, then proceed:
 the same wall-clock at best, worse by `T_xfer` at the margin.
 
-So dedup buys cost and rate limits, and cannot buy latency. Measured, repeatedly:
+So dedup buys cost and rate limits, and cannot buy latency. Measured,
+repeatedly:
 consolidation is *not slower*; single-flight on an idle box is *not faster*
 (373s coordinated vs 342s uncoordinated, inside a ~10% run-to-run spread).
 
@@ -57,6 +154,23 @@ An **earthly target** is already that subtree: a chain of vertices with one
 output and a declared frontier. No graph partitioning, no heuristic boundary
 selection -- use the boundary the Earthfile author already wrote, that `BUILD`
 edges already connect, and that the lease key already keys on.
+
+**And the LLB says the same thing without the Earthfile.** That mattered more
+than expected once the client stopped being assumed to be earthly:
+
+- `Op.inputs` is the graph, so a subtree is reachability from any op -- no
+  partitioning heuristic, just a closure.
+- The subtree's frontier is exactly its SOURCE ops, and their identifiers say
+  what a handover costs. `docker-image://` is a digest any machine can pull;
+  `local://` is the build context, which lives on the invoking machine and is
+  `LOCALLY` in all but name.
+- `OpMetadata.ProgressGroup` is buildkit's OWN grouping of vertices into
+  logical units -- an earthly target, a Dockerfile stage, a dagger step. It is
+  the frontend-agnostic name for the thing this section is about, and it is
+  already on the wire.
+
+So "use the boundary the author declared" survives the generalisation intact:
+every frontend declares one, and buildkit already carries it.
 
 Fewer, larger units also make each decision affordable to get right, which is
 the third argument against a cost model (below).
@@ -157,7 +271,8 @@ run it.
 
 The wire already carries what is needed: `pb.Op` has both `Platform` and
 `WorkerConstraints`, per op. And main's driver already routes REAPI actions by
-their demanded platform for buck2 -- so the fleet-side concept exists and this is
+their demanded platform for buck2 -- so the fleet-side concept exists and this
+is
 extending it to buildkit rather than inventing it.
 
 Three consequences:
@@ -176,19 +291,22 @@ Three consequences:
 
 ## Sequencing
 
-| | why now |
-| --- | ------- |
-| 0. **rebalance the twelve groups** | free, needs nothing; group4 is ~100x group11 and SETS makespan today |
-| 1. port the dedup delta onto main | new files carry cleanly; ~1590 lines of hooks |
-| 2. **timing store**, banked | rebalancing, scheduling, the bloom and dispatch all guess without it |
-| 3. published-key bloom + batch query | kills per-vertex hops we already pay |
-| 4. `D2W::Lead { subtree, frontier }` | the only genuinely new protocol |
-| 5. coalesce CI to `+test-no-qemu` | one driver, N workers, existing actions |
-| 6. report **utilisation, per platform** | a 60%-utilised fleet may be 100% linux and 0% elsewhere |
+Written when mechanism A was assumed. Kept because most of it is
+mechanism-neutral, and marked with what is actually true now.
 
-Step 0 is first on purpose: fixing the imbalance makes every later fleet number
-honest instead of flattering. Step 2 before 3 and 4 because nothing currently
-times a vertex, and a threshold picked without data is a guess wearing a number.
+| | state |
+| --- | ------- |
+| 0. rebalance the twelve groups | not done; free latency, needs an Earthfile change |
+| 1. port the dedup delta | superseded -- pinched, not merged |
+| 2. timing store, banked | **built** -- ingest, banking, critical path |
+| 3. published-key bloom + batch query | **built** |
+| 4. `D2W::Lead { subtree, frontier }` | **built** -- mechanism A specifically |
+| 5. coalesce CI to `+test-no-qemu` | not done |
+| 6. report utilisation, per platform | not done |
+
+**What comes next is not item 5.** It is characterising a real build on the
+wire, because items 4 and 5 both assume mechanism A and that assumption is
+now the open question rather than the plan.
 
 ## Excluded from dispatch by construction
 
@@ -206,7 +324,8 @@ conservatively:
 
 - **Normalisation** (a `norm.rs` analogue). buck2 injects the target label into
   an otherwise-identical command, so normalising removes contamination that was
-  never semantic. A buildkit `ExecOp` has NO label -- measured twice: cross-shard
+    never semantic. A buildkit `ExecOp` has NO label -- measured twice: cross-
+  shard
   sharing is 10 commands with a ceiling of 41, and every within-shard
   near-collapse is explained by `span`, which is display metadata already absent
   from the cache key. buildkit already dedups these.

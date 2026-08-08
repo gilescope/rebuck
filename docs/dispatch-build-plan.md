@@ -1,8 +1,54 @@
-# Dispatch - the build plan
+# The build plan
 
 What to build, in what order, and what proves each step. Design rationale is in
 [dispatch-plan.md](dispatch-plan.md); product claims are in
 [dist-buildkit-principles.md](dist-buildkit-principles.md).
+
+**The goal is a distributed buildkit for any client. The mechanism is open.**
+Milestones M0-M5 below were cut for one mechanism -- subdivide the graph and
+offer subtrees to peers -- and most of that is now built and working. It is
+not established that it is the right mechanism, and the milestones should be
+read as "what got built and what it proved" rather than as a roadmap.
+
+## Where it actually stands
+
+| | state |
+| ---- | ------------------------------------------------------------- |
+| M0 | 9/12 cold numbers; two cold-only failures unexplained |
+| M1 | bin-packer built; the Earthfile change and measured round are not done |
+| M2 | **done** -- store, ingest, banking, stability, critical path |
+| M2.5 | superseded -- `lease`, `registry` and the store's upload surface were PINCHED rather than merged |
+| M3 | **done** -- published-key bloom, non-blocking batch query |
+| M4 | **done and demonstrated** -- a peer builds a subtree, driver disk reads 0 bytes |
+| M5 | not done |
+| gateway | **done** -- the proxy sees any client's graph on one connection |
+
+**What is NOT established, and it is the important half:**
+
+- No real earthbuild graph has been through `analyse`. Cut counts on a 3-op
+  fixture prove the plumbing, not the opportunity.
+- Nothing has run at fleet scale. Every measurement here is one machine.
+- Nothing produces an offer in anger: subdivision does not exist.
+- The "bank the stem" comparison below is still unrun, and it is the thing
+  that decides whether any of M4 is worth keeping.
+
+## The next measurement is mechanism-NEUTRAL
+
+The tempting next step is to count free-frontier cuts on a real shard. That
+prices exactly one mechanism, and asking it first is how you measure the
+wrong thing convincingly.
+
+What prices all of them at once is a characterisation of a real build on the
+wire, which the proxy can already collect:
+
+- how many `LLBBridge.Solve` calls a build makes, and how big each graph is
+- wall-clock per Solve, and how unbalanced they are
+- platform spread, and how much of the graph is pinned
+- source schemes, and how much is `local://` and therefore not going anywhere
+- how much two Solves overlap
+
+That single run says whether subtree dispatch, per-Solve routing, or a shared
+lease table is the answer -- and it needs no new mechanism to collect.
 
 ## The numbers this plan is built on
 

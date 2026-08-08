@@ -8,7 +8,11 @@ yourself. Those are working practice, equally true of any project, and live
 where they are used — the header comments of the rigs in `rebuck2/tests/`,
 which record the specific ways each one lied.
 
-Companion to [dispatch-plan.md](dispatch-plan.md) — what we are building now.
+Companion to [dispatch-plan.md](dispatch-plan.md) — what we are building now:
+**a buildkitd that distributes one build across a fleet**, for any buildkit
+client. These are claims about that product. Where one names an earthly
+target, it is naming an example of a unit every frontend declares — see §10
+and §15.
 
 These principles were paid for by the DEDUPLICATION line of work (single-flight,
 consolidation, the mesh mirror). That line is measured and complete; its plan,
@@ -222,6 +226,14 @@ connected by `BUILD` edges, and already what the lease key keys on. A
 partitioning heuristic here would be us re-deriving, worse, a boundary the
 Earthfile states outright.
 
+**Every frontend declares one, and buildkit already carries it.**
+`OpMetadata.ProgressGroup` is buildkit's own grouping of vertices into logical
+units — an earthly target, a Dockerfile stage, a dagger step — and it is on
+the wire for any client. So "use the author's boundary" is not an earthly
+convenience; it is available wherever the graph is. A client also hands over
+one `LLBBridge.Solve` per such unit, which is a boundary delivered rather than
+inferred.
+
 The same error has a smaller twin in the coordination protocol: `claim` is one
 round trip per vertex, and one pair run recorded `led=828` — over half of them
 for vertices cheaper than the round trip that asked about them. Per-vertex is the
@@ -260,6 +272,13 @@ So the rule is **cut at the narrowest declared seam available**, not "at the nex
 handover: its entire frontier is a public digest, so a peer needs nothing from
 us at all. A `COPY +deps/lockfile` boundary is next best -- one artifact crosses,
 not a rootfs.
+
+Read off the LLB, which is where a generic client's seams actually are: a
+`SourceOp` whose identifier is `docker-image://` IS `FROM <registry image>` —
+its frontier is a digest any machine can pull. A `local://` source is the
+build context, which lives on the invoking machine and is `LOCALLY` in all
+but name. So the table is computable without reading an Earthfile, and
+`dispatch::analyse` computes it.
 
 The word DECLARED is load-bearing. The moment we cut somewhere the Earthfile does
 not name, we are inventing a boundary and have re-introduced the partitioning
@@ -312,6 +331,12 @@ layer (principle 5). An estimate must be STABLE: it is consulted to decide
 scheduling order, how deep to subdivide, and what is worth dispatching -- and
 being wrong by 20% costs a slightly worse schedule, while having no entry at all
 costs no schedule.
+
+Outside earthly the same key exists under a different name:
+`OpMetadata.ProgressGroup`, or the `llb.customname` description buildkit
+renders in progress output. Both are coarse, both are stable across commits,
+and both are on the wire — so the estimate generalises without becoming a
+cache key by accident.
 
 Key the estimate on content and it is perfect and useless: every commit
 invalidates every sample, and a build system whose input changes constantly
@@ -366,3 +391,37 @@ Corollary: a cheap way to be wrong is to bank by SIZE, on the reasoning that big
 things are expensive to rebuild. Size is uncorrelated with survival. A 2 GB image
 layer rebuilt every commit is worth less than a 40 MB toolchain that has not
 moved since March.
+
+## 15. The client must not have to change
+
+The product is a buildkitd. A user points `BUILDKIT_HOST` at it and gets a
+fleet; that is the whole interface. Not a plugin, not a patched earthly, not
+a fork of buildx, not an SDK.
+
+This is a product claim and not a convenience, because it decides what we are
+allowed to build. Any design that needs a change in the client — a flag, a
+hook, an agreed side-channel, a cooperating frontend — has stopped being a
+distributed buildkit and become a feature of whichever client agreed to it.
+That is the position the dedup line was in, and it is why the earthbuild
+version of this could only ever help earthbuild.
+
+Three consequences:
+
+- **The wire is the contract, and it is not ours.** `Control` and `LLBBridge`
+  are versioned by moby. We serve them; we do not extend them. A capability
+  we wish existed is a capability we do without, or upstream.
+- **We only see what a client already sends.** Measured: a client-built graph
+  arrives at `LLBBridge.Solve`, and a frontend requested BY NAME sends no
+  graph at all because it runs inside the daemon. The second case is not a
+  gap to close — there is nothing on the wire to distribute, and that build
+  was always going to run on one machine.
+- **Degrading has to be invisible.** A fleet with no peers, a graph we cannot
+  cut, a subtree nobody will take: every one of these must produce the build
+  an ordinary buildkitd would have produced, at ordinary speed. Principle 5
+  said fail open; §15 says the client must not be able to tell.
+
+Corollary, and it is the honest cost: **we inherit the whole Control surface**
+— disk usage, prune, build history, cache import and export — whether or not
+we distribute any of it. Being a convincing daemon is most of the work of
+being one, and a client that hits an unimplemented method has been told, in
+effect, to change.
