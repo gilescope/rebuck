@@ -277,6 +277,10 @@ const SPECULATE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct Driver {
     pub store: Arc<Store>,
+    /// Cross-machine single-flight. One per driver: it is the fleet's single
+    /// coordinator, so there is no consensus problem to solve, only a
+    /// liveness one.
+    leases: crate::lease::Leases,
     cfg: DriverCfg,
     jobs: Mutex<HashMap<u64, Job>>,
     workers: Mutex<Vec<WorkerConn>>,
@@ -349,6 +353,7 @@ impl Driver {
             .map(|n| n.get())
             .unwrap_or(4);
         Arc::new(Self {
+            leases: crate::lease::Leases::default(),
             store,
             cfg,
             jobs: Mutex::new(HashMap::new()),
@@ -1240,6 +1245,37 @@ impl Driver {
             return self.store.get(d).await;
         }
         Ok(None)
+    }
+
+    /// A driver with a throwaway store, for tests that need one to hang a
+    /// router off. Not `cfg(test)`: the registry's tests are in another
+    /// module and would not see it.
+    pub fn for_test() -> Arc<Self> {
+        let dir = tempfile::tempdir().unwrap().keep();
+        Driver::new(
+            Arc::new(Store::new(dir).unwrap()),
+            DriverCfg {
+                session: "test".into(),
+                min_workers: 0,
+                require_shards: 0,
+                local_exec: false,
+                decentralized: false,
+                hardlinks: true,
+                cache_failures: false,
+                finalize_file: None,
+                locality: false,
+                prefetch_metadata: false,
+                name_independent: false,
+                addr_file: None,
+                scratch: std::env::temp_dir(),
+            },
+        )
+    }
+
+    /// The fleet's lease table, for anything coordinating on its behalf -
+    /// the registry mirror's single-flight, notably.
+    pub fn lease_table(&self) -> &crate::lease::Leases {
+        &self.leases
     }
 
     /// Blob by hash ALONE, for OCI.

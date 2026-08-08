@@ -8,6 +8,10 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+# The peer-to-peer OCI mirror (`registry`). Principle 6 says the coordinator
+# is never on the data path, and this is the mechanism: a buildkitd pushes to
+# loopback and pulls from whichever peer built the thing.
+axum = "0.8"
 bazel-remote-apis = "0.27"
 # BuildKit's LLB wire types (pb::Op / ExecOp / Definition). The buildkit-
 # facing side of the fleet has to read what a subtree IS before deciding
@@ -34,6 +38,12 @@ tokio-stream = "0.1"
 tonic = "0.14"
 # GitHub wraps every artifact in a zip, whatever we put inside it.
 zip = { version = "6", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+# `oneshot` on a Router: the registry's tests drive real HTTP requests
+# through the real router rather than calling handlers directly, so a
+# routing or method mistake shows up as a 404 in a test instead of in CI.
+tower = { version = "0.5", features = ["util"] }
 
 [[bin]]
 name = "rebuck2"

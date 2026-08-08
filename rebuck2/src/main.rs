@@ -17,6 +17,7 @@ mod github;
 mod lease;
 mod mesh;
 mod norm;
+mod registry;
 mod rpc;
 mod store;
 mod worker;

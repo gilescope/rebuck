@@ -140,7 +140,10 @@ impl Store {
     }
 
     pub fn new(root: PathBuf) -> Result<Self> {
-        for sub in ["cas", "ac", "tmp"] {
+        // "tags" is the OCI ref namespace - without it every tag_put fails
+        // at the rename and the registry answers 500 to a perfectly valid
+        // manifest PUT.
+        for sub in ["cas", "ac", "tmp", "tags"] {
             std::fs::create_dir_all(root.join(sub))?;
         }
         Ok(Self {
