@@ -1394,6 +1394,49 @@ mod tests {
         assert!(empty.dispatchable());
     }
 
+    /// The three lifts compose, and none of them lifts a fourth thing.
+    ///
+    /// Each arm is independent by construction, which is exactly the kind of
+    /// claim that stops being true when someone adds the next one. A graph
+    /// carrying all three tolerable hazards must dispatch when all three are
+    /// allowed, and a single insecure exec must still ground it however many
+    /// permissions are granted.
+    #[test]
+    fn the_lifts_compose_and_do_not_widen() {
+        let three = Verdict {
+            exclusions: vec![
+                (0, Exclusion::CacheMount),
+                (1, Exclusion::Secret),
+                (2, Exclusion::SshAgent),
+            ],
+            platform: Platform::Any,
+            constraints: Default::default(),
+            ops: 3,
+        };
+        assert!(!three.dispatchable());
+        assert!(!three.dispatchable_when(Allow {
+            secrets: true,
+            caches: true,
+            agent: false,
+        }));
+        assert!(three.dispatchable_when(Allow {
+            secrets: true,
+            caches: true,
+            agent: true,
+        }));
+
+        // A privilege is never lifted, whatever else is.
+        let privileged = Verdict {
+            exclusions: vec![(0, Exclusion::Insecure)],
+            ..three.clone()
+        };
+        assert!(!privileged.dispatchable_when(Allow {
+            secrets: true,
+            caches: true,
+            agent: true,
+        }));
+    }
+
     #[test]
     fn one_hazard_anywhere_excludes_the_whole_subtree() {
         // Principle 10: exclusions propagate UPWARD. The hazard is on the
