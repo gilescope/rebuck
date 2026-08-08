@@ -18,6 +18,38 @@ deliberately does not assert wall clock: those numbers move for reasons that
 have nothing to do with this code, and a suite that fails on a busy laptop
 gets switched off.
 
+## A secret no longer grounds a subtree
+
+The oldest exclusion, and the one that capped earthly at 1 solve in 12. A
+secret mount names an ID the daemon resolves by calling back over the
+client's session; a dispatched solve had no session, so the peer had nobody
+to ask and buildkit refused with `no active sessions`.
+
+`buildkit-session` gives the peer somebody. Eight builds whose exec mounts a
+secret, four local slots:
+
+```text
+REBUCK2_SERVE_SECRETS=1   placed {home: 4, peer1: 4}   failed 0
+unset (the control)       placed {}                    excluded: Secret x8
+```
+
+The exec is `test "$(cat /run/secrets/probe)" = the-value`, so a wrong or
+missing secret is a non-zero exit and a failed build - the four dispatched
+builds got the right value, they did not merely start. And the control shows
+the gate holds: without the flag nothing leaves, and the reason names the
+mount.
+
+The value comes from the PROXY's environment, not the peer's. That matters:
+the proxy runs beside the client, so its environment is far likelier to
+match than a remote worker's, and the fleet does not have to be provisioned
+identically for the answer to be right. It is off by default because it is
+the one thing here that moves a user's credential off their machine, and no
+amount of scheduling benefit makes that a decision to take on their behalf.
+
+Still excluded, deliberately: cache mounts, ssh sockets and host binds. Each
+needs a different service, and lifting them together would be assuming three
+things from evidence about one.
+
 Recurring theme, stated once so the sections below do not each have to: nearly
 every wrong turn recorded here was a plausible cause accepted without a
 control. The ones that cost most were a metric that improved for an unrelated

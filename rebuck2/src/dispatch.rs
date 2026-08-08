@@ -73,7 +73,23 @@ pub struct Verdict {
 
 impl Verdict {
     pub fn dispatchable(&self) -> bool {
-        self.exclusions.is_empty() && !matches!(self.platform, Platform::Conflict(_))
+        self.dispatchable_with(false)
+    }
+
+    /// `serving_secrets` lifts the Secret exclusion, and ONLY that one.
+    ///
+    /// A secret was fatal because a peer solves with no session and has
+    /// nobody to ask. With `buildkit_session` we can attach one and answer
+    /// the callback ourselves, so the hazard is gone - for secrets. Cache
+    /// mounts, ssh sockets and host binds are untouched: each needs a
+    /// different service, and lifting them together would be assuming three
+    /// things from evidence about one.
+    pub fn dispatchable_with(&self, serving_secrets: bool) -> bool {
+        let blocked = self
+            .exclusions
+            .iter()
+            .any(|(_, e)| !(serving_secrets && matches!(e, Exclusion::Secret)));
+        !blocked && !matches!(self.platform, Platform::Conflict(_))
     }
 }
 

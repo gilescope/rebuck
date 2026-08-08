@@ -334,6 +334,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "buildkit-session"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "bollard-buildkit-proto",
+ "bytes",
+ "futures",
+ "hyper",
+ "hyper-util",
+ "prost",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tower",
+ "uuid",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2849,6 +2869,7 @@ dependencies = [
  "axum",
  "bazel-remote-apis",
  "bollard-buildkit-proto",
+ "buildkit-session",
  "futures",
  "iroh",
  "postcard",

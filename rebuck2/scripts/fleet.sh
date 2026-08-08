@@ -56,6 +56,9 @@ DOCKERFILE=${DOCKERFILE:-}
 # LLB that reads a real build CONTEXT from the client's disk. The only mode
 # that exercises context publishing, which every other run reports as 0.
 CONTEXT=${CONTEXT:-}
+# LLB whose exec mounts a SECRET. Undispatchable by construction until a peer
+# could be handed a session, so this is the fixture that proves it can.
+SECRET=${SECRET:-}
 # A peer on ANOTHER MACHINE. Everything else here runs several daemons on one
 # host, which can measure overhead and placement but never capacity: the fleet
 # has no more CPU than the single daemon did.
@@ -127,6 +130,7 @@ else
     # $RUN is mounted at the same path so `--output dest=$RUN/...` lands on
     # the host and not inside a container that is about to be deleted.
     docker run --rm -i --add-host host.docker.internal:host-gateway \
+      -e "rebuck2_probe=${rebuck2_probe:-}" \
       -v "$RUN:$RUN" --entrypoint buildctl "$IMAGE" "${args[@]}"
   }
 fi
@@ -161,6 +165,10 @@ fi
 
 say "generate llb"
 fixture=write_fanout_llb
+if [ -n "$SECRET" ]; then
+  fixture=write_secret_llb
+  export rebuck2_probe=the-value
+fi
 if [ -n "$CONTEXT" ]; then
   fixture=write_context_llb
   for i in $(seq 0 $((BUILDS - 1))); do
@@ -268,7 +276,8 @@ else
   addr="tcp://127.0.0.1:$PROXY_PORT"
   # peers holds --peer and its value, so its length is twice the count.
   say "proxy on $addr -> daemon 0 plus $((${#peers[@]} / 2)) peer(s)"
-  REBUCK2_MIRROR="$MIRROR_HOST:$REG_PORT" \
+  rebuck2_probe="${rebuck2_probe:-}" \
+    REBUCK2_MIRROR="$MIRROR_HOST:$REG_PORT" \
     "$bin" buildkit-proxy --listen "$BIND:$PROXY_PORT" \
     --upstream "http://127.0.0.1:$BASE_PORT" "${peers[@]}" >"$RUN/proxy.log" 2>&1 &
   proxy_pid=$!
@@ -300,6 +309,13 @@ for round in $(seq 1 "$ROUNDS"); do
     elif [ -n "$CONTEXT" ]; then
       bctl --addr "$addr" build --no-cache \
         --local "context=$RUN/ctx/$n" \
+        --output "type=local,dest=$RUN/out-$n" <"$f" >"$RUN/build-$n.log" 2>&1 &
+    elif [ -n "$SECRET" ]; then
+      # The CLIENT serves the secret too. Home builds resolve it through the
+      # client's own session exactly as they always did; only the dispatched
+      # ones need the proxy to serve a second session to the peer.
+      bctl --addr "$addr" build --no-cache \
+        --secret id=rebuck2_probe,env=rebuck2_probe \
         --output "type=local,dest=$RUN/out-$n" <"$f" >"$RUN/build-$n.log" 2>&1 &
     else
       bctl --addr "$addr" build --no-cache \

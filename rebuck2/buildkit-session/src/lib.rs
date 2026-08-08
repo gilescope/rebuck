@@ -182,6 +182,18 @@ mod tests {
             .any(|(k, v)| *k == "x-docker-expose-session-uuid" && v == "abc"));
     }
 
+    /// Both id shapes clients actually send.
+    #[test]
+    fn an_id_names_its_environment_variable() {
+        assert_eq!(
+            EnvSecrets::var_for("name=npm_token&org=&project=&v=1"),
+            "npm_token"
+        );
+        assert_eq!(EnvSecrets::var_for("npm_token"), "npm_token");
+        // No `name=` key, so the id is the name - not the first pair.
+        assert_eq!(EnvSecrets::var_for("org=acme&v=1"), "org=acme&v=1");
+    }
+
     /// The proto we need is present and names the method we will advertise.
     #[test]
     fn the_secrets_service_is_available() {
@@ -439,6 +451,63 @@ mod e2e {
         match out {
             Ok(_) => println!("[session] SOLVED - the daemon got the secret from us"),
             Err(e) => panic!("solve failed: {e}"),
+        }
+    }
+}
+
+/// Resolve secrets from this process's environment.
+///
+/// A buildkit secret id is an opaque string, and clients put structure in it:
+/// earthly sends `name=<x>&org=&project=&v=1`, buildctl sends the bare name.
+/// So: take `name` from the query if the id parses as one, otherwise take the
+/// id whole, and look up that environment variable - exact case first, then
+/// upper - because `--secret id=npm_token` conventionally means `NPM_TOKEN`.
+///
+/// Deliberately no fallback to a file, a keychain or a cloud store. Every
+/// source added here is another place a secret can come from that the person
+/// running the fleet did not think about.
+#[derive(Debug, Default, Clone)]
+pub struct EnvSecrets;
+
+impl EnvSecrets {
+    /// The environment variable an id names, if any.
+    ///
+    /// Split out so it can be tested without setting process environment,
+    /// which is global and makes tests order-dependent.
+    pub fn var_for(id: &str) -> String {
+        for pair in id.split('&') {
+            if let Some(name) = pair.strip_prefix("name=") {
+                return name.to_owned();
+            }
+        }
+        id.to_owned()
+    }
+}
+
+#[tonic::async_trait]
+impl bollard_buildkit_proto::moby::buildkit::secrets::v1::secrets_server::Secrets for EnvSecrets {
+    async fn get_secret(
+        &self,
+        req: tonic::Request<bollard_buildkit_proto::moby::buildkit::secrets::v1::GetSecretRequest>,
+    ) -> Result<
+        tonic::Response<bollard_buildkit_proto::moby::buildkit::secrets::v1::GetSecretResponse>,
+        tonic::Status,
+    > {
+        let id = req.get_ref().id.clone();
+        let name = Self::var_for(&id);
+        let found = std::env::var(&name).or_else(|_| std::env::var(name.to_uppercase()));
+        match found {
+            // The VALUE is never logged, here or anywhere. The id is enough
+            // to debug with and is already in the graph.
+            Ok(v) => Ok(tonic::Response::new(
+                bollard_buildkit_proto::moby::buildkit::secrets::v1::GetSecretResponse {
+                    data: v.into_bytes(),
+                },
+            )),
+            Err(_) => {
+                println!("[session] no environment secret for {name:?} (id {id:?})");
+                Err(tonic::Status::not_found(name))
+            }
         }
     }
 }

@@ -310,6 +310,7 @@ pub async fn build_and_publish(
     peer_addr: &str,
     registry: &str,
     def: pb::Definition,
+    serve_secrets: bool,
 ) -> anyhow::Result<String> {
     let mut bytes: Vec<u8> = Vec::new();
     for op in &def.def {
@@ -323,26 +324,60 @@ pub async fn build_and_publish(
     attrs.insert("push".to_owned(), "true".to_owned());
     attrs.insert("registry.insecure".to_owned(), "true".to_owned());
 
+    // A session, if this graph needs one and we are allowed to serve it.
+    //
+    // Dispatched solves were sessionless by design - a portable graph's
+    // inputs are digests, so there is nothing to ask for. A secret is the
+    // exception: it is a NAME the daemon resolves by calling back, and with
+    // no session it has nobody to call. `buildkit_session` gives the peer
+    // somebody, and the value comes from this process's environment rather
+    // than from the peer's, so a fleet does not have to be provisioned
+    // identically for the answer to be right.
+    //
+    // Opt-in, because it means a secret this machine holds is handed to
+    // another machine. That is a trust decision and it is not ours to make
+    // quietly.
+    let session = if serve_secrets {
+        let channel = tonic::transport::Endpoint::new(peer_addr.to_owned())?
+            .connect()
+            .await?;
+        let (id, task) =
+            buildkit_session::serve_secrets(channel, buildkit_session::EnvSecrets).await?;
+        // Held until the solve returns, then dropped - the session outliving
+        // the build it serves is a secret left reachable for no reason.
+        Some((id, task))
+    } else {
+        None
+    };
+
     let mut c = connect(peer_addr).await?;
-    c.solve(control::SolveRequest {
-        r#ref: format!(
-            "rebuck2-adopt.{}.{}",
-            std::process::id(),
-            SOLVE_SEQ.fetch_add(1, Ordering::Relaxed)
-        ),
-        definition: Some(def),
-        // Both forms: an older daemon reads only the deprecated one and
-        // would otherwise export nothing while reporting success.
-        exporter_deprecated: "image".to_owned(),
-        exporter_attrs_deprecated: attrs.clone(),
-        exporters: vec![control::Exporter {
-            r#type: "image".to_owned(),
-            attrs,
-        }],
-        ..Default::default()
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("peer solve: {} {}", e.code(), e.message()))?;
+    let out = c
+        .solve(control::SolveRequest {
+            r#ref: format!(
+                "rebuck2-adopt.{}.{}",
+                std::process::id(),
+                SOLVE_SEQ.fetch_add(1, Ordering::Relaxed)
+            ),
+            session: session
+                .as_ref()
+                .map(|(id, _)| id.clone())
+                .unwrap_or_default(),
+            definition: Some(def),
+            // Both forms: an older daemon reads only the deprecated one and
+            // would otherwise export nothing while reporting success.
+            exporter_deprecated: "image".to_owned(),
+            exporter_attrs_deprecated: attrs.clone(),
+            exporters: vec![control::Exporter {
+                r#type: "image".to_owned(),
+                attrs,
+            }],
+            ..Default::default()
+        })
+        .await;
+    if let Some((_, task)) = session {
+        task.abort();
+    }
+    out.map_err(|e| anyhow::anyhow!("peer solve: {} {}", e.code(), e.message()))?;
     Ok(format!("docker-image://{name}"))
 }
 
@@ -965,6 +1000,112 @@ mod tests {
                 Err(e) => e.message().to_string(),
             }
         );
+    }
+
+    /// Emit N builds whose exec mounts a SECRET.
+    ///
+    /// The shape that was undispatchable by construction until a peer could
+    /// be given a session. The exec checks the value, so a build that gets
+    /// the wrong secret fails rather than quietly producing wrong bytes.
+    ///
+    ///   REBUCK2_SECRET=the-value cargo test --bin rebuck2 write_secret_llb \
+    ///     -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn write_secret_llb() {
+        use prost::Message;
+        let dg = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
+        let out = std::env::var("REBUCK2_LLB_OUT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let n: usize = std::env::var("REBUCK2_LLB_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let work: usize = std::env::var("REBUCK2_LLB_WORK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90);
+        for i in 0..n {
+            let base = pb::Op {
+                op: Some(pb::op::Op::Source(pb::SourceOp {
+                    identifier: "docker-image://docker.io/library/alpine:3.20".into(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let base_b = base.encode_to_vec();
+            let exec = pb::Op {
+                inputs: vec![pb::Input {
+                    digest: dg(&base_b),
+                    index: 0,
+                }],
+                op: Some(pb::op::Op::Exec(pb::ExecOp {
+                    meta: Some(pb::Meta {
+                        args: vec![
+                            "/bin/sh".into(),
+                            "-c".into(),
+                            format!(
+                                "test \"$(cat /run/secrets/probe)\" = the-value; \
+                                 i=0; while [ $i -lt {work} ]; do dd if=/dev/zero bs=1M \
+                                 count=20 2>/dev/null | sha256sum >/dev/null; \
+                                 i=$((i+1)); done; mkdir -p /result; \
+                                 echo task-{i} > /result/task"
+                            ),
+                        ],
+                        cwd: "/".into(),
+                        ..Default::default()
+                    }),
+                    mounts: vec![
+                        pb::Mount {
+                            input: 0,
+                            dest: "/".into(),
+                            output: 0,
+                            ..Default::default()
+                        },
+                        pb::Mount {
+                            input: -1,
+                            dest: "/run/secrets/probe".into(),
+                            output: -1,
+                            mount_type: pb::MountType::Secret as i32,
+                            secret_opt: Some(pb::SecretOpt {
+                                id: "rebuck2_probe".into(),
+                                mode: 0o444,
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                        pb::Mount {
+                            input: -1,
+                            dest: "/result".into(),
+                            output: 1,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let exec_b = exec.encode_to_vec();
+            let term = pb::Op {
+                inputs: vec![pb::Input {
+                    digest: dg(&exec_b),
+                    index: 1,
+                }],
+                ..Default::default()
+            };
+            let def = pb::Definition {
+                metadata: [&base_b, &exec_b]
+                    .iter()
+                    .map(|b| (dg(b), pb::OpMetadata::default()))
+                    .collect(),
+                def: vec![base_b, exec_b, term.encode_to_vec()],
+                ..Default::default()
+            };
+            let path = out.join(format!("rebuck2-fanout-{i}.llb"));
+            std::fs::write(&path, def.encode_to_vec()).unwrap();
+            println!("[fixture] {}", path.display());
+        }
     }
 
     /// Emit N plain-LLB builds that read a LOCAL build context.

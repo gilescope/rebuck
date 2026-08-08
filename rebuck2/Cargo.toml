@@ -25,6 +25,9 @@ bazel-remote-apis = "0.27"
 # on the same prost/tonic 0.14 as everything else here - buildkit-proto,
 # the other candidate, has not moved since 2020.
 bollard-buildkit-proto = "0.8"
+# Serving buildkit session attachables to a peer. A sibling crate because it
+# speaks a protocol that has nothing to do with dispatch.
+buildkit-session = { path = "buildkit-session" }
 futures = "0.3"
 iroh = "1"
 postcard = { version = "1", features = ["use-std"] }

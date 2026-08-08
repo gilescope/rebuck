@@ -464,6 +464,7 @@ impl Proxy {
             addr,
             registry,
             portable.clone(),
+            serving_secrets(),
         ));
         loop {
             tokio::select! {
@@ -796,6 +797,15 @@ fn trace(wire: &std::sync::Mutex<Wire>, call: &str) {
 ///
 /// Peer 0 takes its turn and the graph is built in place, which is the
 /// round-trip skipped rather than paid.
+/// May we hand a secret this machine holds to another machine?
+///
+/// Off unless asked. Serving secrets to a peer is the one thing here that
+/// moves a user's credential off their box, and no amount of scheduling
+/// benefit makes that a decision to take on their behalf.
+fn serving_secrets() -> bool {
+    std::env::var("REBUCK2_SERVE_SECRETS").as_deref() == Ok("1")
+}
+
 /// A graph's identity, for remembering how long it took.
 ///
 /// The same bytes `solve::build_and_publish` tags the adopted image with, so
@@ -1801,7 +1811,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 // touches source identifiers, so the original graph gives
                 // the same verdict for nothing.
                 let verdict = crate::dispatch::inspect(&def);
-                let allowed = verdict.dispatchable();
+                let allowed = verdict.dispatchable_with(serving_secrets());
                 if !allowed {
                     // Name the secret, not just its kind. A build that
                     // declares none can still be full of them: a frontend
