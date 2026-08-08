@@ -38,6 +38,8 @@ tokio-stream = "0.1"
 tonic = "0.14"
 # GitHub wraps every artifact in a zip, whatever we put inside it.
 zip = { version = "6", default-features = false, features = ["deflate"] }
+prost-types = "0.14"
+tonic-prost = "0.14"
 
 [dev-dependencies]
 # `oneshot` on a Router: the registry's tests drive real HTTP requests
@@ -48,3 +50,5 @@ tower = { version = "0.5", features = ["util"] }
 [[bin]]
 name = "rebuck2"
 path = "src/main.rs"
+
+[build-dependencies]

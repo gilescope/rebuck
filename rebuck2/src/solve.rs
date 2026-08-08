@@ -285,6 +285,28 @@ mod tests {
         .expect("solve");
     }
 
+    /// Emit a sample LLB Definition in the wire form `buildctl build` reads
+    /// on stdin. A fixture generator, not an assertion:
+    ///   cargo test --bin rebuck2 write_sample_llb -- --ignored
+    ///   buildctl --addr tcp://... build < /tmp/rebuck2-sample.llb
+    ///
+    /// Needed because a frontend-by-NAME build (`--frontend dockerfile.v0`)
+    /// sends no LLB at all - the frontend runs inside the daemon. Only a
+    /// client that constructs LLB itself puts a graph on the wire, which is
+    /// what earthly does and what this imitates.
+    #[test]
+    #[ignore]
+    fn write_sample_llb() {
+        use prost::Message;
+        let path = std::env::temp_dir().join("rebuck2-sample.llb");
+        std::fs::write(&path, alpine_exec_definition().encode_to_vec()).unwrap();
+        println!(
+            "[fixture] {} bytes -> {}",
+            std::fs::metadata(&path).unwrap().len(),
+            path.display()
+        );
+    }
+
     /// The plan's acceptance test for M4, as far as one process can take it:
     /// a subtree is built by a daemon that did not invoke it, the result
     /// lands in the BUILDER's mirror, and the coordinator's disk stays flat.

@@ -2853,6 +2853,7 @@ dependencies = [
  "iroh",
  "postcard",
  "prost",
+ "prost-types",
  "reflink-copy",
  "reqwest",
  "rustls",
@@ -2863,6 +2864,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tonic-prost",
  "tower",
  "zip",
 ]

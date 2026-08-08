@@ -13,6 +13,7 @@ mod bench;
 mod dispatch;
 mod driver;
 mod exec;
+mod gateway;
 mod github;
 mod lease;
 mod mesh;

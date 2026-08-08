@@ -16,36 +16,32 @@
 //! this in one repo: the Control service is a stable, versioned wire, and
 //! we already speak it.
 //!
-//! # MEASURED: this is the wrong layer, and here is the evidence
+//! # MEASURED: this IS the right layer, once it serves the gateway too
 //!
-//! It works, and it sees nothing worth seeing. A real `buildctl` build
-//! through this proxy reports:
+//! An earlier round concluded the opposite, and was wrong. `Control.Solve`
+//! really does arrive with no definition — but the graph was not missing,
+//! it was on the other service. A buildkit client drives its build through
+//! `LLBBridge` created with `NewLLBBridgeClient(c.conn)`: the SAME
+//! connection, a second service. The `Unimplemented` blamed on session
+//! relaying was this proxy not offering it.
+//!
+//! Measured, with a real `buildctl` through a real daemon:
 //!
 //! ```text
 //! [proxy] solve ...: NO definition on the wire (frontend="")
+//! [proxy] GATEWAY solve: 3 ops, 0 cuts >= 4, 0 free-frontier
 //! ```
 //!
-//! For any FRONTEND or GATEWAY build - which is what buildctl and earthly
-//! both do - the LLB is generated INSIDE the daemon, or exchanged over the
-//! session as gateway calls. It never crosses `Control.Solve`, so a
-//! Control-layer proxy cannot see the graph it exists to analyse.
+//! Three client shapes, and only the middle one is invisible:
 //!
-//! Kept because the finding is worth more than the code: it cost one
-//! afternoon and it rules out an approach that looked obviously right. To
-//! see earthly's LLB the options are now (a) proxy the gateway service
-//! INSIDE the session, which is a much deeper interposition, (b) have
-//! earthbuild hand the definition over, or (c) read it back out of
-//! buildkit's build history.
+//! | client | where the LLB is |
+//! | ------------------------------- | ---------------------------- |
+//! | raw LLB (our own solve, testkit) | `Control.Solve`, definition set |
+//! | frontend by NAME (`--frontend dockerfile.v0`) | nowhere — the frontend runs INSIDE the daemon |
+//! | client-built LLB (earthly, `buildctl build < llb`) | `LLBBridge.Solve` — **here** |
 //!
-//! # KNOWN INCOMPLETE: the session relay
-//!
-//! Unary methods forward correctly. `Session` does not: the daemon reports
-//! `healthcheck failed ... EOF` and the solve is cancelled. Buildkit's
-//! session is a TUNNELLED REVERSE connection - the daemon dials back
-//! through it to call services the CLIENT implements - and relaying that
-//! faithfully at the gRPC message layer is not the same as relaying bytes.
-//! Left unfixed on purpose: the finding above means nobody should build on
-//! this until the layer question is settled.
+//! The invisible one costs nothing: if no graph crosses the wire there is
+//! no graph to dispatch, and the daemon was always going to build it alone.
 //!
 //! # What "transparent" has to mean
 //!
@@ -56,6 +52,7 @@
 
 use std::pin::Pin;
 
+use crate::gateway::frontend as gw;
 use bollard_buildkit_proto::moby::buildkit::v1 as control;
 use futures::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
@@ -67,7 +64,9 @@ const MIN_CUT_OPS: usize = 4;
 
 type Chan = tonic::transport::Channel;
 type Client = control::control_client::ControlClient<Chan>;
+type GwClient = gw::llb_bridge_client::LlbBridgeClient<Chan>;
 
+#[derive(Clone)]
 pub struct Proxy {
     /// ONE channel for the whole proxy, cloned per call.
     ///
@@ -79,17 +78,25 @@ pub struct Proxy {
     /// with nothing pointing at a dropped connection. Measured, by doing it
     /// the other way first.
     client: Client,
+    channel: Chan,
 }
 
 impl Proxy {
     pub async fn connect(upstream: String) -> anyhow::Result<Self> {
+        let channel = tonic::transport::Endpoint::new(upstream)?.connect().await?;
         Ok(Proxy {
-            client: control::control_client::ControlClient::connect(upstream).await?,
+            client: control::control_client::ControlClient::new(channel.clone()),
+            channel,
         })
     }
 
     fn client(&self) -> Client {
         self.client.clone()
+    }
+
+    /// The gateway rides the same channel, because the client's does.
+    fn gw(&self) -> GwClient {
+        gw::llb_bridge_client::LlbBridgeClient::new(self.channel.clone())
     }
 }
 
@@ -244,13 +251,197 @@ impl control::control_server::Control for Proxy {
     }
 }
 
+/// What the gateway's Solve offers a dispatcher. THIS is the graph.
+fn report_gateway(req: &gw::SolveRequest) {
+    let Some(def) = &req.definition else {
+        return;
+    };
+    let a = crate::dispatch::analyse(def, MIN_CUT_OPS);
+    let free: Vec<&crate::dispatch::Cut> = a.free_cuts().collect();
+    println!(
+        "[proxy] GATEWAY solve: {} ops, {} cuts >= {MIN_CUT_OPS}, {} free-frontier, biggest {} ops",
+        a.ops,
+        a.cuts.len(),
+        free.len(),
+        free.first().map(|c| c.ops).unwrap_or(0),
+    );
+}
+
 /// Serve the Control service on `addr`, forwarding to `upstream`.
 pub async fn serve(addr: std::net::SocketAddr, upstream: String) -> anyhow::Result<()> {
     println!("[proxy] buildkit control on {addr} -> {upstream}");
     let proxy = Proxy::connect(upstream).await?;
     tonic::transport::Server::builder()
-        .add_service(control::control_server::ControlServer::new(proxy))
+        .add_service(control::control_server::ControlServer::new(proxy.clone()))
+        .add_service(gw::llb_bridge_server::LlbBridgeServer::new(proxy))
         .serve(addr)
         .await?;
     Ok(())
+}
+
+/// The GATEWAY, which is where the graph is.
+///
+/// A buildkit client drives its build through `LLBBridge` on the SAME
+/// connection it speaks Control on, so these calls land here beside the
+/// Control ones — and `Solve` carries the `Definition` that `Control.Solve`
+/// does not. Forwarded unchanged; only `solve` is looked at on the way
+/// through.
+#[tonic::async_trait]
+impl gw::llb_bridge_server::LlbBridge for Proxy {
+    async fn solve(
+        &self,
+        request: Request<gw::SolveRequest>,
+    ) -> Result<Response<gw::SolveResponse>, Status> {
+        let (meta, ext, req) = request.into_parts();
+        report_gateway(&req);
+        self.gw().solve(Request::from_parts(meta, ext, req)).await
+    }
+
+    async fn resolve_image_config(
+        &self,
+        request: Request<gw::ResolveImageConfigRequest>,
+    ) -> Result<Response<gw::ResolveImageConfigResponse>, Status> {
+        let (meta, ext, req) = request.into_parts();
+        self.gw()
+            .resolve_image_config(Request::from_parts(meta, ext, req))
+            .await
+    }
+    async fn resolve_source_meta(
+        &self,
+        request: Request<gw::ResolveSourceMetaRequest>,
+    ) -> Result<Response<gw::ResolveSourceMetaResponse>, Status> {
+        let (meta, ext, req) = request.into_parts();
+        self.gw()
+            .resolve_source_meta(Request::from_parts(meta, ext, req))
+            .await
+    }
+    async fn read_file(
+        &self,
+        request: Request<gw::ReadFileRequest>,
+    ) -> Result<Response<gw::ReadFileResponse>, Status> {
+        let (meta, ext, req) = request.into_parts();
+        self.gw()
+            .read_file(Request::from_parts(meta, ext, req))
+            .await
+    }
+    async fn read_dir(
+        &self,
+        request: Request<gw::ReadDirRequest>,
+    ) -> Result<Response<gw::ReadDirResponse>, Status> {
+        let (meta, ext, req) = request.into_parts();
+        self.gw()
+            .read_dir(Request::from_parts(meta, ext, req))
+            .await
+    }
+    async fn stat_file(
+        &self,
+        request: Request<gw::StatFileRequest>,
+    ) -> Result<Response<gw::StatFileResponse>, Status> {
+        let (meta, ext, req) = request.into_parts();
+        self.gw()
+            .stat_file(Request::from_parts(meta, ext, req))
+            .await
+    }
+    async fn evaluate(
+        &self,
+        request: Request<gw::EvaluateRequest>,
+    ) -> Result<Response<gw::EvaluateResponse>, Status> {
+        let (meta, ext, req) = request.into_parts();
+        self.gw()
+            .evaluate(Request::from_parts(meta, ext, req))
+            .await
+    }
+    async fn ping(
+        &self,
+        request: Request<gw::PingRequest>,
+    ) -> Result<Response<gw::PongResponse>, Status> {
+        let (meta, ext, req) = request.into_parts();
+        self.gw().ping(Request::from_parts(meta, ext, req)).await
+    }
+    async fn inputs(
+        &self,
+        request: Request<gw::InputsRequest>,
+    ) -> Result<Response<gw::InputsResponse>, Status> {
+        let (meta, ext, req) = request.into_parts();
+        self.gw().inputs(Request::from_parts(meta, ext, req)).await
+    }
+    async fn new_container(
+        &self,
+        request: Request<gw::NewContainerRequest>,
+    ) -> Result<Response<gw::NewContainerResponse>, Status> {
+        let (meta, ext, req) = request.into_parts();
+        self.gw()
+            .new_container(Request::from_parts(meta, ext, req))
+            .await
+    }
+    async fn release_container(
+        &self,
+        request: Request<gw::ReleaseContainerRequest>,
+    ) -> Result<Response<gw::ReleaseContainerResponse>, Status> {
+        let (meta, ext, req) = request.into_parts();
+        self.gw()
+            .release_container(Request::from_parts(meta, ext, req))
+            .await
+    }
+    async fn read_file_container(
+        &self,
+        request: Request<gw::ReadFileRequest>,
+    ) -> Result<Response<gw::ReadFileResponse>, Status> {
+        let (meta, ext, req) = request.into_parts();
+        self.gw()
+            .read_file_container(Request::from_parts(meta, ext, req))
+            .await
+    }
+    async fn read_dir_container(
+        &self,
+        request: Request<gw::ReadDirRequest>,
+    ) -> Result<Response<gw::ReadDirResponse>, Status> {
+        let (meta, ext, req) = request.into_parts();
+        self.gw()
+            .read_dir_container(Request::from_parts(meta, ext, req))
+            .await
+    }
+    async fn stat_file_container(
+        &self,
+        request: Request<gw::StatFileRequest>,
+    ) -> Result<Response<gw::StatFileResponse>, Status> {
+        let (meta, ext, req) = request.into_parts();
+        self.gw()
+            .stat_file_container(Request::from_parts(meta, ext, req))
+            .await
+    }
+    async fn warn(
+        &self,
+        request: Request<gw::WarnRequest>,
+    ) -> Result<Response<gw::WarnResponse>, Status> {
+        let (meta, ext, req) = request.into_parts();
+        self.gw().warn(Request::from_parts(meta, ext, req)).await
+    }
+
+    /// `return` is a keyword here and a method name there.
+    async fn r#return(
+        &self,
+        request: Request<gw::ReturnRequest>,
+    ) -> Result<Response<gw::ReturnResponse>, Status> {
+        let (meta, ext, req) = request.into_parts();
+        self.gw()
+            .r#return(Request::from_parts(meta, ext, req))
+            .await
+    }
+
+    type ExecProcessStream =
+        Pin<Box<dyn futures::Stream<Item = Result<gw::ExecMessage, Status>> + Send>>;
+
+    async fn exec_process(
+        &self,
+        request: Request<Streaming<gw::ExecMessage>>,
+    ) -> Result<Response<Self::ExecProcessStream>, Status> {
+        let (meta, ext, stream) = request.into_parts();
+        let inbound = stream.filter_map(|m| futures::future::ready(m.ok()));
+        let s = self
+            .gw()
+            .exec_process(Request::from_parts(meta, ext, inbound))
+            .await?;
+        Ok(Response::new(Box::pin(s.into_inner())))
+    }
 }
