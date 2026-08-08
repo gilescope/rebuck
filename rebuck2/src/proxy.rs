@@ -43,6 +43,50 @@
 //! The invisible one costs nothing: if no graph crosses the wire there is
 //! no graph to dispatch, and the daemon was always going to build it alone.
 //!
+//! # First real measurement: earthly, end to end
+//!
+//! A real `earthly +test` on a three-target Earthfile, through this proxy,
+//! against earthbuild's own buildkitd. It succeeded, and it said:
+//!
+//! ```text
+//! gateway solves : 6
+//! ops per solve  : min 3 median 9 max 9
+//! sources        : 6 registry, 0 local, 0 other
+//! platforms      : {"linux/arm64"}
+//! repeated ops   : 31 (73% of all ops seen again in a later solve)
+//! ```
+//!
+//! **73% repetition is the finding, and it prices a mechanism.** Routing
+//! whole gateway Solves to different daemons - the cheap option, because the
+//! client has already subdivided for us - would have each daemon rebuild the
+//! ops the others already did. The Solves are not disjoint units of work;
+//! they nest, each extending the last. Per-Solve routing therefore needs a
+//! shared cache to be anything other than a duplication engine, and with one
+//! it starts to look like the dedup line rather than a new mechanism.
+//!
+//! Caveats, honestly: three targets is not a shard, and this Earthfile has
+//! no `COPY` from the build context, which is why `local` sources are zero.
+//! A real repo will not look like that. The instrument works, which is what
+//! this run establishes; the numbers want a real workload.
+//!
+//! # Pointing earthly at a proxy, which is not obvious
+//!
+//! Earthly MANAGES buildkitd when it thinks the address is local, and
+//! `containerutil.IsLocal` matches the literal strings `127.0.0.1`,
+//! `localhost` and `::1`. So a loopback address spelled differently reads as
+//! remote and it connects instead:
+//!
+//! ```yaml
+//! global:
+//!   buildkit_host: tcp://[0:0:0:0:0:0:0:1]:11234   # ::1, expanded
+//!   tls_enabled: false
+//! ```
+//!
+//! The upstream must be earthbuild's OWN `earthbuild/buildkitd`, not
+//! `moby/buildkit`: earthly asks for an exporter named `earthly` that only
+//! its fork has. Stock buildkit gets as far as the build and then says
+//! `exporter "earthly" could not be found`.
+//!
 //! # What "transparent" has to mean
 //!
 //! All nine methods, including the streams. `Session` in particular is
@@ -79,6 +123,7 @@ pub struct Proxy {
     /// the other way first.
     client: Client,
     channel: Chan,
+    pub wire: std::sync::Arc<std::sync::Mutex<Wire>>,
 }
 
 impl Proxy {
@@ -87,6 +132,7 @@ impl Proxy {
         Ok(Proxy {
             client: control::control_client::ControlClient::new(channel.clone()),
             channel,
+            wire: Default::default(),
         })
     }
 
@@ -251,19 +297,107 @@ impl control::control_server::Control for Proxy {
     }
 }
 
+/// One gateway Solve, characterised.
+///
+/// Deliberately NOT "how many cuts could mechanism A take" - that prices one
+/// design and asking it first is how you measure the wrong thing
+/// convincingly. This describes the WORKLOAD, which prices every candidate
+/// at once: how many Solves a build makes and how big each is (does routing
+/// whole Solves have enough to route?), how much is `local://` (that part is
+/// going nowhere whatever we build), and what platforms appear (is there
+/// native multi-arch work here at all?).
+#[derive(Default)]
+pub struct Wire {
+    pub solves: u64,
+    pub ops: u64,
+    pub registry_sources: u64,
+    pub local_sources: u64,
+    pub other_sources: u64,
+    pub platforms: std::collections::BTreeSet<String>,
+    /// Ops per Solve, in arrival order - the balance question.
+    pub per_solve: Vec<usize>,
+    /// Graph digests seen, to measure how much two Solves share.
+    seen_ops: std::collections::BTreeSet<String>,
+    pub repeated_ops: u64,
+}
+
+impl Wire {
+    fn observe(&mut self, def: &bollard_buildkit_proto::pb::Definition) {
+        use prost::Message;
+        self.solves += 1;
+        self.ops += def.def.len() as u64;
+        self.per_solve.push(def.def.len());
+        for bytes in &def.def {
+            let digest = crate::store::sha256_hex(bytes);
+            if !self.seen_ops.insert(digest) {
+                // The same op in two Solves. High overlap means routing
+                // whole Solves duplicates work that dispatch would share.
+                self.repeated_ops += 1;
+            }
+            let Ok(op) = bollard_buildkit_proto::pb::Op::decode(bytes.as_slice()) else {
+                continue;
+            };
+            if let Some(p) = &op.platform {
+                self.platforms
+                    .insert(format!("{}/{}", p.os, p.architecture));
+            }
+            if let Some(bollard_buildkit_proto::pb::op::Op::Source(src)) = &op.op {
+                match src.identifier.split_once("://").map(|(s, _)| s) {
+                    Some("docker-image") => self.registry_sources += 1,
+                    Some("local") => self.local_sources += 1,
+                    _ => self.other_sources += 1,
+                }
+            }
+        }
+    }
+
+    /// The characterisation, as one block. Printed on shutdown because the
+    /// interesting numbers are about the BUILD, not any one Solve.
+    pub fn report(&self) {
+        let mut sizes = self.per_solve.clone();
+        sizes.sort_unstable();
+        let median = sizes.get(sizes.len() / 2).copied().unwrap_or(0);
+        println!("[wire] ---- what this build looked like ----");
+        println!("[wire] gateway solves : {}", self.solves);
+        println!("[wire] ops total      : {}", self.ops);
+        println!(
+            "[wire] ops per solve  : min {} median {} max {}",
+            sizes.first().copied().unwrap_or(0),
+            median,
+            sizes.last().copied().unwrap_or(0),
+        );
+        println!(
+            "[wire] sources        : {} registry, {} local, {} other",
+            self.registry_sources, self.local_sources, self.other_sources
+        );
+        println!("[wire] platforms      : {:?}", self.platforms);
+        println!(
+            "[wire] repeated ops   : {} ({}% of all ops seen again in a later solve)",
+            self.repeated_ops,
+            if self.ops > 0 {
+                self.repeated_ops * 100 / self.ops
+            } else {
+                0
+            }
+        );
+    }
+}
+
 /// What the gateway's Solve offers a dispatcher. THIS is the graph.
-fn report_gateway(req: &gw::SolveRequest) {
+fn report_gateway(wire: &std::sync::Mutex<Wire>, req: &gw::SolveRequest) {
     let Some(def) = &req.definition else {
         return;
     };
     let a = crate::dispatch::analyse(def, MIN_CUT_OPS);
     let free: Vec<&crate::dispatch::Cut> = a.free_cuts().collect();
+    let mut w = wire.lock().expect("wire");
+    w.observe(def);
     println!(
-        "[proxy] GATEWAY solve: {} ops, {} cuts >= {MIN_CUT_OPS}, {} free-frontier, biggest {} ops",
+        "[proxy] gateway solve #{}: {} ops, {} cuts >= {MIN_CUT_OPS}, {} free-frontier",
+        w.solves,
         a.ops,
         a.cuts.len(),
         free.len(),
-        free.first().map(|c| c.ops).unwrap_or(0),
     );
 }
 
@@ -271,6 +405,14 @@ fn report_gateway(req: &gw::SolveRequest) {
 pub async fn serve(addr: std::net::SocketAddr, upstream: String) -> anyhow::Result<()> {
     println!("[proxy] buildkit control on {addr} -> {upstream}");
     let proxy = Proxy::connect(upstream).await?;
+    // The characterisation is about the BUILD, so it prints when we are
+    // asked to stop rather than per Solve.
+    let wire = proxy.wire.clone();
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        wire.lock().expect("wire").report();
+        std::process::exit(0);
+    });
     tonic::transport::Server::builder()
         .add_service(control::control_server::ControlServer::new(proxy.clone()))
         .add_service(gw::llb_bridge_server::LlbBridgeServer::new(proxy))
@@ -293,7 +435,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         request: Request<gw::SolveRequest>,
     ) -> Result<Response<gw::SolveResponse>, Status> {
         let (meta, ext, req) = request.into_parts();
-        report_gateway(&req);
+        report_gateway(&self.wire, &req);
         self.gw().solve(Request::from_parts(meta, ext, req)).await
     }
 
