@@ -112,6 +112,14 @@ pub fn solve_request(
             SOLVE_SEQ.fetch_add(1, Ordering::Relaxed)
         ),
         definition: Some(def),
+        // BOTH forms, deliberately. earthly's fork predates `exporters` and
+        // reads only the deprecated pair; protobuf drops a field it does not
+        // know without a word, so a request carrying only the new form asks
+        // that daemon for no export at all - it solves, publishes nothing,
+        // and returns success. See
+        // `the_exporter_is_named_the_old_way_too_or_a_fork_ignores_it`.
+        exporter_deprecated: "image".to_owned(),
+        exporter_attrs_deprecated: attrs.clone(),
         exporters: vec![control::Exporter {
             r#type: "image".to_owned(),
             attrs,
@@ -437,6 +445,35 @@ pub fn published_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_exporter_is_named_the_old_way_too_or_a_fork_ignores_it() {
+        // earthly's buildkit fork is cut from 2024-05, and its SolveRequest
+        // has NO `Exporters` field - only `Exporter = 3` and
+        // `ExporterAttrs = 4`. Protobuf drops fields it does not know
+        // SILENTLY, so a request carrying only the new repeated form arrives
+        // there with no exporter named at all.
+        //
+        // The fork then does exactly what it should with a request that asks
+        // for no export: it solves, exports nothing, and returns an empty
+        // response with no error. Measured - the subtree pushed zero blobs
+        // and zero manifests while `mirror_image`, which sets both forms,
+        // pushed its base image through the same daemon on the same run.
+        //
+        // Newer buildkit prefers `exporters` and falls back to this pair, so
+        // setting both costs nothing and is what every buildkit since 0.13
+        // documents the deprecated fields as being for.
+        let r = solve_request(1, pb::Definition::default(), "r:5000", "");
+        assert_eq!(
+            r.exporter_deprecated, "image",
+            "a 2024-era daemon reads THIS field and nothing else"
+        );
+        assert_eq!(
+            r.exporter_attrs_deprecated, r.exporters[0].attrs,
+            "the two forms must describe the same export, or which one the \
+             daemon happens to read changes what gets published"
+        );
+    }
 
     #[test]
     fn a_silent_export_is_a_failed_handover_not_a_tag() {
