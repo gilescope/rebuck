@@ -366,7 +366,32 @@ struct Reg<S> {
     /// BuildKit itself never opens a chunked session (containerd's pusher does
     /// monolithic POST-then-PUT and leaves chunked upload a `// TODO`), but
     /// every other OCI client does — skopeo, crane and `docker push` all PATCH.
-    sessions: std::sync::Mutex<HashMap<u64, Upload>>,
+    sessions: std::sync::Mutex<HashMap<u64, (std::time::Instant, Upload)>>,
+}
+
+/// How long an upload session may sit untouched before it is assumed
+/// abandoned. Generous: a slow client PATCHing a large blob over a thin link
+/// refreshes the stamp on every chunk, so this bounds idleness and not
+/// duration.
+const UPLOAD_IDLE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Drop upload sessions untouched for `ttl`.
+///
+/// Every [`Upload`] holds an OPEN FILE. The tmp file it also holds is the
+/// visible half and the lesser one: a few hundred abandoned pushes exhaust the
+/// descriptor table and the registry stops accepting connections, which takes
+/// the whole fleet's dispatch with it.
+///
+/// Called when a session is opened rather than from a timer. The work is
+/// proportional to sessions currently open, which is the same quantity the
+/// caller is about to add to, and it needs no task to outlive anything.
+fn reap_stale(
+    sessions: &mut HashMap<u64, (std::time::Instant, Upload)>,
+    now: std::time::Instant,
+    ttl: std::time::Duration,
+) {
+    // Dropping the Upload closes the descriptor and removes the tmp file.
+    sessions.retain(|_, (touched, _)| now.duration_since(*touched) < ttl);
 }
 
 /// Canonical `sha256:<64 lowercase hex>` -> the hex. Anything else is rejected
@@ -509,7 +534,11 @@ async fn handle<S: RegistryStore>(
             }
         };
         let id = reg.next_upload.fetch_add(1, Ordering::Relaxed);
-        reg.sessions.held().insert(id, up);
+        {
+            let mut open = reg.sessions.held();
+            reap_stale(&mut open, std::time::Instant::now(), UPLOAD_IDLE);
+            open.insert(id, (std::time::Instant::now(), up));
+        }
         let mut h = HeaderMap::new();
         h.insert(
             header::LOCATION,
@@ -530,7 +559,7 @@ async fn handle<S: RegistryStore>(
 
         // Take the session out to write to it and put it back after: the lock
         // is std, so it must never be held across an await.
-        let Some(mut up) = reg.sessions.held().remove(&id) else {
+        let Some((_, mut up)) = reg.sessions.held().remove(&id) else {
             return err(StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", "no session");
         };
 
@@ -551,12 +580,16 @@ async fn handle<S: RegistryStore>(
                 header::RANGE,
                 HeaderValue::from_str(&format!("0-{end}")).unwrap(),
             );
-            reg.sessions.held().insert(id, up);
+            reg.sessions
+                .held()
+                .insert(id, (std::time::Instant::now(), up));
             return (StatusCode::ACCEPTED, h).into_response();
         }
 
         if method != Method::PUT {
-            reg.sessions.held().insert(id, up);
+            reg.sessions
+                .held()
+                .insert(id, (std::time::Instant::now(), up));
             return err(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "UNSUPPORTED",
@@ -1431,6 +1464,35 @@ mod tests {
             .await;
             assert_eq!(st, StatusCode::BAD_REQUEST, "accepted a bad digest: {bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_upload_does_not_leak_a_file_descriptor_forever() {
+        // A client that POSTs to open an upload and then vanishes - a peer
+        // killed mid-push, which this project's own suite does deliberately -
+        // used to leave its session in the map until the process exited.
+        //
+        // The tmp file was the visible part and the least of it. Every
+        // `Upload` holds an OPEN FILE, so a few hundred abandoned pushes
+        // exhaust the descriptor table and the registry stops accepting
+        // connections. A mirror that stops accepting connections takes the
+        // whole fleet's dispatch with it.
+        let s = store();
+        let mut sessions: HashMap<u64, (std::time::Instant, Upload)> = HashMap::new();
+        let now = std::time::Instant::now();
+        sessions.insert(
+            1,
+            (
+                now - std::time::Duration::from_secs(3600),
+                s.upload_begin().await.unwrap(),
+            ),
+        );
+        sessions.insert(2, (now, s.upload_begin().await.unwrap()));
+
+        reap_stale(&mut sessions, now, std::time::Duration::from_secs(600));
+
+        assert!(!sessions.contains_key(&1), "an hour-old session survived");
+        assert!(sessions.contains_key(&2), "a fresh session was reaped");
     }
 
     /// The registry over a real [`Driver`] (not a bare Store): a blob the
