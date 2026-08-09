@@ -37,6 +37,8 @@ PROXY_PORT=${PROXY_PORT:-21234}
 # only way to put anything in front of earthly.
 LAN=${LAN:-$(ipconfig getifaddr en0 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')}
 REG_PORT=${REG_PORT:-25000}
+BK_PORT=${BK_PORT:-28371}
+OWN_BK=${OWN_BK:-rebuck2-earthly-bk}
 
 [ -d "$EB" ] || { echo "no earthbuild checkout at $EB (set EB=)"; exit 1; }
 [ -n "$LAN" ] || { echo "no non-loopback address found (set LAN=)"; exit 1; }
@@ -46,6 +48,7 @@ rm -rf "$RUN"; mkdir -p "$RUN"
 pids=()
 cleanup() {
   for p in "${pids[@]:-}"; do kill "$p" 2>/dev/null || true; done
+  docker rm -f "$OWN_BK" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -85,20 +88,42 @@ MIRROR_HOST=${MIRROR_HOST:-host.docker.internal}
 } >"$RUN/earthly.yml"
 export EARTHLY_CONFIG="$RUN/earthly.yml"
 
-echo "== earthly's own buildkitd"
-# Its converter emits fork-only ops, so the daemon must be the one earthly
-# picked, not moby's.
+echo "== a buildkitd we can actually proxy"
+# Bootstrap to learn the IMAGE, then run our OWN container from it.
+#
+# "Just use the daemon earthly started" does not work, and the reason is not
+# obvious: earthly runs it with BUILDKIT_TCP_TRANSPORT_ENABLED=false. It talks
+# to its daemon over a unix socket, and the port it publishes answers HTTP/1.1
+# - a gRPC client gets "frame too large, note that the frame header looked
+# like an HTTP/1.1 header". Nothing can sit in front of that.
+#
+# The image still has to be earthly's: the converter emits fork-only ops
+# (host binds, earthly_interactive sockets) that stock buildkit rejects. So
+# bootstrap picks the image and we start it the way a proxy needs.
 earthly bootstrap >/dev/null 2>&1 || true
-BK=$(docker ps --filter 'name=buildkitd' --format '{{.Names}}' | head -1)
-[ -n "$BK" ] || { echo "earthly started no buildkitd"; exit 1; }
-# Whatever it publishes, not a port we assumed. v0.8.17 uses 8371 and maps it
-# to a dynamic host port; asking for 8372 got nothing and the probe exited
-# with no explanation. Same class of guess as hardcoding the image.
-BK_ADDR=$(docker port "$BK" | head -1 | awk -F' -> ' '{print $2}')
-[ -n "$BK_ADDR" ] || {
-  echo "$BK publishes no ports - cannot proxy it:"; docker port "$BK"; exit 1;
+SEED=$(docker ps -a --filter 'name=buildkitd' --format '{{.Names}}' | head -1)
+[ -n "$SEED" ] || { echo "earthly started no buildkitd to copy an image from"; exit 1; }
+BK_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$SEED")
+echo "   image: $BK_IMAGE (from $SEED)"
+
+docker rm -f "$OWN_BK" >/dev/null 2>&1 || true
+docker run -d --name "$OWN_BK" --privileged \
+  -p "$BK_PORT:8371" \
+  -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
+  -e BUILDKIT_TLS_ENABLED=false \
+  -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG="[registry.\"$MIRROR_HOST:$REG_PORT\"]
+  http = true
+  insecure = true" \
+  "$BK_IMAGE" >/dev/null
+BK_ADDR="127.0.0.1:$BK_PORT"
+for _ in $(seq 1 90); do
+  docker exec "$OWN_BK" buildctl --addr tcp://127.0.0.1:8371 debug workers >/dev/null 2>&1 && break
+  sleep 1
+done
+docker exec "$OWN_BK" buildctl --addr tcp://127.0.0.1:8371 debug workers >/dev/null 2>&1 || {
+  echo "our buildkitd never became ready:"; docker logs --tail 20 "$OWN_BK"; exit 1;
 }
-echo "   $BK on $BK_ADDR"
+echo "   ours on $BK_ADDR"
 
 echo "== coordinator"
 REBUCK2_MIRROR="$MIRROR_HOST:$REG_PORT" \

@@ -120,6 +120,40 @@ constant where the daemon decides:
   is not a published tag; `:v0.8.17` is. Run `earthly bootstrap` and copy
   what it chose.
 
+## earthly's own daemon cannot be proxied
+
+Worse than awkward - impossible, and it took an A/B to see it.
+
+`earthly bootstrap` runs its daemon with `BUILDKIT_TCP_TRANSPORT_ENABLED=false`.
+It speaks to that daemon over a unix socket; the port the container publishes
+answers HTTP/1.1, so a gRPC client gets:
+
+```text
+error reading server preface: http2: frame too large, note that the
+frame header looked like an HTTP/1.1 header
+```
+
+Nothing can sit in front of it, whatever address you use.
+
+The mis-attribution is the instructive part. Pointing a proxy at it and
+running earthly gave `h2 protocol error`, which looked like an earthly
+problem. `buildctl` produced the SAME error, so not earthly. Loopback
+produced the same error as the LAN address, so not the address. The only
+remaining variable was the UPSTREAM: every green run in this repo proxies a
+plain moby daemon, and this one proxied earthly's.
+
+So the working shape is a hybrid, and both halves matter:
+
+- the IMAGE must be earthly's fork - `earthly bootstrap`, then
+  `docker inspect -f '{{.Config.Image}}'`. Stock buildkit rejects the graph.
+- the CONTAINER must be ours - `docker run` with
+  `BUILDKIT_TCP_TRANSPORT_ENABLED=true`, so it serves gRPC on a port a proxy
+  can reach.
+
+Registry trust then goes on our container as
+`EARTHLY_ADDITIONAL_BUILDKIT_CONFIG`, where it cannot disturb earthly's
+settings hash - which is what made the loopback restart so hard to attribute.
+
 ## The ceiling after #784, counted from the Earthfile
 
 Fixing #784 does not make earthbuild's own root Earthfile fully
