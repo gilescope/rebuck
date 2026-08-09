@@ -98,6 +98,10 @@ REMOTE_DAEMONS=${REMOTE_DAEMONS:-1}
 # The remote's share, relative to this machine. Buildkit does not report core
 # counts, so somebody has to say. 2 means "twice the turns".
 REMOTE_WEIGHT=${REMOTE_WEIGHT:-1}
+# Relative share for the LAST local daemon, e.g. PEER_WEIGHT=3. Until this
+# existed only the REMOTE peer could carry a `*N`, so the weighting mechanism
+# could not be exercised without a second machine - and therefore never was.
+PEER_WEIGHT=${PEER_WEIGHT:-1}
 # Kill the LAST daemon this many seconds into the build. Fail-open is a
 # stated principle and had never been tested by actually breaking something:
 # a build must still finish, with the right bytes, when a peer dies holding
@@ -295,7 +299,15 @@ for i in $(seq 0 $((DAEMONS - 1))); do
   say "daemon $i on 127.0.0.1:$port ($name)"
   # `if`, not `[ ] &&`: a false test is the loop body's last command, and
   # under `set -e` that ends the script on daemon 0.
-  if [ "$i" -gt 0 ]; then peers+=(--peer "http://127.0.0.1:$port"); fi
+  if [ "$i" -gt 0 ]; then
+    # The last daemon carries the weight, the same one SLOW slows, so the two
+    # knobs describe the same machine and can be reasoned about together.
+    if [ "$i" -eq $((DAEMONS - 1)) ] && [ "$PEER_WEIGHT" != "1" ]; then
+      peers+=(--peer "http://127.0.0.1:$port*$PEER_WEIGHT")
+    else
+      peers+=(--peer "http://127.0.0.1:$port")
+    fi
+  fi
 done
 
 if [ -n "$REMOTE" ]; then

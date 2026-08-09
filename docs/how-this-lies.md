@@ -133,9 +133,41 @@ property actually has. If the answer is "none", that is the bug. `struck` is
 now reported always, including empty, because a line that appears only on
 failure cannot evidence an absence.
 
+## 12. A check that finds nothing without proving it looked
+
+An audit prints no findings. That reads as "clean" and is equally consistent
+with "never ran".
+
+**Instance:** auditing which `REBUCK2_*` variables the suite exercises. The
+loop ran ONCE rather than seventeen times - zsh does not word-split unquoted
+parameter expansions - and its `grep -q` was handed a multi-line pattern,
+which greps as an alternation and so matched because SOME name appeared. It
+printed nothing. Reported as "all exercised". Six of seventeen were not, and
+one of those was hiding an unbounded map that nothing read.
+
+**Countermeasure:** make the search state its own size. `found N, checked N,
+unchecked M` cannot be satisfied by a loop that never ran.
+
+## 13. A knob that is wired, documented, and inert
+
+Not dead code - dead *effect*. Every part exists and the value arrives
+where it is read, but something upstream is constant, so the mechanism
+cannot express itself.
+
+**Instance:** peer weights. `--peer url*4` parses, reaches the proxy, prints
+in the banner, and is consumed by the placement score - divided into a load
+counter that is never incremented anywhere, and therefore always zero. Zero
+over any weight is zero. Measured 6/6 against 6/6 with a fourfold weight
+under full contention.
+
+**Countermeasure:** vary the knob and require the OUTPUT to move. This one
+was never exercised end to end, so nothing ever asked it to make a
+difference. It also invalidated a conclusion drawn from it - "informed
+weights measured worse" compared the mechanism against itself doing nothing.
+
 ## The common thread
 
-Ten of these eleven produced a GREEN result. Not one announced itself.
+Twelve of these thirteen produced a GREEN result. Not one announced itself.
 
 The discipline that caught them is the same every time: **find the
 observation that differs between the world where it works and the world where
