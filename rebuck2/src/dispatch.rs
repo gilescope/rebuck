@@ -241,6 +241,54 @@ fn hazards(op: &pb::Op) -> Vec<Exclusion> {
     out
 }
 
+/// Everything a graph carries that a SESSIONLESS solve cannot satisfy,
+/// spelled out for a human.
+///
+/// `inspect` answers yes-or-no from the hazards it models. This answers "what
+/// is actually in here", and exists because a real earthly graph was declined
+/// with `no active sessions` while inspect called it clean - so the model has
+/// a gap and guessing at it twice was already one time too many.
+///
+/// Mount types by NUMBER as well as name: an unmodelled type is exactly the
+/// case worth seeing, and it has no name here to print.
+pub fn session_shape(def: &pb::Definition) -> BTreeMap<String, usize> {
+    let mut out: BTreeMap<String, usize> = BTreeMap::new();
+    for bytes in &def.def {
+        let Ok(op) = pb::Op::decode(bytes.as_slice()) else {
+            *out.entry("op: undecodable".into()).or_default() += 1;
+            continue;
+        };
+        match op.op {
+            Some(pb::op::Op::Source(ref src)) => {
+                let scheme = src
+                    .identifier
+                    .split_once("://")
+                    .map(|(s, _)| s.to_owned())
+                    .unwrap_or_else(|| "source: no scheme".into());
+                *out.entry(format!("source: {scheme}")).or_default() += 1;
+            }
+            Some(pb::op::Op::Exec(ref e)) => {
+                if !e.secretenv.is_empty() {
+                    *out.entry("exec: secretenv".into()).or_default() += 1;
+                }
+                for m in &e.mounts {
+                    let name = match m.mount_type {
+                        x if x == pb::MountType::Bind as i32 => "bind".to_owned(),
+                        x if x == pb::MountType::Secret as i32 => "secret".to_owned(),
+                        x if x == pb::MountType::Ssh as i32 => "ssh".to_owned(),
+                        x if x == pb::MountType::Cache as i32 => "cache".to_owned(),
+                        x if x == pb::MountType::Tmpfs as i32 => "tmpfs".to_owned(),
+                        other => format!("UNMODELLED({other})"),
+                    };
+                    *out.entry(format!("mount: {name}")).or_default() += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Read a `Definition` and decide whether its subtree may be handed to a peer.
 pub fn inspect(def: &pb::Definition) -> Verdict {
     let mut exclusions = Vec::new();

@@ -1671,6 +1671,16 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                             // refusal to report against any machine: we
                             // build it here, exactly as without a fleet.
                             None => {
+                                // Nobody took it. Say WHAT was in the graph,
+                                // once: a refusal with no shape attached is
+                                // how two wrong theories got as far as they
+                                // did today.
+                                if self.wire.held().routed == 0 {
+                                    println!(
+                                        "[proxy] nothing taken; graph carries {:?}",
+                                        crate::dispatch::session_shape(&portable)
+                                    );
+                                }
                                 self.wire.held().home += 1;
                                 *self
                                     .wire
