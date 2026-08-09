@@ -1158,15 +1158,24 @@ pub async fn serve_with_upstream<S: RegistryStore>(
             next.run(req).await
         },
     ));
-    tokio::spawn(async {
-        let _ = tokio::signal::ctrl_c().await;
-        if let Some(m) = TRAFFIC.held().as_ref() {
-            let total: u64 = m.values().sum();
-            println!("[registry] served {total} requests: {m:?}");
-        }
-        std::process::exit(0);
-    });
-    axum::serve(listener, app).await?;
+    // Graceful shutdown rather than `std::process::exit`, which is what this
+    // was. That was invisible while the registry owned its process and fatal
+    // the moment it shared one: co-located with the proxy, the registry's
+    // SIGINT handler printed this tally and then killed the process
+    // mid-sentence, truncating the proxy's own report and failing every
+    // placement assertion against output that was never written.
+    //
+    // Stopping the SERVER is this function's business. Ending the PROCESS
+    // belongs to whoever owns it.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+            if let Some(m) = TRAFFIC.held().as_ref() {
+                let total: u64 = m.values().sum();
+                println!("[registry] served {total} requests: {m:?}");
+            }
+        })
+        .await?;
     Ok(())
 }
 

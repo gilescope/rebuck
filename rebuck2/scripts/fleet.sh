@@ -113,6 +113,10 @@ KILL_AFTER=${KILL_AFTER:-}
 KILL_REGISTRY_AFTER=${KILL_REGISTRY_AFTER:-}
 
 crate=$(cd "$(dirname "$0")/.." && pwd)
+# Keyless rendezvous: proxy and workers derive the driver's iroh identity from
+# this string, so nothing has to learn an address. Per-run, or two concurrent
+# rigs would join each other's fleet.
+SESSION=${SESSION:-"fleet-$$-$(date +%s 2>/dev/null || echo 0)"}
 rm -rf "$RUN"
 mkdir -p "$RUN/llb" "$RUN/store"
 
@@ -235,10 +239,16 @@ say "daemons: $IMAGE on $PLATFORM"
 docker pull --platform "$PLATFORM" -q "$IMAGE" >/dev/null
 echo "image arch: $(docker image inspect "$IMAGE" --format '{{.Architecture}}')"
 
-say "registry on 0.0.0.0:$REG_PORT (daemons reach it as host.docker.internal)"
-"$bin" registry --bind "0.0.0.0:$REG_PORT" --store "$RUN/store" >"$RUN/registry.log" 2>&1 &
-reg_pid=$!
-pids+=("$reg_pid")
+# The registry is served BY THE PROXY, over its driver, so it is mesh-backed:
+# a layer built on one worker is served to another over iroh. A separate
+# process here would hold no provider index and would be a third copy of a job
+# the mesh already does. The baseline needs one anyway, having no proxy.
+if [ -n "$NOPROXY" ]; then
+  say "registry on 0.0.0.0:$REG_PORT (baseline has no proxy to host it)"
+  "$bin" registry --bind "0.0.0.0:$REG_PORT" --store "$RUN/store" >"$RUN/registry.log" 2>&1 &
+  reg_pid=$!
+  pids+=("$reg_pid")
+fi
 
 # Daemons trust the mirror over plain HTTP. Without this a peer with no
 # session cannot pull what another daemon published, and the failure looks
@@ -264,7 +274,6 @@ TOML
 fi
 
 
-peers=()
 for i in $(seq 0 $((DAEMONS - 1))); do
   port=$((BASE_PORT + i))
   name="rebuck2-fleet-$i"
@@ -297,17 +306,6 @@ for i in $(seq 0 $((DAEMONS - 1))); do
     ${HOSTNET:+--allow-insecure-entitlement network.host} >/dev/null
   containers+=("$name")
   say "daemon $i on 127.0.0.1:$port ($name)"
-  # `if`, not `[ ] &&`: a false test is the loop body's last command, and
-  # under `set -e` that ends the script on daemon 0.
-  if [ "$i" -gt 0 ]; then
-    # The last daemon carries the weight, the same one SLOW slows, so the two
-    # knobs describe the same machine and can be reasoned about together.
-    if [ "$i" -eq $((DAEMONS - 1)) ] && [ "$PEER_WEIGHT" != "1" ]; then
-      peers+=(--peer "http://127.0.0.1:$port*$PEER_WEIGHT")
-    else
-      peers+=(--peer "http://127.0.0.1:$port")
-    fi
-  fi
 done
 
 if [ -n "$REMOTE" ]; then
@@ -324,8 +322,10 @@ if [ -n "$REMOTE" ]; then
         -p 0.0.0.0:$rport:8372 \
         -v /tmp/rebuck2-buildkitd.toml:/etc/buildkit/buildkitd.toml:ro \
         $IMAGE" >/dev/null
-    peers+=(--peer "http://$remote_host:$rport*$REMOTE_WEIGHT")
-    say "remote daemon $r on $remote_host:$rport"
+    # No --peer any more. A remote daemon joins by running a WORKER against
+    # it, the same way a local one does; the mesh finds the driver by session
+    # and needs no address here.
+    say "remote daemon $r on $remote_host:$rport (start a worker against it)"
   done
 fi
 
@@ -344,8 +344,7 @@ if [ -n "$NOPROXY" ]; then
   say "baseline: client -> daemon 0 direct"
 else
   addr="tcp://127.0.0.1:$PROXY_PORT"
-  # peers holds --peer and its value, so its length is twice the count.
-  say "proxy on $addr -> daemon 0 plus $((${#peers[@]} / 2)) peer(s)"
+  say "proxy on $addr -> daemon 0, plus $((DAEMONS - 1)) worker(s) on the mesh"
   # UNRESOLVABLE=1 keeps the secret from the PROXY while leaving it with the
   # client. That is the earthly shape: a secret the build legitimately uses
   # and nothing outside the client process can produce.
@@ -354,13 +353,42 @@ else
   rebuck2_probe="$proxy_secret" \
     REBUCK2_MIRROR="$MIRROR_HOST:$REG_PORT" \
     "$bin" buildkit-proxy --listen "$BIND:$PROXY_PORT" \
-    --upstream "http://127.0.0.1:$BASE_PORT" "${peers[@]}" >"$RUN/proxy.log" 2>&1 &
+    --upstream "http://127.0.0.1:$BASE_PORT" \
+    --registry-bind "0.0.0.0:$REG_PORT" \
+    --session "$SESSION" --store "$RUN/store" >"$RUN/proxy.log" 2>&1 &
   proxy_pid=$!
   pids+=("$proxy_pid")
+
+  # One worker per AWAY daemon. Daemon 0 is the proxy's own upstream and is
+  # not a worker: the gateway builds its share there by falling through.
+  # Rendezvous is keyless - both sides derive the driver's identity from
+  # $SESSION - so there is no address to configure and no ordering to get
+  # right.
+  for i in $(seq 1 $((DAEMONS - 1))); do
+    "$bin" worker --session "$SESSION" \
+      --store "$RUN/worker-$i" \
+      --buildkit-addr "http://127.0.0.1:$((BASE_PORT + i))" \
+      --registry-addr "$MIRROR_HOST:$REG_PORT" >"$RUN/worker-$i.log" 2>&1 &
+    pids+=("$!")
+  done
   for _ in $(seq 1 30); do
     bctl --addr "$addr" debug workers >/dev/null 2>&1 && break
     sleep 1
   done
+  # BARRIER on the mesh, not just on the gateway. A worker joins over iroh
+  # some hundreds of ms after its process starts, and the proxy asks
+  # `worker_count() > 0` per solve - so without this the first builds see an
+  # empty fleet, dispatch nothing, and the run reports a placement failure
+  # that is really a startup race. re-e2e.yml waits the same way.
+  want=$((DAEMONS - 1))
+  if [ "$want" -gt 0 ]; then
+    for _ in $(seq 1 60); do
+      joined=$(grep -c "^\[driver\] worker .* joined" "$RUN/proxy.log" 2>/dev/null || true)
+      [ "${joined:-0}" -ge "$want" ] && break
+      sleep 1
+    done
+    say "$joined/$want worker(s) on the mesh"
+  fi
 fi
 
 fail=0
@@ -417,7 +445,7 @@ for round in $(seq 1 "$ROUNDS"); do
   if [ -n "$KILL_REGISTRY_AFTER" ]; then
     ( sleep "$KILL_REGISTRY_AFTER"
       echo "=== killing the registry mid-build"
-      kill "$reg_pid" 2>/dev/null || true ) &
+      kill "${reg_pid:-$proxy_pid}" 2>/dev/null || true ) &
   fi
   if [ -n "$KILL_AFTER" ]; then
     victim="rebuck2-fleet-$((DAEMONS - 1))"
@@ -456,9 +484,23 @@ if [ -z "$NOPROXY" ]; then
   # The wire report prints on SIGINT, so ask for it before the trap kills
   # everything with SIGTERM.
   kill -INT "$proxy_pid" 2>/dev/null || true
-  kill -INT "$reg_pid" 2>/dev/null || true
-  sleep 2
-  grep -E "^\[registry\] served" "$RUN/registry.log" || true
+  # NOT `kill -INT "${reg_pid:-0}"`. PID 0 means "every process in my process
+  # group", so the fallback signalled the script itself and the run ended
+  # right after printing a clean summary - exit 1 with nothing to explain it.
+  [ -n "${reg_pid:-}" ] && kill -INT "$reg_pid" 2>/dev/null
+  true
+  # Wait for the report to LAND, not for a guessed interval. The proxy now
+  # also winds down a driver, a mesh endpoint and a registry, and two seconds
+  # stopped being enough - the report was cut off mid-line and every
+  # placement assertion failed against output that simply had not been
+  # written yet.
+  for _ in $(seq 1 30); do
+    grep -q "^\[wire\] placed" "$RUN/proxy.log" 2>/dev/null && break
+    sleep 1
+  done
+  # The registry lives in the proxy now, so its tally is in the proxy log.
+  # Baseline runs still have a standalone one.
+  grep -hE "^\[registry\] served" "$RUN/proxy.log" "$RUN/registry.log" 2>/dev/null || true
   grep -E '^\[wire\]|^\[proxy\] +(adopted|peer|taking|frontend|what)' "$RUN/proxy.log" || true
 fi
 

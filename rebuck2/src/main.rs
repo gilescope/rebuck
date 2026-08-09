@@ -245,12 +245,29 @@ async fn main() -> Result<()> {
                     scratch,
                 },
             );
+            let registry_bind = args.opt("--registry-bind");
             args.done();
             {
                 let d = d.clone();
                 tokio::spawn(async move {
                     if let Err(e) = d.serve_mesh().await {
                         eprintln!("[proxy] mesh died: {e:#}");
+                    }
+                });
+            }
+            // The registry is served over the DRIVER, not over a bare
+            // store, which is what makes it mesh-backed: a layer built on
+            // one worker is served to another's buildkitd over iroh. A
+            // separate `rebuck2 registry` process would be a third copy of
+            // the same job and would hold no such index.
+            if let Some(bind) = registry_bind {
+                let d = d.clone();
+                let up = registry::HttpUpstream::from_env()
+                    .map(|u| Arc::new(u) as Arc<dyn registry::Upstream>);
+                let addr: std::net::SocketAddr = bind.parse()?;
+                tokio::spawn(async move {
+                    if let Err(e) = registry::serve_with_upstream(addr, d, up).await {
+                        eprintln!("[proxy] registry died: {e:#}");
                     }
                 });
             }

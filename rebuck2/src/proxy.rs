@@ -1641,7 +1641,19 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                             Some(reference) => {
                                 println!("[proxy] fleet built it: {reference}");
                                 self.wire.held().routed += 1;
-                                req.definition = Some(crate::dispatch::import_graph(&reference));
+                                // `Led` carries a bare `host:port/repo:tag` -
+                                // what the registry speaks and what a worker
+                                // prints. An LLB source identifier is a URL,
+                                // so buildkit rejects it unschemed with
+                                // "failed to parse ... invalid". The deleted
+                                // peer path prefixed this on the way out;
+                                // here is where that moved to.
+                                let src = if reference.contains("://") {
+                                    reference
+                                } else {
+                                    format!("docker-image://{reference}")
+                                };
+                                req.definition = Some(crate::dispatch::import_graph(&src));
                             }
                             // Nobody took it. Not a failure and not a
                             // refusal to report against any machine: we
