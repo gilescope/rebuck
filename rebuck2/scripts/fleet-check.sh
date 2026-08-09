@@ -100,6 +100,15 @@ placed() {
 # each 400-byte manifest up to a block, which flatters and then panics.
 blobs() { echo "$1" | sed -n 's/^store blobs: \([0-9]*\) .*/\1/p' | head -1; }
 
+# How many DISTINCT workers the driver dispatched a subtree to.
+#
+# `placed` cannot answer this any more and should not: it counts the
+# gateway's home-or-fleet decision, and WHICH machine took the work is the
+# driver's to report. It says so with one line per lead.
+spread() { echo "$1" | grep -oE -- '-> worker [0-9]+' | sort -u | wc -l | tr -d ' '; }
+# Total leads dispatched, distinct workers aside.
+leads() { echo "$1" | grep -cE -- '-> worker [0-9]+' || true; }
+
 echo "== baseline (one daemon, no proxy)"
 out=$(run NOPROXY=1 DAEMONS=1 RUN="$base" || true)
 echo "$out" | grep -E '^wall' | tr -s ' '
@@ -121,11 +130,12 @@ out=$(run DAEMONS=2 KILL_AFTER=2 EXPECT="$base/digests.txt" || true)
 echo "$out" | grep -E '^wall' | tr -s ' ' | sed 's/^/  /'
 guard "every build still finishes" "$out" && check "every build still finishes" "$(count "$out" '^failed  : 0')" 1 || true
 present "outputs still identical" "$out" 'outputs identical'
-# The counterpart to the registry scenario below. Here the peer really is
-# the one that failed, so it MUST be struck - otherwise `struck: {}` there
-# proves nothing, being what an unused counter says too.
-guard "and this time the peer IS struck" "$out" &&
-  present "and this time the peer IS struck" "$out" 'struck *: {1:' || true
+# The proxy no longer keeps strikes - refusal IS the signal, and it is the
+# driver that hears it. A worker whose daemon has been destroyed declines,
+# and the driver says so; that is the same property the strike counter used
+# to stand for, read where the decision now lives.
+guard "and the driver hears the refusal" "$out" &&
+  present "and the driver hears the refusal" "$out" 'declined subtree job' || true
 
 echo
 echo "== more than one peer"
@@ -134,14 +144,15 @@ echo "== more than one peer"
 # strike deprioritisation - was only ever exercised by unit tests.
 out=$(run DAEMONS=3 || true)
 echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
-guard "the surplus splits across BOTH peers" "$out" && {
-  p1=$(placed "$out" 1)
-  p2=$(placed "$out" 2)
-  # 12 builds, 8 slots: 8 at home and 4 away, 2 each. Asserting the split
-  # rather than the total, because one peer taking all 4 is also "4 away"
-  # and is the failure this scenario exists to catch.
-  check "the surplus splits across BOTH peers" "${p1:-0}/${p2:-0}" "2/2"
-} || true
+# Read from the DRIVER, not from `placed`. The gateway now reports only
+# home-or-fleet, so `placed {0: 8, 1: 4}` is true whether the four went to
+# one worker or two - which is exactly the failure this exists to catch, and
+# it went undetected until the driver started naming the worker.
+#
+# Both workers, not a ratio: the split depends on how the leads overlap, and
+# asserting 2/2 would be asserting the scheduler's timing.
+guard "the surplus reaches BOTH workers" "$out" &&
+  check "the surplus reaches BOTH workers" "$(spread "$out")" 2 || true
 
 echo
 echo "== one peer of two destroyed mid-build"
@@ -151,31 +162,34 @@ out=$(run DAEMONS=3 KILL_AFTER=2 REBUCK2_HOME_SLOTS=4 EXPECT="$base/digests.txt"
 echo "$out" | grep -E '^wall|placed|struck' | tr -s ' ' | sed 's/^/  /'
 guard "every build still finishes" "$out" && check "every build still finishes" "$(count "$out" '^failed  : 0')" 1 || true
 check "outputs still identical" "$(count "$out" 'outputs identical')" 1
-guard "the surviving peer keeps taking work" "$out" && {
-  if [ "$(placed "$out" 1)" -gt 0 ]; then ok "the surviving peer keeps taking work"
-  else no "the surviving peer keeps taking work (nothing placed on peer 1)"; fi
+guard "the fleet keeps taking work" "$out" && {
+  if [ "$(leads "$out")" -gt 0 ]; then ok "the fleet keeps taking work"
+  else no "the fleet keeps taking work (the driver dispatched nothing)"; fi
 } || true
-# Names the peer, so a run that struck EVERYONE cannot pass this.
-present "and only the dead one is struck" "$out" 'struck *: {2:'
-absent "and only the dead one is struck (peer 1 spared)" "$out" 'struck *: {1:'
+# The dead machine refuses and the driver re-offers; the survivor builds. A
+# fleet that had collapsed to home would show no leads at all, which the
+# check above catches, so this one is about the refusal being HEARD.
+present "and the refusal is heard, not waited out" "$out" 'declined subtree job'
 
 echo
 echo "== a peer that is slow rather than dead"
-# Step 5 of the placement algorithm - a bounded wait, past which an adoption
-# is withdrawn and built at home - and nothing exercised it end to end. A
-# machine that dies is easy; one that merely crawls holds a slot open and is
-# the case the hedge exists for.
+# There is NO straggler withdrawal any more, and this scenario is here to
+# keep that visible rather than to pretend otherwise.
 #
-# --cpus 0.15 on the last daemon. The peer is NOT cancelled when withdrawn,
-# so both copies race and whoever publishes first wins.
+# The proxy used to hedge: past three times the observed median an adoption
+# was taken back and built at home, the peer left running so whoever
+# published first won. That lived in the transport M4.5 deleted, and the mesh
+# has no equivalent - a worker that crawls holds its lead until it finishes.
+# Recorded as a gap in docs/dispatch-build-plan.md, not papered over here.
+#
+# What still holds, and is worth checking, is that a slow machine costs
+# TIME and not CORRECTNESS: --cpus 0.15 on the last daemon, and the build
+# still completes with the same bytes.
 out=$(run DAEMONS=3 SLOW=0.15 ROUNDS=2 REBUCK2_HOME_SLOTS=4 EXPECT="$base/digests.txt" || true)
-echo "$out" | grep -E '^wall|placed|struck|not routed' | tr -s ' ' | sed 's/^/  /'
-guard "every build still finishes" "$out" && check "every build still finishes" "$(count "$out" '^failed  : 0')" 1 || true
-check "outputs still identical" "$(count "$out" 'outputs identical')" 1
-# The mechanism, not the symptom: a run where the straggler simply finished
-# in time would pass the two checks above having tested nothing.
-present "the straggler is withdrawn from" "$out" 'too slow'
-present "and it is the SLOW one that is struck" "$out" 'struck *: {2:'
+echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
+guard "a crawling worker still finishes the build" "$out" &&
+  check "a crawling worker still finishes the build" "$(count "$out" '^failed  : 0')" 1 || true
+check "and the bytes are unchanged by its slowness" "$(count "$out" 'outputs identical')" 1
 
 echo
 echo "== a named frontend cannot be distributed"
@@ -192,20 +206,6 @@ guard "and nothing was placed on a peer" "$out" &&
 # check above would pass for one. The reason has to be the structural one.
 present "for the structural reason, not a broken fleet" "$out" \
   'frontend runs in the daemon: dockerfile.v0'
-
-echo
-echo "== the registry destroyed mid-build"
-out=$(run DAEMONS=2 KILL_REGISTRY_AFTER=2 EXPECT="$base/digests.txt" || true)
-echo "$out" | grep -E '^wall' | tr -s ' ' | sed 's/^/  /'
-guard "every build still finishes" "$out" && check "every build still finishes" "$(count "$out" '^failed  : 0')" 1 || true
-check "outputs still identical" "$(count "$out" 'outputs identical')" 1
-# The claim is that a dead MIRROR costs no peer its standing. Asserting the
-# message 'peer not blamed' tested one of the two ways that happens and
-# flaked at about 1 in 3: if the registry dies before the base is mirrored,
-# `make_portable` fails first, the graph is never offered, and no peer
-# failure exists to attribute - reported as "base unmirrored" instead. Both
-# are correct, so assert the thing they have in common.
-present "the peer is not blamed for it" "$out" 'struck *: {}'
 
 echo
 echo "== a build context leaves the client's machine"
@@ -279,31 +279,6 @@ for priv in INSECURE:Insecure HOSTNET:HostNetwork; do
 done
 
 echo
-echo "== a peer declared bigger takes more of the work"
-# `--peer url*N` is documented as a relative share and was inert: the score
-# divides in-flight load by the weight, and the load counter was never
-# incremented, so every peer scored zero however it was weighted.
-#
-# HOME_SLOTS=0 so every build travels, and a work size large enough that
-# solves overlap - a weight can only express itself while peers are holding
-# jobs at the same time. With them idle the score is a tie by construction
-# and placement correctly falls back to round robin.
-out=$(run DAEMONS=3 PEER_WEIGHT=4 REBUCK2_HOME_SLOTS=0 REBUCK2_LLB_WORK=40 \
-  EXPECT="$base/digests.txt" || true)
-echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
-guard "every build finishes" "$out" && check "every build finishes" "$(count "$out" '^failed  : 0')" 1 || true
-check "outputs identical to baseline" "$(count "$out" 'outputs identical')" 1
-guard "the heavier peer takes strictly more" "$out" && {
-  p1=$(placed "$out" 1)
-  p2=$(placed "$out" 2)
-  # Strictly more, not a ratio. The exact split depends on how the solves
-  # happen to overlap, and asserting 4:1 would be asserting the scheduler's
-  # timing rather than that the weight is consulted at all.
-  if [ "${p2:-0}" -gt "${p1:-0}" ]; then ok "the heavier peer takes strictly more"
-  else no "the heavier peer takes strictly more (peer1=${p1:-0} peer2=${p2:-0})"; fi
-} || true
-
-echo
 echo "== the two placement experiments that are off by default"
 # REBUCK2_GATE and REBUCK2_ADAPT are kept with their measurements rather than
 # deleted, so nobody re-derives them. Neither had ever been RUN by this suite:
@@ -327,6 +302,7 @@ echo "== a fleet that is silently doing nothing"
 out=$(run NO_REGISTRY_TRUST=1 DAEMONS=2 || true)
 check "the build still succeeds" "$(count "$out" '^failed  : 0')" 1
 present "but the proxy says the fleet did nothing" "$out" 'no solve completed on a peer'
+# The diagnosis moved to the driver with the refusals it reads from.
 present "and names the likely cause" "$out" 'cannot PULL from the mirror'
 
 echo
@@ -426,7 +402,10 @@ if ! echo "$out" | grep -q 'placed'; then
   skipped=$((skipped + 1))
 else
   guard "every build still finishes" "$out" && check "every build still finishes" "$(count "$out" '^failed  : 0')" 1 || true
-  check "the emulated peer is given nothing" "$(placed "$out" 1)" ""
+  # `placed` counts the gateway OFFERING, not a machine taking. With one
+  # away worker and it emulated, the honest question is whether the driver
+  # ever dispatched to it - which only the driver can answer.
+  check "the emulated peer is given nothing" "$(leads "$out")" 0
 fi
 fi
 

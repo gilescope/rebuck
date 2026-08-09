@@ -671,6 +671,26 @@ impl Driver {
                     // The job stays ours to place elsewhere or build here.
                     W2D::Decline { job, why } => {
                         println!("[driver] worker declined subtree job {job}: {why}");
+                        // The one refusal worth explaining rather than
+                        // counting. A daemon with no `[registry]` stanza
+                        // pushes happily and cannot PULL, so the fleet fills
+                        // the mirror, declines everything, and every build
+                        // still succeeds at home - the quiet green this
+                        // project keeps arguing against. The proxy used to
+                        // say this; it cannot see refusals any more, and
+                        // this is where they arrive.
+                        if why.contains("server gave HTTP response to HTTPS client") {
+                            println!(
+                                "[driver] LIKELY CAUSE: a worker cannot PULL from the mirror over\n\
+                                 [driver]   plain HTTP. Publishing is insecure per-solve, so the\n\
+                                 [driver]   mirror filled and the log looked fine; pulling needs\n\
+                                 [driver]   daemon config. Add to every buildkitd's\n\
+                                 [driver]   /etc/buildkit/buildkitd.toml:\n\
+                                 [driver]     [registry.\"<REBUCK2_MIRROR>\"]\n\
+                                 [driver]       http = true\n\
+                                 [driver]       insecure = true"
+                            );
+                        }
                         self.subtree_declined(job, worker_id, &why).await;
                     }
                     W2D::Done {

@@ -98,10 +98,6 @@ REMOTE_DAEMONS=${REMOTE_DAEMONS:-1}
 # The remote's share, relative to this machine. Buildkit does not report core
 # counts, so somebody has to say. 2 means "twice the turns".
 REMOTE_WEIGHT=${REMOTE_WEIGHT:-1}
-# Relative share for the LAST local daemon, e.g. PEER_WEIGHT=3. Until this
-# existed only the REMOTE peer could carry a `*N`, so the weighting mechanism
-# could not be exercised without a second machine - and therefore never was.
-PEER_WEIGHT=${PEER_WEIGHT:-1}
 # Kill the LAST daemon this many seconds into the build. Fail-open is a
 # stated principle and had never been tested by actually breaking something:
 # a build must still finish, with the right bytes, when a peer dies holding
@@ -382,12 +378,21 @@ else
   # that is really a startup race. re-e2e.yml waits the same way.
   want=$((DAEMONS - 1))
   if [ "$want" -gt 0 ]; then
-    for _ in $(seq 1 60); do
+    # Bounded at 20s, not 60. A worker that has not joined in twenty seconds
+    # is not joining, and waiting the full minute in every scenario that
+    # cannot satisfy this is what turned a six-minute suite into a
+    # hundred-and-eight-minute one. Say so rather than proceeding quietly:
+    # a short fleet is a real finding, and every placement assertion
+    # downstream depends on it.
+    for _ in $(seq 1 20); do
       joined=$(grep -c "^\[driver\] worker .* joined" "$RUN/proxy.log" 2>/dev/null || true)
       [ "${joined:-0}" -ge "$want" ] && break
       sleep 1
     done
-    say "$joined/$want worker(s) on the mesh"
+    say "${joined:-0}/$want worker(s) on the mesh"
+    if [ "${joined:-0}" -lt "$want" ]; then
+      say "WARNING: fleet is short - placement below is not what was asked for"
+    fi
   fi
 fi
 
@@ -494,14 +499,22 @@ if [ -z "$NOPROXY" ]; then
   # stopped being enough - the report was cut off mid-line and every
   # placement assertion failed against output that simply had not been
   # written yet.
-  for _ in $(seq 1 30); do
+  # Stop as soon as the proxy is GONE, not only when the report lands. A
+  # scenario that kills the proxy can never print `placed`, and waiting the
+  # full timeout for it in every such run was half the suite's slowdown.
+  for _ in $(seq 1 15); do
     grep -q "^\[wire\] placed" "$RUN/proxy.log" 2>/dev/null && break
+    kill -0 "$proxy_pid" 2>/dev/null || break
     sleep 1
   done
   # The registry lives in the proxy now, so its tally is in the proxy log.
   # Baseline runs still have a standalone one.
   grep -hE "^\[registry\] served" "$RUN/proxy.log" "$RUN/registry.log" 2>/dev/null || true
-  grep -E '^\[wire\]|^\[proxy\] +(adopted|peer|taking|frontend|what)' "$RUN/proxy.log" || true
+  # `[driver]` lines are now part of the evidence, not just noise: WHICH
+  # machine took a subtree, who declined one, and who joined are only visible
+  # there since the gateway stopped choosing.
+  grep -E '^\[wire\]|^\[driver\]|^\[proxy\] +(adopted|peer|taking|frontend|what|fleet)' \
+    "$RUN/proxy.log" || true
 fi
 
 # The identity of the result, per build. Written to a file so a proxied run
