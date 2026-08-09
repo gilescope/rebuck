@@ -154,12 +154,31 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
     };
     println!("[worker] connected");
 
+    // What this worker can BUILD, which is its daemon's platform and not its
+    // host's. On macOS the host is darwin/arm64 and the daemon is
+    // linux/arm64, so a worker advertising the host is offered nothing at
+    // all - the driver filters every linux graph out as WrongPlatform and
+    // the fleet reports "took nothing" while looking perfectly healthy.
+    //
+    // Falls back to the host when there is no daemon to ask: such a worker
+    // takes REAPI actions only, and those really are host-platform.
+    let (os, arch) = match cfg.buildkit_addr.as_deref() {
+        Some(bk) => crate::solve::daemon_platforms(bk)
+            .await
+            .first()
+            .and_then(|p| p.split_once('/'))
+            .map(|(o, a)| (o.to_owned(), a.to_owned()))
+            .unwrap_or_else(|| (std::env::consts::OS.to_owned(), arch().to_owned())),
+        None => (std::env::consts::OS.to_owned(), arch().to_owned()),
+    };
+    println!("[worker] offering {os}/{arch}");
+
     let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?;
     mesh::send_frame(
         &mut ctrl_send,
         &W2D::Hello {
-            os: std::env::consts::OS.into(),
-            arch: std::env::consts::ARCH.into(),
+            os: os.clone(),
+            arch: arch.clone(),
             slots: cfg.slots as u32,
             preloaded_shard: cfg.preloaded_shard,
         },
@@ -512,7 +531,16 @@ async fn lead_reply(
         peer: 0,
         driver: cfg.slots - slots.available_permits(),
     };
-    let me = format!("{}/{}", std::env::consts::OS, arch());
+    // The same platform we advertised, not the host's: re-checking against
+    // the host would refuse exactly the work we said we could take.
+    let me = match cfg.buildkit_addr.as_deref() {
+        Some(bk) => crate::solve::daemon_platforms(bk)
+            .await
+            .first()
+            .cloned()
+            .unwrap_or_else(|| format!("{}/{}", std::env::consts::OS, arch())),
+        None => format!("{}/{}", std::env::consts::OS, arch()),
+    };
     if let Err(why) = crate::dispatch::consider(load, &verdict, &me) {
         return decline(format!("{why:?}"));
     }

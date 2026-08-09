@@ -45,6 +45,33 @@ is seconds per build on one machine, where dispatch is mostly overhead by
 construction -- fine for deciding whether placement is CORRECT, useless for
 deciding whether it PAYS.
 
+## How much of earthbuild's Earthfile can actually run
+
+The target is the root Earthfile; this is the ladder to it, each rung
+measured on `earthly +code` through the gateway rather than estimated.
+
+| rung | state | dispatchable | blocker after |
+| ---- | ----- | -----------: | ------------- |
+| 0 | as shipped | **0 of 6** | `Secret` - the debugger mount on every RUN |
+| 1 | EarthBuild#784 gated locally | **1 of 6** | `CacheMount` on 5 |
+| 2 | + `REBUCK2_PEER_CACHE_MOUNTS=1` | measuring | - |
+| 3 | + a worker-side session for the 9 real secrets | not built | - |
+
+Rung 0 and 1 are like for like: same target, same fleet, 6 solves and 64 ops
+either side, both builds green.
+
+Two things this ladder makes visible that the earlier estimates hid.
+
+**Rung 1 is upstream, not here.** Nothing in this repo can lift the debugger
+secret: its id is minted per build inside earthly's process, so there is
+nothing outside that process which could answer for it.
+
+**Rung 2 may be a bad trade even when it works.** The lift exists on the
+argument that a cache mount is scratch and a peer has its own. These are
+`go-mod`, `go-build` and `npm` - a cold module cache on a worker is correct
+and SLOW. Dispatching five solves and taking longer is the lift working and
+the trade failing, and only a fleet of real machines can tell those apart.
+
 ## What is now measured, not argued
 
 All from `rebuck2/scripts/fleet.sh`, which produces every number here.

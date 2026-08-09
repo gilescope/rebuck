@@ -333,6 +333,41 @@ pub async fn mirror_image(
 /// the solve, and the push the exporter performs. The DECISIONS - may it
 /// travel, is it worth sending, will this worker take it - were all made
 /// before we got here, by `crate::dispatch`.
+/// What the DAEMON can build, in buildkit's own spelling.
+///
+/// A worker lends its buildkitd, not its host, and on macOS those disagree:
+/// the host is `darwin/arm64` and the daemon in its container is
+/// `linux/arm64`. A worker advertising the host is offered nothing, because
+/// no linux graph matches it - measured, and the fleet reported "took
+/// nothing" six times for six perfectly dispatchable solves.
+///
+/// A Linux runner hides this completely: host and daemon agree there, so the
+/// wrong value happens to be right and the bug waits for the first developer
+/// on a Mac.
+///
+/// First platform is the native one; the rest are emulated. Empty on any
+/// failure, and the caller falls back to the host rather than refusing to
+/// join - a worker that cannot say what it is should still be able to lend
+/// REAPI capacity.
+pub async fn daemon_platforms(bk_addr: &str) -> Vec<String> {
+    let Ok(mut c) = connect(bk_addr).await else {
+        return Vec::new();
+    };
+    let Ok(resp) = c.list_workers(control::ListWorkersRequest::default()).await else {
+        return Vec::new();
+    };
+    resp.into_inner()
+        .record
+        .first()
+        .map(|w| {
+            w.platforms
+                .iter()
+                .map(|p| format!("{}/{}", p.os, p.architecture))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub async fn build_subtree(
     bk_addr: &str,
     registry: &str,

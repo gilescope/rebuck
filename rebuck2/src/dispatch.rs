@@ -187,18 +187,28 @@ fn plat_str(p: &pb::Platform) -> String {
 /// secrets and no security mode. Grounding those would ground exactly the
 /// `FROM <registry image>` chains principle 11 calls the BEST handover -
 /// the ones whose whole frontier is a digest any machine can fetch.
-fn hazard(op: &pb::Op) -> Option<Exclusion> {
-    let pb::op::Op::Exec(e) = op.op.as_ref()? else {
-        return None;
+fn hazards(op: &pb::Op) -> Vec<Exclusion> {
+    let mut out = Vec::new();
+    let Some(pb::op::Op::Exec(e)) = op.op.as_ref() else {
+        return out;
     };
+    // EVERY hazard on this op, not the first.
+    //
+    // This returned one, and one is wrong as soon as a lift exists: an
+    // earthly RUN carries a go-mod cache mount AND the debugger's socket on
+    // the same exec, so reporting only the cache mount and then lifting it
+    // with REBUCK2_PEER_CACHE_MOUNTS=1 made the op look clean. The graph was
+    // offered to a worker that solves without a session and declined with
+    // "no active sessions" - fail-open saved the build and the fleet did
+    // nothing, which is the failure this codebase is mostly about.
     if e.security == pb::SecurityMode::Insecure as i32 {
-        return Some(Exclusion::Insecure);
+        out.push(Exclusion::Insecure);
     }
     if e.network == pb::NetMode::Host as i32 {
-        return Some(Exclusion::HostNetwork);
+        out.push(Exclusion::HostNetwork);
     }
     if !e.secretenv.is_empty() {
-        return Some(Exclusion::Secret);
+        out.push(Exclusion::Secret);
     }
     // NOT detected: a mount that binds a path from the WORKER's filesystem.
     //
@@ -214,19 +224,21 @@ fn hazard(op: &pb::Op) -> Option<Exclusion> {
     // those graphs are already excluded by the secret and ssh mounts that
     // come with it. Guessing at a detection rule for an encoding this tree
     // cannot produce would be a check that never fires, tested by nothing.
-    e.mounts.iter().find_map(|m| {
+    for m in &e.mounts {
         // Read BOTH the type and the option: a cache mount is identified by
         // either, and trusting one alone leaves the other as a way through.
         if m.mount_type == pb::MountType::Cache as i32 || m.cache_opt.is_some() {
-            Some(Exclusion::CacheMount)
-        } else if m.mount_type == pb::MountType::Secret as i32 || m.secret_opt.is_some() {
-            Some(Exclusion::Secret)
-        } else if m.mount_type == pb::MountType::Ssh as i32 || m.ssh_opt.is_some() {
-            Some(Exclusion::SshAgent)
-        } else {
-            None
+            out.push(Exclusion::CacheMount);
         }
-    })
+        if m.mount_type == pb::MountType::Secret as i32 || m.secret_opt.is_some() {
+            out.push(Exclusion::Secret);
+        }
+        if m.mount_type == pb::MountType::Ssh as i32 || m.ssh_opt.is_some() {
+            out.push(Exclusion::SshAgent);
+        }
+    }
+    out.dedup();
+    out
 }
 
 /// Read a `Definition` and decide whether its subtree may be handed to a peer.
@@ -240,7 +252,7 @@ pub fn inspect(def: &pb::Definition) -> Verdict {
             exclusions.push((i, Exclusion::Undecodable));
             continue;
         };
-        if let Some(why) = hazard(&op) {
+        for why in hazards(&op) {
             exclusions.push((i, why));
         }
         if let Some(p) = &op.platform {
@@ -1505,6 +1517,47 @@ mod tests {
             })]));
             assert!(v.dispatchable(), "{ok:?} is ordinary");
         }
+    }
+
+    #[test]
+    fn one_op_can_carry_two_hazards_and_both_must_count() {
+        // `every_blocker_is_reported_not_just_the_first` uses one hazard per
+        // OP, so it says nothing about an op carrying two - and a real
+        // earthly RUN carries exactly that: a go-mod cache mount and the
+        // debugger's socket on the same exec.
+        //
+        // With only the first reported, lifting it makes the op look clean:
+        // REBUCK2_PEER_CACHE_MOUNTS=1 lifts CacheMount, nothing mentions the
+        // socket, and the graph is offered to a worker that builds without a
+        // session. Measured - the worker declined with "no active sessions"
+        // and the fleet reported taking nothing.
+        let mut e = exec_of(&plain());
+        e.mounts = vec![mount(pb::MountType::Cache), mount(pb::MountType::Ssh)];
+        let mut op = plain();
+        op.op = Some(OpKind::Exec(e));
+
+        let v = inspect(&def(vec![op]));
+        assert!(
+            v.exclusions
+                .iter()
+                .any(|(_, x)| *x == Exclusion::CacheMount),
+            "cache mount not reported: {:?}",
+            v.exclusions
+        );
+        assert!(
+            v.exclusions.iter().any(|(_, x)| *x == Exclusion::SshAgent),
+            "ssh mount hidden behind the cache mount: {:?}",
+            v.exclusions
+        );
+
+        // And the point of reporting both: lifting ONE must not clear the op.
+        assert!(
+            !v.dispatchable_when(Allow {
+                caches: true,
+                ..Default::default()
+            }),
+            "lifting the cache mount let an ssh mount travel"
+        );
     }
 
     #[test]
