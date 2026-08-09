@@ -279,6 +279,31 @@ for priv in INSECURE:Insecure HOSTNET:HostNetwork; do
 done
 
 echo
+echo "== a peer declared bigger takes more of the work"
+# `--peer url*N` is documented as a relative share and was inert: the score
+# divides in-flight load by the weight, and the load counter was never
+# incremented, so every peer scored zero however it was weighted.
+#
+# HOME_SLOTS=0 so every build travels, and a work size large enough that
+# solves overlap - a weight can only express itself while peers are holding
+# jobs at the same time. With them idle the score is a tie by construction
+# and placement correctly falls back to round robin.
+out=$(run DAEMONS=3 PEER_WEIGHT=4 REBUCK2_HOME_SLOTS=0 REBUCK2_LLB_WORK=40 \
+  EXPECT="$base/digests.txt" || true)
+echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
+guard "every build finishes" "$out" && check "every build finishes" "$(count "$out" '^failed  : 0')" 1 || true
+check "outputs identical to baseline" "$(count "$out" 'outputs identical')" 1
+guard "the heavier peer takes strictly more" "$out" && {
+  p1=$(placed "$out" 1)
+  p2=$(placed "$out" 2)
+  # Strictly more, not a ratio. The exact split depends on how the solves
+  # happen to overlap, and asserting 4:1 would be asserting the scheduler's
+  # timing rather than that the weight is consulted at all.
+  if [ "${p2:-0}" -gt "${p1:-0}" ]; then ok "the heavier peer takes strictly more"
+  else no "the heavier peer takes strictly more (peer1=${p1:-0} peer2=${p2:-0})"; fi
+} || true
+
+echo
 echo "== the two placement experiments that are off by default"
 # REBUCK2_GATE and REBUCK2_ADAPT are kept with their measurements rather than
 # deleted, so nobody re-derives them. Neither had ever been RUN by this suite:

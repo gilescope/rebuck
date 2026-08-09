@@ -1253,6 +1253,25 @@ fn place(
     Some(1 + least_loaded(&effective, cursor))
 }
 
+/// A peer is spoken for, from the moment it is CHOSEN until the attempt ends.
+///
+/// The span matters more than the counting. Reserving at adoption time looks
+/// equivalent and is not: ~1.6s of `make_portable` sits between the choice
+/// and the adoption, so a burst of solves all decide against a counter that
+/// is still zero and pile onto the same peer. Measured - twelve solves
+/// arriving in 130ms split 6/6 with one peer weighted four times the other.
+///
+/// A guard rather than a decrement on each exit path, because the exits
+/// include a take-back inside a `select!` loop. A missed decrement never
+/// heals, and a peer holding a phantom job is one the fleet stops choosing.
+struct Holding<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for Holding<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Which away peer, given how much each is already holding.
 ///
 /// `turn` decides home-or-away and this decides WHICH away, because the two
@@ -2139,6 +2158,13 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 } else {
                     None
                 };
+                // Reserved here, not at adoption: everything between the two
+                // is preparation, and a sibling deciding during it must see
+                // this peer as busy.
+                let _holding = peer.map(|p| {
+                    self.outstanding[p].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Holding(&self.outstanding[p])
+                });
                 // The slot was claimed above. Hand it back if the work is
                 // leaving after all.
                 if peer.is_some() && claimed {
