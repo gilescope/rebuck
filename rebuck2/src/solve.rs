@@ -34,8 +34,12 @@ static SOLVE_SEQ: AtomicU64 = AtomicU64::new(0);
 /// One repo per job: two subtrees building concurrently on one worker must
 /// not collide on a tag, and a peer fetching the result asks for exactly
 /// this string.
+/// Where a built subtree lands. One repo, so a digest reference needs only
+/// the registry that is serving it, not the job that made it.
+pub const SUBTREE_REPO: &str = "rebuck2/subtree";
+
 pub fn result_ref(registry: &str, job: u64) -> String {
-    format!("{registry}/rebuck2/subtree:job-{job}")
+    format!("{registry}/{SUBTREE_REPO}:job-{job}")
 }
 
 /// Exporter attrs for everything this crate pushes to the mirror - adopted
@@ -339,10 +343,28 @@ pub async fn build_subtree(
     // No session: measured, buildkit accepts a solve without one when the
     // build has no local sources and needs no registry auth, and a
     // dispatched subtree has neither.
-    c.solve(solve_request(job, def, registry, ""))
+    let resp = c
+        .solve(solve_request(job, def, registry, ""))
         .await
-        .map_err(|e| anyhow::anyhow!("solve: {} {}", e.code(), e.message()))?;
-    Ok(result_ref(registry, job))
+        .map_err(|e| anyhow::anyhow!("solve: {} {}", e.code(), e.message()))?
+        .into_inner();
+    // BY DIGEST, not by the tag we pushed to.
+    //
+    // A tag lives in ONE registry's mutable namespace. The requester is on
+    // another machine with its own registry, and propagating tags between
+    // them is a whole gossip problem - `registry.rs` calls it the next step.
+    // A digest needs none of it: whoever ends up holding the manifest can
+    // serve it, which is what the mesh already does for every other blob.
+    //
+    // Falls back to the tag when the exporter does not report one. On one
+    // machine both work and the tag is what every earlier measurement used,
+    // so this degrades to the old behaviour rather than failing.
+    let by_digest = resp
+        .exporter_response
+        .get("containerimage.digest")
+        .filter(|d| d.starts_with("sha256:"))
+        .map(|d| format!("{registry}/{SUBTREE_REPO}@{d}"));
+    Ok(by_digest.unwrap_or_else(|| result_ref(registry, job)))
 }
 
 #[cfg(test)]

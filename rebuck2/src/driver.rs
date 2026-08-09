@@ -2533,6 +2533,24 @@ async fn serve_blob_stream(
         return Ok(());
     };
     match req {
+        // Serve from what we hold, and no further. A by-hash request has no
+        // size, so it cannot drive `ensure_blob_local`'s read-through - and
+        // should not: the asker is walking the fleet itself, and a driver
+        // that fetched on its behalf would put the coordinator back on the
+        // data path it is meant to stay off (principle 6).
+        BlobReq::GetByHash(hash) => match driver.store.get_by_hash(&hash).await {
+            Ok(Some(bytes)) => {
+                mesh::send_frame(
+                    &mut send,
+                    &BlobResp::Found {
+                        size: bytes.len() as u64,
+                    },
+                )
+                .await?;
+                send.write_all(&bytes).await?;
+            }
+            _ => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
+        },
         BlobReq::Get(d) => {
             // Decentralized: point the asker at the producer instead of
             // relaying bytes through the driver's NIC.

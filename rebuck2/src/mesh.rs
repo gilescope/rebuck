@@ -242,6 +242,19 @@ pub enum BlobReq {
     /// sequential per-file staging at ~12 RTT-bound fetches/s was a 20-minute
     /// pre-rustc stall on the big crate forests (run 29160244348).
     GetMany(Vec<Dig>),
+    /// Fetch knowing only the hash.
+    ///
+    /// Every other request carries a `Dig`, because REAPI always knows the
+    /// size. A REGISTRY does not: buildkit asks for
+    /// `/v2/<repo>/blobs/sha256:<hex>` and the size is what the answer is
+    /// supposed to tell it. Without this a mesh-backed registry cannot ask
+    /// the fleet for anything, which is why there was not one.
+    ///
+    /// LAST, not inserted: postcard encodes a variant by index, so a new one
+    /// in the middle would reinterpret every later variant on a mixed-version
+    /// fleet. A peer that predates this replies `Err`, which the caller
+    /// treats as "not here" - the same as a miss.
+    GetByHash(String),
 }
 
 #[derive(Debug, Serialize, Deserialize)]

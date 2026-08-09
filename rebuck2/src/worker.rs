@@ -367,6 +367,22 @@ async fn serve_get(
         return Ok(());
     };
     match req {
+        // A registry asks by hash: buildkit's URL is the digest and the size
+        // is what the reply is meant to supply. Served only from what this
+        // worker holds - it does not walk the fleet on someone else's behalf.
+        BlobReq::GetByHash(hash) => match store.get_by_hash(&hash).await {
+            Ok(Some(bytes)) => {
+                mesh::send_frame(
+                    &mut send,
+                    &BlobResp::Found {
+                        size: bytes.len() as u64,
+                    },
+                )
+                .await?;
+                send.write_all(&bytes).await?;
+            }
+            _ => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
+        },
         BlobReq::Get(d) => {
             if store.has(&d).await {
                 mesh::send_frame(
