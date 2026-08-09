@@ -86,6 +86,42 @@ what this product is: a distributed BuildKit works today for any client that
 builds its own LLB, and a distributed earthly additionally needs this one
 upstream patch.
 
+## The ceiling after #784, counted from the Earthfile
+
+Fixing #784 does not make earthbuild's own root Earthfile fully
+dispatchable, and it is worth knowing by how much BEFORE the patch, so the
+patch is not credited with more than it buys. Counted on the 1060-line
+Earthfile at the root of earthbuild:
+
+| construct | RUN steps | what it does to dispatch |
+| ------------------------- | --------: | ------------------------ |
+| total `RUN` | 65 | |
+| `--mount type=cache` | 25 | excluded unless `REBUCK2_PEER_CACHE_MOUNTS=1` |
+| `--secret` | 9 | excluded; no session reaches a worker |
+| `LOCALLY` | 1 | never dispatchable, by definition |
+| `--privileged`, `--ssh`, host network | 0 | nothing to lift |
+
+Four cache ids do the work: `go-mod`, `go-build`, `npm`,
+`littleredcorvette-id`. That is a Go and Node build keeping its module and
+compiler caches warm, which is exactly what a cache mount is FOR - so this is
+not misuse to be tidied away upstream, it is the shape of the build.
+
+So the ladder, in the order the numbers say to climb it:
+
+1. **#784** - the debugger's secret and host bind on every non-`LOCALLY`
+   `RUN`. Until this lands, nothing dispatches and the rest is unmeasurable.
+2. **Cache mounts, 38% of RUNs.** `REBUCK2_PEER_CACHE_MOUNTS=1` already lifts
+   them, on the argument that a cache mount is scratch a peer has its own of.
+   That argument is sound and untested against a build that actually depends
+   on one being warm - a cold `go-mod` on a worker is correct and slow, and
+   slow enough may be worse than not dispatching.
+3. **Secrets, 9 RUNs.** These need a session on the worker side, which the
+   mesh path does not have. Smallest of the three and the most work.
+
+None of that is proxy work. The distributed BuildKit is not what limits
+earthbuild's Earthfile.
+
 - Found: 2026-08-08.
 - Raised upstream: [EarthBuild/earthbuild#784](https://github.com/EarthBuild/earthbuild/issues/784).
   Issue only - no patch offered, and any PR needs consent first.
+- Earthfile counts: 2026-08-09, at earthbuild `main`.
