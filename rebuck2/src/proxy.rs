@@ -2254,29 +2254,29 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                     // count-and-continue, which is how a check becomes
                     // decoration.
                     let adopted = if local_clear && bases_clear {
-                        // Held across the await, so the count is exact -
-                        // this is the whole reason `least_loaded` can be
-                        // trusted where peer 0's occupancy cannot.
-                        // `fetch_add` returns the PREVIOUS value, so zero
-                        // means this adoption has the peer to itself and its
+                        // The reservation is taken at the DECISION, above,
+                        // and this solve is inside the count - so one means
+                        // this adoption has the peer to itself and its
                         // duration is a clean speed sample.
-                        let alone = self.outstanding[peer]
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                            == 0;
+                        //
+                        // It used to add here and test for zero, which is
+                        // the same question asked too late: everything
+                        // between the choice and this line is preparation,
+                        // and a peer picked up three siblings during it that
+                        // this counter could not see.
+                        let alone =
+                            self.outstanding[peer].load(std::sync::atomic::Ordering::Relaxed) == 1;
                         let t = std::time::Instant::now();
                         let r = self
                             .adopt_or_take_back(peer, &addr, &mirror.registry, &portable, t)
                             .await;
                         t_adopt = t.elapsed().as_millis() as u64;
-                        // Read the count BEFORE giving the slot back.
-                        // `fetch_sub` returns the previous value, so 1 means
-                        // this adoption was still the only one - checking
-                        // after the decrement asked whether the peer was
-                        // empty, which it always is, and produced no samples
-                        // at all from two builds that were genuinely alone.
-                        let still_alone = self.outstanding[peer]
-                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed)
-                            == 1;
+                        // Still one, still just us. The guard gives the
+                        // slot back when the solve ends, not here, so this
+                        // reads the live count rather than a pre-decrement
+                        // value.
+                        let still_alone =
+                            self.outstanding[peer].load(std::sync::atomic::Ordering::Relaxed) == 1;
                         // Only a COMPLETED adoption tells us what normal
                         // costs. Recording a take-back would fold our own
                         // impatience into the threshold that produced it.

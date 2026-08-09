@@ -156,9 +156,20 @@ cannot express itself.
 
 **Instance:** peer weights. `--peer url*4` parses, reaches the proxy, prints
 in the banner, and is consumed by the placement score - divided into a load
-counter that is never incremented anywhere, and therefore always zero. Zero
-over any weight is zero. Measured 6/6 against 6/6 with a fourfold weight
-under full contention.
+counter that was still zero every time the score was computed. Zero over any
+weight is zero. Measured 6/6 against 6/6 with a fourfold weight under full
+contention, and 3/9 once fixed.
+
+The counter WAS maintained - around the adoption. About 1.6s of preparation
+sits between choosing a peer and adopting on it, and a burst of twelve solves
+decides inside 130ms, so every decision read a counter that nothing had
+reached yet. Right quantity, wrong instant.
+
+My first write-up of this said the counter was "never incremented anywhere".
+It was: `grep 'outstanding.*fetch_add'` is a single-line pattern and the call
+is split over two lines by the formatter. That is shape 12 again - a search
+that found nothing and did not prove it looked - used as evidence for a
+stronger claim than the symptom supported.
 
 **Countermeasure:** vary the knob and require the OUTPUT to move. This one
 was never exercised end to end, so nothing ever asked it to make a
