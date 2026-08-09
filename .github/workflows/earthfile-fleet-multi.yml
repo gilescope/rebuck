@@ -96,8 +96,29 @@ jobs:
           earthly bootstrap
           BK=$(docker ps --filter 'name=buildkitd' --format '{{.Names}}' | head -1)
           [ -n "$BK" ] || { echo "no buildkitd started"; exit 1; }
-          docker port "$BK" || true
-          echo "BK_ADDR=$(docker port "$BK" | head -1 | awk -F' -> ' '{print $2}')" >> "$GITHUB_ENV"
+          # OUR OWN daemon from the image earthly chose. earthly starts its
+          # buildkitd with TCP disabled and speaks to it over a unix socket;
+          # the port it publishes is the embedded registry and answers
+          # HTTP/1.1, so nothing can proxy it. The image must still be
+          # earthly's - fork-only ops - so bootstrap picks it and we start it
+          # with gRPC on 8372, which the fork's own tcp template sets.
+          BK_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$BK")
+          docker rm -f own-bk >/dev/null 2>&1 || true
+          docker run -d --name own-bk --privileged -p 18372:8372 \
+            -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
+            -e BUILDKIT_TLS_ENABLED=false \
+            -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG='[registry."172.17.0.1:15000"]
+            http = true
+            insecure = true' \
+            "$BK_IMAGE" >/dev/null
+          for _ in $(seq 1 120); do
+            docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers \
+              >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 || {
+            echo "our buildkitd never became ready:"; docker logs --tail 20 own-bk; exit 1; }
+          echo "BK_ADDR=127.0.0.1:18372" >> "$GITHUB_ENV"
 
       - name: serve until the coordinator goes
         env:
@@ -164,8 +185,30 @@ jobs:
           earthly bootstrap
           BK=$(docker ps --filter 'name=buildkitd' --format '{{.Names}}' | head -1)
           [ -n "$BK" ] || { echo "no buildkitd started"; exit 1; }
-          BK_ADDR=$(docker port "$BK" | head -1 | awk -F' -> ' '{print $2}')
-          echo "BK_ADDR=$BK_ADDR" >> "$GITHUB_ENV"
+          # OUR OWN daemon from the image earthly chose. earthly starts its
+          # buildkitd with TCP disabled and speaks to it over a unix socket;
+          # the port it publishes is the embedded registry and answers
+          # HTTP/1.1, so nothing can proxy it. The image must still be
+          # earthly's - fork-only ops - so bootstrap picks it and we start it
+          # with gRPC on 8372, which the fork's own tcp template sets.
+          BK_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$BK")
+          docker rm -f own-bk >/dev/null 2>&1 || true
+          docker run -d --name own-bk --privileged -p 18372:8372 \
+            -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
+            -e BUILDKIT_TLS_ENABLED=false \
+            -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG='[registry."172.17.0.1:15000"]
+            http = true
+            insecure = true' \
+            "$BK_IMAGE" >/dev/null
+          for _ in $(seq 1 120); do
+            docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers \
+              >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 || {
+            echo "our buildkitd never became ready:"; docker logs --tail 20 own-bk; exit 1; }
+          echo "BK_ADDR=127.0.0.1:18372" >> "$GITHUB_ENV"
+          BK_ADDR=127.0.0.1:18372
 
           # NOT loopback. earthly's `IsLocal` counts 127.0.0.1, localhost and
           # ::1 as "a buildkit I manage", so a gateway on loopback makes it

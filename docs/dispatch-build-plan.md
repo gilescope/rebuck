@@ -23,7 +23,7 @@ read as "what got built and what it proved" rather than as a roadmap.
 | M4.5 | **done** -- one transport. The gateway offers, the driver arbitrates, 51 checks green |
 | M4.6 | **done** -- a result is a digest; both registries fetch from the fleet, so a worker can be on its own machine |
 | M5 | not done |
-| gateway | **done** -- the proxy sees any client's graph on one connection |
+| gateway | **done** -- the proxy sees any client's graph on one connection, and a real earthly build succeeds through it |
 | fleet | **done and measured on two machines** -- see below. Two, because the proxy's own transport is what limits it; the mesh runs at 19 |
 
 ## The target
@@ -71,8 +71,11 @@ the fleet matters most, and no constant in it was chosen to fit a fixture.
 - **Subdivision does not exist.** Everything measured dispatches WHOLE solves.
   Whether cutting a graph beats routing it is untested, and the mechanism
   question below is still open for that reason.
-- Earthly dispatches 1 solve in 12, and cannot do better without a change to
-  earthbuild -- see [earthly-dispatch.md](earthly-dispatch.md).
+- Earthly dispatches ZERO, measured on a real target rather than inferred.
+  `earthly +code` through the gateway: 6 solves, 64 ops, build SUCCEEDS, and
+  all 6 excluded on `earthly_debugger_settings`. The earlier "1 in 12" was a
+  different build; for this one it is none. See
+  [earthly-dispatch.md](earthly-dispatch.md).
 - A named frontend (`docker build`) dispatches NOTHING and structurally
   cannot: the daemon resolves the frontend, so the graph never crosses the
   proxy.

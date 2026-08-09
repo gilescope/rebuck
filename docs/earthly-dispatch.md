@@ -86,6 +86,42 @@ what this product is: a distributed BuildKit works today for any client that
 builds its own LLB, and a distributed earthly additionally needs this one
 upstream patch.
 
+## Measured: 0 of 6, and the reason names itself
+
+A real earthly build, through the gateway, on 2026-08-09:
+
+```text
+earthly +code            SUCCESS in 91s
+[wire] gateway solves : 6
+[wire] ops total      : 64
+[wire] sources        : 6 registry, 14 local, 0 other
+[wire] solves routed  : 0 to other daemons
+[wire] built at home  : 6
+[wire] not routed     : {"considered": 6,
+  "excluded: Secret [\"mount /run/secrets/earthly_debugger_settings
+   id=name=da39a3ee...&org=&project=&v=1\"]": 6}
+```
+
+**Zero of six**, every one for the same reason, and the reason is this
+document. Not "1 in 12" for this target - none at all.
+
+Two things it settles that reading `converter.go` could not.
+
+The build SUCCEEDS. 64 ops through the proxy, correct output, the gateway
+analysing every graph and then getting out of the way. Fail-open is not a
+claim about a fixture any more.
+
+And the secret is unresolvable by construction, not merely absent. The id is
+`name=<sha>&org=&project=&v=1` - generated inside earthly's process per
+build. `REBUCK2_SERVE_SECRETS` cannot help: there is nothing outside that
+process which could answer, which is why the lift exists and does not apply
+here.
+
+It also settles the ORDER of the ceiling below. The 25 cache mounts and 9
+explicit secrets are all behind this one: no solve gets far enough for them
+to matter, so #784 is not the first of several obstacles, it is the only
+reachable one.
+
 ## You cannot put a proxy on loopback
 
 Discovered the hard way, and it applies to anything that wants to sit between

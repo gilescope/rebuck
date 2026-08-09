@@ -107,8 +107,16 @@ BK_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$SEED")
 echo "   image: $BK_IMAGE (from $SEED)"
 
 docker rm -f "$OWN_BK" >/dev/null 2>&1 || true
+# 8372, and this one is KNOWN rather than discovered: the fork's own
+# /etc/buildkitd.tcp.template sets `[grpc] address = tcp://0.0.0.0:8372`, and
+# we are the ones enabling TCP. The 8371 earthly publishes on its own
+# container is its embedded REGISTRY - the only port it exposes, because its
+# gRPC never leaves a unix socket. Probing that gave HTTP 301s answering the
+# HTTP/2 preface.
+#
+# Discover what someone else configured; know what you configured yourself.
 docker run -d --name "$OWN_BK" --privileged \
-  -p "$BK_PORT:8371" \
+  -p "$BK_PORT:8372" \
   -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
   -e BUILDKIT_TLS_ENABLED=false \
   -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG="[registry.\"$MIRROR_HOST:$REG_PORT\"]
@@ -117,10 +125,10 @@ docker run -d --name "$OWN_BK" --privileged \
   "$BK_IMAGE" >/dev/null
 BK_ADDR="127.0.0.1:$BK_PORT"
 for _ in $(seq 1 90); do
-  docker exec "$OWN_BK" buildctl --addr tcp://127.0.0.1:8371 debug workers >/dev/null 2>&1 && break
+  docker exec "$OWN_BK" buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 && break
   sleep 1
 done
-docker exec "$OWN_BK" buildctl --addr tcp://127.0.0.1:8371 debug workers >/dev/null 2>&1 || {
+docker exec "$OWN_BK" buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 || {
   echo "our buildkitd never became ready:"; docker logs --tail 20 "$OWN_BK"; exit 1;
 }
 echo "   ours on $BK_ADDR"

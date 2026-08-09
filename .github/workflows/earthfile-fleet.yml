@@ -113,20 +113,42 @@ jobs:
           # image, and any version skew is impossible by construction.
           earthly bootstrap
           docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}'
-          BK_NAME=$(docker ps --filter 'name=buildkitd' --format '{{.Names}}' | head -1)
-          if [ -z "$BK_NAME" ]; then
-            echo "earthly started no buildkitd container - cannot mirror it"; exit 1
+          SEED=$(docker ps -a --filter 'name=buildkitd' --format '{{.Names}}' | head -1)
+          if [ -z "$SEED" ]; then
+            echo "earthly started no buildkitd - nothing to copy an image from"; exit 1
           fi
-          BK_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$BK_NAME")
-          echo "earthly chose: $BK_NAME from $BK_IMAGE"
-          # Its own address, as earthly will use it.
-          # Whatever it publishes: v0.8.17 uses 8371, mapped to a dynamic host
-          # port. Asking for a port we assumed returns nothing and reads as a
-          # daemon that failed to start.
-          BK0=$(docker port "$BK_NAME" | head -1 | awk -F' -> ' '{print $2}')
-          echo "coordinator daemon at ${BK0:-<no published port>}"
-          echo "BK_IMAGE=$BK_IMAGE" >> "$GITHUB_ENV"
-          echo "BK0=${BK0:-127.0.0.1:8372}" >> "$GITHUB_ENV"
+          # OUR OWN daemon, from the image earthly chose.
+          #
+          # earthly starts its buildkitd with BUILDKIT_TCP_TRANSPORT_ENABLED=false
+          # and talks to it over a unix socket; the port it publishes is its
+          # embedded REGISTRY and answers HTTP/1.1, so a gRPC client gets
+          # "frame too large ... looked like an HTTP/1.1 header". Nothing can
+          # proxy that daemon at any address.
+          #
+          # The IMAGE must still be earthly's - the converter emits host binds
+          # and earthly_interactive sockets stock buildkit rejects - so
+          # bootstrap picks it and we start it the way a proxy needs. 8372 is
+          # KNOWN, not discovered: the fork's own buildkitd.tcp.template sets
+          # `[grpc] address = tcp://0.0.0.0:8372` and we are the ones turning
+          # TCP on.
+          BK_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$SEED")
+          echo "earthly chose image: $BK_IMAGE"
+          docker rm -f own-bk >/dev/null 2>&1 || true
+          docker run -d --name own-bk --privileged -p 18372:8372 \
+            -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
+            -e BUILDKIT_TLS_ENABLED=false \
+            -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG='[registry."172.17.0.1:15000"]
+            http = true
+            insecure = true' \
+            "$BK_IMAGE" >/dev/null
+          for _ in $(seq 1 120); do
+            docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers \
+              >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 || {
+            echo "our buildkitd never became ready:"; docker logs --tail 20 own-bk; exit 1; }
+          echo "BK0=127.0.0.1:18372" >> "$GITHUB_ENV"
 
           # One more daemon per worker, same image, same env earthly uses.
           for i in $(seq 1 "$WORKERS"); do
