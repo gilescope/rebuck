@@ -311,6 +311,11 @@ impl Proxy {
     /// Median rather than mean: one build that queued behind everything else
     /// must not make a subtree look permanently expensive, and therefore
     /// permanently worth shipping.
+    ///
+    /// Only ever populated when [`gating`] is on. The history is keyed by
+    /// graph digest, so it grows with the number of DISTINCT graphs a proxy
+    /// has seen and no window bounds that - and with the gate off it was
+    /// being filled for a reader that never ran.
     fn estimate(&self, key: &str) -> Option<u64> {
         let seen = self.seen_ms.held();
         let v = seen.get(key)?;
@@ -654,7 +659,9 @@ impl control::control_server::Control for Proxy {
         }
         drop(w);
         if let Some((_, key, _)) = went {
-            remember(self.seen_ms.held().entry(key).or_default(), ms);
+            if gating() {
+                remember(self.seen_ms.held().entry(key).or_default(), ms);
+            }
         }
         out
     }
@@ -1070,6 +1077,16 @@ fn remember(history: &mut Vec<u64>, ms: u64) {
         // never a growing backlog.
         history.remove(0);
     }
+}
+
+/// Is the size gate on?
+///
+/// One reader, because the two sides of this used to be written separately:
+/// the estimator recorded unconditionally while only the gate consulted it,
+/// so with the gate off - the default, and the measured recommendation - the
+/// proxy maintained an unbounded per-graph history that nothing read.
+fn gating() -> bool {
+    std::env::var("REBUCK2_GATE").as_deref() == Ok("1")
 }
 
 fn hedge_after(observed: &[u64]) -> Option<std::time::Duration> {
@@ -2052,8 +2069,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 // OFF by default; `REBUCK2_GATE=1` opts in. The estimator is
                 // measured and reported, and the gate around it does not
                 // hold up - see `worth_shipping`.
-                let worth = std::env::var("REBUCK2_GATE").as_deref() != Ok("1")
-                    || worth_shipping(self.estimate(&key), self.overhead_ms());
+                let worth = !gating() || worth_shipping(self.estimate(&key), self.overhead_ms());
                 // Nothing can be adopted while the mirror is down, whoever
                 // owns the fault. Building at home IS the fail-open answer,
                 // so refusing to offer costs nothing beyond the fleet.

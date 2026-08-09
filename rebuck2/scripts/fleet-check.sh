@@ -279,6 +279,22 @@ for priv in INSECURE:Insecure HOSTNET:HostNetwork; do
 done
 
 echo
+echo "== the two placement experiments that are off by default"
+# REBUCK2_GATE and REBUCK2_ADAPT are kept with their measurements rather than
+# deleted, so nobody re-derives them. Neither had ever been RUN by this suite:
+# both change placement, so a panic or a hang in either would have waited for
+# whoever switched it on.
+#
+# The claim is only that opting in stays SAFE - still correct, still
+# fail-open. Neither is asserted to improve anything, because neither does.
+for knob in REBUCK2_GATE REBUCK2_ADAPT; do
+  out=$(run DAEMONS=2 "$knob=1" EXPECT="$base/digests.txt" || true)
+  guard "$knob=1: every build finishes" "$out" &&
+    check "$knob=1: every build finishes" "$(count "$out" '^failed  : 0')" 1 || true
+  check "$knob=1: outputs identical to baseline" "$(count "$out" 'outputs identical')" 1
+done
+
+echo
 echo "== a fleet that is silently doing nothing"
 # The failure that reads as success: daemons that will not pull from an HTTP
 # mirror. Every peer refuses, dispatch falls back home, the BUILD SUCCEEDS.
