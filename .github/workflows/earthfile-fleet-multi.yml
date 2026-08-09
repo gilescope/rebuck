@@ -96,8 +96,8 @@ jobs:
           earthly bootstrap
           BK=$(docker ps --filter 'name=buildkitd' --format '{{.Names}}' | head -1)
           [ -n "$BK" ] || { echo "no buildkitd started"; exit 1; }
-          docker port "$BK" 8372 || true
-          echo "BK_ADDR=$(docker port "$BK" 8372 | head -1)" >> "$GITHUB_ENV"
+          docker port "$BK" || true
+          echo "BK_ADDR=$(docker port "$BK" | head -1 | awk -F' -> ' '{print $2}')" >> "$GITHUB_ENV"
 
       - name: serve until the coordinator goes
         env:
@@ -164,12 +164,20 @@ jobs:
           earthly bootstrap
           BK=$(docker ps --filter 'name=buildkitd' --format '{{.Names}}' | head -1)
           [ -n "$BK" ] || { echo "no buildkitd started"; exit 1; }
-          BK_ADDR=$(docker port "$BK" 8372 | head -1)
+          BK_ADDR=$(docker port "$BK" | head -1 | awk -F' -> ' '{print $2}')
           echo "BK_ADDR=$BK_ADDR" >> "$GITHUB_ENV"
 
+          # NOT loopback. earthly's `IsLocal` counts 127.0.0.1, localhost and
+          # ::1 as "a buildkit I manage", so a gateway on loopback makes it
+          # compare its OWN container's settings hash, decide they differ and
+          # restart it - the build then dies before one solve reaches the
+          # proxy, with a TLS error that names nothing relevant. A routable
+          # address is !isLocal and earthly simply connects.
+          LAN=$(hostname -I | awk '{print $1}')
+          echo "LAN=$LAN" >> "$GITHUB_ENV"
           REBUCK2_MIRROR=172.17.0.1:15000 \
             ./rebuck2-repo/rebuck2/target/release/rebuck2 buildkit-proxy \
-              --listen 127.0.0.1:1234 \
+              --listen 0.0.0.0:1234 \
               --upstream "http://$BK_ADDR" \
               --registry-bind 0.0.0.0:15000 \
               --session "earthfile-${GITHUB_RUN_ID}" \
@@ -197,7 +205,7 @@ jobs:
         run: |
           set -euo pipefail
           start=$SECONDS
-          EARTHLY_BUILDKIT_HOST=tcp://127.0.0.1:1234 \
+          EARTHLY_BUILDKIT_HOST="tcp://${LAN}:1234" \
             earthly --no-cache "$TARGET" 2>&1 | tail -60
           echo "FLEET_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
 

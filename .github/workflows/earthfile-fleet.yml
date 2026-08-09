@@ -120,7 +120,10 @@ jobs:
           BK_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$BK_NAME")
           echo "earthly chose: $BK_NAME from $BK_IMAGE"
           # Its own address, as earthly will use it.
-          BK0=$(docker port "$BK_NAME" 8372 2>/dev/null | head -1)
+          # Whatever it publishes: v0.8.17 uses 8371, mapped to a dynamic host
+          # port. Asking for a port we assumed returns nothing and reads as a
+          # daemon that failed to start.
+          BK0=$(docker port "$BK_NAME" | head -1 | awk -F' -> ' '{print $2}')
           echo "coordinator daemon at ${BK0:-<no published port>}"
           echo "BK_IMAGE=$BK_IMAGE" >> "$GITHUB_ENV"
           echo "BK0=${BK0:-127.0.0.1:8372}" >> "$GITHUB_ENV"
@@ -149,8 +152,16 @@ jobs:
           # 172.17.0.1 is the docker bridge gateway: how a container reaches
           # the runner. `host.docker.internal` is a Docker Desktop thing and
           # does not resolve here.
+          # NOT loopback. earthly's `IsLocal` counts 127.0.0.1, localhost and
+          # ::1 as "a buildkit I manage", so a gateway on loopback makes it
+          # compare its OWN container's settings hash, decide they differ and
+          # restart it - the build then dies before one solve reaches the
+          # proxy, with a TLS error that names nothing relevant. A routable
+          # address is !isLocal and earthly simply connects.
+          LAN=$(hostname -I | awk '{print $1}')
+          echo "LAN=$LAN" >> "$GITHUB_ENV"
           REBUCK2_MIRROR=172.17.0.1:15000 \
-            "$BIN" buildkit-proxy --listen 127.0.0.1:1234 \
+            "$BIN" buildkit-proxy --listen 0.0.0.0:1234 \
               --upstream "http://$BK0" \
               --registry-bind 0.0.0.0:15000 \
               --session "$SESSION" --store /tmp/coord > /tmp/proxy.log 2>&1 &
@@ -190,7 +201,7 @@ jobs:
         run: |
           set -euo pipefail
           start=$SECONDS
-          EARTHLY_BUILDKIT_HOST=tcp://127.0.0.1:1234 \
+          EARTHLY_BUILDKIT_HOST="tcp://${LAN}:1234" \
             earthly --no-cache "$TARGET" 2>&1 | tail -40
           echo "FLEET_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
 

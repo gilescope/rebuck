@@ -86,6 +86,40 @@ what this product is: a distributed BuildKit works today for any client that
 builds its own LLB, and a distributed earthly additionally needs this one
 upstream patch.
 
+## You cannot put a proxy on loopback
+
+Discovered the hard way, and it applies to anything that wants to sit between
+earthly and a buildkit - not only this project.
+
+`containerutil.IsLocal` counts `127.0.0.1`, `localhost` and `::1` as **a
+buildkit earthly MANAGES**. Point `EARTHLY_BUILDKIT_HOST` at a proxy on
+loopback and earthly compares the settings hash of its own container, decides
+they do not match, and restarts it:
+
+```text
+buildkitd | Found buildkit daemon as docker container (earthly-dev-buildkitd)
+buildkitd | Settings do not match. Restarting buildkit daemon with updated settings...
+Error: ... TLS CA file ".../certs/ca_cert.pem" is missing: file does not exist
+```
+
+The build dies before ONE solve reaches the proxy, and the error names TLS
+certificates, which have nothing to do with the cause. A routable address is
+`!isLocal`, and earthly then prints `Connecting to ...` and does nothing
+else: no settings hash, no restart, no container management.
+
+So the gateway must bind something routable. On a developer machine that is
+the LAN address; on a runner, `hostname -I`. Every workflow and script in
+this repo used `127.0.0.1:1234` and none of them could have worked.
+
+Two smaller ones from the same afternoon, both the same mistake - assuming a
+constant where the daemon decides:
+
+- The published port is **not 8372**. `earthbuild/buildkitd:v0.8.17` exposes
+  8371 and docker maps it to a dynamic host port. Ask `docker port`.
+- The image is whatever the earthly BINARY compiled in. `earthbuild/buildkitd:main`
+  is not a published tag; `:v0.8.17` is. Run `earthly bootstrap` and copy
+  what it chose.
+
 ## The ceiling after #784, counted from the Earthfile
 
 Fixing #784 does not make earthbuild's own root Earthfile fully
