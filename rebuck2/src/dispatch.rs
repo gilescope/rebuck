@@ -440,6 +440,16 @@ impl Placement {
         }
     }
 
+    /// Who is holding this offer right now, if anyone.
+    ///
+    /// Exposed so the driver can price a worker's outstanding LEADS when it
+    /// picks the next one. Derived from the placements themselves rather
+    /// than tallied alongside them: a second counter for the same fact is
+    /// how the proxy ended up dispatching against a number nothing updated.
+    pub fn holder(&self) -> Option<u64> {
+        self.outstanding
+    }
+
     /// Offer to the next peer. `None` = nobody left; build it yourself.
     pub fn offer(&mut self) -> Option<u64> {
         let who = self.order.get(self.next).copied();

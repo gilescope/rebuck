@@ -1326,6 +1326,31 @@ impl Driver {
         };
         let verdict = crate::dispatch::inspect(&def);
 
+        // Subtree leads a worker is already holding. `inflight` counts REAPI
+        // jobs ONLY, so without this every worker prices as idle however many
+        // subtrees it is sitting on - measured: four leads, all to worker 1,
+        // worker 2 never offered anything. At nineteen workers that is a
+        // fleet doing one machine's work.
+        //
+        // Locked before `workers`, matching `subtree_declined`, which takes
+        // subtrees and then reaches for workers via `tell`.
+        //
+        // The guard is held from the COUNT to the INSERT below, because
+        // releasing between them is check-then-act: four offers arriving
+        // together each counted zero leads before any of them had recorded
+        // one, and three landed on the same worker. Same shape as the
+        // proxy's reservation, which had to be moved to its decision for
+        // exactly this reason.
+        let mut open = self.subtrees.lock().await;
+        let leads: std::collections::BTreeMap<u64, usize> = {
+            let mut m = std::collections::BTreeMap::new();
+            for s in open.values() {
+                if let Some(w) = s.placement.holder() {
+                    *m.entry(w).or_default() += 1;
+                }
+            }
+            m
+        };
         let candidates: Vec<crate::dispatch::Candidate> = {
             let ws = self.workers.lock().await;
             ws.iter()
@@ -1338,7 +1363,8 @@ impl Driver {
                     load: crate::dispatch::Load {
                         slots: w.slots as usize,
                         peer: 0,
-                        driver: w.inflight.load(Ordering::Relaxed) as usize,
+                        driver: w.inflight.load(Ordering::Relaxed) as usize
+                            + leads.get(&w.id).copied().unwrap_or(0),
                     },
                 })
                 .collect()
@@ -1346,10 +1372,11 @@ impl Driver {
 
         let mut placement = crate::dispatch::Placement::new(&verdict, &candidates);
         let Some(first) = placement.offer() else {
+            drop(open);
             self.unplaced(requester, job, "no peer can take it").await;
             return;
         };
-        self.subtrees.lock().await.insert(
+        open.insert(
             job,
             Subtree {
                 requester,
@@ -1358,6 +1385,14 @@ impl Driver {
                 placement,
             },
         );
+        // Claim recorded; `tell` needs the workers lock and must not hold
+        // this one across it.
+        drop(open);
+        // Same shape as the REAPI line above, deliberately: WHICH machine
+        // took a subtree is only visible here now that the gateway offers
+        // instead of choosing, and `grep -o -- '-> worker [0-9]*' | uniq -c`
+        // is how spread is read in CI.
+        println!("[driver] subtree job {job} -> worker {first}");
         self.tell(
             first,
             D2W::Lead {
@@ -1392,6 +1427,7 @@ impl Driver {
         };
         match next {
             Some(peer) if peer != who => {
+                println!("[driver] subtree job {job} -> worker {peer} (after a decline)");
                 self.tell(
                     peer,
                     D2W::Lead {
