@@ -207,12 +207,54 @@ async fn main() -> Result<()> {
             let upstream = args
                 .opt("--upstream")
                 .unwrap_or_else(|| "http://127.0.0.1:1235".into());
-            // Repeatable: --peer http://host:port for each extra daemon.
-            let mut peers = Vec::new();
-            while let Some(p) = args.opt("--peer") {
-                peers.push(p);
+            // The proxy places through a driver, so it starts one and
+            // serves the mesh: workers join THIS process, exactly as they
+            // join a driver, and the gateway offers them work through the
+            // same arbitration a subdividing worker gets.
+            //
+            // No `--peer`. A peer list here was a second way to find a
+            // machine and a second way to move a layer, and the mesh is
+            // older, tested to 19 workers, and keeps the coordinator off the
+            // data path.
+            let store_root: std::path::PathBuf = args
+                .opt("--store")
+                .map(Into::into)
+                .unwrap_or_else(|| default_store("proxy"));
+            let store = Arc::new(store::Store::new(store_root.clone())?);
+            let scratch = store_root.join("exec");
+            std::fs::create_dir_all(&scratch)?;
+            let d = driver::Driver::new(
+                store,
+                driver::DriverCfg {
+                    session: args.opt("--session").unwrap_or_else(default_session),
+                    min_workers: 0,
+                    require_shards: 0,
+                    // The gateway is the only thing feeding this driver, and
+                    // it builds its own share by falling through to the
+                    // upstream daemon. REAPI local exec would be a second
+                    // executor with nothing to run.
+                    local_exec: false,
+                    decentralized: args.flag("--decentralized-cas"),
+                    hardlinks: true,
+                    cache_failures: false,
+                    locality: false,
+                    prefetch_metadata: false,
+                    name_independent: true,
+                    addr_file: args.opt("--addr-file").map(Into::into),
+                    finalize_file: None,
+                    scratch,
+                },
+            );
+            args.done();
+            {
+                let d = d.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = d.serve_mesh().await {
+                        eprintln!("[proxy] mesh died: {e:#}");
+                    }
+                });
             }
-            proxy::serve(listen.parse()?, upstream, peers).await
+            proxy::serve(listen.parse()?, upstream, d).await
         }
         "worker" => {
             let store_root: std::path::PathBuf = args

@@ -284,9 +284,6 @@ const SPECULATE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 /// buildkit proxy runs in THIS process, holding a client's Solve open, and
 /// answering it over a wire to ourselves would be a second transport for a
 /// question we can answer with a channel.
-// Removed in the commit that switches the proxy over; kept separate so the
-// seam lands on its own and can be reverted on its own.
-#[allow(dead_code)]
 enum Requester {
     Worker(u64),
     /// The gateway in-process. Resolves to the image ref a peer published,
@@ -1443,7 +1440,6 @@ impl Driver {
     ///
     /// `None` means nobody took it, which is not an error: it is the answer
     /// that says build it here.
-    #[allow(dead_code)] // wired up by the proxy switch, next commit
     pub async fn lead_subtree(
         self: &Arc<Self>,
         subtree: Vec<u8>,
