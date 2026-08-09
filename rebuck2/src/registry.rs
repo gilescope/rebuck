@@ -1283,10 +1283,29 @@ pub async fn serve_with_upstream<S: RegistryStore>(
     let app = router_with_upstream(store, upstream).layer(axum::middleware::from_fn(
         |req: axum::extract::Request, next: axum::middleware::Next| async move {
             let k = shape(req.method().as_str(), req.uri().path());
+            // Keep the PATH for a moment: a miss is only useful if it says
+            // what was missed.
+            let path = req.uri().path().to_owned();
+            let res = next.run(req).await;
+            // Tally the STATUS, not just the shape. "served 22 requests" was
+            // reported by a registry whose consumer had just failed with
+            // `not found` - a tally that counts a 404 and a 200 as the same
+            // event cannot be used to answer the only question being asked
+            // of it.
+            let st = res.status();
+            let key = if st.is_success() || st.is_redirection() {
+                k
+            } else {
+                format!("{k} -> {}", st.as_u16())
+            };
             if let Some(m) = TRAFFIC.held().as_mut() {
-                *m.entry(k).or_default() += 1;
+                let seen = m.entry(key).or_default();
+                *seen += 1;
+                if st == axum::http::StatusCode::NOT_FOUND && *seen == 1 {
+                    println!("[registry] 404 {path}");
+                }
             }
-            next.run(req).await
+            res
         },
     ));
     // Graceful shutdown rather than `std::process::exit`, which is what this

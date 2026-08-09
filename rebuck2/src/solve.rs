@@ -403,17 +403,81 @@ pub async fn build_subtree(
     //
     // Naming the builder's own registry here is what confined the fleet to
     // one host: it produced a reference nobody else could resolve.
-    let by_digest = resp
-        .exporter_response
+    published_reference(&resp.exporter_response, registry, job)
+}
+
+/// What the builder may CLAIM to have published, given what the exporter said.
+pub fn published_reference(
+    exporter_response: &HashMap<String, String>,
+    registry: &str,
+    job: u64,
+) -> anyhow::Result<String> {
+    if let Some(d) = exporter_response
         .get("containerimage.digest")
         .filter(|d| d.starts_with("sha256:"))
-        .cloned();
-    Ok(by_digest.unwrap_or_else(|| result_ref(registry, job)))
+    {
+        return Ok(d.clone());
+    }
+    // NOT the tag. See `a_silent_export_is_a_failed_handover_not_a_tag`:
+    // falling back here reports a name the registry does not hold, and the
+    // requester finds out several minutes later with `not found`.
+    //
+    // The keys are in the message because the fix for THIS being wrong is
+    // knowing what the exporter did say instead.
+    let mut keys: Vec<&str> = exporter_response.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    anyhow::bail!(
+        "subtree {job}: exporter reported no digest, so nothing was published to \
+         {} - refusing to claim {}. exporter said: {keys:?}",
+        registry,
+        result_ref(registry, job)
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_silent_export_is_a_failed_handover_not_a_tag() {
+        // Measured on `earthly +code`: the worker solved, reported
+        //
+        //     [driver] subtree job 1 built at .../rebuck2/subtree:job-1
+        //
+        // and the registry held no such tag - no manifest, no blobs, nothing
+        // pushed under that name at all. The requester then died on
+        //
+        //     failed to load cache key: .../rebuck2/subtree:job-1: not found
+        //
+        // The old code called that a safe degradation: no digest reported, so
+        // fall back to the tag we asked to push to. But the exporter reports
+        // no digest exactly WHEN it did not export, so the tag it falls back
+        // to is the one name guaranteed to be absent. The fallback converts a
+        // failed build into a confident lie, and the driver has no way to
+        // tell - it reassigns nothing, and the fleet's own refusal machinery
+        // never runs.
+        //
+        // A handover nobody can fetch is not a handover.
+        let empty = HashMap::new();
+        let e = published_reference(&empty, "r:5000", 1)
+            .expect_err("a silent export must not be reported as a publish");
+        let msg = format!("{e:#}");
+        assert!(
+            msg.contains("no digest"),
+            "the error must say what was missing: {msg}"
+        );
+
+        // And when the exporter DOES report one, that is the answer - bare,
+        // because a digest names content rather than a host.
+        let d = "sha256:".to_owned() + &"ab".repeat(32);
+        let got = published_reference(
+            &HashMap::from([("containerimage.digest".to_owned(), d.clone())]),
+            "r:5000",
+            1,
+        )
+        .unwrap();
+        assert_eq!(got, d, "the digest is the reference");
+    }
 
     fn req() -> control::SolveRequest {
         let def = pb::Definition {
@@ -1812,7 +1876,15 @@ mod tests {
         let got = build_subtree("http://127.0.0.1:11234", &registry, 1, def)
             .await
             .expect("the peer builds it");
-        assert_eq!(got, result_ref(&registry, 1));
+        // A DIGEST, not the tag. The tag form used to be accepted here, and
+        // that is what let a silent export pass for a publish - see
+        // `a_silent_export_is_a_failed_handover_not_a_tag`. If this daemon
+        // stops reporting `containerimage.digest`, this test is where that
+        // shows up, rather than in a build that fails minutes later.
+        assert!(
+            got.starts_with("sha256:"),
+            "expected a bare digest, got {got}"
+        );
 
         // The result landed in the BUILDER's mirror.
         let worker_bytes = dir_bytes(&worker_root.join("cas"));
