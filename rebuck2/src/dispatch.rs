@@ -50,6 +50,17 @@ pub enum Exclusion {
     /// An op we could not read. Conservative on purpose: we cannot show it is
     /// safe, so it is not.
     Undecodable,
+    /// A mount type outside the five buildkit declares - so a fork's, and its
+    /// meaning is whatever that fork decided.
+    ///
+    /// Failing OPEN here cost a day. earthly's fork adds `SOCKET = 101`
+    /// (`solver/pb/ops.proto:123`, "Earthly specific") and attaches two to
+    /// every RUN. Those are session-backed: a worker takes the lead, then dies
+    /// with `no active sessions`. inspect called the graph clean throughout,
+    /// because it matched the types it knew and said nothing about the rest.
+    ///
+    /// Carries the number - having no name for it is the entire point.
+    UnknownMount(i32),
 }
 
 /// Where the subtree can run.
@@ -187,6 +198,15 @@ fn plat_str(p: &pb::Platform) -> String {
 /// secrets and no security mode. Grounding those would ground exactly the
 /// `FROM <registry image>` chains principle 11 calls the BEST handover -
 /// the ones whose whole frontier is a digest any machine can fetch.
+/// The mount types buildkit itself declares. Anything else is a fork's.
+const KNOWN_MOUNTS: [i32; 5] = [
+    pb::MountType::Bind as i32,
+    pb::MountType::Secret as i32,
+    pb::MountType::Ssh as i32,
+    pb::MountType::Cache as i32,
+    pb::MountType::Tmpfs as i32,
+];
+
 fn hazards(op: &pb::Op) -> Vec<Exclusion> {
     let mut out = Vec::new();
     let Some(pb::op::Op::Exec(e)) = op.op.as_ref() else {
@@ -235,6 +255,11 @@ fn hazards(op: &pb::Op) -> Vec<Exclusion> {
         }
         if m.mount_type == pb::MountType::Ssh as i32 || m.ssh_opt.is_some() {
             out.push(Exclusion::SshAgent);
+        }
+        // Fail CLOSED on anything else. A number we do not recognise is a
+        // fork extension whose requirements we cannot see.
+        if !KNOWN_MOUNTS.contains(&m.mount_type) {
+            out.push(Exclusion::UnknownMount(m.mount_type));
         }
     }
     out.dedup();
@@ -879,6 +904,15 @@ mod tests {
             m.cache_opt = Some(pb::CacheOpt::default());
         }
         m
+    }
+
+    /// A mount by RAW type number - the only way to build a fork's.
+    fn mount_of_type(kind: i32) -> Mount {
+        Mount {
+            dest: "/m".into(),
+            mount_type: kind,
+            ..Default::default()
+        }
     }
 
     // --- M4: the offer, and the right to refuse ------------------------
@@ -1577,8 +1611,12 @@ mod tests {
         // With only the first reported, lifting it makes the op look clean:
         // REBUCK2_PEER_CACHE_MOUNTS=1 lifts CacheMount, nothing mentions the
         // socket, and the graph is offered to a worker that builds without a
-        // session. Measured - the worker declined with "no active sessions"
-        // and the fleet reported taking nothing.
+        // session.
+        //
+        // The bug is real, but do NOT credit it with the earthly decline this
+        // was written next to: that one was mount type 101, and is
+        // `a_fork_only_mount_type_is_a_blocker_not_a_blank`. Fixing this
+        // changed that measurement by nothing at all.
         let mut e = exec_of(&plain());
         e.mounts = vec![mount(pb::MountType::Cache), mount(pb::MountType::Ssh)];
         let mut op = plain();
@@ -1605,6 +1643,51 @@ mod tests {
                 ..Default::default()
             }),
             "lifting the cache mount let an ssh mount travel"
+        );
+    }
+
+    #[test]
+    fn a_fork_only_mount_type_is_a_blocker_not_a_blank() {
+        // 101 is not a number anyone would guess. earthly's buildkit fork
+        // declares `SOCKET = 101; // Earthly specific.` (solver/pb/ops.proto)
+        // and its converter attaches TWO to every non-LOCALLY RUN.
+        //
+        // The old matcher tested for the five types buildkit declares and
+        // said nothing about the rest, so a graph carrying only these looked
+        // CLEAN: offered, led, and then dead on the worker with
+        //
+        //     build failed: solve: Unknown error no active sessions
+        //
+        // Nothing in that message names a mount, and inspect - the one
+        // component whose entire job is to predict it - was the component
+        // asserting there was nothing to name.
+        //
+        // The rule this encodes is not "exclude 101". It is that an unknown
+        // mount type fails CLOSED, so the NEXT fork extension costs a
+        // declined offer instead of a day.
+        const EARTHLY_SOCKET: i32 = 101;
+        let mut e = exec_of(&plain());
+        e.mounts = vec![mount_of_type(EARTHLY_SOCKET), mount_of_type(EARTHLY_SOCKET)];
+        let mut op = plain();
+        op.op = Some(OpKind::Exec(e));
+        let v = inspect(&def(vec![op]));
+
+        assert!(
+            v.exclusions
+                .iter()
+                .any(|(_, x)| *x == Exclusion::UnknownMount(EARTHLY_SOCKET)),
+            "fork mount type sailed through: {:?}",
+            v.exclusions
+        );
+        // Nothing lifts it. Every Allow flag names a hazard we understand
+        // well enough to weigh; this one we do not understand at all.
+        assert!(
+            !v.dispatchable_when(Allow {
+                caches: true,
+                secrets: true,
+                ..Default::default()
+            }),
+            "an opt-in flag cleared a mount type we cannot even name"
         );
     }
 
