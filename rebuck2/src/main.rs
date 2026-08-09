@@ -23,8 +23,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use bazel_remote_apis::build::bazel::remote::execution::v2 as re;
-use bazel_remote_apis::google::bytestream as bs;
 
 fn usage() -> ! {
     eprintln!(
@@ -272,14 +270,47 @@ async fn run_driver(mut args: Args) -> Result<()> {
             use std::sync::atomic::Ordering::Relaxed;
             let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
             let mut last_read = 0u64;
+            let mut idle_mins = 0u64;
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 let read = store.read_bytes.load(Relaxed);
+
+                // Silence on the REAPI port is not idleness - it is the shape
+                // of a build that will never start. Say so, with the two
+                // diagnoses spelled out, rather than leaving a reader to infer
+                // it from a row of zeroes (run 31157521034: four hours of
+                // `ac_ok=0 ac_fail=0` that nobody could interpret).
+                let conns = rs.conns.load(Relaxed);
+                let asked = rs.ac_hits.load(Relaxed)
+                    + rs.ac_misses.load(Relaxed)
+                    + rs.blobs_read.load(Relaxed);
+                if asked == 0 {
+                    idle_mins += 1;
+                    if idle_mins.is_multiple_of(5) {
+                        if conns == 0 {
+                            eprintln!(
+                                "[driver] WARNING: {idle_mins}m serving and NOTHING has connected \
+                                 to the REAPI port. buck2 is not dialling this address - check \
+                                 .buckconfig.local [buck2_re_client] against the port above."
+                            );
+                        } else {
+                            eprintln!(
+                                "[driver] WARNING: {idle_mins}m serving, {conns} connection(s) \
+                                 accepted but ZERO requests. buck2 reached us and is not asking - \
+                                 check execution_platforms is in-graph, not passed via --config."
+                            );
+                        }
+                    }
+                } else {
+                    idle_mins = 0;
+                }
+
                 println!(
-                    "[stats] store={:.2} GiB served_total={:.2} GiB serve_rate={:.1} MiB/s pending_jobs={} workers={} ac_ok={} ac_fail={} dnc_exec={} queued[{}] mem[{}] grpc[ac {}/{}/{}u {:.2} GiB | casR {} {:.2} GiB | casW {:.2} GiB]",
+                    "[stats] store={:.2} GiB served_total={:.2} GiB serve_rate={:.1} MiB/s conns={} pending_jobs={} workers={} ac_ok={} ac_fail={} dnc_exec={} queued[{}] mem[{}] grpc[ac {}/{}/{}u {:.2} GiB | casR {} {:.2} GiB | casW {:.2} GiB]",
                     gib(store.stored_bytes.load(Relaxed)),
                     gib(read),
                     (read - last_read) as f64 / (60.0 * 1024.0 * 1024.0),
+                    conns,
                     d.pending_jobs().await,
                     d.worker_count().await,
                     d.ac_hit_ok.load(Relaxed),
@@ -300,47 +331,31 @@ async fn run_driver(mut args: Args) -> Result<()> {
         });
     }
 
-    let addr = format!("127.0.0.1:{grpc_port}").parse()?;
-    println!("[driver] REAPI listening on grpc://{addr}");
-    let max = 256 * 1024 * 1024; // rustc rlibs can be chunky
-    tonic::transport::Server::builder()
-        .add_service(
-            re::capabilities_server::CapabilitiesServer::new(rpc::Caps)
-                .max_decoding_message_size(max),
-        )
-        .add_service(
-            re::content_addressable_storage_server::ContentAddressableStorageServer::new(
-                rpc::Cas {
-                    driver: d.clone(),
-                    stats: rpc_stats.clone(),
-                },
-            )
-            .max_decoding_message_size(max),
-        )
-        .add_service(
-            bs::byte_stream_server::ByteStreamServer::new(rpc::ByteStreamSvc {
-                driver: d.clone(),
-                stats: rpc_stats.clone(),
-            })
-            .max_decoding_message_size(max),
-        )
-        .add_service(
-            re::action_cache_server::ActionCacheServer::new(rpc::Ac {
-                store: store.clone(),
-                stats: rpc_stats.clone(),
-                driver: d.clone(),
-            })
-            .max_decoding_message_size(max),
-        )
-        .add_service(
-            re::execution_server::ExecutionServer::new(rpc::Exec {
-                driver: d.clone(),
-                stats: rpc_stats.clone(),
-            })
-            .max_decoding_message_size(max),
-        )
-        .serve(addr)
+    // Bind BEFORE announcing. The driver action gates the build legs on this
+    // line, so printing it ahead of the bind makes it a claim rather than a
+    // fact - and a leg released against an unbound port waits forever.
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{grpc_port}").parse()?;
+    let listener = tokio::net::TcpListener::bind(addr)
         .await
+        .with_context(|| format!("binding REAPI listener on {addr}"))?;
+    // Count accepted connections so the heartbeat can tell "nobody dialled"
+    // from "dialled, got nothing back" - the two are indistinguishable in
+    // every other counter, and that ambiguity cost a four-hour lap.
+    let incoming = rpc::counting_incoming(listener, rpc_stats.clone());
+    let server = tokio::spawn(
+        rpc::router(d.clone(), store.clone(), rpc_stats.clone()).serve_with_incoming(incoming),
+    );
+
+    // A bound socket is not a serving one. Prove a client can round-trip
+    // before anything downstream is released against this address: the build
+    // legs start on the line below, and a leg that dials a bound-but-silent
+    // port waits forever rather than failing.
+    rpc::self_check(addr).await?;
+    println!("[driver] REAPI listening on grpc://{addr} (round-trip verified)");
+
+    server
+        .await
+        .context("gRPC server task")?
         .context("gRPC server")?;
 
     mesh.abort();

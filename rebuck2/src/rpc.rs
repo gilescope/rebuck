@@ -46,10 +46,30 @@ pub struct RpcStats {
     pub blob_read_bytes: AtomicU64,
     /// Bytes accepted via `BatchUpdateBlobs` + `ByteStream::Write` combined.
     pub blob_write_bytes: AtomicU64,
+    /// TCP connections accepted on the REAPI port, ever.
+    ///
+    /// The one number that separates "buck2 never dialled us" from "buck2
+    /// dialled and we never answered". Every other counter here reads zero in
+    /// both worlds, which is how run 31157521034 stayed ambiguous for four
+    /// hours: `ac_ok=0 ac_fail=0` says nothing failed, not that nothing came.
+    pub conns: AtomicU64,
 }
 
 type OpStream = Pin<Box<dyn Stream<Item = Result<Operation, Status>> + Send + 'static>>;
 
+/// Validate a client digest and normalise it to the store's one spelling.
+///
+/// REAPI does not forbid uppercase hex, and `is_ascii_hexdigit` accepts it, but
+/// the store is content-addressed BY FILENAME - so `AB..` and `ab..` are the
+/// same blob on a case-insensitive filesystem (macOS APFS, windows) and two
+/// different ones on a case-sensitive filesystem (linux ext4). Left
+/// unnormalised that is a bug that only appears on some of the fleet: the blob
+/// is accepted, then never found, and the action re-executes forever.
+///
+/// Lowercasing here is the single choke point - `parse_resource` routes through
+/// it too - so every store key, mesh advertisement and bloom filter downstream
+/// sees one spelling. Responses still echo the client's own casing, because
+/// they are built from the request digests rather than from these.
 fn dig(d: &re::Digest) -> Result<Dig, Status> {
     if d.hash.len() != 64 || !d.hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Status::invalid_argument(format!(
@@ -58,7 +78,7 @@ fn dig(d: &re::Digest) -> Result<Dig, Status> {
         )));
     }
     Ok(Dig {
-        hash: d.hash.clone(),
+        hash: d.hash.to_ascii_lowercase(),
         size: d.size_bytes,
     })
 }
@@ -518,6 +538,131 @@ fn op_stream(action: &Dig, result: re::ActionResult, cached: bool) -> Response<O
     Response::new(Box::pin(tokio_stream::once(Ok(op))))
 }
 
+/// Every REAPI service the driver serves, wired onto one router.
+///
+/// Extracted from `main` so a test can bind it to an ephemeral port and drive
+/// it through a real client. Calling the service structs directly exercises
+/// their logic but not the transport - and the transport is its own failure
+/// surface: a client can connect to a listening socket and still never
+/// complete a round trip (buck2-fixups run 31157521034 sat on
+/// `[re_action_cache]` for four hours against a driver reporting `ac_ok=0
+/// ac_fail=0` - nothing arrived, so nothing could fail).
+pub fn router(
+    driver: Arc<crate::driver::Driver>,
+    store: Arc<Store>,
+    stats: Arc<RpcStats>,
+) -> tonic::transport::server::Router {
+    // rustc rlibs can be chunky.
+    let max = 256 * 1024 * 1024;
+    tonic::transport::Server::builder()
+        .add_service(
+            re::capabilities_server::CapabilitiesServer::new(Caps).max_decoding_message_size(max),
+        )
+        .add_service(
+            re::content_addressable_storage_server::ContentAddressableStorageServer::new(Cas {
+                driver: driver.clone(),
+                stats: stats.clone(),
+            })
+            .max_decoding_message_size(max),
+        )
+        .add_service(
+            bs::byte_stream_server::ByteStreamServer::new(ByteStreamSvc {
+                driver: driver.clone(),
+                stats: stats.clone(),
+            })
+            .max_decoding_message_size(max),
+        )
+        .add_service(
+            re::action_cache_server::ActionCacheServer::new(Ac {
+                store,
+                stats: stats.clone(),
+                driver: driver.clone(),
+            })
+            .max_decoding_message_size(max),
+        )
+        .add_service(
+            re::execution_server::ExecutionServer::new(Exec { driver, stats })
+                .max_decoding_message_size(max),
+        )
+}
+
+/// Wrap a listener so every accepted connection bumps [`RpcStats::conns`].
+///
+/// Lives here rather than at the call site so a test can prove the counter
+/// actually counts - a diagnostic that silently reads zero is worse than none,
+/// because it argues for the wrong diagnosis.
+pub fn counting_incoming(
+    listener: tokio::net::TcpListener,
+    stats: Arc<RpcStats>,
+) -> impl futures::Stream<Item = std::io::Result<tokio::net::TcpStream>> {
+    use futures::StreamExt as _;
+    tokio_stream::wrappers::TcpListenerStream::new(listener).inspect(move |conn| {
+        if conn.is_ok() {
+            stats.conns.fetch_add(1, Relaxed);
+        }
+    })
+}
+
+/// How long the self-check waits for its own server to answer. Generous for a
+/// loaded CI box; four hours short of the outage it exists to prevent.
+const SELF_CHECK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Prove a client can complete a REAPI round trip against `addr` before the
+/// driver tells anyone it is ready.
+///
+/// A bound socket is not a serving one: a client connects (the kernel accepts
+/// into the backlog), sends a request, and waits - forever, if nothing ever
+/// answers. That is what stranded buck2-fixups run 31157521034, with buck2 on
+/// `[re_action_cache]` for four hours against a driver logging `ac_ok=0
+/// ac_fail=0`. Neither side had a deadline, so neither side could notice.
+///
+/// A server-side request timeout cannot cover this - it only fires on requests
+/// that arrive - and it would have to be long enough for `Execute` to run a
+/// whole compile, which makes it useless for an AC lookup. Checking the round
+/// trip once, at startup, costs one RPC and converts a silent hang into a loud
+/// startup failure.
+pub async fn self_check(addr: std::net::SocketAddr) -> anyhow::Result<()> {
+    self_check_within(addr, SELF_CHECK).await
+}
+
+/// [`self_check`] with an explicit budget, so tests can assert the give-up
+/// behaviour without waiting out the production timeout.
+pub async fn self_check_within(
+    addr: std::net::SocketAddr,
+    budget: std::time::Duration,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let endpoint = format!("http://{addr}");
+    let mut client = tokio::time::timeout(
+        budget,
+        re::capabilities_client::CapabilitiesClient::connect(endpoint.clone()),
+    )
+    .await
+    .with_context(|| format!("REAPI self-check: no connection to {endpoint} within {budget:?}"))?
+    .with_context(|| format!("REAPI self-check: connecting to {endpoint}"))?;
+
+    let caps = tokio::time::timeout(
+        budget,
+        client.get_capabilities(Request::new(re::GetCapabilitiesRequest::default())),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "REAPI self-check: {endpoint} accepted a connection but did not answer \
+             GetCapabilities within {budget:?} - the socket is bound but not serving, \
+             which is the shape that hangs buck2 indefinitely"
+        )
+    })?
+    .with_context(|| format!("REAPI self-check: GetCapabilities against {endpoint}"))?;
+
+    anyhow::ensure!(
+        caps.into_inner().cache_capabilities.is_some(),
+        "REAPI self-check: {endpoint} answered without cache_capabilities - a client \
+         cannot decide to use the cache"
+    );
+    Ok(())
+}
+
 fn no_digest() -> Status {
     Status::invalid_argument("missing action_digest")
 }
@@ -620,5 +765,319 @@ mod tests {
         ac.driver.note_ac_written(&key).await;
         ac.get_action_result(req(&key)).await.expect("now servable");
         assert_eq!(ac.stats.ac_hits.load(Relaxed), 1);
+    }
+
+    // ---- transport round-trips -------------------------------------------
+    //
+    // The tests above call the service structs directly, which exercises their
+    // logic but not the wire. A client can connect to a listening socket and
+    // still never complete a round trip - that is what stranded run
+    // 31157521034 for four hours, with buck2 blocked on `[re_action_cache]`
+    // and the driver reporting `ac_ok=0 ac_fail=0`: nothing arrived, so
+    // nothing could fail, and neither side had a deadline. Every test here
+    // asserts under a timeout, so a hang is a failure rather than a hung run.
+
+    use std::time::Duration;
+
+    /// Ceiling for a loopback round trip. Generous for a laptop under load,
+    /// still four hours short of the outage this pins.
+    const RTT: Duration = Duration::from_secs(10);
+
+    /// Serve the full router on an ephemeral port; returns its address.
+    async fn serve_rig() -> (String, Arc<Store>, Arc<crate::driver::Driver>) {
+        let ac = rig();
+        let (store, driver) = (ac.store.clone(), ac.driver.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = router(driver.clone(), store.clone(), Arc::new(RpcStats::default()));
+        tokio::spawn(async move {
+            router
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+        });
+        (format!("http://{addr}"), store, driver)
+    }
+
+    /// The bind-then-serve contract: once the listener exists, a client must be
+    /// able to connect AND get an answer. `main` announces readiness off the
+    /// same bind, and the driver action releases the build legs on that line.
+    #[tokio::test]
+    async fn a_client_completes_a_round_trip_against_the_bound_port() {
+        let (addr, _s, _d) = serve_rig().await;
+        let mut c = tokio::time::timeout(
+            RTT,
+            re::capabilities_client::CapabilitiesClient::connect(addr),
+        )
+        .await
+        .expect("connect did not hang")
+        .expect("connected");
+        let caps = tokio::time::timeout(
+            RTT,
+            c.get_capabilities(Request::new(re::GetCapabilitiesRequest::default())),
+        )
+        .await
+        .expect("GetCapabilities did not hang")
+        .expect("capabilities served");
+        assert!(
+            caps.into_inner().cache_capabilities.is_some(),
+            "a client that gets no cache_capabilities cannot decide to use the cache"
+        );
+    }
+
+    /// buck2 asks the AC first and blocks on the answer. A miss must come back
+    /// promptly as NOT_FOUND - silence is indistinguishable from a slow hit,
+    /// and buck2 waits.
+    #[tokio::test]
+    async fn an_ac_miss_answers_not_found_over_the_wire() {
+        let (addr, _s, _d) = serve_rig().await;
+        let mut c = re::action_cache_client::ActionCacheClient::connect(addr)
+            .await
+            .unwrap();
+        let err = tokio::time::timeout(RTT, c.get_action_result(req(&"b".repeat(64))))
+            .await
+            .expect("AC miss did not hang")
+            .expect_err("a miss is an error status");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    /// FindMissingBlobs is the next call buck2 makes, and it is how it decides
+    /// what to upload. An empty request must still answer.
+    #[tokio::test]
+    async fn find_missing_blobs_answers_over_the_wire() {
+        let (addr, store, _d) = serve_rig().await;
+        let d = crate::mesh::Dig {
+            hash: ABC.into(),
+            size: 3,
+        };
+        store.put(Some(&d), b"abc").await.unwrap();
+        let mut c =
+            re::content_addressable_storage_client::ContentAddressableStorageClient::connect(addr)
+                .await
+                .unwrap();
+        let present = re::Digest {
+            hash: ABC.into(),
+            size_bytes: 3,
+        };
+        let absent = re::Digest {
+            hash: "c".repeat(64),
+            size_bytes: 7,
+        };
+        let resp = tokio::time::timeout(
+            RTT,
+            c.find_missing_blobs(Request::new(re::FindMissingBlobsRequest {
+                blob_digests: vec![present.clone(), absent.clone()],
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("FindMissingBlobs did not hang")
+        .expect("served")
+        .into_inner();
+        let missing: Vec<String> = resp
+            .missing_blob_digests
+            .iter()
+            .map(|d| d.hash.clone())
+            .collect();
+        assert!(
+            !missing.contains(&present.hash),
+            "a blob the store holds must not be reported missing - the client would re-upload it"
+        );
+        assert!(
+            missing.contains(&absent.hash),
+            "a blob the store lacks must be reported missing - otherwise the client never uploads it \
+             and every later action referencing it strands"
+        );
+    }
+
+    // ---- probes: edges a real client can reach -----------------------------
+
+    /// Platform-independent guard for the same defect the end-to-end probe
+    /// below catches only on a case-SENSITIVE filesystem. It passed on macOS
+    /// (APFS folds case, so the lookup accidentally worked) and failed on
+    /// linux CI - so the unit-level assertion is the one that actually holds
+    /// the line on every runner in a heterogeneous fleet.
+    #[test]
+    fn a_client_digest_is_normalised_to_one_spelling() {
+        let d = dig(&re::Digest {
+            hash: ABC.to_uppercase(),
+            size_bytes: 3,
+        })
+        .expect("uppercase hex is valid REAPI");
+        assert_eq!(
+            d.hash, ABC,
+            "the store keys blobs by filename, so an unnormalised uppercase digest is the \
+             same blob on macOS/windows and a different one on linux - accepted, then never found"
+        );
+    }
+
+    /// `dig()` accepts any ASCII hex digit, so an UPPERCASE digest passes
+    /// validation. If the store keys on lowercase, such a digest is accepted
+    /// and then never found - a silent permanent miss rather than a rejection.
+    /// REAPI does not forbid uppercase, so a client may legitimately send it.
+    #[tokio::test]
+    async fn an_uppercase_digest_is_not_silently_unfindable() {
+        let (addr, store, _d) = serve_rig().await;
+        let d = crate::mesh::Dig {
+            hash: ABC.into(),
+            size: 3,
+        };
+        store.put(Some(&d), b"abc").await.unwrap();
+
+        let mut c =
+            re::content_addressable_storage_client::ContentAddressableStorageClient::connect(addr)
+                .await
+                .unwrap();
+        let upper = re::Digest {
+            hash: ABC.to_uppercase(),
+            size_bytes: 3,
+        };
+        let resp = tokio::time::timeout(
+            RTT,
+            c.find_missing_blobs(Request::new(re::FindMissingBlobsRequest {
+                blob_digests: vec![upper.clone()],
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("did not hang")
+        .expect("served")
+        .into_inner();
+        assert!(
+            resp.missing_blob_digests.is_empty(),
+            "an uppercase spelling of a blob we hold was reported missing: either \
+             normalise the hash on the way in, or reject non-lowercase at the door - \
+             accepting it and never finding it is the worst of the three"
+        );
+    }
+
+    /// buck2 sends empty FindMissingBlobs batches. An empty request must answer
+    /// empty, not error and not hang.
+    #[tokio::test]
+    async fn an_empty_find_missing_batch_answers_empty() {
+        let (addr, _s, _d) = serve_rig().await;
+        let mut c =
+            re::content_addressable_storage_client::ContentAddressableStorageClient::connect(addr)
+                .await
+                .unwrap();
+        let resp = tokio::time::timeout(
+            RTT,
+            c.find_missing_blobs(Request::new(re::FindMissingBlobsRequest::default())),
+        )
+        .await
+        .expect("did not hang")
+        .expect("served")
+        .into_inner();
+        assert!(resp.missing_blob_digests.is_empty());
+    }
+
+    /// A digest that is not 64 hex must be REJECTED, not accepted-and-lost. The
+    /// error names SHA256 so a misconfigured client learns why.
+    #[tokio::test]
+    async fn a_non_sha256_digest_is_rejected_with_a_legible_error() {
+        let (addr, _s, _d) = serve_rig().await;
+        let mut c =
+            re::content_addressable_storage_client::ContentAddressableStorageClient::connect(addr)
+                .await
+                .unwrap();
+        let err = tokio::time::timeout(
+            RTT,
+            c.find_missing_blobs(Request::new(re::FindMissingBlobsRequest {
+                blob_digests: vec![re::Digest {
+                    hash: "deadbeef".into(),
+                    size_bytes: 4,
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .expect("did not hang")
+        .expect_err("a 8-hex digest is not sha256");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("SHA256") || err.message().contains("sha256"),
+            "the error should name the likely cause, got {:?}",
+            err.message()
+        );
+    }
+
+    /// ByteStream resource names carry an optional instance prefix. buck2 sends
+    /// one; parsing it wrong loses every blob read.
+    #[test]
+    fn resource_names_parse_with_and_without_an_instance_prefix() {
+        let bare = parse_resource(&format!("blobs/{ABC}/3")).expect("bare");
+        let instanced = parse_resource(&format!("my-instance/blobs/{ABC}/3")).expect("instanced");
+        let upload = parse_resource(&format!(
+            "my-instance/uploads/550e8400-e29b-41d4-a716-446655440000/blobs/{ABC}/3"
+        ))
+        .expect("upload form");
+        assert_eq!(bare.hash, ABC);
+        assert_eq!(instanced.hash, ABC);
+        assert_eq!(upload.hash, ABC);
+        assert_eq!((bare.size, instanced.size, upload.size), (3, 3, 3));
+    }
+
+    /// The self-check must pass against a genuinely serving router.
+    #[tokio::test]
+    async fn self_check_passes_against_a_serving_router() {
+        let (addr, _s, _d) = serve_rig().await;
+        let sock: std::net::SocketAddr = addr.trim_start_matches("http://").parse().unwrap();
+        self_check(sock).await.expect("a serving router passes");
+    }
+
+    /// The outage shape, reproduced: a socket that is BOUND but never serves.
+    /// The kernel accepts the connection into the backlog, so a client thinks
+    /// it has connected and then waits for an answer that never comes. This is
+    /// what four hours of `[re_action_cache]` looked like. The self-check must
+    /// give up and say so, rather than inherit the hang.
+    #[tokio::test]
+    async fn self_check_refuses_a_bound_but_silent_port() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sock = listener.local_addr().unwrap();
+        // Hold the listener without ever accepting: connections queue in the
+        // backlog and no bytes are ever answered.
+        let _held = listener;
+
+        // A short injected budget: the point is that the check GIVES UP, not
+        // how long production waits. The outer bound is generously larger, so
+        // a self-check that hangs fails here instead of stalling the suite.
+        let budget = Duration::from_millis(300);
+        let verdict =
+            tokio::time::timeout(Duration::from_secs(10), self_check_within(sock, budget)).await;
+        let err = verdict
+            .expect("self_check must return, not hang")
+            .expect_err("a silent port must not pass the self-check");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("self-check"),
+            "the error should name itself so a CI log reader knows what failed, got {msg:?}"
+        );
+    }
+
+    /// The connection counter must actually count. A diagnostic stuck at zero
+    /// is worse than none: it argues for "buck2 never dialled us" when buck2
+    /// did, and sends the next reader to the wrong half of the problem.
+    #[tokio::test]
+    async fn accepted_connections_are_counted() {
+        let ac = rig();
+        let stats = Arc::new(RpcStats::default());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = router(ac.driver.clone(), ac.store.clone(), stats.clone());
+        let incoming = counting_incoming(listener, stats.clone());
+        tokio::spawn(async move { router.serve_with_incoming(incoming).await });
+
+        assert_eq!(stats.conns.load(Relaxed), 0, "nothing dialled yet");
+
+        let mut c = re::capabilities_client::CapabilitiesClient::connect(format!("http://{addr}"))
+            .await
+            .unwrap();
+        c.get_capabilities(Request::new(re::GetCapabilitiesRequest::default()))
+            .await
+            .unwrap();
+
+        assert!(
+            stats.conns.load(Relaxed) >= 1,
+            "a client connected and completed a request, but conns stayed at 0"
+        );
     }
 }
