@@ -949,14 +949,38 @@ async fn ensure_present<S: RegistryStore>(
 
     // Drop the gate from the map when nobody else holds it, so a long-lived
     // agent does not accumulate an entry per blob it has ever served.
+    //
+    // BOTH drops matter. `_held` is the lock guard; `gate` is this caller's
+    // clone of the Arc, and while it lives the map's copy is never the last
+    // one - which is why the removal below used to be unreachable.
+    // `_held` borrows `gate`, so the compiler will not let this move happen
+    // in the wrong order.
     drop(_held);
-    let mut m = reg.inflight.lock().await;
-    if let Some(g) = m.get(hex) {
-        if Arc::strong_count(g) == 1 {
-            m.remove(hex);
-        }
-    }
+    release_gate(&mut *reg.inflight.lock().await, hex, gate);
     landed
+}
+
+/// Hand back a blob's fetch gate, removing it if this was the last holder.
+///
+/// Takes the caller's `Arc` BY VALUE, which is the whole point. The original
+/// asked `strong_count == 1` while the caller's own clone was still alive, so
+/// the count was never below two and the removal was unreachable - a leak of
+/// one entry per blob ever fetched, under a comment promising the opposite.
+/// Consuming the handle makes that mistake impossible to write rather than
+/// something a comment has to warn about.
+fn release_gate(
+    m: &mut HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    hex: &str,
+    gate: Arc<tokio::sync::Mutex<()>>,
+) {
+    drop(gate);
+    // Only the map's own reference left, so nobody is queued behind it.
+    // Removing it while a waiter still holds one would leave them blocking on
+    // a gate no longer reachable, and the next arrival would fetch in
+    // parallel with them - the exact duplication the gate exists to stop.
+    if m.get(hex).is_some_and(|g| Arc::strong_count(g) == 1) {
+        m.remove(hex);
+    }
 }
 
 /// The fetch itself: stream the origin into an upload, and let the store verify
@@ -1464,6 +1488,31 @@ mod tests {
             .await;
             assert_eq!(st, StatusCode::BAD_REQUEST, "accepted a bad digest: {bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_last_waiter_out_removes_the_gate() {
+        // One gate per blob fetched from upstream, kept so concurrent callers
+        // queue instead of each dialling the origin. It has to go afterwards
+        // or a long-lived mirror holds an entry for every blob it has ever
+        // served.
+        //
+        // It did not go. The check was `Arc::strong_count == 1` while the
+        // caller's own clone was still alive, so the count was always at
+        // least two and the branch was unreachable. The comment above it
+        // described the behaviour it was meant to have.
+        let mut m: HashMap<String, Arc<tokio::sync::Mutex<()>>> = HashMap::new();
+        m.entry("abc".into()).or_default();
+
+        // Somebody else is still queued: keep it, or they wait on a gate no
+        // longer reachable from the map and two callers fetch at once.
+        let mine = m.get("abc").expect("gate").clone();
+        let other = m.get("abc").expect("gate").clone();
+        release_gate(&mut m, "abc", mine);
+        assert!(m.contains_key("abc"), "dropped a gate with a waiter on it");
+
+        release_gate(&mut m, "abc", other);
+        assert!(!m.contains_key("abc"), "last one out left the gate behind");
     }
 
     #[tokio::test]
