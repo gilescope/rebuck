@@ -1348,6 +1348,22 @@ impl Span {
     }
 }
 
+/// Everything the SIGINT report is computed from.
+///
+/// **This grows for the life of the process, on purpose and not without
+/// cost.** Eight of the fields below keep one entry per solve - `arrivals`,
+/// `spans`, `graph_ids` and the timing vectors - because the report quotes
+/// medians and orderings that a running total cannot reconstruct.
+///
+/// A proxy started per build, which is how it is normally driven, ends before
+/// that matters. A proxy left up as a service accumulates roughly a hundred
+/// bytes a solve, plus a `graph_ids` entry, indefinitely. Bounding them is not
+/// free: several are read with `len()` as a COUNT, so a window would silently
+/// change what the report claims rather than just what it remembers.
+///
+/// Recorded rather than fixed because the fix is per-field - counts want to
+/// become counters, distributions want a window - and doing half of it would
+/// leave a report that is bounded and wrong.
 #[derive(Default)]
 pub struct Wire {
     pub solves: u64,
@@ -1359,7 +1375,16 @@ pub struct Wire {
     /// Ops per Solve, in arrival order - the balance question.
     pub per_solve: Vec<usize>,
     /// Graph digests seen, to measure how much two Solves share.
-    seen_ops: std::collections::BTreeSet<String>,
+    /// Held as the digest's leading 64 bits, not its hex text.
+    ///
+    /// One entry per DISTINCT op for the life of the process, so on a
+    /// monorepo this is every vertex of every graph and the largest thing
+    /// here by some way. A 64-char `String` costs about ninety bytes before
+    /// the set's own overhead; the digest is already a hash, so the text was
+    /// pure carriage. Collisions are a miscount of one in a diagnostic, and
+    /// at a million distinct ops the odds are about three in a hundred
+    /// million.
+    seen_ops: std::collections::BTreeSet<u64>,
     pub repeated_ops: u64,
     /// Digest of each Solve's whole op set, in order.
     ///
@@ -1546,7 +1571,8 @@ impl Wire {
         let mut already = 0usize;
         for bytes in &def.def {
             let digest = crate::store::sha256_hex(bytes);
-            if !self.seen_ops.insert(digest) {
+            let short = u64::from_str_radix(&digest[..16], 16).unwrap_or_default();
+            if !self.seen_ops.insert(short) {
                 // The same op in two Solves. High overlap means routing
                 // whole Solves duplicates work that dispatch would share.
                 self.repeated_ops += 1;
