@@ -20,9 +20,22 @@ read as "what got built and what it proved" rather than as a roadmap.
 | M2.5 | superseded -- `lease`, `registry` and the store's upload surface were PINCHED rather than merged |
 | M3 | **done** -- published-key bloom, non-blocking batch query |
 | M4 | **done and demonstrated** -- a peer builds a subtree, driver disk reads 0 bytes |
+| M4.5 | **not done** -- two transports do the same job; the proxy must place over the mesh |
 | M5 | not done |
 | gateway | **done** -- the proxy sees any client's graph on one connection |
-| fleet | **done and measured on two machines** -- see below |
+| fleet | **done and measured on two machines** -- see below. Two, because the proxy's own transport is what limits it; the mesh runs at 19 |
+
+## The target
+
+One driver and nineteen workers taking earthbuild's root Earthfile to
+completion, every solve arriving through the driver's proxy buildkit. Nothing
+below is finished until that runs.
+
+Two things stand between here and there, in order: the duplicated transport
+(M4.5), and a load large enough to mean anything. Everything measured so far
+is seconds per build on one machine, where dispatch is mostly overhead by
+construction -- fine for deciding whether placement is CORRECT, useless for
+deciding whether it PAYS.
 
 ## What is now measured, not argued
 
@@ -57,7 +70,12 @@ the fleet matters most, and no constant in it was chosen to fit a fixture.
   proxy.
 - The "bank the stem" comparison below is still unrun.
 - Everything above is two machines on one LAN. Three or more, and a WAN, are
-  untested.
+  untested -- and the cause is M4.5, not the fleet size. The proxy's transport
+  needs every daemon to reach one HTTP mirror; the mesh has no such
+  requirement and already runs at 4, 8, 12 and 19 workers. So this is a
+  de-duplication question wearing a scale question's clothes.
+- No real load. Every number here is seconds per build. earthbuild's root
+  Earthfile is the target and nothing has been run against it.
 
 ## The mechanism-neutral measurement was taken, and it decided
 
@@ -355,6 +373,46 @@ existing `adoptLeaderResult` path is unchanged.
   instead.
 - **Done when**: a single earthly build whose vertices demonstrably executed on
   machines that did not invoke it, and the driver's disk stays flat.
+
+### M4.5 - ONE transport: the proxy places over the mesh
+
+The gateway line and the mesh line grew separately and now do the same job
+twice. That is the thing to fix before any of it meets a real load, because
+the duplicate is also what pins the fleet to two machines on one LAN.
+
+| job | mesh (built, stress-tested to 19 workers) | proxy (built, one LAN) |
+| ---------------- | ----------------------------------------- | ---------------------- |
+| find a peer | `place_subtree` over `Candidate` + platform + load | `place` / `least_loaded` / weights / strikes |
+| offer it | `W2D::Offer` -> `D2W::Lead`, refusable | direct HTTP `Control.Solve` on the peer |
+| move layers | mesh registry, blobs peer-to-peer over iroh | shared HTTP mirror every daemon must reach |
+| take the result | `W2D::Led { image_ref }` from the builder's mirror | adopt by import from the shared mirror |
+| refuse | `W2D::Decline` - the backpressure (principle 12) | strike + hedge, rediscovered locally |
+
+The mesh side is the survivor in every row: it is older, tested at 4, 8, 12
+and 19 workers, and it already satisfies principle 6 - the driver arbitrates
+and carries nothing, which the shared mirror cannot claim because every layer
+crosses it.
+
+**What the proxy keeps**, because the mesh has no equivalent: the gateway
+itself. Holding the client's connection and seeing the graph any buildkit
+client sends is the whole reason this works for clients that are not ours, and
+nothing in the mesh does it.
+
+**What it loses**: `--peer`, the placement policy, the hedge, strikes, the
+mirror breaker, and publishing through a shared registry. Each has a mesh
+counterpart above, and keeping two answers to one question is how they drift.
+
+- **Done when**: a `buildctl` build through the proxy has solves that executed
+  on machines which did not invoke it, placed by the driver, with the driver's
+  disk flat afterwards.
+- **Retest locally first.** The local rig is seconds per round and the mesh
+  path is not yet exercised by it; de-duplicate against the fast loop and only
+  then scale. Correctness first, load after.
+- **Note**: `dispatch::inspect` is already shared - `driver.rs:1301`,
+  `worker.rs:468` and `proxy.rs:2071` all call it - so the exclusion set, the
+  platform union and the privilege rules survive the move untouched. So do the
+  registry and store fixes, since the mesh-backed registry is the same
+  `RegistryStore`.
 
 ### M5 - coalesce CI to one build
 
