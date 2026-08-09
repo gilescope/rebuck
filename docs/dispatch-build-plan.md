@@ -20,7 +20,7 @@ read as "what got built and what it proved" rather than as a roadmap.
 | M2.5 | superseded -- `lease`, `registry` and the store's upload surface were PINCHED rather than merged |
 | M3 | **done** -- published-key bloom, non-blocking batch query |
 | M4 | **done and demonstrated** -- a peer builds a subtree, driver disk reads 0 bytes |
-| M4.5 | **not done** -- two transports do the same job; the proxy must place over the mesh |
+| M4.5 | **done** -- one transport. The gateway offers, the driver arbitrates, 51 checks green |
 | M5 | not done |
 | gateway | **done** -- the proxy sees any client's graph on one connection |
 | fleet | **done and measured on two machines** -- see below. Two, because the proxy's own transport is what limits it; the mesh runs at 19 |
@@ -413,6 +413,27 @@ counterpart above, and keeping two answers to one question is how they drift.
   platform union and the privilege rules survive the move untouched. So do the
   registry and store fixes, since the mesh-backed registry is the same
   `RegistryStore`.
+
+#### What M4.5 cost, and is not paid back yet
+
+The deletion took a capability with it, recorded here rather than discovered
+later.
+
+**No straggler withdrawal.** The proxy hedged: past three times the observed
+median an adoption was taken back and rebuilt at home, the peer left running
+so whoever published first won. It lived in the transport that went, and the
+mesh has no equivalent - a worker that crawls holds its lead until it
+finishes. Correctness is unaffected and the bytes are right; one slow machine
+can pace a build. The fleet suite still runs the scenario, asserting the part
+that is still true.
+
+**Secrets and the ssh agent do not travel.** A dispatched subtree used to be
+built over a connection the proxy had opened, so it could attach a session
+and answer the peer's secret lookups. A worker builds on its own connection
+with nobody to ask. This MATCHES M4 - one secret anywhere excludes the
+subtree - but `REBUCK2_SERVE_SECRETS` and `REBUCK2_FORWARD_AGENT` still lift
+the exclusion, so the graph is offered and every worker declines it. Correct,
+and a wasted round trip.
 
 ### M5 - coalesce CI to one build
 

@@ -8,23 +8,37 @@ measurements behind them are in [fleet-findings.md](fleet-findings.md).
 
 ## The smallest thing that works
 
-```sh
-# a peer-to-peer mirror the daemons can all reach
-rebuck2 registry --bind 0.0.0.0:15000 --store ~/data/rebuck2-mirror
+One process is the fleet's coordinator: it holds the client's connection,
+arbitrates placement, and serves the shared registry.
 
-# the fleet, in front of your own buildkitd
-REBUCK2_MIRROR=<addr-the-daemons-see>:15000 \
+```sh
+# the coordinator: gateway + driver + registry in one
+REBUCK2_MIRROR=<addr-the-workers-see>:15000 \
   rebuck2 buildkit-proxy --listen 127.0.0.1:1234 \
     --upstream http://127.0.0.1:8372 \
-    --peer http://other-machine:8372
+    --registry-bind 0.0.0.0:15000 \
+    --session my-fleet
 
 export BUILDKIT_HOST=tcp://127.0.0.1:1234
 ```
 
-`REBUCK2_MIRROR` is the address the **daemons** use, not the one you use. It
-is baked into every rewritten graph, so all daemons must resolve the same
-string: on one host that is `host.docker.internal:15000`, across machines a
-LAN address.
+Then a worker per machine that should build, each against its own buildkitd:
+
+```sh
+rebuck2 worker --session my-fleet \
+  --buildkit-addr http://127.0.0.1:8372 \
+  --registry-addr <addr-the-workers-see>:15000
+```
+
+**There is no `--peer`.** Workers find the coordinator over the iroh mesh by
+deriving its identity from `--session`, so there is no address to configure
+and no order to start them in. A worker that joins mid-build is simply
+available for the next placement.
+
+`REBUCK2_MIRROR` is the address the **workers' daemons** use, not the one you
+use. It is baked into every rewritten graph, so all of them must resolve the
+same string: on one host that is `host.docker.internal:15000`, across
+machines a LAN address.
 
 ### Every daemon must trust the mirror
 
@@ -46,9 +60,11 @@ every peer then fails with
 Head "https://<mirror>/v2/...": http: server gave HTTP response to HTTPS client
 ```
 
-Dispatch falls back to building at home, the build SUCCEEDS, and a fleet that
-placed nothing looks exactly like a fleet that had nothing to place. Check
-`placed` in the report before believing otherwise.
+The worker declines, the driver runs out of candidates, the build SUCCEEDS at
+home, and a fleet that placed nothing looks exactly like a fleet that had
+nothing to place. The driver names this one when it sees it - `LIKELY CAUSE:
+a worker cannot PULL from the mirror` - but check `-> worker` in the log
+before believing any fleet distributed anything.
 
 ## Which clients this can distribute
 
@@ -72,35 +88,41 @@ full.** Slots default to the local core count.
 
 That happens to land on the best split a hand sweep could find at the build
 size where a fleet matters, and it needs no estimate of how fast anyone is.
-Attempts to do better by ranking peers all measured worse - see the findings
-doc before trying again.
+Attempts to do better by ranking machines all measured worse - see the
+findings doc before trying again.
 
-Peers may be weighted (`--peer http://host:port*2`), and a weight is a claim
-about observed end-to-end throughput, **not** about hardware. Setting one
-from core counts measured worse than leaving it alone.
+**Which** worker takes it is the driver's decision, not the gateway's, and it
+is the same arbitration a worker gets when it subdivides: candidates filtered
+to those that can actually run the subtree, emptiest first, ties on worker id
+so the choice is deterministic. There are no weights - `--peer url*N` went
+with the transport that had a peer list.
 
-A weight decides **which peer**, never how much leaves this machine. That is
-slots, and only slots. Measured on three daemons with everything dispatched:
-a fourfold weight moves the split from 6/6 to 3/9, and equal weights still
-alternate. It bites only while peers hold work at the same time - with them
-idle every score is a tie and placement correctly falls back to round-robin.
-
-`REBUCK2_HOME_WEIGHT` is currently **inert** and kept only so the flag does
-not vanish from under anyone: it feeds a rotation that saturation now decides
-in front of.
+A worker's load counts the subtree leads it is already holding, not only its
+REAPI jobs. Without that every worker priced as idle and the first candidate
+took everything: measured four leads, all to one worker, its neighbour never
+offered anything. Read `-> worker N` in the driver's log to see the spread;
+`placed` only says home-or-fleet.
 
 ## Failure
 
 Everything fails open: a build that cannot be distributed is a build that
 runs locally, at ordinary speed.
 
-- a peer that refuses or dies: struck, avoided afterwards, work rebuilt at home
-- a peer that goes slow: withdrawn after 3x the observed median
-- the mirror down: the fleet stops offering entirely until it returns
-- a peer that cannot build the architecture natively: not offered it
+- a worker that refuses or dies: declines, the driver offers the next, and
+  the requester builds it itself if nobody takes it
+- a worker that cannot build the architecture natively: not offered it
+- nobody takes it at all: built at home, which is what would have happened
+  without a fleet
 
-Verified by destroying each of them mid-build. Outputs stayed byte-identical
-to a one-machine baseline every time.
+Verified by destroying machines mid-build. Outputs stayed byte-identical to a
+one-machine baseline every time.
+
+**A worker that goes SLOW is not handled.** The proxy used to withdraw an
+adoption past three times the observed median and rebuild at home, leaving
+the peer running so whoever published first won. That lived in the transport
+the mesh replaced, and there is no equivalent yet: a machine that crawls
+holds its lead until it finishes. Slowness costs time, not correctness - the
+bytes are still right - but one bad machine can pace a build.
 
 ## The three permissions
 
@@ -110,17 +132,19 @@ to another machine.
 
 | variable | what it permits | what it costs you |
 | -------- | --------------- | ----------------- |
-| `REBUCK2_PEER_CACHE_MOUNTS=1` | a peer uses its own cache mount | nothing leaves your machine; a colder cache, which the cache-mount contract already allows |
-| `REBUCK2_SERVE_SECRETS=1` | this process answers the peer's secret lookups from its own environment | the secret's VALUE reaches the peer |
-| `REBUCK2_FORWARD_AGENT=1` | this process forwards its ssh agent | a CAPABILITY reaches the peer: it can sign anything, for as long as the build runs |
+| `REBUCK2_PEER_CACHE_MOUNTS=1` | a worker uses its own cache mount | nothing leaves your machine; a colder cache, which the cache-mount contract already allows |
 
-Read that last row twice. A secret is a string; an agent is the ability to
-use your key. Enable it only on a fleet whose machines you would already
-trust with the key itself.
+**Secrets and the ssh agent no longer travel, and the two flags for them do
+nothing.** A dispatched subtree used to be built by a peer over a connection
+this process had opened, so it could attach a session and answer the peer's
+secret lookups itself. A worker builds on its own connection with no session
+to answer, so a graph naming a secret stays home - which is what principle 10
+said all along: one secret anywhere excludes the whole subtree.
 
-Secrets are lifted per GRAPH, not per capability: if any secret a graph names
-cannot be resolved here, the whole subtree stays home rather than failing on
-the peer.
+`REBUCK2_SERVE_SECRETS` and `REBUCK2_FORWARD_AGENT` are still read and still
+lift the exclusion, so the graph is offered and every worker declines it. The
+build is correct and the round trip is wasted. They should either go or grow
+a session on the worker side; until one of those happens, leave them off.
 
 **Never lifted:** insecure/privileged exec and host networking. Granting a
 privilege is a trust decision, and no session service makes a peer's
@@ -131,15 +155,14 @@ privilege is a trust decision, and no session service makes a peer's
 | | |
 | ---------------------------- | --------------------------------------- |
 | `--listen` | where clients connect (default `127.0.0.1:1234`) |
-| `registry --bind` | mirror listen address (default `127.0.0.1:5000`) |
 | `--upstream` | your own buildkitd |
-| `--peer URL[*N]` | repeatable; `*N` is a relative share |
-| `REBUCK2_MIRROR` | registry address **as the daemons see it** |
+| `--registry-bind` | serve the mesh-backed registry here |
+| `--session` | fleet name; workers derive the coordinator's identity from it |
+| `worker --buildkit-addr` | the daemon that worker builds on |
+| `worker --registry-addr` | the coordinator's registry, as that worker sees it |
+| `REBUCK2_MIRROR` | registry address **as the workers' daemons see it** |
 | `REBUCK2_HOME_SLOTS` | local concurrency before work is sent away (default: cores) |
-| `REBUCK2_HOME_WEIGHT` | home's share, for a weighted split |
 | `REBUCK2_PEER_CACHE_MOUNTS` | see above |
-| `REBUCK2_SERVE_SECRETS` | see above |
-| `REBUCK2_FORWARD_AGENT` | see above |
 | `REBUCK2_ADAPT=1` | derive weights from service times. **Unstable** - it chases itself, see the findings doc |
 | `REBUCK2_GATE=1` | skip subtrees smaller than their transfer. Does not fire in practice |
 
@@ -206,10 +229,14 @@ avoid.
 matters is `placed`:
 
 ```text
-[wire] placed         : {0: 16, 1: 8} (0 = home)
+[wire] placed         : {0: 16, 1: 8} (0 = home, 1 = the fleet)
+[driver] subtree job 7 -> worker 2
 ```
 
-That is the only honest evidence of distribution. Wall clock moves for
+`placed` says how much left this machine. It does NOT say where it went, and
+reading it as though it did hid a fleet running entirely on one worker - the
+suite's own spread check passed throughout. `-> worker N` is the line that
+names a machine. Wall clock moves for
 unrelated reasons, and a control run has twice overturned a conclusion drawn
 from it.
 
