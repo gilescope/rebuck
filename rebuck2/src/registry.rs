@@ -54,6 +54,7 @@
 //! very large layer costs its own size in RAM. Streaming to disk is the
 //! follow-up; see [`MAX_UPLOAD`].
 
+use crate::store::Held;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -508,7 +509,7 @@ async fn handle<S: RegistryStore>(
             }
         };
         let id = reg.next_upload.fetch_add(1, Ordering::Relaxed);
-        reg.sessions.lock().unwrap().insert(id, up);
+        reg.sessions.held().insert(id, up);
         let mut h = HeaderMap::new();
         h.insert(
             header::LOCATION,
@@ -529,7 +530,7 @@ async fn handle<S: RegistryStore>(
 
         // Take the session out to write to it and put it back after: the lock
         // is std, so it must never be held across an await.
-        let Some(mut up) = reg.sessions.lock().unwrap().remove(&id) else {
+        let Some(mut up) = reg.sessions.held().remove(&id) else {
             return err(StatusCode::NOT_FOUND, "BLOB_UPLOAD_UNKNOWN", "no session");
         };
 
@@ -550,12 +551,12 @@ async fn handle<S: RegistryStore>(
                 header::RANGE,
                 HeaderValue::from_str(&format!("0-{end}")).unwrap(),
             );
-            reg.sessions.lock().unwrap().insert(id, up);
+            reg.sessions.held().insert(id, up);
             return (StatusCode::ACCEPTED, h).into_response();
         }
 
         if method != Method::PUT {
-            reg.sessions.lock().unwrap().insert(id, up);
+            reg.sessions.held().insert(id, up);
             return err(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "UNSUPPORTED",
@@ -1090,11 +1091,11 @@ pub async fn serve_with_upstream<S: RegistryStore>(
         "[registry] OCI v2 on http://{}{via}",
         listener.local_addr()?
     );
-    *TRAFFIC.lock().expect("traffic") = Some(Default::default());
+    *TRAFFIC.held() = Some(Default::default());
     let app = router_with_upstream(store, upstream).layer(axum::middleware::from_fn(
         |req: axum::extract::Request, next: axum::middleware::Next| async move {
             let k = shape(req.method().as_str(), req.uri().path());
-            if let Some(m) = TRAFFIC.lock().expect("traffic").as_mut() {
+            if let Some(m) = TRAFFIC.held().as_mut() {
                 *m.entry(k).or_default() += 1;
             }
             next.run(req).await
@@ -1102,7 +1103,7 @@ pub async fn serve_with_upstream<S: RegistryStore>(
     ));
     tokio::spawn(async {
         let _ = tokio::signal::ctrl_c().await;
-        if let Some(m) = TRAFFIC.lock().expect("traffic").as_ref() {
+        if let Some(m) = TRAFFIC.held().as_ref() {
             let total: u64 = m.values().sum();
             println!("[registry] served {total} requests: {m:?}");
         }

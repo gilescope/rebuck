@@ -812,6 +812,27 @@ impl Store {
     }
 }
 
+/// Take a lock, ignoring poisoning.
+///
+/// The mutexes this is used on guard a counter, a map or a timestamp. There
+/// is no invariant across them that a panic mid-update could leave broken, so
+/// poisoning carries no information worth acting on.
+///
+/// What it does carry is a cascade. A panic while one is held makes every
+/// LATER lock panic too, so one bad solve stops being one bad solve and
+/// becomes every subsequent request dying. That is exactly inverted from what
+/// the proxy promises: a build that cannot be distributed is a build that
+/// runs locally.
+pub trait Held<T> {
+    fn held(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> Held<T> for std::sync::Mutex<T> {
+    fn held(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Case-collision / leftover tolerance: materializing onto an existing

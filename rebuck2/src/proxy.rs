@@ -67,6 +67,7 @@
 use std::pin::Pin;
 
 use crate::gateway::frontend as gw;
+use crate::store::Held;
 use bollard_buildkit_proto::moby::buildkit::v1 as control;
 use futures::StreamExt;
 use tonic::{Request, Response, Status, Streaming};
@@ -255,7 +256,7 @@ impl Proxy {
         /// Long enough that a restart is not hammered, short enough that a
         /// recovered mirror is back in service within one build.
         const COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15);
-        let mut g = self.mirror_down_until.lock().expect("mirror_down_until");
+        let mut g = self.mirror_down_until.held();
         match *g {
             Some(t) if t.elapsed() < COOLDOWN => true,
             Some(_) => {
@@ -299,8 +300,7 @@ impl Proxy {
             Ok(_) => true,
             Err(e) => {
                 println!("[proxy] mirror {addr} is not answering: {e}");
-                *self.mirror_down_until.lock().expect("mirror_down_until") =
-                    Some(std::time::Instant::now());
+                *self.mirror_down_until.held() = Some(std::time::Instant::now());
                 false
             }
         }
@@ -312,7 +312,7 @@ impl Proxy {
     /// must not make a subtree look permanently expensive, and therefore
     /// permanently worth shipping.
     fn estimate(&self, key: &str) -> Option<u64> {
-        let seen = self.seen_ms.lock().expect("seen_ms");
+        let seen = self.seen_ms.held();
         let v = seen.get(key)?;
         if v.is_empty() {
             return None;
@@ -334,7 +334,7 @@ impl Proxy {
     /// That is the deliberate cold start - something has to run somewhere
     /// before there is anything to know.
     fn overhead_ms(&self) -> u64 {
-        let w = self.wire.lock().expect("wire");
+        let w = self.wire.held();
         let mean = |v: &[u64]| -> u64 {
             if v.is_empty() {
                 0
@@ -413,7 +413,7 @@ impl Proxy {
             // condition is a system of equations, not a ratio, and shipping
             // the two-peer arithmetic as though it generalised would be the
             // same error as guessing from cores.
-            let w = self.wire.lock().expect("wire");
+            let w = self.wire.held();
             let mean = |v: &[u64]| -> u64 {
                 if v.len() < MIN_SAMPLES {
                     0
@@ -447,13 +447,7 @@ impl Proxy {
     /// why the fleet had gone lopsided.
     fn strike(&self, peer: usize) {
         self.strikes[peer].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        *self
-            .wire
-            .lock()
-            .expect("wire")
-            .struck
-            .entry(peer)
-            .or_default() += 1;
+        *self.wire.held().struck.entry(peer).or_default() += 1;
     }
 
     /// Wait for a peer to build it - but not forever, once the fleet has said
@@ -498,7 +492,7 @@ impl Proxy {
                     Err(e) => Adoption::Refused(e),
                 },
                 _ = tokio::time::sleep(POLL) => {
-                    let observed = self.adopted_ms.lock().expect("adopted_ms").clone();
+                    let observed = self.adopted_ms.held().clone();
                     let Some(limit) = hedge_after(&observed) else { continue };
                     if started.elapsed() <= limit {
                         continue;
@@ -510,8 +504,7 @@ impl Proxy {
                     );
                     *self
                         .wire
-                        .lock()
-                        .expect("wire")
+                        .held()
                         .rejected
                         .entry(format!("peer {peer} too slow"))
                         .or_default() += 1;
@@ -619,8 +612,7 @@ impl control::control_server::Control for Proxy {
         // this call finds nothing.
         if !req.r#ref.is_empty() && !req.session.is_empty() {
             self.sessions
-                .lock()
-                .expect("sessions")
+                .held()
                 .insert(req.r#ref.clone(), req.session.clone());
         }
         // Kept before the request is consumed: the client blocks on this call,
@@ -637,8 +629,8 @@ impl control::control_server::Control for Proxy {
             .solve(Request::from_parts(meta, ext, req))
             .await;
         let ms = t.elapsed().as_millis() as u64;
-        let went = self.went.lock().expect("went").get(&build_id).cloned();
-        let mut w = self.wire.lock().expect("wire");
+        let went = self.went.held().get(&build_id).cloned();
+        let mut w = self.wire.held();
         w.control_solves.push(ms);
         match &went {
             Some((Some(_), _, _)) => w.away_ms.push(ms),
@@ -662,12 +654,7 @@ impl control::control_server::Control for Proxy {
         }
         drop(w);
         if let Some((_, key, _)) = went {
-            self.seen_ms
-                .lock()
-                .expect("seen_ms")
-                .entry(key)
-                .or_default()
-                .push(ms);
+            self.seen_ms.held().entry(key).or_default().push(ms);
         }
         out
     }
@@ -771,8 +758,7 @@ impl control::control_server::Control for Proxy {
         let up = self.wire.clone();
         let inbound = stream.filter_map(move |m| {
             if let Ok(msg) = &m {
-                up.lock()
-                    .expect("wire")
+                up.held()
                     .session_to_daemon
                     .fetch_add(msg.data.len() as u64, Ordering::Relaxed);
             }
@@ -785,8 +771,7 @@ impl control::control_server::Control for Proxy {
         let down = self.wire.clone();
         let out = s.into_inner().map(move |m| {
             if let Ok(msg) = &m {
-                down.lock()
-                    .expect("wire")
+                down.held()
                     .session_to_client
                     .fetch_add(msg.data.len() as u64, Ordering::Relaxed);
             }
@@ -805,7 +790,7 @@ impl control::control_server::Control for Proxy {
 /// from them, or hands one solve's ref to another, then a ref that lives on
 /// the wrong machine is a broken build.
 fn trace(wire: &std::sync::Mutex<Wire>, call: &str) {
-    wire.lock().expect("wire").calls.push(call.to_owned());
+    wire.held().calls.push(call.to_owned());
 }
 
 /// Round-robin over a fleet of `peers`, peer 0 included.
@@ -1642,8 +1627,7 @@ impl Proxy {
         key: &(String, String),
     ) -> std::sync::Arc<tokio::sync::OnceCell<Option<String>>> {
         self.published
-            .lock()
-            .expect("published")
+            .held()
             .entry(key.clone())
             .or_default()
             .clone()
@@ -1652,8 +1636,7 @@ impl Proxy {
     /// What a key resolved to, if it has resolved and succeeded.
     fn resolved(&self, key: &(String, String)) -> Option<String> {
         self.published
-            .lock()
-            .expect("published")
+            .held()
             .get(key)
             .and_then(|c| c.get().cloned().flatten())
     }
@@ -1662,7 +1645,7 @@ impl Proxy {
     fn session_for(&self, meta: &tonic::metadata::MetadataMap) -> String {
         meta.get("buildkit-controlapi-buildid")
             .and_then(|v| v.to_str().ok())
-            .and_then(|b| self.sessions.lock().expect("sessions").get(b).cloned())
+            .and_then(|b| self.sessions.held().get(b).cloned())
             .unwrap_or_default()
     }
 
@@ -1725,7 +1708,7 @@ impl Proxy {
                     }
                     Err(e) => {
                         println!("[proxy] base {r} not mirrored: {e:#}");
-                        self.wire.lock().expect("wire").last_mirror_error = Some(format!("{e:#}"));
+                        self.wire.held().last_mirror_error = Some(format!("{e:#}"));
                         None
                     }
                 }
@@ -1764,7 +1747,7 @@ impl Proxy {
         let session = meta
             .get("buildkit-controlapi-buildid")
             .and_then(|v| v.to_str().ok())
-            .and_then(|b| self.sessions.lock().expect("sessions").get(b).cloned());
+            .and_then(|b| self.sessions.held().get(b).cloned());
         let Some(session) = session else {
             println!("[proxy] gateway solve with no known session - not publishing");
             return;
@@ -1793,7 +1776,7 @@ impl Proxy {
                 {
                     Ok(reference) => {
                         println!("[proxy] context {name:?} published as {reference}");
-                        self.wire.lock().expect("wire").contexts_published += 1;
+                        self.wire.held().contexts_published += 1;
                         Some(reference)
                     }
                     // Remembered for this build rather than retried per
@@ -1818,7 +1801,7 @@ fn report_gateway(wire: &std::sync::Mutex<Wire>, req: &gw::SolveRequest) {
         // "no definition" is true and useless; a user who points `docker
         // build` at this proxy and sees an even split of nothing deserves the
         // reason and the remedy.
-        let mut w = wire.lock().expect("wire");
+        let mut w = wire.held();
         if req.frontend.is_empty() {
             *w.rejected.entry("no definition".to_owned()).or_default() += 1;
             return;
@@ -1844,7 +1827,7 @@ fn report_gateway(wire: &std::sync::Mutex<Wire>, req: &gw::SolveRequest) {
     };
     let a = crate::dispatch::analyse(def, MIN_CUT_OPS);
     let free: Vec<&crate::dispatch::Cut> = a.free_cuts().collect();
-    let mut w = wire.lock().expect("wire");
+    let mut w = wire.held();
     w.observe(def);
     println!(
         "[proxy] gateway solve #{}: {} ops, {} cuts >= {MIN_CUT_OPS}, {} free-frontier",
@@ -1876,8 +1859,8 @@ pub async fn serve(
     let solo = proxy.solo_ms.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
-        wire.lock().expect("wire").report();
-        let solo = solo.lock().expect("solo_ms");
+        wire.held().report();
+        let solo = solo.held();
         let medians: std::collections::BTreeMap<usize, u64> = solo
             .iter()
             .map(|(p, v)| {
@@ -1924,7 +1907,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         // of those three are not round-trips at all.
         let t_solve = std::time::Instant::now();
         {
-            let mut w = self.wire.lock().expect("wire");
+            let mut w = self.wire.held();
             let first = *w.first_solve.get_or_insert(t_solve);
             let at = t_solve.duration_since(first).as_millis() as u64;
             w.arrivals.push(at);
@@ -1947,7 +1930,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         // building, and the ref it returns is its own.
         let mut req = req;
         {
-            let mut w = self.wire.lock().expect("wire");
+            let mut w = self.wire.held();
             let key = match (
                 self.peers.len() > 1,
                 self.mirror.is_some(),
@@ -2007,13 +1990,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         .first()
                         .map(|(_, e)| format!("excluded: {e:?} {detail:?}"))
                         .unwrap_or_else(|| "excluded: platform".to_owned());
-                    *self
-                        .wire
-                        .lock()
-                        .expect("wire")
-                        .rejected
-                        .entry(why)
-                        .or_default() += 1;
+                    *self.wire.held().rejected.entry(why).or_default() += 1;
                 }
                 // Draw ONCE, and only among solves that COULD move. Two
                 // calls advance the cursor twice, so the peer that gets the
@@ -2038,8 +2015,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 if allowed && worth && mirror_down {
                     *self
                         .wire
-                        .lock()
-                        .expect("wire")
+                        .held()
                         .rejected
                         .entry("mirror down, not offering".to_owned())
                         .or_default() += 1;
@@ -2047,8 +2023,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 if allowed && !worth {
                     *self
                         .wire
-                        .lock()
-                        .expect("wire")
+                        .held()
                         .rejected
                         .entry("not worth shipping".to_owned())
                         .or_default() += 1;
@@ -2081,7 +2056,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                     .is_ok();
                 let saturated = !claimed;
                 {
-                    let mut w = self.wire.lock().expect("wire");
+                    let mut w = self.wire.held();
                     w.peak_home = w.peak_home.max(
                         self.home_inflight
                             .load(std::sync::atomic::Ordering::Relaxed),
@@ -2091,8 +2066,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 if allowed && worth && !saturated {
                     *self
                         .wire
-                        .lock()
-                        .expect("wire")
+                        .held()
                         .rejected
                         .entry("home has room".to_owned())
                         .or_default() += 1;
@@ -2112,8 +2086,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 if allowed {
                     *self
                         .wire
-                        .lock()
-                        .expect("wire")
+                        .held()
                         .placed
                         .entry(peer.unwrap_or(0))
                         .or_default() += 1;
@@ -2129,8 +2102,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                     .and_then(|v| v.to_str().ok())
                 {
                     self.went
-                        .lock()
-                        .expect("went")
+                        .held()
                         .insert(id.to_owned(), (peer, key.clone(), claimed));
                 }
                 if allowed && peer.is_none() {
@@ -2140,7 +2112,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                     // import, no adoption. This is not merely the cheaper
                     // route: peer 0's `addr` is the sentinel "upstream", so
                     // it is the only route.
-                    self.wire.lock().expect("wire").home += 1;
+                    self.wire.held().home += 1;
                 } else if let Some(peer) = peer {
                     let addr = self.peers[peer].addr.clone();
                     debug_assert_ne!(
@@ -2215,35 +2187,29 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         // costs. Recording a take-back would fold our own
                         // impatience into the threshold that produced it.
                         if matches!(r, Adoption::Done(_)) {
-                            self.adopted_ms.lock().expect("adopted_ms").push(t_adopt);
+                            self.adopted_ms.held().push(t_adopt);
                             // Still alone at the END as well as the start:
                             // a second adoption arriving mid-build makes the
                             // sample contended, and a contended sample is the
                             // endogenous number this exists to avoid.
                             if alone && still_alone {
-                                self.solo_ms
-                                    .lock()
-                                    .expect("solo_ms")
-                                    .entry(peer)
-                                    .or_default()
-                                    .push(t_adopt);
+                                self.solo_ms.held().entry(peer).or_default().push(t_adopt);
                             }
                         }
                         r
                     } else {
-                        let why = match (local_clear, bases_clear) {
-                            (false, false) => "context and base unmirrored",
-                            (false, true) => "context unmirrored",
-                            (true, false) => "base unmirrored",
-                            (true, true) => unreachable!(),
+                        // Both-clear cannot reach here - it is the `if` above -
+                        // but saying so with `unreachable!` puts a live panic
+                        // one edit of that condition away. Phrased so the
+                        // impossible case simply has no arm to reach.
+                        let why = if !local_clear && !bases_clear {
+                            "context and base unmirrored"
+                        } else if !local_clear {
+                            "context unmirrored"
+                        } else {
+                            "base unmirrored"
                         };
-                        *self
-                            .wire
-                            .lock()
-                            .expect("wire")
-                            .rejected
-                            .entry(why.to_owned())
-                            .or_default() += 1;
+                        *self.wire.held().rejected.entry(why.to_owned()).or_default() += 1;
                         Adoption::NotOffered
                     };
                     match adopted {
@@ -2253,7 +2219,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         Adoption::NotOffered | Adoption::TookBack => {}
                         Adoption::Done(reference) => {
                             println!("[proxy] adopted from peer {peer}: {reference}");
-                            self.wire.lock().expect("wire").routed += 1;
+                            self.wire.held().routed += 1;
                             req.definition = Some(crate::dispatch::import_graph(&reference));
                         }
                         // Fail open: build it here, exactly as we would
@@ -2278,7 +2244,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                             println!(
                                 "[proxy] peer {peer} could not take it: {e:#} | sources={srcs:?}"
                             );
-                            self.wire.lock().expect("wire").last_refusal = Some(format!("{e:#}"));
+                            self.wire.held().last_refusal = Some(format!("{e:#}"));
                             // Count the FAILURES too. `routed` counts only
                             // successes, so a fleet attempting twelve
                             // adoptions and completing one looked identical
@@ -2286,8 +2252,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                             // hunting a placement bug that did not exist.
                             *self
                                 .wire
-                                .lock()
-                                .expect("wire")
+                                .held()
                                 .rejected
                                 .entry(format!("peer {peer} refused"))
                                 .or_default() += 1;
@@ -2309,8 +2274,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                             } else {
                                 *self
                                     .wire
-                                    .lock()
-                                    .expect("wire")
+                                    .held()
                                     .rejected
                                     .entry("mirror down, peer not blamed".to_owned())
                                     .or_default() += 1;
@@ -2326,7 +2290,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         let t_answer = std::time::Instant::now();
         let out = self.gw().solve(Request::from_parts(meta, ext, req)).await?;
         let answer = t_answer.elapsed().as_millis() as u64;
-        self.wire.lock().expect("wire").spans.push(Span {
+        self.wire.held().spans.push(Span {
             total: t_solve.elapsed().as_millis() as u64,
             portable: t_portable,
             adopt: t_adopt,
@@ -2489,8 +2453,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
             .r#return(Request::from_parts(meta, ext, req))
             .await;
         self.wire
-            .lock()
-            .expect("wire")
+            .held()
             .returns
             .push(t.elapsed().as_millis() as u64);
         out
