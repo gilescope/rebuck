@@ -21,6 +21,7 @@ read as "what got built and what it proved" rather than as a roadmap.
 | M3 | **done** -- published-key bloom, non-blocking batch query |
 | M4 | **done and demonstrated** -- a peer builds a subtree, driver disk reads 0 bytes |
 | M4.5 | **done** -- one transport. The gateway offers, the driver arbitrates, 51 checks green |
+| M4.6 | **done** -- a result is a digest; both registries fetch from the fleet, so a worker can be on its own machine |
 | M5 | not done |
 | gateway | **done** -- the proxy sees any client's graph on one connection |
 | fleet | **done and measured on two machines** -- see below. Two, because the proxy's own transport is what limits it; the mesh runs at 19 |
@@ -31,8 +32,15 @@ One driver and nineteen workers taking earthbuild's root Earthfile to
 completion, every solve arriving through the driver's proxy buildkit. Nothing
 below is finished until that runs.
 
-Two things stand between here and there, in order: the duplicated transport
-(M4.5), and a load large enough to mean anything. Everything measured so far
+The duplicated transport (M4.5) is gone, and so is the thing that kept the
+fleet on one host: a result is now handed back as a DIGEST, and both the
+coordinator's registry and each worker's are backed by the fleet, so a layer
+is fetched from whoever built it rather than from one host everybody must be
+able to route to. Measured: the coordinator took 2 uploads and served 12
+blobs.
+
+What stands between here and the target is now a load large enough to mean
+anything, and the runs to prove it. Everything measured so far
 is seconds per build on one machine, where dispatch is mostly overhead by
 construction -- fine for deciding whether placement is CORRECT, useless for
 deciding whether it PAYS.

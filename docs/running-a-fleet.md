@@ -22,23 +22,50 @@ REBUCK2_MIRROR=<addr-the-workers-see>:15000 \
 export BUILDKIT_HOST=tcp://127.0.0.1:1234
 ```
 
-Then a worker per machine that should build, each against its own buildkitd:
+Then a worker per machine that should build, each against its own buildkitd.
+
+On **one host**, where every worker can reach the coordinator's registry:
 
 ```sh
 rebuck2 worker --session my-fleet \
   --buildkit-addr http://127.0.0.1:8372 \
-  --registry-addr <addr-the-workers-see>:15000
+  --registry-addr <addr-the-daemons-see>:15000
 ```
+
+On **its own machine**, where it cannot, the worker serves a registry too:
+
+```sh
+rebuck2 worker --session my-fleet \
+  --buildkit-addr http://127.0.0.1:8372 \
+  --registry-bind 0.0.0.0:15000 \
+  --registry-addr <this machine, as its own daemon sees it>:15000
+```
+
+That registry is backed by the fleet. Its daemon pulls a base it has never
+seen from localhost, the local store misses, and the bytes come off whichever
+machine has them - so nothing needs a route to one shared host.
 
 **There is no `--peer`.** Workers find the coordinator over the iroh mesh by
 deriving its identity from `--session`, so there is no address to configure
 and no order to start them in. A worker that joins mid-build is simply
 available for the next placement.
 
-`REBUCK2_MIRROR` is the address the **workers' daemons** use, not the one you
-use. It is baked into every rewritten graph, so all of them must resolve the
-same string: on one host that is `host.docker.internal:15000`, across
-machines a LAN address.
+### Why a second machine works at all
+
+A built subtree is handed back as a **digest**, not an address. The builder
+publishes into whatever registry it can reach; the requester prefixes the one
+IT can reach and asks for the same content. A digest names content and not a
+location, so no registry has to be reachable from everywhere and no tag has
+to be gossiped between them.
+
+The coordinator's registry is fleet-backed for the same reason in reverse: it
+serves the result to its own daemon without ever having received it. Measured
+on a two-worker fleet - the coordinator took **2 uploads and served 12
+blobs**, the other ten fetched from the runners that built them.
+
+`REBUCK2_MIRROR` is the address the **coordinator's** daemon uses for the
+graphs it rewrites: on one host `host.docker.internal:15000`, across machines
+whatever that host answers to.
 
 ### Every daemon must trust the mirror
 

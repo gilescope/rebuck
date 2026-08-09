@@ -1,0 +1,226 @@
+# earthbuild's Earthfile across SEPARATE runners.
+#
+# The single-runner sibling (earthfile-fleet.yml) can prove correctness and
+# nothing about capacity: its workers share four cores, so a second worker is
+# contention. This is the one that can answer whether distribution pays,
+# because each worker is a whole machine.
+#
+# It became possible only once a result stopped naming a location. A worker
+# publishes a subtree into its OWN registry and replies with a bare digest;
+# the coordinator prefixes the registry IT can reach, misses, and fetches the
+# layers from the builder over iroh. Measured locally first - the coordinator
+# served twelve blobs having received two uploads, which it could only have
+# got from the workers.
+#
+# Rendezvous is keyless: every job derives the coordinator's identity from
+# GITHUB_RUN_ID, exactly as re-e2e.yml already does for the REAPI line. There
+# is no address to publish and no ordering to arrange.
+#
+# WHAT TO READ FIRST in a failed run: `hits_peer` in the worker logs. Zero
+# means layers did not move peer to peer and everything fell back through the
+# coordinator - which still BUILDS correctly, and is the quiet failure this
+# project keeps being caught by.
+name: earthfile-fleet-multi
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "earthbuild target to build"
+        default: "+code"
+      workers:
+        description: "worker runners, as a JSON array - matrix AND barrier read this"
+        default: "[1,2,3]"
+      ref:
+        description: "earthbuild ref"
+        default: "main"
+
+env:
+  # Written before `earthly bootstrap` in BOTH jobs. earthly hands this to the
+  # buildkitd container as EARTHLY_ADDITIONAL_BUILDKIT_CONFIG, and a daemon
+  # that does not trust the registry it is told to pull from fails the SILENT
+  # way: publishing is insecure per-solve so the registry fills, pulling is
+  # governed by daemon config alone, so every lead declines and the build
+  # succeeds at home having distributed nothing.
+  TRUST_SNIPPET: |
+    global:
+      buildkit_additional_config: |
+        [registry."172.17.0.1:15000"]
+          http = true
+          insecure = true
+
+permissions:
+  contents: read
+
+jobs:
+  # One job per worker. They join the coordinator's mesh, lend their buildkitd
+  # to it, and exit when it disconnects.
+  worker:
+    strategy:
+      fail-fast: false
+      # From the input, so the barrier cannot expect a different number of
+      # workers than the matrix starts. Hard-coding both is a trap: set
+      # workers=5 against a fixed [1,2,3] and the coordinator waits out its
+      # timeout for two runners nobody launched.
+      matrix:
+        n: ${{ fromJSON(inputs.workers) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: rebuck2
+      - name: build rebuck2
+        run: cargo build --release --manifest-path rebuck2/Cargo.toml
+
+      - name: install earthly
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /usr/local/bin/earthly \
+            https://github.com/EarthBuild/earthbuild/releases/latest/download/earthly-linux-amd64
+          chmod +x /usr/local/bin/earthly
+
+      - name: buildkitd, the fork earthly needs
+        run: |
+          set -euo pipefail
+          # Same reasoning as the single-runner workflow: an earthly graph
+          # carries fork-only ops, so `earthly bootstrap` picks the daemon and
+          # this copies its choice rather than guessing an image.
+          mkdir -p ~/.earthly && printf '%s\n' "$TRUST_SNIPPET" > ~/.earthly/config.yml
+          earthly bootstrap
+          BK=$(docker ps --filter 'name=buildkitd' --format '{{.Names}}' | head -1)
+          [ -n "$BK" ] || { echo "no buildkitd started"; exit 1; }
+          docker port "$BK" 8372 || true
+          echo "BK_ADDR=$(docker port "$BK" 8372 | head -1)" >> "$GITHUB_ENV"
+
+      - name: serve until the coordinator goes
+        env:
+          WORKER_N: ${{ matrix.n }}
+        run: |
+          set -euo pipefail
+          # Its OWN registry, reachable only from this machine - which is the
+          # point. Its daemon pulls from localhost; a miss is answered by
+          # whichever runner holds the layer, over the mesh.
+          timeout 3000 ./rebuck2/target/release/rebuck2 worker \
+            --session "earthfile-${GITHUB_RUN_ID}" \
+            --store "$HOME/.cache/rebuck2/worker" \
+            --buildkit-addr "http://${BK_ADDR}" \
+            --registry-bind 0.0.0.0:15000 \
+            --registry-addr 172.17.0.1:15000 | tee "worker-${WORKER_N}.log"
+
+      - name: where did this worker's blobs come from
+        if: always()
+        env:
+          WORKER_N: ${{ matrix.n }}
+        run: |
+          # local / peer / driver. `peer` non-zero is the evidence that layers
+          # moved runner to runner instead of through the coordinator.
+          grep -E "hits|fetch|leading subtree|declined" "worker-${WORKER_N}.log" | tail -30 || true
+
+  coordinator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: rebuck2-repo
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: EarthBuild/earthbuild
+          ref: ${{ inputs.ref }}
+          path: earthbuild
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: rebuck2-repo/rebuck2
+      - name: build rebuck2
+        run: cargo build --release --manifest-path rebuck2-repo/rebuck2/Cargo.toml
+
+      - name: install earthly
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /usr/local/bin/earthly \
+            https://github.com/EarthBuild/earthbuild/releases/latest/download/earthly-linux-amd64
+          chmod +x /usr/local/bin/earthly
+
+      - name: coordinator - gateway, driver and registry
+        env:
+          WANT_JSON: ${{ inputs.workers }}
+        run: |
+          set -euo pipefail
+          WANT=$(echo "$WANT_JSON" | tr -cd '0-9,' | awk -F, '{print NF}')
+          echo "expecting $WANT worker runner(s)"
+          mkdir -p ~/.earthly && printf '%s\n' "$TRUST_SNIPPET" > ~/.earthly/config.yml
+          earthly bootstrap
+          BK=$(docker ps --filter 'name=buildkitd' --format '{{.Names}}' | head -1)
+          [ -n "$BK" ] || { echo "no buildkitd started"; exit 1; }
+          BK_ADDR=$(docker port "$BK" 8372 | head -1)
+          echo "BK_ADDR=$BK_ADDR" >> "$GITHUB_ENV"
+
+          REBUCK2_MIRROR=172.17.0.1:15000 \
+            ./rebuck2-repo/rebuck2/target/release/rebuck2 buildkit-proxy \
+              --listen 127.0.0.1:1234 \
+              --upstream "http://$BK_ADDR" \
+              --registry-bind 0.0.0.0:15000 \
+              --session "earthfile-${GITHUB_RUN_ID}" \
+              --store "$HOME/.cache/rebuck2/coord" > proxy.log 2>&1 &
+          echo $! > proxy.pid
+
+          # Workers are whole runners now, so they can take minutes to appear -
+          # a queued job, a cold cargo build. Waiting is not optional: the
+          # gateway asks whether the fleet is empty PER SOLVE, so a build that
+          # starts early quietly runs alone and reports a fleet that did
+          # nothing.
+          for _ in $(seq 1 120); do
+            j=$(grep -c "joined" proxy.log 2>/dev/null || true)
+            [ "${j:-0}" -ge "$WANT" ] && break
+            sleep 5
+          done
+          echo "workers joined: $(grep -c joined proxy.log || echo 0)/$WANT"
+          grep -c joined proxy.log | grep -qv '^0$' || {
+            echo "no worker ever joined - the rest measures one machine"; }
+
+      - name: the Earthfile, through the fleet
+        working-directory: earthbuild
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          EARTHLY_BUILDKIT_HOST=tcp://127.0.0.1:1234 \
+            earthly --no-cache "$TARGET" 2>&1 | tail -60
+          echo "FLEET_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
+
+      - name: what the fleet did
+        if: always()
+        run: |
+          set -euo pipefail
+          kill -INT "$(cat proxy.pid)" 2>/dev/null || true
+          for _ in $(seq 1 20); do
+            grep -q "^\[wire\] placed" proxy.log && break
+            kill -0 "$(cat proxy.pid)" 2>/dev/null || break
+            sleep 1
+          done
+          echo "=== dispatchable at all?"
+          grep -E '^\[wire\] (gateway solves|solves routed|built at home|placed|not routed)' proxy.log || true
+          echo "=== which RUNNER took what"
+          grep -oE -- '-> worker [0-9]+' proxy.log | sort | uniq -c || true
+          echo "=== the coordinator's registry"
+          grep -E '^\[registry\] served' proxy.log || true
+          echo "   uploads far below blobs served means results were fetched"
+          echo "   from the runners that built them, which is the whole point."
+          echo "=== wall: ${FLEET_SECS:-?}s"
+
+      - name: logs
+        if: always()
+        run: tail -150 proxy.log || true
