@@ -168,6 +168,137 @@ pub enum Claimed {
     Retry,
 }
 
+/// Fetch a blob from wherever in the fleet it lives, knowing only its hash.
+///
+/// The registry's half of the mesh. Deliberately one method: a registry needs
+/// exactly this and nothing else, and a narrow trait is what lets the driver
+/// and a worker supply it from two quite different sets of machinery without
+/// either learning about the other.
+#[async_trait::async_trait]
+pub trait FleetBlobs: Send + Sync + 'static {
+    /// `None` for "nobody has it", not for "the lookup failed". A registry
+    /// turns both into 404 and there is nothing useful it could do
+    /// differently, so the distinction is not worth carrying up.
+    async fn by_hash(&self, hash: &str) -> Option<Vec<u8>>;
+}
+
+/// A local store, with the fleet behind it.
+///
+/// Wraps any [`RegistryStore`] and answers a miss by asking the fleet. This
+/// is what makes a registry serve a layer it never held: buildkit asks its
+/// own registry on localhost, the store misses, and the bytes come off
+/// whichever machine built them.
+///
+/// A DECORATOR rather than two impls, because the coordinator and every
+/// worker want identical behaviour from different innards - and the previous
+/// arrangement, where each side had its own local-only impl and a comment
+/// claiming otherwise, is exactly how this went unnoticed.
+///
+/// Writes are always local. A registry is a cache of the fleet, not a way to
+/// write into other machines.
+pub struct MeshBacked<S> {
+    local: Arc<S>,
+    fleet: Arc<dyn FleetBlobs>,
+}
+
+impl<S> MeshBacked<S> {
+    pub fn new(local: Arc<S>, fleet: Arc<dyn FleetBlobs>) -> Arc<Self> {
+        Arc::new(MeshBacked { local, fleet })
+    }
+}
+
+#[async_trait::async_trait]
+impl<S: RegistryStore> RegistryStore for MeshBacked<S> {
+    async fn blob_size(&self, hash: &str) -> Option<u64> {
+        if let Some(n) = self.local.blob_size(hash).await {
+            return Some(n);
+        }
+        // A HEAD has to be honest about FLEET-wide presence or buildkit
+        // re-pushes layers the fleet already holds. It costs a fetch on the
+        // first probe, and the GET that always follows then finds it local -
+        // the same trade the driver's own impl made, kept identical so there
+        // are not two policies for one question.
+        self.fetch_and_cache(hash).await.map(|b| b.len() as u64)
+    }
+
+    async fn blob_get(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        if let Some(b) = self.local.blob_get(hash).await? {
+            return Ok(Some(b));
+        }
+        Ok(self.fetch_and_cache(hash).await)
+    }
+
+    /// Streams only what is already here. A blob fetched from the fleet is
+    /// cached by `blob_get` first, so the stream path finds it local on the
+    /// retry - buffering a 500 MB layer to satisfy the first probe is the one
+    /// thing this must not do.
+    async fn blob_stream(&self, hash: &str) -> Option<(u64, Body)> {
+        if let Some(s) = self.local.blob_stream(hash).await {
+            return Some(s);
+        }
+        let bytes = self.fetch_and_cache(hash).await?;
+        self.local.blob_stream(hash).await.or_else(|| {
+            let n = bytes.len() as u64;
+            Some((n, Body::from(bytes)))
+        })
+    }
+
+    async fn blob_put(&self, bytes: &[u8]) -> Result<String> {
+        self.local.blob_put(bytes).await
+    }
+    async fn upload_begin(&self) -> Result<Upload> {
+        self.local.upload_begin().await
+    }
+    async fn upload_finish(&self, up: Upload, expected: Option<&str>) -> Result<String> {
+        self.local.upload_finish(up, expected).await
+    }
+    async fn tag_get(&self, key: &str) -> Option<String> {
+        self.local.tag_get(key).await
+    }
+    async fn tag_put(&self, key: &str, manifest_hash: &str) -> Result<()> {
+        self.local.tag_put(key, manifest_hash).await
+    }
+    async fn lease_claim(&self, key: &str) -> Option<Claimed> {
+        self.local.lease_claim(key).await
+    }
+    async fn lease_heartbeat(&self, key: &str, holder: &str) -> bool {
+        self.local.lease_heartbeat(key, holder).await
+    }
+    async fn lease_release(&self, key: &str, holder: &str, result: Vec<u8>) {
+        self.local.lease_release(key, holder, result).await
+    }
+    async fn lease_abandon(&self, key: &str, holder: &str) {
+        self.local.lease_abandon(key, holder).await
+    }
+    fn lease_stats(&self) -> Option<(u64, u64, u64)> {
+        self.local.lease_stats()
+    }
+    fn resolve_stats(&self) -> Option<(u64, u64)> {
+        self.local.resolve_stats()
+    }
+    fn lease_forget_all(&self) -> usize {
+        self.local.lease_forget_all()
+    }
+}
+
+impl<S: RegistryStore> MeshBacked<S> {
+    /// Ask the fleet, and keep what comes back.
+    ///
+    /// Caching is not an optimisation here. Buildkit HEADs a blob and then
+    /// GETs it, and a pull walks the manifest and then every layer; without
+    /// the write-back each of those crosses the network again.
+    async fn fetch_and_cache(&self, hash: &str) -> Option<Vec<u8>> {
+        let bytes = self.fleet.by_hash(hash).await?;
+        // A failed write is not a failed fetch: serve what we have and let
+        // the next probe try again. Losing the cache costs a round trip;
+        // losing the bytes costs the build.
+        if let Err(e) = self.local.blob_put(&bytes).await {
+            eprintln!("[registry] fetched {hash} from the fleet but could not cache it: {e:#}");
+        }
+        Some(bytes)
+    }
+}
+
 #[async_trait::async_trait]
 impl RegistryStore for Store {
     /// Chunks off the CAS file. The upload path already streams to disk; this is
@@ -1497,6 +1628,64 @@ mod tests {
             .await;
             assert_eq!(st, StatusCode::BAD_REQUEST, "accepted a bad digest: {bad}");
         }
+    }
+
+    /// A fleet holding exactly one blob, and counting how often it is asked.
+    struct OnePeer {
+        bytes: Vec<u8>,
+        hash: String,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl FleetBlobs for OnePeer {
+        async fn by_hash(&self, hash: &str) -> Option<Vec<u8>> {
+            self.asked
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (hash == self.hash).then(|| self.bytes.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_registry_serves_a_layer_it_never_held() {
+        // The whole point of a registry on every worker: its buildkitd asks
+        // localhost for a layer built on another machine, the local store
+        // misses, and the bytes come off whoever has them.
+        //
+        // Without it a worker can only be given work whose inputs already sit
+        // in the one registry every daemon reaches over HTTP - which is why
+        // this fleet has never left a single host.
+        let payload = b"a layer built somewhere else".to_vec();
+        let hash = crate::store::sha256_hex(&payload);
+        let fleet = Arc::new(OnePeer {
+            bytes: payload.clone(),
+            hash: hash.clone(),
+            asked: Default::default(),
+        });
+        let reg = MeshBacked::new(store(), fleet.clone());
+
+        assert_eq!(
+            reg.blob_get(&hash).await.unwrap(),
+            Some(payload.clone()),
+            "a blob the fleet holds must be servable"
+        );
+
+        // CACHED, not re-fetched. buildkit HEADs then GETs, and a pull walks
+        // a manifest and then every layer under it; a decorator that went to
+        // the network per probe would cross it several times per blob.
+        let after_first = fleet.asked.load(std::sync::atomic::Ordering::Relaxed);
+        reg.blob_get(&hash).await.unwrap();
+        reg.blob_size(&hash).await;
+        assert_eq!(
+            fleet.asked.load(std::sync::atomic::Ordering::Relaxed),
+            after_first,
+            "the fleet was asked again for a blob already cached locally"
+        );
+
+        // A miss stays a miss: 404, not a hang and not an error.
+        let absent = crate::store::sha256_hex(b"nobody has this");
+        assert_eq!(reg.blob_get(&absent).await.unwrap(), None);
+        assert_eq!(reg.blob_size(&absent).await, None);
     }
 
     #[tokio::test]

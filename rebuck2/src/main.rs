@@ -285,6 +285,7 @@ async fn main() -> Result<()> {
             let cfg = worker::WorkerCfg {
                 buildkit_addr: args.opt("--buildkit-addr"),
                 registry_addr: args.opt("--registry-addr"),
+                registry_bind: args.opt("--registry-bind"),
                 session: args.opt("--session").unwrap_or_else(default_session),
                 slots: args
                     .opt("--slots")

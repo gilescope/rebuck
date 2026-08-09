@@ -31,6 +31,13 @@ pub struct WorkerCfg {
     /// would have without dispatch at all.
     pub buildkit_addr: Option<String>,
     pub registry_addr: Option<String>,
+    /// Serve a registry HERE, backed by the fleet.
+    ///
+    /// The piece that lets a worker live on its own machine. Its buildkitd
+    /// speaks OCI and cannot speak the mesh, so it needs a registry it can
+    /// reach; with one on localhost, a miss is answered by whichever machine
+    /// built the layer instead of by an HTTP host every daemon must route to.
+    pub registry_bind: Option<String>,
     pub scratch: std::path::PathBuf,
     pub connect_wait: Duration,
     /// Path to a JSON EndpointAddr for the driver (CI run artifact).
@@ -184,6 +191,24 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
         hits_peer: std::sync::atomic::AtomicU64::new(0),
         hits_driver: std::sync::atomic::AtomicU64::new(0),
     });
+
+    // A registry on this worker, backed by the fleet behind `blobs`.
+    if let Some(bind) = cfg.registry_bind.clone() {
+        let reg = crate::registry::MeshBacked::new(store.clone(), blobs.clone());
+        match bind.parse() {
+            Ok(addr) => {
+                tokio::spawn(async move {
+                    if let Err(e) = crate::registry::serve_with_upstream(addr, reg, None).await {
+                        eprintln!("[worker] registry died: {e:#}");
+                    }
+                });
+            }
+            // Loud, not fatal: without it this worker's daemon has nowhere to
+            // pull from and every lead will decline, which is correct but
+            // reads as a fleet that mysteriously refuses everything.
+            Err(e) => eprintln!("[worker] --registry-bind {bind:?} is not an address: {e}"),
+        }
+    }
 
     // Fetch-source stats: one line a minute (when changed) makes peer-serving
     // measurable rather than a matter of faith.
@@ -616,6 +641,38 @@ impl RemoteBlobs {
         }
     }
 
+    /// `BlobReq::GetByHash` against one peer, dialled directly.
+    async fn fetch_by_hash_from(&self, endpoint: &str, hash: &str) -> Result<Vec<u8>> {
+        let id: iroh::EndpointId = endpoint
+            .parse()
+            .map_err(|_| anyhow::anyhow!("bad provider endpoint {endpoint:?} for {hash}"))?;
+        let conn = self.ep.connect(id, mesh::ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        mesh::send_frame(&mut send, &BlobReq::GetByHash(hash.to_owned())).await?;
+        send.finish()?;
+        match mesh::recv_frame::<BlobResp>(&mut recv)
+            .await?
+            .context("provider closed blob stream")?
+        {
+            BlobResp::Found { size } => Ok(mesh::recv_raw(&mut recv, size).await?),
+            other => bail!("provider {endpoint} for {hash}: {other:?}"),
+        }
+    }
+
+    /// The same question to the driver, on the connection we already hold.
+    async fn fetch_by_hash_driver(&self, hash: &str) -> Result<Vec<u8>> {
+        let (mut send, mut recv) = self.conn.open_bi().await?;
+        mesh::send_frame(&mut send, &BlobReq::GetByHash(hash.to_owned())).await?;
+        send.finish()?;
+        match mesh::recv_frame::<BlobResp>(&mut recv)
+            .await?
+            .context("driver closed blob stream")?
+        {
+            BlobResp::Found { size } => Ok(mesh::recv_raw(&mut recv, size).await?),
+            other => bail!("driver for {hash}: {other:?}"),
+        }
+    }
+
     async fn fetch_from(&self, endpoint: &str, d: &Dig) -> Result<Vec<u8>> {
         let id: iroh::EndpointId = endpoint.parse().map_err(|_| {
             anyhow::anyhow!("bad provider endpoint {endpoint:?} for blob {}", d.hash)
@@ -684,6 +741,41 @@ impl RemoteBlobs {
             }
         }
         Ok(unfetched)
+    }
+}
+
+/// The fleet, as a registry sees it.
+///
+/// `exec::Blobs` needs a `Dig` because REAPI always knows the size; a
+/// registry only ever has the hash. Same walk - ours, then a peer the bloom
+/// claims, then the driver - asked the one way a registry can ask.
+#[async_trait::async_trait]
+impl crate::registry::FleetBlobs for RemoteBlobs {
+    async fn by_hash(&self, hash: &str) -> Option<Vec<u8>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Ok(Some(b)) = self.store.get_by_hash(hash).await {
+            self.hits_local.fetch_add(1, Relaxed);
+            return Some(b);
+        }
+        let candidates: Vec<String> = {
+            let peers = self.peers.lock().await;
+            peers
+                .iter()
+                .filter(|(id, b)| **id != self.my_id && b.contains(hash))
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for who in &candidates {
+            if let Ok(bytes) = self.fetch_by_hash_from(who, hash).await {
+                self.hits_peer.fetch_add(1, Relaxed);
+                return Some(bytes);
+            }
+        }
+        // The driver last. It holds what the gateway mirrored - bases and
+        // published contexts - which a worker needs and no peer built.
+        let bytes = self.fetch_by_hash_driver(hash).await.ok()?;
+        self.hits_driver.fetch_add(1, Relaxed);
+        Some(bytes)
     }
 }
 
