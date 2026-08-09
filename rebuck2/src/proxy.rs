@@ -1648,7 +1648,19 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                                 // "failed to parse ... invalid". The deleted
                                 // peer path prefixed this on the way out;
                                 // here is where that moved to.
-                                let src = if reference.contains("://") {
+                                // A bare `sha256:...` is content with no
+                                // location: the builder published it into
+                                // its own store and we name the registry WE
+                                // pull from, which fetches it from whoever
+                                // has it. Anything else is a full reference
+                                // from an older worker - take it as given.
+                                let src = if let Some(d) = reference.strip_prefix("sha256:") {
+                                    format!(
+                                        "docker-image://{}/{}@sha256:{d}",
+                                        mirror.registry,
+                                        crate::solve::SUBTREE_REPO
+                                    )
+                                } else if reference.contains("://") {
                                     reference
                                 } else {
                                     format!("docker-image://{reference}")

@@ -1662,6 +1662,21 @@ impl Driver {
         Ok(false)
     }
 
+    /// Ask one worker for a blob by hash.
+    async fn fetch_by_hash_from(&self, endpoint: &str, hash: &str) -> Result<Vec<u8>> {
+        let conn = self.peer_conn(endpoint).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        mesh::send_frame(&mut send, &BlobReq::GetByHash(hash.to_owned())).await?;
+        send.finish()?;
+        match mesh::recv_frame::<BlobResp>(&mut recv)
+            .await?
+            .context("worker closed blob stream")?
+        {
+            BlobResp::Found { size } => Ok(mesh::recv_raw(&mut recv, size).await?),
+            other => anyhow::bail!("worker {endpoint} for {hash}: {other:?}"),
+        }
+    }
+
     /// One blob fetch from one peer, streamed straight into the store: two
     /// attempts (retry once on a fresh connection if the pooled one went
     /// stale). Ok(false) = peer answered Missing; Err = peer unreachable/
@@ -2674,6 +2689,43 @@ async fn serve_blob_stream(
     }
     send.finish()?;
     Ok(())
+}
+
+/// The fleet, as the COORDINATOR's registry sees it.
+///
+/// The mirror of the worker's impl, and the half that makes a result
+/// reachable from another machine: a worker publishes a subtree into its own
+/// store, and the coordinator's daemon then pulls that digest from the
+/// coordinator's registry, which does not have it and asks whoever does.
+///
+/// Without this a lead's reference can only name the builder's own registry,
+/// which is fine on one host and unroutable from a second - the reason
+/// multi-runner dispatch did not work.
+#[async_trait::async_trait]
+impl crate::registry::FleetBlobs for Driver {
+    async fn by_hash(&self, hash: &str) -> Option<Vec<u8>> {
+        if let Ok(Some(b)) = self.store.get_by_hash(hash).await {
+            return Some(b);
+        }
+        // Bloom first, then everyone else. A bloom lies only in the safe
+        // direction, so a claimant may not have it; a non-claimant that
+        // acquired it since the last gossip still might, and a build stalling
+        // on stale gossip is worse than one extra round trip.
+        let (claimants, others): (Vec<String>, Vec<String>) = {
+            let blooms = self.blooms.lock().await;
+            let (yes, no): (Vec<_>, Vec<_>) = blooms.iter().partition(|(_, b)| b.contains(hash));
+            (
+                yes.into_iter().map(|(e, _)| e.clone()).collect(),
+                no.into_iter().map(|(e, _)| e.clone()).collect(),
+            )
+        };
+        for who in claimants.iter().chain(others.iter()) {
+            if let Ok(bytes) = self.fetch_by_hash_from(who, hash).await {
+                return Some(bytes);
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]

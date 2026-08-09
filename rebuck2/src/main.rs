@@ -261,12 +261,17 @@ async fn main() -> Result<()> {
             // separate `rebuck2 registry` process would be a third copy of
             // the same job and would hold no such index.
             if let Some(bind) = registry_bind {
-                let d = d.clone();
                 let up = registry::HttpUpstream::from_env()
                     .map(|u| Arc::new(u) as Arc<dyn registry::Upstream>);
                 let addr: std::net::SocketAddr = bind.parse()?;
+                // MeshBacked, not the bare driver. A subtree is built into
+                // the BUILDER's store, so the coordinator serving the result
+                // to its own daemon is serving something it does not have -
+                // which is the whole reason a worker can be on another
+                // machine.
+                let reg = registry::MeshBacked::new(d.clone(), d.clone());
                 tokio::spawn(async move {
-                    if let Err(e) = registry::serve_with_upstream(addr, d, up).await {
+                    if let Err(e) = registry::serve_with_upstream(addr, reg, up).await {
                         eprintln!("[proxy] registry died: {e:#}");
                     }
                 });

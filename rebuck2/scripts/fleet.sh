@@ -262,11 +262,17 @@ TOML
 # insecure per-solve so the mirror fills, pulling is not, so every peer
 # refuses and the build quietly falls back to home.
 if [ -z "${NO_REGISTRY_TRUST:-}" ]; then
-  cat >>"$RUN/buildkitd.toml" <<TOML
-[registry."$MIRROR_HOST:$REG_PORT"]
+  # The coordinator's, plus one per worker when they serve their own. A
+  # daemon that does not trust the registry it is told to pull from fails the
+  # silent way described above, so the trust list has to cover every address
+  # any daemon might be handed - not just the shared one.
+  for r in $(seq 0 $((DAEMONS - 1))); do
+    cat >>"$RUN/buildkitd.toml" <<TOML
+[registry."$MIRROR_HOST:$((REG_PORT + r))"]
   http = true
   insecure = true
 TOML
+  done
 fi
 
 
@@ -360,12 +366,34 @@ else
   # Rendezvous is keyless - both sides derive the driver's identity from
   # $SESSION - so there is no address to configure and no ordering to get
   # right.
+  # PER_WORKER_REGISTRY=1 gives each worker its own, backed by the fleet: its
+  # daemon pulls from localhost and a miss is answered by whoever built the
+  # layer. That is the configuration a second MACHINE needs, because the
+  # coordinator's registry is not reachable from one - so it is worth being
+  # able to run it here, where a failure is a log away rather than a CI run.
+  #
+  # Off by default until it has earned it: every measurement to date used the
+  # shared registry, and switching the default would silently re-baseline all
+  # of them.
   for i in $(seq 1 $((DAEMONS - 1))); do
+    if [ -n "${PER_WORKER_REGISTRY:-}" ]; then
+      wreg="127.0.0.1:$((REG_PORT + i))"
+      bind=(--registry-bind "0.0.0.0:$((REG_PORT + i))")
+      # The daemon is a container, so it reaches its worker's registry the
+      # same way it reaches the coordinator's - via the host, not localhost.
+      seen="$MIRROR_HOST:$((REG_PORT + i))"
+    else
+      wreg=""
+      bind=()
+      seen="$MIRROR_HOST:$REG_PORT"
+    fi
     "$bin" worker --session "$SESSION" \
       --store "$RUN/worker-$i" \
       --buildkit-addr "http://127.0.0.1:$((BASE_PORT + i))" \
-      --registry-addr "$MIRROR_HOST:$REG_PORT" >"$RUN/worker-$i.log" 2>&1 &
+      "${bind[@]}" \
+      --registry-addr "$seen" >"$RUN/worker-$i.log" 2>&1 &
     pids+=("$!")
+    [ -n "$wreg" ] && say "worker $i serves its own registry on $wreg"
   done
   for _ in $(seq 1 30); do
     bctl --addr "$addr" debug workers >/dev/null 2>&1 && break

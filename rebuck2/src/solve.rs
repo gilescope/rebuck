@@ -359,11 +359,20 @@ pub async fn build_subtree(
     // Falls back to the tag when the exporter does not report one. On one
     // machine both work and the tag is what every earlier measurement used,
     // so this degrades to the old behaviour rather than failing.
+    //
+    // And BARE - the digest alone, no host. The builder pushed into the
+    // registry it can reach, which on another machine is not the one the
+    // requester can reach. A digest names content and not a location, so the
+    // requester prefixes whichever registry it will actually pull from and
+    // that registry answers by asking the fleet.
+    //
+    // Naming the builder's own registry here is what confined the fleet to
+    // one host: it produced a reference nobody else could resolve.
     let by_digest = resp
         .exporter_response
         .get("containerimage.digest")
         .filter(|d| d.starts_with("sha256:"))
-        .map(|d| format!("{registry}/{SUBTREE_REPO}@{d}"));
+        .cloned();
     Ok(by_digest.unwrap_or_else(|| result_ref(registry, job)))
 }
 
