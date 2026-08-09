@@ -1085,6 +1085,46 @@ end-to-end throughput, not about hardware, and setting it from a core
 count is worse than leaving it alone. Deriving it from measurement is the
 next thing; the sweep above is what it has to beat.
 
+## Load-aware placement is round-robin plus strikes, in practice
+
+The score divides a peer's in-flight count by its declared weight, so a
+busier or smaller machine should be picked less. Once the counter feeding it
+was fixed, the obvious question was whether it BUYS anything. Controlled
+against the same binary with the reservation disabled - one variable, three
+runs each:
+
+```text
+                        placed        struck    wall
+slow peer, 0.3 cpu
+  load-aware            {1:11, 2:1}   {2: 1}    15 4 3 4s
+  round-robin           {1:11, 2:1}   {2: 1}    15 4 4 3s
+mildly slow, 0.6 cpu
+  load-aware            {1: 9, 2:3}   {2: 2}    8 14 3 4s
+  round-robin           {1: 9, 2:3}   {2: 2}    8 14 3 4s
+```
+
+Identical. Not close - identical, including the strike counts. Whatever is
+routing around the slow peer, it is not this: it is the hedge withdrawing an
+adoption and the strike that follows, and it gets there first at every
+slowness that can be produced locally. 0.6 CPU already trips it.
+
+The first reading of the top-left cell was that load-awareness had shifted
+eleven of twelve builds off a slow machine. That was the control's to
+refute, and it did.
+
+Two regimes are left where the score could still matter and neither is
+reachable here: peers that differ in capacity while all staying inside three
+times the median, and arrivals spread thinly enough that one peer is idle
+while another is not. In BURST arrival - twelve solves inside 130ms, which is
+what a fanout build does - every decision is taken before any completion, so
+the counter rises symmetrically and the score alternates exactly as round
+robin would.
+
+So the fix stands on correctness, not throughput. Peer weights are a
+documented feature that did nothing (6/6 against 3/9 once fixed) and
+`solo_ms` called every sample uncontended. Neither claim is about speed, and
+neither should be sold as one.
+
 **The mechanism that sweep used no longer exists.** At the time, a weight
 reached the home-versus-away decision through `turn`. Saturation was then
 made the single authority on that question - two mechanisms deciding it in
