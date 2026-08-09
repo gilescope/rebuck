@@ -1,0 +1,222 @@
+# earthbuild's own root Earthfile, through the fleet, on a runner.
+#
+# Everything measured so far is a synthetic fixture: three ops, five seconds,
+# a fanout designed to be dispatchable. This is the first time a real build
+# has been pointed at the gateway, and the target is the one the project is
+# actually for - the 77-target Earthfile at the root of earthbuild.
+#
+# ONE RUNNER, deliberately, and this is the honest limit rather than a
+# simplification. A worker's buildkitd speaks OCI registry and cannot speak
+# the mesh, so it needs a registry it can reach; today that is the
+# coordinator's, over HTTP. Two GitHub runners have no route between them, so
+# a worker on a second runner could not pull. `registry.rs` names the missing
+# piece: "a registry per worker would need tags gossiped over the mesh - that
+# is the next step, not this one."
+#
+# So this measures what a runner-sized fleet does with a real graph:
+#   - how many of earthly's solves are DISPATCHABLE at all (the fixture says
+#     1 in 12 and nobody has checked that against a real target)
+#   - whether the bytes match a no-fleet build of the same target
+#   - what the gateway costs when the graph is not built to be friendly
+#
+# It does NOT measure whether distribution PAYS. Workers here share the
+# runner's four cores, so a second worker adds contention and not capacity.
+#
+# UNPROVEN. This has never run. Three things are assumed and only the first
+# run will settle them: that `earthly bootstrap` publishes a port this
+# workflow can read, that a worker's daemon started from the same image is
+# accepted by the same earthly binary, and that a real earthly graph gets
+# through `make_portable` at all. Expect the first run to be a probe rather
+# than a measurement, and read the logs step before the timings.
+name: earthfile-fleet
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "earthbuild target to build"
+        default: "+code"
+      workers:
+        description: "workers on the runner"
+        default: "2"
+      ref:
+        description: "earthbuild ref to check out"
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  earthfile:
+    runs-on: ubuntu-latest
+    # A real target, cold, on four cores. The fixture suite takes 11 minutes;
+    # this has no prior measurement at all, so the bound is generous and the
+    # run reports its own elapsed time to replace the guess.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: rebuck2-repo
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: EarthBuild/earthbuild
+          ref: ${{ inputs.ref }}
+          path: earthbuild
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: rebuck2-repo/rebuck2
+
+      - name: build rebuck2
+        working-directory: rebuck2-repo/rebuck2
+        run: cargo build --release
+
+      - name: install earthly
+        run: |
+          set -euo pipefail
+          # The released binary, not a from-source build: this measures
+          # rebuck2 against earthbuild's Earthfile, not earthbuild's own
+          # bootstrap - and bootstrapping earthly with earthly would need a
+          # working buildkit before the thing under test exists.
+          curl -fsSL -o /usr/local/bin/earthly \
+            https://github.com/EarthBuild/earthbuild/releases/latest/download/earthly-linux-amd64
+          chmod +x /usr/local/bin/earthly
+          earthly --version
+
+      - name: start the fleet
+        id: fleet
+        env:
+          WORKERS: ${{ inputs.workers }}
+        run: |
+          set -euo pipefail
+          BIN=rebuck2-repo/rebuck2/target/release/rebuck2
+          SESSION="earthfile-${GITHUB_RUN_ID}"
+          echo "SESSION=$SESSION" >> "$GITHUB_ENV"
+
+          # One buildkitd per participant: the coordinator's own, plus one
+          # per worker. Each needs to trust the mirror over plain HTTP or it
+          # pushes happily and cannot pull - the silent failure this project
+          # has already been caught by once.
+          # Let EARTHLY start the first daemon, and copy whatever it chose.
+          #
+          # Its converter emits `llb.HostBind()` and `earthly_interactive`
+          # sockets - fork-only, the surface behind EarthBuild#784 - so stock
+          # moby/buildkit cannot run this graph at all. Which fork, at which
+          # version, with which env, is decided by the earthly BINARY: the
+          # image is compiled in as DefaultBuildkitdImage and it checks a
+          # settings hash against the running container.
+          #
+          # So it is not for this workflow to guess. `earthly bootstrap`
+          # starts the daemon earthly wants; the workers then run the same
+          # image, and any version skew is impossible by construction.
+          earthly bootstrap
+          docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}'
+          BK_NAME=$(docker ps --filter 'name=buildkitd' --format '{{.Names}}' | head -1)
+          if [ -z "$BK_NAME" ]; then
+            echo "earthly started no buildkitd container - cannot mirror it"; exit 1
+          fi
+          BK_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$BK_NAME")
+          echo "earthly chose: $BK_NAME from $BK_IMAGE"
+          # Its own address, as earthly will use it.
+          BK0=$(docker port "$BK_NAME" 8372 2>/dev/null | head -1)
+          echo "coordinator daemon at ${BK0:-<no published port>}"
+          echo "BK_IMAGE=$BK_IMAGE" >> "$GITHUB_ENV"
+          echo "BK0=${BK0:-127.0.0.1:8372}" >> "$GITHUB_ENV"
+
+          # One more daemon per worker, same image, same env earthly uses.
+          for i in $(seq 1 "$WORKERS"); do
+            docker run -d --name "bk-$i" --privileged \
+              -p "$((18372 + i)):8372" \
+              -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
+              -e BUILDKIT_TLS_ENABLED=false \
+              -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG='[registry."172.17.0.1:15000"]
+            http = true
+            insecure = true' \
+              -v "/tmp/earthbuild-$i:/tmp/earthbuild" \
+              "$BK_IMAGE" >/dev/null
+          done
+          for i in $(seq 1 "$WORKERS"); do
+            for _ in $(seq 1 120); do
+              docker exec "bk-$i" buildctl --addr tcp://127.0.0.1:8372 debug workers \
+                >/dev/null 2>&1 && break
+              sleep 1
+            done
+          done
+          docker ps --format '{{.Names}} {{.Status}}'
+
+          # 172.17.0.1 is the docker bridge gateway: how a container reaches
+          # the runner. `host.docker.internal` is a Docker Desktop thing and
+          # does not resolve here.
+          REBUCK2_MIRROR=172.17.0.1:15000 \
+            "$BIN" buildkit-proxy --listen 127.0.0.1:1234 \
+              --upstream "http://$BK0" \
+              --registry-bind 0.0.0.0:15000 \
+              --session "$SESSION" --store /tmp/coord > /tmp/proxy.log 2>&1 &
+          echo $! > /tmp/proxy.pid
+
+          for i in $(seq 1 "$WORKERS"); do
+            "$BIN" worker --session "$SESSION" \
+              --store "/tmp/worker-$i" \
+              --buildkit-addr "http://127.0.0.1:$((18372 + i))" \
+              --registry-addr 172.17.0.1:15000 > "/tmp/worker-$i.log" 2>&1 &
+          done
+
+          # Barrier: a worker joins over iroh a moment after its process
+          # starts, and the gateway asks whether the fleet is empty per solve.
+          for _ in $(seq 1 60); do
+            j=$(grep -c "joined" /tmp/proxy.log 2>/dev/null || true)
+            [ "${j:-0}" -ge "$WORKERS" ] && break
+            sleep 1
+          done
+          echo "workers joined: $(grep -c joined /tmp/proxy.log || echo 0)/$WORKERS"
+
+      - name: baseline - the same target with no fleet
+        working-directory: earthbuild
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          EARTHLY_BUILDKIT_HOST="tcp://$BK0" \
+            earthly --no-cache "$TARGET" 2>&1 | tail -40
+          echo "BASELINE_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
+
+      - name: through the fleet
+        working-directory: earthbuild
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          EARTHLY_BUILDKIT_HOST=tcp://127.0.0.1:1234 \
+            earthly --no-cache "$TARGET" 2>&1 | tail -40
+          echo "FLEET_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
+
+      - name: what the fleet actually did
+        if: always()
+        run: |
+          set -euo pipefail
+          kill -INT "$(cat /tmp/proxy.pid)" 2>/dev/null || true
+          for _ in $(seq 1 20); do
+            grep -q "^\[wire\] placed" /tmp/proxy.log && break
+            sleep 1
+          done
+          echo "=== solves, and how many could move"
+          grep -E '^\[wire\] (gateway solves|solves routed|built at home|placed|not routed)' \
+            /tmp/proxy.log || true
+          echo "=== which machine took what"
+          grep -oE -- '-> worker [0-9]+' /tmp/proxy.log | sort | uniq -c || true
+          echo "=== why the rest could not move"
+          grep -E '^\[wire\] not routed' /tmp/proxy.log || true
+          echo "=== wall"
+          echo "baseline ${BASELINE_SECS:-?}s   fleet ${FLEET_SECS:-?}s"
+          echo "NOTE: workers share this runner's cores, so the fleet column"
+          echo "measures OVERHEAD, not speedup. Dispatchability is the result."
+
+      - name: logs
+        if: always()
+        run: |
+          tail -100 /tmp/proxy.log || true
+          for f in /tmp/worker-*.log; do echo "=== $f"; tail -20 "$f"; done || true
