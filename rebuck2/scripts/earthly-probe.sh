@@ -159,8 +159,10 @@ echo "   workers joined: $j/$WORKERS"
 
 echo "== earthly $TARGET through the proxy"
 start=$SECONDS
+# EARTHLY_BIN lets a PATCHED earthly be measured against the same fleet -
+# the only way to price EarthBuild#784 before it lands.
 ( cd "$EB" && EARTHLY_BUILDKIT_HOST="tcp://$LAN:$PROXY_PORT" \
-    earthly "$TARGET" >"$RUN/earthly.log" 2>&1 ) && ok=yes || ok=no
+    "${EARTHLY_BIN:-earthly}" "$TARGET" >"$RUN/earthly.log" 2>&1 ) && ok=yes || ok=no
 echo "   build: $ok in $((SECONDS - start))s"
 
 kill -INT "${pids[0]}" 2>/dev/null || true

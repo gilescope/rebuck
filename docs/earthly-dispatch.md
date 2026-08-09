@@ -122,6 +122,42 @@ explicit secrets are all behind this one: no solve gets far enough for them
 to matter, so #784 is not the first of several obstacles, it is the only
 reachable one.
 
+## What the fix buys, measured by applying it
+
+The gate from #784, applied locally to `main` (3380dc20) and re-run against
+the same fleet and the same target:
+
+```text
+                      before            after
+build                 SUCCESS 91s       SUCCESS 87s
+gateway solves        6                 6
+ops total             64                64
+blocking exclusion    Secret x6         CacheMount x5
+dispatchable          0                 1
+```
+
+Identical graph either side, so it is like for like. The debugger secret
+stops blocking anything and one solve becomes genuinely dispatchable - held
+at home only because home had room, not because it could not travel.
+
+**And the issue as filed is wrong: it is three sites, not two.** Gating the
+secret and the host bind leaves `prependDebugger := !opts.Locally` (~2806)
+prefixing every command with `/usr/bin/earth_debugger`, which exists only
+because of the bind. Every build then dies on its first RUN:
+
+```text
+/bin/sh: /usr/bin/earth_debugger: not found
+RUN apk add --no-cache git   did not complete successfully. Exit code 127
+```
+
+Nothing in that error names the debugger. Anyone attempting the change from
+the issue text alone would hit an inscrutable failure on `apk add` and could
+reasonably conclude the change is unsafe - which is a good argument for
+measuring a proposal by applying it before asking someone else to.
+
+A draft comment carrying these numbers upstream is written and NOT posted;
+posting under a maintainer-visible identity is the repo owner's call.
+
 ## You cannot put a proxy on loopback
 
 Discovered the hard way, and it applies to anything that wants to sit between
