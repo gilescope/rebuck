@@ -1207,6 +1207,12 @@ fn place(
     // two mechanisms deciding the same thing in series, each unaware of the
     // other. It showed as `placed {0: 20, 1: 4}` with 16 slots: sixteen while
     // home had room, then eight saturated of which the rotation kept four.
+    // UNREACHABLE as things stand: the sole caller passes `home_allowed:
+    // false`, because saturation has already settled home-versus-away by the
+    // time this is asked. Kept, with the reason, because the branch reads as
+    // live and a reader who assumes it fires will conclude that a weight
+    // shifts work between home and away. It does not - only between away
+    // peers, via the score below. Slots are the home/away control.
     if home_allowed && turn(cursor, weights) == 0 {
         return None;
     }

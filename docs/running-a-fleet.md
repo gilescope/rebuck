@@ -75,9 +75,19 @@ size where a fleet matters, and it needs no estimate of how fast anyone is.
 Attempts to do better by ranking peers all measured worse - see the findings
 doc before trying again.
 
-Peers may be weighted (`--peer http://host:port*2`), but a weight is a claim
+Peers may be weighted (`--peer http://host:port*2`), and a weight is a claim
 about observed end-to-end throughput, **not** about hardware. Setting one
 from core counts measured worse than leaving it alone.
+
+A weight decides **which peer**, never how much leaves this machine. That is
+slots, and only slots. Measured on three daemons with everything dispatched:
+a fourfold weight moves the split from 6/6 to 3/9, and equal weights still
+alternate. It bites only while peers hold work at the same time - with them
+idle every score is a tie and placement correctly falls back to round-robin.
+
+`REBUCK2_HOME_WEIGHT` is currently **inert** and kept only so the flag does
+not vanish from under anyone: it feeds a rotation that saturation now decides
+in front of.
 
 ## Failure
 

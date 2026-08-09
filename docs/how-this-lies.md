@@ -162,8 +162,20 @@ under full contention.
 
 **Countermeasure:** vary the knob and require the OUTPUT to move. This one
 was never exercised end to end, so nothing ever asked it to make a
-difference. It also invalidated a conclusion drawn from it - "informed
-weights measured worse" compared the mechanism against itself doing nothing.
+difference.
+
+**And then the same shape again, in the correction.** The first write-up of
+this said the finding "informed weights measured worse - 21s against 18s" was
+therefore noise. It was not. That sweep ran on TWO daemons, where the weight
+acted through `turn` on the home-versus-away decision, and `turn` worked. The
+inert path was choosing between two away peers, which a two-daemon fleet never
+does. A later, correct fix - stopping saturation and the rotation from both
+deciding home-versus-away - retired the path the sweep had used.
+
+So the number was real evidence about a mechanism that no longer exists,
+which is a third thing, distinct from both "valid" and "noise". Deciding a
+past measurement is void is itself a claim, and wants the same standard of
+evidence as the measurement did.
 
 ## The common thread
 

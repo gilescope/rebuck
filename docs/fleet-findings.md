@@ -1085,6 +1085,20 @@ end-to-end throughput, not about hardware, and setting it from a core
 count is worse than leaving it alone. Deriving it from measurement is the
 next thing; the sweep above is what it has to beat.
 
+**The mechanism that sweep used no longer exists.** At the time, a weight
+reached the home-versus-away decision through `turn`. Saturation was then
+made the single authority on that question - two mechanisms deciding it in
+series was its own bug - and `turn`'s home branch became unreachable. Today
+the same sweep is done with `REBUCK2_HOME_SLOTS`, and the numbers above
+should be read as a slots sweep, which is what they measured.
+
+The conclusion survives the re-labelling: there is an interior optimum, and
+"it has twice the cores" lands on the wrong side of it. What does not survive
+is the implication that a peer WEIGHT is the control for this. It is not.
+Weight chooses between away peers, and did nothing at all until the load
+counter it divides into was fixed - see "a knob that is wired, documented and
+inert" in how-this-lies.md.
+
 ## It is faster on two machines: 24s -> 18s
 
 The measurement this whole thing existed to make, and which one host could
