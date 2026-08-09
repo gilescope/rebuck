@@ -277,8 +277,37 @@ const SPECULATE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// One subtree in flight: who wants it, what it is, and how far down the
 /// candidate list we have got.
+/// Who asked for a subtree to be placed.
+///
+/// Two, because the gateway is not on the mesh. A worker that subdivides
+/// reaches us over the control stream and is answered the same way; the
+/// buildkit proxy runs in THIS process, holding a client's Solve open, and
+/// answering it over a wire to ourselves would be a second transport for a
+/// question we can answer with a channel.
+// Removed in the commit that switches the proxy over; kept separate so the
+// seam lands on its own and can be reverted on its own.
+#[allow(dead_code)]
+enum Requester {
+    Worker(u64),
+    /// The gateway in-process. Resolves to the image ref a peer published,
+    /// or `None` for "nobody took it" - which the caller treats as "build it
+    /// here", exactly as a worker does with `Unplaced`.
+    Gateway(tokio::sync::oneshot::Sender<Option<String>>),
+}
+
+impl Requester {
+    /// The worker that must not be offered its own subtree back. `None` for
+    /// the gateway, which holds no worker slot and is not a candidate.
+    fn worker_id(&self) -> Option<u64> {
+        match self {
+            Requester::Worker(id) => Some(*id),
+            Requester::Gateway(_) => None,
+        }
+    }
+}
+
 struct Subtree {
-    requester: u64,
+    requester: Requester,
     subtree: Vec<u8>,
     frontier: Vec<Dig>,
     placement: crate::dispatch::Placement,
@@ -629,7 +658,8 @@ impl Driver {
                     // straight back out in a Lead, and the result never
                     // comes near this machine.
                     W2D::Offer { subtree, frontier } => {
-                        self.place_subtree(worker_id, subtree, frontier).await;
+                        self.place_subtree(Requester::Worker(worker_id), subtree, frontier)
+                            .await;
                     }
                     // The subtree built somewhere else and is fetchable from
                     // the builder's mirror. The driver is told WHERE, and
@@ -1283,19 +1313,18 @@ impl Driver {
     /// builder's mirror to the requester without touching this machine.
     /// That is principle 6, and the test for it is to look at this
     /// machine's disk after a dispatched build.
-    async fn place_subtree(self: &Arc<Self>, requester: u64, subtree: Vec<u8>, frontier: Vec<Dig>) {
+    async fn place_subtree(
+        self: &Arc<Self>,
+        requester: Requester,
+        subtree: Vec<u8>,
+        frontier: Vec<Dig>,
+    ) {
         use prost::Message;
 
         let job = self.next_job.fetch_add(1, Ordering::Relaxed);
         let Ok(def) = bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice()) else {
-            self.tell(
-                requester,
-                D2W::Unplaced {
-                    job,
-                    why: "subtree is not a buildkit Definition".into(),
-                },
-            )
-            .await;
+            self.unplaced(requester, job, "subtree is not a buildkit Definition")
+                .await;
             return;
         };
         let verdict = crate::dispatch::inspect(&def);
@@ -1305,7 +1334,7 @@ impl Driver {
             ws.iter()
                 // Never offer a worker its own subtree back. It asked us
                 // precisely because it is blocked on this branch.
-                .filter(|w| w.id != requester)
+                .filter(|w| Some(w.id) != requester.worker_id())
                 .map(|w| crate::dispatch::Candidate {
                     id: w.id,
                     platform: format!("{}/{}", w.os, w.arch),
@@ -1320,14 +1349,7 @@ impl Driver {
 
         let mut placement = crate::dispatch::Placement::new(&verdict, &candidates);
         let Some(first) = placement.offer() else {
-            self.tell(
-                requester,
-                D2W::Unplaced {
-                    job,
-                    why: "no peer can take it".into(),
-                },
-            )
-            .await;
+            self.unplaced(requester, job, "no peer can take it").await;
             return;
         };
         self.subtrees.lock().await.insert(
@@ -1361,11 +1383,15 @@ impl Driver {
 
     /// A peer refused an offered subtree: try the next, or hand it back.
     async fn subtree_declined(self: &Arc<Self>, job: u64, who: u64, why: &str) {
-        let (requester, next, subtree, frontier) = {
+        // The Requester is NOT cloned out here: the gateway's half of a
+        // oneshot cannot be, and taking it early would strand a caller that
+        // is still holding a client's Solve open. It is only removed on the
+        // branch that gives up.
+        let (next, subtree, frontier) = {
             let mut map = self.subtrees.lock().await;
             let Some(st) = map.get_mut(&job) else { return };
             let next = st.placement.declined(who);
-            (st.requester, next, st.subtree.clone(), st.frontier.clone())
+            (next, st.subtree.clone(), st.frontier.clone())
         };
         match next {
             Some(peer) if peer != who => {
@@ -1381,17 +1407,54 @@ impl Driver {
             }
             Some(_) => {}
             None => {
-                self.subtrees.lock().await.remove(&job);
+                let Some(st) = self.subtrees.lock().await.remove(&job) else {
+                    return;
+                };
+                self.unplaced(st.requester, job, why).await;
+            }
+        }
+    }
+
+    /// Nobody took it. A worker hears `Unplaced` and builds it itself; the
+    /// gateway gets `None` and does the same. Fail open, never fail wrong.
+    async fn unplaced(self: &Arc<Self>, requester: Requester, job: u64, why: &str) {
+        match requester {
+            Requester::Worker(id) => {
                 self.tell(
-                    requester,
+                    id,
                     D2W::Unplaced {
                         job,
                         why: why.to_owned(),
                     },
                 )
-                .await;
+                .await
+            }
+            Requester::Gateway(tx) => {
+                let _ = tx.send(None);
             }
         }
+    }
+
+    /// Offer a subtree on behalf of the gateway in this process, and wait.
+    ///
+    /// The same arbitration a worker's `Offer` gets - same candidates, same
+    /// refusals, same fail-open - reached by a channel instead of a frame,
+    /// because the caller is inside the driver.
+    ///
+    /// `None` means nobody took it, which is not an error: it is the answer
+    /// that says build it here.
+    #[allow(dead_code)] // wired up by the proxy switch, next commit
+    pub async fn lead_subtree(
+        self: &Arc<Self>,
+        subtree: Vec<u8>,
+        frontier: Vec<Dig>,
+    ) -> Option<String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.place_subtree(Requester::Gateway(tx), subtree, frontier)
+            .await;
+        // A dropped sender is a driver that forgot the job; treat it as
+        // unplaced rather than hanging on a Solve that will never answer.
+        rx.await.unwrap_or(None)
     }
 
     /// A peer built it. Tell the requester where, and forget the placement -
@@ -1400,8 +1463,12 @@ impl Driver {
         let Some(st) = self.subtrees.lock().await.remove(&job) else {
             return;
         };
-        self.tell(st.requester, D2W::Placed { job, image_ref })
-            .await;
+        match st.requester {
+            Requester::Worker(id) => self.tell(id, D2W::Placed { job, image_ref }).await,
+            Requester::Gateway(tx) => {
+                let _ = tx.send(Some(image_ref));
+            }
+        }
     }
 
     /// A driver with a throwaway store, for tests that need one to hang a
@@ -3217,6 +3284,29 @@ mod tests {
     /// Platform routing: os-tagged jobs only land on matching workers;
     /// untagged jobs land anywhere.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unplaceable_subtree_answers_the_gateway_instead_of_hanging() {
+        // The gateway asks from inside this process while holding a client's
+        // Solve open. Every way an offer can end has to come back, because
+        // the failure mode is not a wrong answer - it is a build that never
+        // returns, which no fail-open elsewhere can rescue.
+        //
+        // An empty fleet is the shortest path to "nobody took it": there are
+        // no candidates, so `placement.offer()` is None on the first pass.
+        let d = test_driver(false);
+        let def = bollard_buildkit_proto::pb::Definition::default();
+        let bytes = prost::Message::encode_to_vec(&def);
+
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            d.lead_subtree(bytes, Vec::new()),
+        )
+        .await
+        .expect("lead_subtree hung with no workers to place on");
+
+        assert_eq!(answer, None, "an empty fleet must answer, and answer no");
+    }
+
+    #[tokio::test]
     async fn jobs_route_to_matching_platform_workers() {
         let d = test_driver(false);
         let log = Arc::new(Mutex::new(Vec::new()));
