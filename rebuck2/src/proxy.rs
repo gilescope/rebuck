@@ -654,7 +654,7 @@ impl control::control_server::Control for Proxy {
         }
         drop(w);
         if let Some((_, key, _)) = went {
-            self.seen_ms.held().entry(key).or_default().push(ms);
+            remember(self.seen_ms.held().entry(key).or_default(), ms);
         }
         out
     }
@@ -790,7 +790,11 @@ impl control::control_server::Control for Proxy {
 /// from them, or hands one solve's ref to another, then a ref that lives on
 /// the wrong machine is a broken build.
 fn trace(wire: &std::sync::Mutex<Wire>, call: &str) {
-    wire.held().calls.push(call.to_owned());
+    let mut w = wire.held();
+    w.calls.push_back(call.to_owned());
+    if w.calls.len() > CALLS_KEPT {
+        w.calls.pop_front();
+    }
 }
 
 /// Round-robin over a fleet of `peers`, peer 0 included.
@@ -1039,6 +1043,35 @@ enum Adoption {
 /// make one measurement look good. The 0.25-CPU peer took 163s against a
 /// normal 9.5s; any threshold between the two "works", and picking one before
 /// the fleet has said what normal is means picking it for the fixture.
+/// How many recent timings any one history keeps.
+///
+/// Enough that a median is not one unlucky build, few enough that the window
+/// turns over inside a single session - the threshold has to be able to
+/// follow the fleet, not average it since boot.
+const OBSERVATIONS: usize = 64;
+
+/// Gateway calls retained for the report. Enough to show the interleaving
+/// around the end of a build, which is the only part anyone reads.
+const CALLS_KEPT: usize = 200;
+
+/// Record a timing, forgetting the oldest once the window is full.
+///
+/// These histories used to grow for the life of the process. The cost people
+/// notice is memory, and the cost that actually bites is that `hedge_after`
+/// clones and sorts the whole thing on every adoption - but neither is the
+/// reason for the bound. An all-time median cannot TRACK anything: a fleet
+/// that was slow this morning keeps a high threshold all afternoon, so the
+/// hedge stops withdrawing from stragglers exactly when the rest of the fleet
+/// has become fast enough for one to hurt.
+fn remember(history: &mut Vec<u64>, ms: u64) {
+    history.push(ms);
+    if history.len() > OBSERVATIONS {
+        // Cheap because it runs every time: one shift of a 64-element vec,
+        // never a growing backlog.
+        history.remove(0);
+    }
+}
+
 fn hedge_after(observed: &[u64]) -> Option<std::time::Duration> {
     /// Not two: a peer that is merely on the slow side of normal should
     /// finish, not be abandoned with the work half done (principle 12 -
@@ -1308,8 +1341,13 @@ pub struct Wire {
     pub session_to_client: std::sync::atomic::AtomicU64,
     /// Build contexts turned into content a peer can pull.
     pub contexts_published: u64,
-    /// Gateway calls in arrival order.
-    pub calls: Vec<String>,
+    /// Gateway calls in arrival order, most recent [`CALLS_KEPT`] only.
+    ///
+    /// Interleaving is what this is for - seeing that a `return` lands before
+    /// the `solve` it belongs to. That is a local question, so the tail
+    /// answers it as well as the whole tape would, and the whole tape both
+    /// grows for the life of the process and prints as a line nobody reads.
+    pub calls: std::collections::VecDeque<String>,
     /// The last failure from mirroring a base image, verbatim.
     ///
     /// A separate field from `last_refusal` because they accuse different
@@ -1605,7 +1643,15 @@ impl Wire {
         // that a dead mirror cost no peer its standing; a line that appears
         // only on failure cannot say that.
         println!("[wire] struck         : {:?}", self.struck);
-        println!("[wire] call order     : {}", self.calls.join(" "));
+        println!(
+            "[wire] call order     : {}{}",
+            if self.calls.len() == CALLS_KEPT {
+                "... "
+            } else {
+                ""
+            },
+            self.calls.iter().cloned().collect::<Vec<_>>().join(" ")
+        );
         println!(
             "[wire] session bytes  : {} KiB client->daemon, {} KiB daemon->client",
             up / 1024,
@@ -2187,13 +2233,13 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         // costs. Recording a take-back would fold our own
                         // impatience into the threshold that produced it.
                         if matches!(r, Adoption::Done(_)) {
-                            self.adopted_ms.held().push(t_adopt);
+                            remember(&mut self.adopted_ms.held(), t_adopt);
                             // Still alone at the END as well as the start:
                             // a second adoption arriving mid-build makes the
                             // sample contended, and a contended sample is the
                             // endogenous number this exists to avoid.
                             if alone && still_alone {
-                                self.solo_ms.held().entry(peer).or_default().push(t_adopt);
+                                remember(self.solo_ms.held().entry(peer).or_default(), t_adopt);
                             }
                         }
                         r
@@ -2630,6 +2676,42 @@ mod tests {
             super::hedge_after(&with_straggler),
             Some(std::time::Duration::from_millis(28_800))
         );
+    }
+
+    #[test]
+    fn the_hedge_forgets_a_fleet_that_is_no_longer_slow() {
+        // Timing history grew forever. Three faults, one cause.
+        //
+        // Memory and CPU are the obvious two: `hedge_after` clones and sorts
+        // the WHOLE history on every adoption, so a long-lived proxy pays
+        // O(n log n) against an n that never stops rising.
+        //
+        // The third is the one that matters. An all-time median cannot track
+        // conditions. A fleet that was slow this morning keeps a high
+        // threshold all afternoon, so the hedge stops withdrawing from
+        // stragglers exactly when the rest of the fleet has got fast enough
+        // for one to matter.
+        let mut v = Vec::new();
+        for _ in 0..200 {
+            super::remember(&mut v, 10_000);
+        }
+        let slow = super::hedge_after(&v).expect("a threshold");
+
+        // Conditions improve. Enough observations to fill the window, and no
+        // more - if the window were unbounded the old 10s samples would still
+        // be half the sample and the median would barely move.
+        for _ in 0..super::OBSERVATIONS {
+            super::remember(&mut v, 100);
+        }
+        let fast = super::hedge_after(&v).expect("a threshold");
+
+        assert_eq!(v.len(), super::OBSERVATIONS, "the window is not bounded");
+        assert!(
+            fast < slow,
+            "hedge did not follow the fleet down: {fast:?} vs {slow:?}"
+        );
+        // 100ms work: 3x the median is under the floor, so the floor governs.
+        assert_eq!(fast, std::time::Duration::from_secs(5));
     }
 
     /// Fast work is not hedged on jitter.
