@@ -1638,7 +1638,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                             .await;
                         t_adopt = t.elapsed().as_millis() as u64;
                         match led {
-                            Some(reference) => {
+                            Ok(reference) => {
                                 println!("[proxy] fleet built it: {reference}");
                                 self.wire.held().routed += 1;
                                 // `Led` carries a bare `host:port/repo:tag` -
@@ -1670,7 +1670,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                             // Nobody took it. Not a failure and not a
                             // refusal to report against any machine: we
                             // build it here, exactly as without a fleet.
-                            None => {
+                            Err(why) => {
                                 // Nobody took it. Say WHAT was in the graph,
                                 // once: a refusal with no shape attached is
                                 // how two wrong theories got as far as they
@@ -1682,11 +1682,15 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                                     );
                                 }
                                 self.wire.held().home += 1;
+                                // The DRIVER's reason, not ours. Four workers
+                                // idle and one lead taken read as "fleet took
+                                // nothing" five times over, which named the
+                                // outcome and hid the cause.
                                 *self
                                     .wire
                                     .held()
                                     .rejected
-                                    .entry("fleet took nothing".to_owned())
+                                    .entry(format!("fleet: {why}"))
                                     .or_default() += 1;
                             }
                         }

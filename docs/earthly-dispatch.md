@@ -265,3 +265,54 @@ earthbuild's Earthfile.
 - Raised upstream: [EarthBuild/earthbuild#784](https://github.com/EarthBuild/earthbuild/issues/784).
   Issue only - no patch offered, and any PR needs consent first.
 - Earthfile counts: 2026-08-09, at earthbuild `main`.
+
+## Climbed: a real earthly subtree, built by a peer
+
+2026-08-10. `earthly +code` through the gateway, one worker, all four #784
+sites gated locally, `REBUCK2_PEER_CACHE_MOUNTS=1`:
+
+```text
+build: yes in 88s
+gateway solves : 6      placed        : {1: 6}
+solves routed  : 1      built at home : 5
+                        subtree job 1 built at sha256:8b32973def46cb54...
+```
+
+One solve from earthbuild's own root Earthfile was cut out, handed to
+another daemon over the mesh, published by digest, pulled back and consumed.
+The other five are backpressure, not failure: one worker holds one lead.
+
+Getting there cost four bugs, and every one of them was ours reporting
+success it had not earned:
+
+| what it claimed | what was true | how it was found |
+| ---------------------------- | ------------------------------- | ------------------------- |
+| `inspect`: graph is clean | two mounts of type 101 | asked the graph, not the converter |
+| worker: `built at subtree:job-1` | nothing pushed under that name | the tag file was the base's |
+| registry: `served 22 requests` | six of them were 404s | counted status, not shape |
+| daemon: solve succeeded | it exported nothing | the fork never saw an exporter |
+
+The last is the one worth remembering. Our `SolveRequest` named its exporter
+only in `exporters`, the repeated field added in buildkit 0.13. earthly's
+fork is cut from 2024-05 and has `Exporter = 3` / `ExporterAttrs = 4` and
+nothing else. Protobuf drops unknown fields **silently**, so the request
+arrived asking for no export, and the daemon correctly solved, exported
+nothing, and returned success. No error on the wire, none in the daemon log,
+and a 200 in the registry tally for the base image that mirrored fine beside
+it.
+
+An unknown protobuf field is not a compatibility warning; it is a hole with a
+success code over it. The `-Deprecated` suffix on those two fields reads like
+a thing to avoid, and it is the only thing a 2024 daemon can read.
+
+## The correction this section is
+
+The ladder above says #784 gates everything. That was right. It also implied
+the rungs above it had been measured, and they had not: every earlier figure
+counted `placed` - solves that cleared exclusion - as though it were
+dispatch. `routed`, meaning a peer actually built it, was **0 for all of
+them**. The two differ by a worker that accepts a lead and then fails, which
+is exactly what was happening and exactly what nothing was counting.
+
+The published figures were the optimistic column, and no run before today had
+a non-zero one in the other.

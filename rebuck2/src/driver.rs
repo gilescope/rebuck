@@ -289,7 +289,7 @@ enum Requester {
     /// The gateway in-process. Resolves to the image ref a peer published,
     /// or `None` for "nobody took it" - which the caller treats as "build it
     /// here", exactly as a worker does with `Unplaced`.
-    Gateway(tokio::sync::oneshot::Sender<Option<String>>),
+    Gateway(tokio::sync::oneshot::Sender<Result<String, String>>),
 }
 
 impl Requester {
@@ -1483,7 +1483,11 @@ impl Driver {
                 .await
             }
             Requester::Gateway(tx) => {
-                let _ = tx.send(None);
+                // The `why` the worker branch sends is the same `why` this
+                // branch used to discard, which is how the gateway came to
+                // report every refusal as "fleet took nothing" - one string
+                // covering saturation, exclusion and an empty fleet alike.
+                let _ = tx.send(Err(why.to_owned()));
             }
         }
     }
@@ -1500,13 +1504,14 @@ impl Driver {
         self: &Arc<Self>,
         subtree: Vec<u8>,
         frontier: Vec<Dig>,
-    ) -> Option<String> {
+    ) -> Result<String, String> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.place_subtree(Requester::Gateway(tx), subtree, frontier)
             .await;
         // A dropped sender is a driver that forgot the job; treat it as
         // unplaced rather than hanging on a Solve that will never answer.
-        rx.await.unwrap_or(None)
+        rx.await
+            .unwrap_or_else(|_| Err("driver dropped the job".to_owned()))
     }
 
     /// A peer built it. Tell the requester where, and forget the placement -
@@ -1518,7 +1523,7 @@ impl Driver {
         match st.requester {
             Requester::Worker(id) => self.tell(id, D2W::Placed { job, image_ref }).await,
             Requester::Gateway(tx) => {
-                let _ = tx.send(Some(image_ref));
+                let _ = tx.send(Ok(image_ref));
             }
         }
     }
@@ -3425,7 +3430,13 @@ mod tests {
         .await
         .expect("lead_subtree hung with no workers to place on");
 
-        assert_eq!(answer, None, "an empty fleet must answer, and answer no");
+        // And SAY SO. A bare no is what let five refusals across four idle
+        // workers all report as "fleet took nothing".
+        let why = answer.expect_err("an empty fleet must answer, and answer no");
+        assert!(
+            !why.is_empty(),
+            "the refusal must carry the driver's reason"
+        );
     }
 
     #[tokio::test]
