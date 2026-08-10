@@ -35,6 +35,12 @@ on:
     branches: [giles-dispatch-ci]
   workflow_dispatch:
     inputs:
+      peer_cache_mounts:
+        description: "lift cache mounts so subtrees can travel (1 = yes)"
+        default: "1"
+      home_slots:
+        description: "slots peer 0 keeps for itself - 0 forces dispatch"
+        default: "0"
       earthly_flags:
         description: "flags for earthly - upstream uses --ci -P"
         default: "--ci -P"
@@ -56,6 +62,25 @@ env:
   #   --ci  changes output mode and strictness.
   # Not --no-cache, which this used to pass and upstream does not.
   EARTHLY_FLAGS: ${{ inputs.earthly_flags || '--ci -P' }}
+  # WITHOUT THESE THE RUN IS GREEN AND MEASURES NOTHING.
+  #
+  # First green CI run reported:
+  #
+  #   solves routed : 0
+  #   not routed    : {"excluded: CacheMount": 5, "home has room": 1}
+  #
+  # Both are correct behaviour and both are defaults that mean "do not
+  # distribute". Every local probe has passed these since the first day and
+  # neither ever reached the workflow, so CI was exercising the pipeline and
+  # not the fleet - the most convincing kind of green there is.
+  #
+  #   PEER_CACHE_MOUNTS  earthbuild's Earthfile puts a cache mount on most
+  #                      RUNs; without lifting them 5 of 6 solves are
+  #                      excluded before placement is even considered.
+  #   HOME_SLOTS=0       otherwise peer 0 takes the work itself whenever it
+  #                      has room, which on an idle runner is always.
+  REBUCK2_PEER_CACHE_MOUNTS: ${{ inputs.peer_cache_mounts || '1' }}
+  REBUCK2_HOME_SLOTS: ${{ inputs.home_slots || '0' }}
   # Written before `earthly bootstrap` in BOTH jobs. earthly hands this to the
   # buildkitd container as EARTHLY_ADDITIONAL_BUILDKIT_CONFIG, and a daemon
   # that does not trust the registry it is told to pull from fails the SILENT
