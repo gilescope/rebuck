@@ -473,6 +473,41 @@ subtree - but `REBUCK2_SERVE_SECRETS` and `REBUCK2_FORWARD_AGENT` still lift
 the exclusion, so the graph is offered and every worker declines it. Correct,
 and a wasted round trip.
 
+### M4.7 - a real earthly target, entirely on peers (DONE 2026-08-10)
+
+`earthly +code` against earthbuild's own root Earthfile, four workers:
+**6 of 6 solves routed, 0 built at home.** Details and the wall-clock
+caveat in `earthly-dispatch.md`; the short version is that this measures
+dispatch, not speed, because four workers on one laptop share one daemon.
+
+What it took was not scheduling work. Five defects, and every one of them
+was a component of ours reporting a success it had not earned:
+
+1. `inspect` failed OPEN on mount types it did not know, so earthly's
+   fork-only `SOCKET = 101` read as a clean graph. Now an unmodelled mount
+   type is a blocker no flag lifts.
+2. `build_subtree` fell back to the tag when the exporter reported no
+   digest - naming the one reference guaranteed to be absent, because the
+   exporter reports no digest precisely when it did not export.
+3. Our `SolveRequest` named its exporter only in `exporters`, added in
+   buildkit 0.13. earthly's fork is from 2024-05 and reads
+   `Exporter`/`ExporterAttrs`. Protobuf drops unknown fields silently, so
+   the daemon was asked for no export, did none, and returned success.
+4. The driver's refusal reached the gateway stripped of its reason: four
+   idle workers reported as "fleet took nothing".
+5. Three components decided the travel policy independently and disagreed.
+
+The through-line is worth stating as a rule for the rungs above:
+
+> Everything that reports success must be able to say what it did. A
+> component that can only say "fine" cannot be debugged by a fleet, only
+> by a person with a hypothesis - and this project spent a day on two
+> wrong ones before asking the graph what it actually contained.
+
+Next rungs, in order: bigger targets from the same Earthfile (`+lint`,
+`+unit-test`), then more than one machine, then the 19-worker shape the
+whole thing is for.
+
 ### M5 - coalesce CI to one build
 
 `+test-no-qemu` already BUILDs all twelve groups; no repo reorganisation. One
