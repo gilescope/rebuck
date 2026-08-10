@@ -768,6 +768,9 @@ impl Span {
 /// leave a report that is bounded and wrong.
 #[derive(Default)]
 pub struct Wire {
+    /// Subtrees whose ancestry was replaced by an import of an already-built
+    /// result - the step from N prefixes to 1.
+    pub grafted: u64,
     pub solves: u64,
     pub ops: u64,
     pub registry_sources: u64,
@@ -1476,6 +1479,10 @@ pub async fn serve(
         // comparison is against the number of workers, not against the
         // number of solves.
         println!("[wire] peak in flight : {peak} subtree(s) at once");
+        println!(
+            "[wire] grafted        : {} subtree(s) started from a built ancestor",
+            wire.held().grafted
+        );
         if uniq > 0 {
             // 1.0x means the subtrees are disjoint and a fleet divides the
             // work. Higher means every machine is rebuilding the same
@@ -1897,6 +1904,53 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                             .collect();
                         println!("[proxy] context unmirrored, still local: {stuck:?}");
                     }
+                    // GRAFT what a peer has already built, before deciding
+                    // whether this is worth dispatching.
+                    //
+                    // Without it every subtree carries its whole ancestor
+                    // chain and each worker executes it: 675s of lead-work
+                    // against a 144s baseline, which is three workers each
+                    // rebuilding the same prefix. With it the chain becomes an
+                    // image pull, and the CCR arithmetic says that trade wins
+                    // by two orders of magnitude - an apt-layer costs 30-120s
+                    // to build and 40-400ms to fetch.
+                    //
+                    // OFF unless REBUCK2_GRAFT=1 until it is measured. The
+                    // last four remedies were each chosen before the
+                    // measurement that would have ruled them out.
+                    let portable = if std::env::var("REBUCK2_GRAFT").as_deref() == Ok("1") {
+                        let built = self.driver.built_ops().await;
+                        if built.is_empty() {
+                            portable
+                        } else {
+                            let before = portable.def.len();
+                            let g = crate::dispatch::graft_built(&portable, &|d| {
+                                built.get(d).map(|r| {
+                                    if let Some(h) = r.strip_prefix("sha256:") {
+                                        format!(
+                                            "docker-image://{}/{}@sha256:{h}",
+                                            mirror.registry,
+                                            crate::solve::SUBTREE_REPO
+                                        )
+                                    } else if r.contains("://") {
+                                        r.clone()
+                                    } else {
+                                        format!("docker-image://{r}")
+                                    }
+                                })
+                            });
+                            if g.def != portable.def {
+                                self.wire.held().grafted += 1;
+                                println!(
+                                    "[proxy] grafted a built ancestor into a {before}-op graph"
+                                );
+                            }
+                            g
+                        }
+                    } else {
+                        portable
+                    };
+
                     // And now STRICTLY. Mirroring is best effort: a git
                     // source we failed to publish leaves the subtree exactly
                     // as grounded as it was, and offering it anyway sends a

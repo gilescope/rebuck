@@ -887,6 +887,86 @@ pub fn rewrite_git_sources(
     rewrite_sources(def, "git://", replacement)
 }
 
+/// Replace ops we have ALREADY BUILT with an import of their published result.
+///
+/// This is the step from N prefixes to 1, and it is the only thing measurement
+/// has left standing. A dispatched subtree carries its whole ancestor chain,
+/// buildkit dedupes only within one daemon, so three workers build the shared
+/// prefix three times where one machine builds it once - measured at 675s of
+/// lead-work against a 144s baseline, which is the duplication ceiling and not
+/// a scheduling problem.
+///
+/// Keyed on the OP DIGEST, which is sound because a buildkit op's bytes embed
+/// the digests of its inputs: two ops with the same digest have the same
+/// ancestry, transitively, so an image built from one is a correct substitute
+/// for the other.
+///
+/// The replaced op keeps no inputs. That is the point - the ancestry stops
+/// being work and becomes a pull.
+pub fn graft_built(def: &pb::Definition, built: &dyn Fn(&str) -> Option<String>) -> pb::Definition {
+    let digest = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
+
+    // Untouched means UNTOUCHED. Reserialising an unchanged graph changes
+    // every digest and buildkit reads that as a whole-build cache miss.
+    if !def.def.iter().any(|b| built(&digest(b)).is_some()) {
+        return def.clone();
+    }
+
+    let mut remap: BTreeMap<String, String> = BTreeMap::new();
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(def.def.len());
+    let mut metadata = def.metadata.clone();
+
+    for bytes in &def.def {
+        let before = digest(bytes);
+        if let Some(reference) = built(&before) {
+            // Grafted: an image source in place of the op and everything it
+            // depended on. Its inputs are dropped, so the ops above it become
+            // unreachable - harmless, buildkit walks from the terminal.
+            let src = pb::Op {
+                op: Some(pb::op::Op::Source(pb::SourceOp {
+                    identifier: reference,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            let nb = src.encode_to_vec();
+            let after = digest(&nb);
+            if after != before {
+                remap.insert(before.clone(), after.clone());
+                if let Some(m) = metadata.remove(&before) {
+                    metadata.insert(after, m);
+                }
+            }
+            out.push(nb);
+            continue;
+        }
+        let Ok(mut op) = pb::Op::decode(bytes.as_slice()) else {
+            out.push(bytes.clone());
+            continue;
+        };
+        for input in &mut op.inputs {
+            if let Some(new) = remap.get(&input.digest) {
+                input.digest = new.clone();
+            }
+        }
+        let nb = op.encode_to_vec();
+        let after = digest(&nb);
+        if after != before {
+            remap.insert(before.clone(), after.clone());
+            if let Some(m) = metadata.remove(&before) {
+                metadata.insert(after, m);
+            }
+        }
+        out.push(nb);
+    }
+
+    pb::Definition {
+        def: out,
+        metadata,
+        ..def.clone()
+    }
+}
+
 /// The cascade, shared by both rewrites.
 fn rewrite_sources(
     def: &pb::Definition,
@@ -1943,6 +2023,68 @@ mod tests {
             seen.into_inner(),
             vec!["example.com/r.git#main".to_owned()],
             "the replacement is called WITHOUT the scheme"
+        );
+    }
+
+    #[test]
+    fn a_built_ancestor_becomes_a_pull_not_a_rebuild() {
+        // The step from N prefixes to 1.
+        //
+        // Measured: three workers spend 675s of lead-work doing what one
+        // machine does in 144s, because each dispatched subtree carries its
+        // whole ancestor chain and buildkit dedupes only within one daemon.
+        // Grafting turns that chain into an image the worker pulls.
+        let base = plain();
+        let base_d = format!("sha256:{}", crate::store::sha256_hex(&base.encode_to_vec()));
+        let mut mid = plain();
+        mid.inputs = vec![pb::Input {
+            digest: base_d.clone(),
+            index: 0,
+        }];
+        let mid_b = mid.encode_to_vec();
+        let mid_d = format!("sha256:{}", crate::store::sha256_hex(&mid_b));
+        let mut top = plain();
+        top.inputs = vec![pb::Input {
+            digest: mid_d.clone(),
+            index: 0,
+        }];
+        let d = pb::Definition {
+            def: vec![base.encode_to_vec(), mid_b, top.encode_to_vec()],
+            ..Default::default()
+        };
+
+        // Nothing built yet: byte-identical, because reserialising an
+        // unchanged graph changes every digest and buildkit reads that as a
+        // whole-build cache miss.
+        assert_eq!(
+            graft_built(&d, &|_| None).def,
+            d.def,
+            "no-op must not touch"
+        );
+
+        // `mid` has been built and published. It should become a source, and
+        // `top` should point at the NEW digest.
+        let out = graft_built(&d, &|dg| {
+            (dg == mid_d).then(|| "docker-image://reg/x@sha256:beef".to_owned())
+        });
+        let ops: Vec<pb::Op> = out
+            .def
+            .iter()
+            .map(|b| pb::Op::decode(b.as_slice()).unwrap())
+            .collect();
+        let grafted = &ops[1];
+        assert!(
+            matches!(&grafted.op, Some(OpKind::Source(s)) if s.identifier.ends_with("@sha256:beef")),
+            "the built op must become an import"
+        );
+        assert!(
+            grafted.inputs.is_empty(),
+            "a grafted op keeps no inputs - the ancestry stops being work"
+        );
+        let new_mid = format!("sha256:{}", crate::store::sha256_hex(&out.def[1]));
+        assert_eq!(
+            ops[2].inputs[0].digest, new_mid,
+            "the consumer must follow the graft, or the graph dangles"
         );
     }
 

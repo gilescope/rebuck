@@ -348,6 +348,13 @@ pub struct Driver {
     /// and the fleet divides the work, 10.0 means ten machines would each
     /// build nine tenths of the same graph.
     dispatched_ops: tokio::sync::Mutex<(std::collections::HashSet<String>, u64)>,
+    /// op digest -> the image a peer published for it.
+    ///
+    /// What makes the step from N prefixes to 1 possible: a later graph
+    /// containing this op can import the result instead of rebuilding the
+    /// chain beneath it. Sound because an op's bytes embed its inputs'
+    /// digests, so equal digests mean equal ancestry, transitively.
+    built: tokio::sync::Mutex<std::collections::HashMap<String, String>>,
     /// Distinct `(op, worker)` pairs - what the fleet will actually EXECUTE.
     ///
     /// Dispatch duplication is an upper bound and not the cost: a worker's
@@ -442,6 +449,7 @@ impl Driver {
             cache_cost: Default::default(),
             peak_inflight: Default::default(),
             dispatched_ops: Default::default(),
+            built: Default::default(),
             op_by_worker: Default::default(),
             store,
             cfg,
@@ -717,6 +725,31 @@ impl Driver {
                         // Read the open record BEFORE `led` consumes it: the
                         // timing and the cache ids live there, and the whole
                         // point is to attribute this job's seconds.
+                        // The op this image IS, so a later graph can import
+                        // it rather than rebuild its chain. The terminal op is
+                        // buildkit's marshalling convention: last in `def`,
+                        // inputs pointing at the real root.
+                        {
+                            use prost::Message;
+                            let root = self.subtrees.lock().await.get(&job).and_then(|st| {
+                                bollard_buildkit_proto::pb::Definition::decode(
+                                    st.subtree.as_slice(),
+                                )
+                                .ok()
+                                .and_then(|d| {
+                                    d.def.last().and_then(|term| {
+                                        bollard_buildkit_proto::pb::Op::decode(term.as_slice())
+                                            .ok()
+                                            .and_then(|o| {
+                                                o.inputs.first().map(|i| i.digest.clone())
+                                            })
+                                    })
+                                })
+                            });
+                            if let Some(r) = root {
+                                self.built.lock().await.insert(r, image_ref.clone());
+                            }
+                        }
                         let (ms, caches) = {
                             let open = self.subtrees.lock().await;
                             match open.get(&job) {
@@ -1639,6 +1672,11 @@ impl Driver {
         let d = self.dispatched_ops.lock().await;
         let pairs = self.op_by_worker.lock().await.len();
         (d.0.len(), d.1, pairs)
+    }
+
+    /// What a peer has already built and published, by op digest.
+    pub async fn built_ops(&self) -> std::collections::HashMap<String, String> {
+        self.built.lock().await.clone()
     }
 
     /// The most subtrees in flight at once, over the whole run.
