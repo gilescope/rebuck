@@ -1162,10 +1162,75 @@ pub fn graft_built(def: &pb::Definition, built: &dyn Fn(&str) -> Option<String>)
         out.push(nb);
     }
 
-    pb::Definition {
+    prune(pb::Definition {
         def: out,
         metadata,
         ..def.clone()
+    })
+}
+
+/// Drop everything the terminal cannot reach.
+///
+/// Grafting orphans by construction: replacing a subtree root with the image
+/// it built makes every op beneath it unreachable, and they stay in `def`
+/// unless something removes them. Buildkit tolerates that - `loadLLB` walks
+/// from the terminal and never looks at the rest - so it costs only bytes on
+/// the wire, which is why it went unnoticed.
+///
+/// What it does NOT tolerate is our own arithmetic. The cut-prefix picker
+/// excludes "the whole graph" by comparing a cut's op count against
+/// `def.len()`; orphans inflate the divisor, a terminal-rooted cut slips
+/// through, and the graph that gets dispatched has two terminals in it. The
+/// symptom was `no support for <nil>`, three hops away from this line.
+///
+/// Order is preserved, so the terminal stays last - which is the only way
+/// buildkit knows it IS the terminal.
+fn prune(def: pb::Definition) -> pb::Definition {
+    let digest = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
+    let by_digest: BTreeMap<String, usize> = def
+        .def
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (digest(b), i))
+        .collect();
+
+    let Some(last) = def.def.len().checked_sub(1) else {
+        return def;
+    };
+    let mut keep = std::collections::BTreeSet::new();
+    let mut stack = vec![last];
+    while let Some(i) = stack.pop() {
+        if !keep.insert(i) {
+            continue;
+        }
+        let Some(op) = def
+            .def
+            .get(i)
+            .and_then(|b| pb::Op::decode(b.as_slice()).ok())
+        else {
+            continue;
+        };
+        for input in &op.inputs {
+            if let Some(&j) = by_digest.get(&input.digest) {
+                stack.push(j);
+            }
+        }
+    }
+    if keep.len() == def.def.len() {
+        return def;
+    }
+
+    let out: Vec<Vec<u8>> = keep.iter().map(|&i| def.def[i].clone()).collect();
+    let live: std::collections::BTreeSet<String> = out.iter().map(|b| digest(b)).collect();
+    let metadata = def
+        .metadata
+        .into_iter()
+        .filter(|(k, _)| live.contains(k))
+        .collect();
+    pb::Definition {
+        def: out,
+        metadata,
+        ..def
     }
 }
 
@@ -1771,6 +1836,47 @@ mod tests {
         pb::Definition {
             def: encoded,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn grafting_leaves_no_orphans_behind() {
+        // Replacing a subtree with the image it built makes every op BELOW
+        // the replaced root unreachable - and they stayed in `def`, which is
+        // how `no support for <nil>` got in. The cut-prefix picker excludes
+        // "the whole graph" by comparing a cut's op count against
+        // `def.len()`, and orphans make that comparison lie: a cut rooted at
+        // the TERMINAL counts fewer ops than the definition holds, passes the
+        // filter, and gets dispatched. Which is also why the error only ever
+        // appeared with grafting on.
+        let d = chain(vec![
+            (src("docker-image://docker.io/library/alpine:3.20"), vec![]),
+            (plain(), vec![0]), // gets replaced
+            (plain(), vec![1]),
+            (pb::Op::default(), vec![2]),
+        ]);
+        let target = format!("sha256:{}", crate::store::sha256_hex(&d.def[1]));
+        let g = graft_built(&d, &|dgst| {
+            (dgst == target).then(|| "docker-image://reg/built@sha256:abc".to_owned())
+        });
+
+        // op 0 is now an orphan: nothing reaches it once op 1 is a source.
+        assert_eq!(g.def.len(), 3, "the orphan is gone");
+        let ops: Vec<pb::Op> = g
+            .def
+            .iter()
+            .map(|b| pb::Op::decode(b.as_slice()).expect("decodes"))
+            .collect();
+        assert!(ops.last().expect("non-empty").op.is_none(), "terminal last");
+        // Metadata must follow: an entry keyed by a digest no longer in the
+        // definition is dead weight the graph carries to every worker.
+        for k in g.metadata.keys() {
+            assert!(
+                g.def
+                    .iter()
+                    .any(|b| &format!("sha256:{}", crate::store::sha256_hex(b)) == k),
+                "metadata for a pruned op: {k}"
+            );
         }
     }
 
@@ -2405,20 +2511,25 @@ mod tests {
             .iter()
             .map(|b| pb::Op::decode(b.as_slice()).unwrap())
             .collect();
-        let grafted = &ops[1];
-        assert!(
-            matches!(&grafted.op, Some(OpKind::Source(s)) if s.identifier.ends_with("@sha256:beef")),
-            "the built op must become an import"
-        );
+        // BY KIND, not by index: grafting prunes what the replaced op used to
+        // depend on, so positions shift by however much ancestry died.
+        let (at, grafted) = ops
+            .iter()
+            .enumerate()
+            .find(|(_, o)| matches!(&o.op, Some(OpKind::Source(s)) if s.identifier.ends_with("@sha256:beef")))
+            .expect("the built op must become an import");
         assert!(
             grafted.inputs.is_empty(),
             "a grafted op keeps no inputs - the ancestry stops being work"
         );
-        let new_mid = format!("sha256:{}", crate::store::sha256_hex(&out.def[1]));
+        let new_mid = format!("sha256:{}", crate::store::sha256_hex(&out.def[at]));
         assert_eq!(
-            ops[2].inputs[0].digest, new_mid,
+            ops[at + 1].inputs[0].digest,
+            new_mid,
             "the consumer must follow the graft, or the graph dangles"
         );
+        // And the ancestry really is gone, not merely bypassed.
+        assert_eq!(out.def.len(), d.def.len() - 1, "the base op was pruned");
     }
 
     #[test]
