@@ -632,6 +632,8 @@ jobs:
 
       - name: what the fleet did
         if: always()
+        env:
+          MACHINES: ${{ needs.plan.outputs.count }}
         run: |
           set -euo pipefail
           kill -INT "$(cat proxy.pid)" 2>/dev/null || true
@@ -677,7 +679,9 @@ jobs:
           echo "   uploads far below blobs served means results were fetched"
           echo "   from the runners that built them, which is the whole point."
           echo "=== wall"
-          echo "one machine ${BASELINE_SECS:-?}s   ${WANT:-?} machines ${FLEET_SECS:-?}s"
+          # WANT lives in the coordinator step's own env, not the job's, so
+          # the headline read "? machines" for every run that printed it.
+          echo "one machine ${BASELINE_SECS:-?}s   ${MACHINES}${MACHINES:+ }machines ${FLEET_SECS:-?}s"
           # The comparison, stated rather than left to the reader: a fleet
           # that is slower has still proven dispatch and not yet proven
           # worth, and saying so here stops the dispatch count being quoted
