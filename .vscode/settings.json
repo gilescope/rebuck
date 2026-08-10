@@ -1,0 +1,8 @@
+{
+    "buck.projectConfig": {
+        "projectPath": "/Users/gilescope/git/gilescope/rebuck2/test",
+        "flavor": [],
+        "target": "",
+        "platform": "linux-x86_64"
+    }
+}

@@ -1064,11 +1064,31 @@ pub fn graft_built(def: &pb::Definition, built: &dyn Fn(&str) -> Option<String>)
             // Grafted: an image source in place of the op and everything it
             // depended on. Its inputs are dropped, so the ops above it become
             // unreachable - harmless, buildkit walks from the terminal.
+            // KEEP THE PLATFORM. A source op carries one, and buildkit
+            // resolves the image for it - `mirror_image` sets it for exactly
+            // this reason, or an arm64 daemon mirrors the arm64 variant and
+            // an x86 peer dies on `exit code: 255`.
+            //
+            // Dropping it here produced, three steps away:
+            //
+            //     no support for running processes with <nil> platform
+            //
+            // truncated by earthly to `no support for <nil>`. The first
+            // theory was a lossy proto round trip - plausible, since this
+            // codebase has lost an exporter and a mount type that way - and
+            // it was wrong: the platform was not lost in translation, it was
+            // never copied.
+            //
+            // Constraints travel too: a worker-selection constraint on the
+            // op it replaces still applies to fetching the result.
+            let replaced = pb::Op::decode(bytes.as_slice()).ok();
             let src = pb::Op {
                 op: Some(pb::op::Op::Source(pb::SourceOp {
                     identifier: reference,
                     ..Default::default()
                 })),
+                platform: replaced.as_ref().and_then(|o| o.platform.clone()),
+                constraints: replaced.as_ref().and_then(|o| o.constraints.clone()),
                 ..Default::default()
             };
             let nb = src.encode_to_vec();

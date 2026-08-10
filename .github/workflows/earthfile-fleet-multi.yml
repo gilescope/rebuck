@@ -574,8 +574,24 @@ jobs:
           start=$SECONDS
           # shellcheck disable=SC2086 # a flag LIST: word-splitting is the point
           EARTHLY_BUILDKIT_HOST="tcp://${LAN}:1234" \
-            earthly $EARTHLY_FLAGS "$TARGET" 2>&1 | tail -60
+            earthly $EARTHLY_FLAGS "$TARGET" > /tmp/fleet.log 2>&1 || true
+          tail -60 /tmp/fleet.log
+          grep -ao "^[^ ]* \*failed\*" /tmp/fleet.log | sed 's/ \*failed\*//' | sort -u > /tmp/fleet.failed || true
+          echo "fleet failed targets: $(wc -l < /tmp/fleet.failed | tr -d ' ')"
           echo "FLEET_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
+
+      - name: did the fleet change the answer
+        run: |
+          set -euo pipefail
+          # A target failing BOTH ways is the machine's problem. Failing only
+          # WITH the fleet is ours - and one does:
+          # `copy-test-verbose-output` asserts earthly did not transfer a file
+          # it does not need, and this fleet publishes the whole context.
+          if diff -u /tmp/baseline.failed /tmp/fleet.failed; then
+            echo "PARITY: the same $(wc -l < /tmp/baseline.failed | tr -d ' ') target(s) failed either way"
+          else
+            echo "::warning::the fleet changed the outcome - see the diff above"
+          fi
 
       - name: what the fleet did
         if: always()
