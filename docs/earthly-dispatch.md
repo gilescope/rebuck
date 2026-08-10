@@ -1081,3 +1081,58 @@ fleet. That is the parity check earning its place: a test asserting on
 earthly's own output is exactly the kind that a distributed build can break
 without breaking anything real, and it needs diagnosis rather than a
 `force_internal_buildkit` sprinkled on it to make the red go away.
+
+## The driver is off the data path, and it changed nothing
+
+Letting the driver redirect a blob fetch to a peer that already holds it
+(`GetByHashAs` -> `Provider`):
+
+| | before | after |
+| ------------- | -----: | ----: |
+| peer fetches | 5 | 36 |
+| driver fetches | 38-47 | 5-7 |
+| wall | 451s | 436s |
+
+The coordinator went from serving ~130 of 145 fetches to ~19 of ~128.
+Principle 6, finally true as a number: the driver arbitrates and carries
+almost nothing.
+
+**And the wall clock did not move** - 436s against 451s is inside the 18%
+noise. Transfer was never the bottleneck; it was architecturally wrong, which
+is a different complaint and worth fixing on its own terms. Both of those are
+worth saying, and only one of them is a speedup.
+
+### Where the time actually is
+
+```text
+104 leads, 675s of lead time
+p50 4.9s   p90 14.6s
+49 leads of <=10 ops -> median 521ms
+```
+
+Small leads are cheap, so this is not fixed per-solve overhead. The cost is in
+the large leads - and 675s of lead-work does what the baseline does in 144s.
+
+That is ~4.7x, and with three workers the ceiling for "every worker rebuilds
+the shared ancestry" is 3x plus transfer and coordination. **The fleet is at
+its duplication ceiling.** Dispatching a 106-op subtree hands a worker the
+whole chain from the base image up, and buildkit dedupes only within one
+daemon - so three daemons build it three times where one builds it once.
+
+### The remaining move, and it is the one that was named at the start
+
+Prefixes, in order of preference:
+
+```text
+0 prefixes   restored from the bank, across generations
+1 prefix     built once, published, imported by every worker
+N prefixes   one per worker - where we are
+12 prefixes  one per CI job - where upstream is
+```
+
+Everything measured today says the gap is the step from N to 1, and nothing
+else has moved it: not a shared cache (three configurations, all worse), not
+peer-to-peer transfer (correct, and neutral), not scheduling (the graph is
+parallel, peak 9). The subtree has to arrive with its ancestry already built
+and named as content, which is this repo's own principle 10 - hand over trees,
+not vertices - unimplemented at the point where it matters.
