@@ -46,9 +46,13 @@ OWN_BK=${OWN_BK:-rebuck2-earthly-bk}
 
 rm -rf "$RUN"; mkdir -p "$RUN"
 pids=()
+bk_names=()
 cleanup() {
   for p in "${pids[@]:-}"; do kill "$p" 2>/dev/null || true; done
   docker rm -f "$OWN_BK" >/dev/null 2>&1 || true
+  for n in "${bk_names[@]:-}"; do
+    [ -n "$n" ] && docker rm -f "$n" >/dev/null 2>&1 || true
+  done
 }
 trap cleanup EXIT
 
@@ -141,12 +145,54 @@ REBUCK2_MIRROR="$MIRROR_HOST:$REG_PORT" \
     --session "$SESSION" --store "$RUN/coord" >"$RUN/proxy.log" 2>&1 &
 pids+=("$!")
 
+# ONE DAEMON PER WORKER, which is the whole point and was not what this did.
+#
+# Every worker used to drive the coordinator's buildkitd. Placement was real,
+# but nothing ever crossed a daemon boundary: a subtree "handed to a peer" was
+# built by the same daemon that would have built it anyway, into the same
+# content store, and the requester found the result already local. That is why
+# `hits_peer` has never once been non-zero in this repo.
+#
+# Separate daemons make the handover cost what it actually costs - a push to
+# the mirror and a pull back - which is the thing being built here.
+#
+# Set WORKER_BK=shared to get the old behaviour for a quick placement check.
 for i in $(seq 1 "$WORKERS"); do
+  if [ "${WORKER_BK:-own}" = shared ]; then
+    w_bk="$BK_ADDR"
+  else
+    w_port=$((BK_PORT + i))
+    docker rm -f "$OWN_BK-$i" >/dev/null 2>&1 || true
+    docker run -d --name "$OWN_BK-$i" --privileged \
+      -p "$w_port:8372" \
+      -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
+      -e BUILDKIT_TLS_ENABLED=false \
+      -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG="[registry.\"$MIRROR_HOST:$REG_PORT\"]
+  http = true
+  insecure = true" \
+      "$BK_IMAGE" >/dev/null
+    w_bk="127.0.0.1:$w_port"
+    bk_names+=("$OWN_BK-$i")
+  fi
   "$BIN" worker --session "$SESSION" \
     --store "$RUN/worker-$i" \
-    --buildkit-addr "http://$BK_ADDR" \
+    --buildkit-addr "http://$w_bk" \
     --registry-addr "$MIRROR_HOST:$REG_PORT" >"$RUN/worker-$i.log" 2>&1 &
   pids+=("$!")
+done
+
+# Wait for every worker daemon before the barrier below: a worker whose
+# daemon is still starting joins the mesh, advertises the host's platform
+# because it cannot ask its daemon, and then declines everything.
+for n in "${bk_names[@]:-}"; do
+  [ -n "$n" ] || continue
+  for _ in $(seq 1 90); do
+    docker exec "$n" buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 && break
+    sleep 1
+  done
+  docker exec "$n" buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 || {
+    echo "worker daemon $n never became ready:"; docker logs --tail 20 "$n"; exit 1;
+  }
 done
 
 for _ in $(seq 1 40); do
@@ -186,5 +232,16 @@ echo "== how much could move, and why not"
 grep -E '^\[wire\] (solves routed|built at home|placed|not routed)' "$RUN/proxy.log" || true
 echo "== which worker took what"
 grep -oE -- '-> worker [0-9]+' "$RUN/proxy.log" | sort | uniq -c || true
+echo "== where each worker's blobs came from"
+# The point of separate daemons: a subtree built on worker N and consumed by
+# the requester has to MOVE. local=warm cache, peer=the mesh did its job,
+# driver=fell back through the coordinator.
+#
+# Reported per worker and not summed: one worker serving everything looks
+# identical to a healthy fleet once you add the columns up.
+for i in $(seq 1 "$WORKERS"); do
+  line=$(grep -E '^\[cas\] fetches' "$RUN/worker-$i.log" 2>/dev/null | tail -1)
+  echo "   worker $i: ${line:-no fetches (nothing crossed a boundary)}"
+done
 echo
 echo "logs in $RUN (earthly.log has the build itself)"

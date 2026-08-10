@@ -237,7 +237,11 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
             use std::sync::atomic::Ordering::Relaxed;
             let mut last = (0, 0, 0);
             loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                // 15s, not 60. This only prints on CHANGE, so the cost of
+                // a short interval is nothing, and the cost of a long one is
+                // a 90-second build reporting no blob movement at all -
+                // indistinguishable from a fleet where none happened.
+                tokio::time::sleep(Duration::from_secs(15)).await;
                 let now = (
                     blobs.hits_local.load(Relaxed),
                     blobs.hits_peer.load(Relaxed),
