@@ -1183,3 +1183,49 @@ Step 2 is the part no current code does. Everything today dispatches the
 moment a solve arrives, which is exactly when nothing has been built. And the
 bank is the version of step 1-3 that costs nothing at all, because a previous
 generation already did it - which is why 0 prefixes beats 1.
+
+## Six remedies, and what they have in common
+
+`group10`, three workers, one variable at a time:
+
+| attempt | wall | verdict |
+| ------------------------ | ---: | ------- |
+| nothing | 443s | baseline for these |
+| graft | 458s | null |
+| graft + warm-up barrier | 489s | worse - serialisation costs and is not repaid |
+
+with, earlier and on `group2`:
+
+| attempt | verdict |
+| ---------------------------- | ------- |
+| shared cache, readwrite | worse (165s) |
+| shared cache, read-only | null |
+| one reference export + import | null |
+| peer-to-peer blob transfer | null, but architecturally right |
+
+**Every one of them requires something built earlier, and a cold run has
+nothing.** That is not six unrelated failures; it is one fact, established six
+times at roughly forty minutes each.
+
+The barrier was the last version of the argument that could be made within a
+single run: build the prefix first, serially, so the rest can import it. It
+costs a solve's worth of serialisation up front and does not earn it back,
+because the prefix it builds is used by the tail of the wave and the head has
+already gone.
+
+### The conclusion, which was the starting advice
+
+```text
+0 prefixes   restored from a previous generation - nothing to build
+1 prefix     built once inside this run - measured, does not pay
+N prefixes   one per worker - where the code is
+```
+
+A single cold run cannot get below N by very much, because everything that
+would reduce it has to be produced by the run itself, in front of the work
+that needs it. The bank is the only version where the prefix already exists
+when the first solve arrives.
+
+That makes persistence across runs the next piece of work, not another
+scheduling idea - and on a GitHub runner it means the coordinator's registry
+store surviving between runs, with care about what a restored layer may carry.
