@@ -132,7 +132,15 @@ jobs:
       matrix:
         n: ${{ fromJSON(inputs.workers || '[1,2,3,4,5,6]') }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 150, not 60. Sized for ONE group when that is what this built; the
+    # whole `+test-no-qemu` is twelve of them and runs TWICE - baseline then
+    # fleet. The first attempt was killed at 60 minutes, 51 of them into a
+    # run that had finished its baseline and was midway through the fleet
+    # leg, so it reported nothing at all.
+    #
+    # A measurement that cannot finish is not a slow measurement, it is no
+    # measurement.
+    timeout-minutes: 150
     permissions:
       contents: read
     steps:
@@ -262,7 +270,15 @@ jobs:
 
   coordinator:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 150, not 60. Sized for ONE group when that is what this built; the
+    # whole `+test-no-qemu` is twelve of them and runs TWICE - baseline then
+    # fleet. The first attempt was killed at 60 minutes, 51 of them into a
+    # run that had finished its baseline and was midway through the fleet
+    # leg, so it reported nothing at all.
+    #
+    # A measurement that cannot finish is not a slow measurement, it is no
+    # measurement.
+    timeout-minutes: 150
     permissions:
       contents: read
     steps:
