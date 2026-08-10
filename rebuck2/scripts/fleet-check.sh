@@ -83,6 +83,25 @@ guard() {
 # failure COUNT, so capturing a scenario that legitimately fails aborts the
 # suite at the assignment under `set -e` - before it can report the failure
 # it was written to detect.
+# A round's headline, or - if it produced no headline - its last words.
+#
+# `echo "$out" | grep '^wall' || true` was the whole of the reporting, so a
+# round that failed printed NOTHING and the assertions that followed said
+# "want 1, got 0" with no hint of why. On CI thirty-six checks failed that
+# way and the log showed section headings forty milliseconds apart and no
+# content at all.
+#
+# The `|| true` was still right: dying is worse. But silence is not a
+# report, and the output was already captured - it was simply never shown.
+wall_or_why() {
+  if echo "$1" | grep -qE '^ *wall'; then
+    echo "$1" | grep -E '^ *wall' | tr -s ' ' | sed 's/^/  /'
+  else
+    echo "  (no wall line - this round did not complete. Last output:)"
+    echo "$1" | tail -6 | sed 's/^/  | /'
+  fi
+}
+
 run() {
   # Everything shares one work size and slot count so the expected placement
   # is arithmetic rather than a guess.
@@ -122,13 +141,14 @@ leads() { echo "$1" | grep -cE -- '-> worker [0-9]+' || true; }
 
 echo "== baseline (one daemon, no proxy)"
 out=$(run NOPROXY=1 DAEMONS=1 RUN="$base" || true)
-echo "$out" | grep -E '^wall' | tr -s ' ' || true
+wall_or_why "$out"
 check "baseline builds succeed" "$(count "$out" '^failed  : 0')" 1
 
 echo
 echo "== two daemons: saturation places the surplus away"
 out=$(run DAEMONS=2 EXPECT="$base/digests.txt" || true)
-echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /' || true
+wall_or_why "$out"
+  echo "$out" | grep -E 'placed' | tr -s ' ' | sed 's/^/  /' || true
 present "outputs identical to baseline" "$out" 'outputs identical'
 check "home takes exactly its slots" \
   "$(echo "$out" | grep -o '{0: [0-9]*' | grep -o '[0-9]*$')" "$slots"
@@ -138,7 +158,7 @@ absent "and a healthy fleet says nothing alarming" "$out" 'no solve completed on
 echo
 echo "== a peer destroyed mid-build"
 out=$(run DAEMONS=2 KILL_AFTER=2 EXPECT="$base/digests.txt" || true)
-echo "$out" | grep -E '^wall' | tr -s ' ' | sed 's/^/  /' || true
+wall_or_why "$out"
 guard "every build still finishes" "$out" && check "every build still finishes" "$(count "$out" '^failed  : 0')" 1 || true
 present "outputs still identical" "$out" 'outputs identical'
 # The proxy no longer keeps strikes - refusal IS the signal, and it is the
@@ -154,7 +174,8 @@ echo "== more than one peer"
 # home and a single peer and the multi-peer half - rotation, least-loaded,
 # strike deprioritisation - was only ever exercised by unit tests.
 out=$(run DAEMONS=3 || true)
-echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /' || true
+wall_or_why "$out"
+  echo "$out" | grep -E 'placed' | tr -s ' ' | sed 's/^/  /' || true
 # Read from the DRIVER, not from `placed`. The gateway now reports only
 # home-or-fleet, so `placed {0: 8, 1: 4}` is true whether the four went to
 # one worker or two - which is exactly the failure this exists to catch, and
@@ -197,7 +218,8 @@ echo "== a peer that is slow rather than dead"
 # TIME and not CORRECTNESS: --cpus 0.15 on the last daemon, and the build
 # still completes with the same bytes.
 out=$(run DAEMONS=3 SLOW=0.15 ROUNDS=2 REBUCK2_HOME_SLOTS=4 EXPECT="$base/digests.txt" || true)
-echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /' || true
+wall_or_why "$out"
+  echo "$out" | grep -E 'placed' | tr -s ' ' | sed 's/^/  /' || true
 guard "a crawling worker still finishes the build" "$out" &&
   check "a crawling worker still finishes the build" "$(count "$out" '^failed  : 0')" 1 || true
 check "and the bytes are unchanged by its slowness" "$(count "$out" 'outputs identical')" 1
@@ -209,7 +231,8 @@ echo "== a named frontend cannot be distributed"
 # crosses the proxy and there is nothing to place. The point of the check is
 # that this stays a clean no-op: the build must still work.
 out=$(run DAEMONS=2 DOCKERFILE=1 || true)
-echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /' || true
+wall_or_why "$out"
+  echo "$out" | grep -E 'placed' | tr -s ' ' | sed 's/^/  /' || true
 guard "the build still succeeds" "$out" && check "the build still succeeds" "$(count "$out" '^failed  : 0')" 1 || true
 guard "and nothing was placed on a peer" "$out" &&
   check "and nothing was placed on a peer" "$(placed "$out" 1)" "" || true
@@ -243,7 +266,8 @@ echo "== a secret-bearing graph"
 # placed away therefore means the peer got the right value, not merely that
 # it started.
 out=$(run SECRET=1 DAEMONS=2 REBUCK2_SERVE_SECRETS=1 || true)
-echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /' || true
+wall_or_why "$out"
+  echo "$out" | grep -E 'placed' | tr -s ' ' | sed 's/^/  /' || true
 guard "every build finishes" "$out" && check "every build finishes" "$(count "$out" '^failed  : 0')" 1 || true
 check "the peer took the surplus" "$(placed "$out" 1)" "$((builds - slots))"
 
@@ -351,7 +375,8 @@ check "cache baseline succeeds" "$(count "$out" '^failed  : 0')" 1
 out=$(run CACHE=1 DAEMONS=2 EXPECT="$cachebase/digests.txt" || true)
 check "excluded while the flag is off" "$(placed "$out" 1)" ""
 out=$(run CACHE=1 DAEMONS=2 REBUCK2_PEER_CACHE_MOUNTS=1 EXPECT="$cachebase/digests.txt" || true)
-echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /' || true
+wall_or_why "$out"
+  echo "$out" | grep -E 'placed' | tr -s ' ' | sed 's/^/  /' || true
 check "the peer takes it with the flag on" "$(placed "$out" 1)" "$((builds - slots))"
 present "and its colder cache changes nothing" "$out" 'outputs identical'
 
@@ -370,7 +395,8 @@ else
   out=$(run SSHM=1 DAEMONS=2 REBUCK2_HOME_SLOTS=0 || true)
   check "excluded while the flag is off" "$(placed "$out" 1)" ""
   out=$(run SSHM=1 DAEMONS=2 REBUCK2_HOME_SLOTS=0 REBUCK2_FORWARD_AGENT=1 || true)
-  echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /' || true
+  wall_or_why "$out"
+  echo "$out" | grep -E 'placed' | tr -s ' ' | sed 's/^/  /' || true
   # The exec runs `ssh-add -l; test $? -ne 2`, so a build that reaches no
   # agent fails. Finishing means the peer talked to ours.
   guard "every build finishes" "$out" && check "every build finishes" "$(count "$out" '^failed  : 0')" 1 || true
@@ -402,7 +428,8 @@ else
 out=$(env -u REMOTE -u MIRROR_HOST REBUCK2_LLB_WORK="$work" \
   REBUCK2_HOME_SLOTS="$slots" \
   BUILDS="$builds" DAEMONS=2 FOREIGN="$foreign" "$fleet" 2>&1 || true)
-echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /' || true
+wall_or_why "$out"
+  echo "$out" | grep -E 'placed' | tr -s ' ' | sed 's/^/  /' || true
 # An emulated privileged buildkitd is the one scenario here with a real
 # environmental dependency: it can fail to START rather than fail an
 # assertion. Those are different facts and must not share a verdict - a
