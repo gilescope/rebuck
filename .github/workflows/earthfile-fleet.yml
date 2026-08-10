@@ -398,9 +398,22 @@ jobs:
           # own container instead of connecting.
           printf 'global:\n  tls_enabled: false\n' > "$RUNNER_TEMP/earthly.yml"
           # shellcheck disable=SC2086 # a flag LIST: word-splitting is the point
+          # NOT `set -e` on the build itself. A red baseline is not a
+          # fleet failure - `+test-no-qemu-group1` fails
+          # ./t/autocompletion+test-no-parent-at-root-from-home on a bare
+          # daemon with no proxy anywhere near it - and failing the job here
+          # would throw away the only comparison worth making.
+          #
+          # What matters is whether the fleet CHANGES the answer, which is
+          # what scripts/parity.sh does locally and what the compare step
+          # below now does here.
           EARTHLY_CONFIG="$RUNNER_TEMP/earthly.yml" \
           EARTHLY_BUILDKIT_HOST="tcp://${LAN}:18372" \
-            earthly $EARTHLY_FLAGS "$TARGET" 2>&1 | tail -40
+            earthly $EARTHLY_FLAGS "$TARGET" > /tmp/baseline.log 2>&1 || true
+          tail -40 /tmp/baseline.log
+          grep -ao "^[^ ]* \*failed\*" /tmp/baseline.log | sed 's/ \*failed\*//' \
+            | sort -u > /tmp/baseline.failed || true
+          echo "baseline failed targets: $(wc -l < /tmp/baseline.failed | tr -d ' ')"
           echo "BASELINE_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
 
       - name: through the fleet
@@ -416,8 +429,27 @@ jobs:
           # shellcheck disable=SC2086 # a flag LIST: word-splitting is the point
           EARTHLY_CONFIG="$RUNNER_TEMP/earthly.yml" \
           EARTHLY_BUILDKIT_HOST="tcp://${LAN}:1234" \
-            earthly $EARTHLY_FLAGS "$TARGET" 2>&1 | tail -40
+            earthly $EARTHLY_FLAGS "$TARGET" > /tmp/fleet.log 2>&1 || true
+          tail -40 /tmp/fleet.log
+          grep -ao "^[^ ]* \*failed\*" /tmp/fleet.log | sed 's/ \*failed\*//' \
+            | sort -u > /tmp/fleet.failed || true
+          echo "fleet failed targets: $(wc -l < /tmp/fleet.failed | tr -d ' ')"
           echo "FLEET_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
+
+      - name: did the fleet change the answer
+        run: |
+          set -euo pipefail
+          # The whole point. A target that fails BOTH ways is the machine's
+          # problem; a target that fails only with the fleet is ours; and a
+          # target that fails only WITHOUT it means the two runs were not
+          # comparable and the measurement is void.
+          if diff -u /tmp/baseline.failed /tmp/fleet.failed; then
+            n=$(wc -l < /tmp/baseline.failed | tr -d ' ')
+            echo "PARITY: the same $n target(s) failed either way"
+          else
+            echo "::error::the fleet changed the outcome - see the diff above"
+            exit 1
+          fi
 
       - name: what the fleet actually did
         if: always()
