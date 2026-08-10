@@ -161,8 +161,16 @@ echo "== earthly $TARGET through the proxy"
 start=$SECONDS
 # EARTHLY_BIN lets a PATCHED earthly be measured against the same fleet -
 # the only way to price EarthBuild#784 before it lands.
+# EARTHLY_ARGS carries flags the TARGET needs, not flags we prefer.
+# `+test-no-qemu` uses WITH DOCKER, which is `security.insecure`, and earthly
+# only requests that entitlement when --allow-privileged is passed
+# (build_cmd.go: `if b.cli.Flags().AllowPrivileged`). Without it the build
+# dies on `failed to load LLB: security.insecure is not allowed`, which reads
+# like the proxy stripped something and does not.
+# shellcheck disable=SC2086 # deliberate word-splitting: these are flags
 ( cd "$EB" && EARTHLY_BUILDKIT_HOST="tcp://$LAN:$PROXY_PORT" \
-    "${EARTHLY_BIN:-earthly}" "$TARGET" >"$RUN/earthly.log" 2>&1 ) && ok=yes || ok=no
+    "${EARTHLY_BIN:-earthly}" ${EARTHLY_ARGS:-} "$TARGET" >"$RUN/earthly.log" 2>&1 ) \
+  && ok=yes || ok=no
 echo "   build: $ok in $((SECONDS - start))s"
 
 kill -INT "${pids[0]}" 2>/dev/null || true

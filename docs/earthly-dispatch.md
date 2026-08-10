@@ -369,6 +369,7 @@ Same fleet, same day, the next rung up:
 | `+code` | 64 | 6 | 6 | 0 | yes, 114s | 4/2 |
 | `+unit-test` | 113 | 8 | 8 | 0 | yes, 126s | 4/2 |
 | `+lint` | 143 | 9 | 9 | 0 | yes, 149s | 6/3 |
+| `+lint-all` | 349 | 20 | 20 | 0 | yes, 143s | - |
 | `+all-binaries` | 638 | 33 | 33 | 0 | yes, 194s | 12/8/7/6 |
 
 `+all-binaries` is ten times the graph of `+code` and every solve of it was

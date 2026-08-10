@@ -1630,6 +1630,32 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                             _ => true,
                         }
                     });
+                    if !local_clear && self.wire.held().routed == 0 {
+                        // WHICH local sources survived the rewrite. 22 of 38
+                        // solves stopped here on a real target and the report
+                        // said only "context unmirrored" - true of a context
+                        // that failed to publish, one that was never asked
+                        // for, and one whose name we resolved differently.
+                        let stuck: Vec<String> = portable
+                            .def
+                            .iter()
+                            .filter_map(|b| {
+                                use prost::Message;
+                                match bollard_buildkit_proto::pb::Op::decode(b.as_slice())
+                                    .ok()
+                                    .and_then(|o| o.op)
+                                {
+                                    Some(bollard_buildkit_proto::pb::op::Op::Source(src))
+                                        if src.identifier.starts_with("local://") =>
+                                    {
+                                        Some(src.identifier)
+                                    }
+                                    _ => None,
+                                }
+                            })
+                            .collect();
+                        println!("[proxy] context unmirrored, still local: {stuck:?}");
+                    }
                     if local_clear && bases_clear {
                         use prost::Message;
                         let t = std::time::Instant::now();
