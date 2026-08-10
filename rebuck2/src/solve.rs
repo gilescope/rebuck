@@ -125,6 +125,58 @@ pub fn context_tag(session: &str, local_name: &str) -> String {
     )
 }
 
+/// Where the fleet keeps its shared buildkit cache, if it keeps one.
+///
+/// `None` unless REBUCK2_FLEET_CACHE=1, and OFF by default on purpose: this
+/// is the first change that could make the fleet FASTER rather than merely
+/// correct, and an unmeasured speedup that defaults on is indistinguishable
+/// from one that does not work.
+///
+/// The measurement it exists to answer: six machines took 590s against 307s
+/// on one, and `go-mod` (~24.2s per lead) plus `go-build` (~24.7s) account
+/// for the gap. A cache mount does not travel, so one machine pays that once
+/// and six machines pay it six times.
+pub fn fleet_cache_ref(registry: &str) -> Option<String> {
+    (std::env::var("REBUCK2_FLEET_CACHE").as_deref() == Ok("1"))
+        .then(|| format!("{registry}/rebuck2/cache:fleet"))
+}
+
+/// Import from the fleet cache, and export back into it.
+///
+/// ONE ref for the whole fleet, and last-writer-wins on the tag. That is
+/// crude and it is the right first version: the win being chased is a worker
+/// starting warm rather than re-downloading the Go module graph, and for
+/// that it does not matter whose export it reads, only that it reads one.
+///
+/// `ignore-error=true` on the export because a cache that fails to publish
+/// must never fail the build. The whole feature is an optimisation, and an
+/// optimisation that can turn a green build red is a liability.
+fn cache_opts(registry: &str) -> Option<control::CacheOptions> {
+    let r = fleet_cache_ref(registry)?;
+    let entry = |extra: &[(&str, &str)]| control::CacheOptionsEntry {
+        r#type: "registry".to_owned(),
+        attrs: [("ref".to_owned(), r.clone())]
+            .into_iter()
+            .chain(
+                extra
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned())),
+            )
+            .collect(),
+    };
+    Some(control::CacheOptions {
+        imports: vec![entry(&[("registry.insecure", "true")])],
+        exports: vec![entry(&[
+            ("registry.insecure", "true"),
+            // max: intermediate layers too, which is the whole point - a
+            // cache of final images would not warm a `go mod download`.
+            ("mode", "max"),
+            ("ignore-error", "true"),
+        ])],
+        ..Default::default()
+    })
+}
+
 /// The request that builds `def` and publishes it where a peer can get it.
 pub fn solve_request(
     job: u64,
@@ -153,6 +205,10 @@ pub fn solve_request(
             SOLVE_SEQ.fetch_add(1, Ordering::Relaxed)
         ),
         definition: Some(def),
+        // The fleet's shared cache, when one is configured. Both the fork
+        // and upstream have had Exports/Imports since v0.4.0, so unlike the
+        // exporter there is no deprecated pair to set as well.
+        cache: cache_opts(registry),
         // BOTH forms, deliberately. earthly's fork predates `exporters` and
         // reads only the deprecated pair; protobuf drops a field it does not
         // know without a word, so a request carrying only the new form asks
@@ -545,6 +601,40 @@ pub fn published_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_fleet_cache_is_off_unless_asked_for_and_never_fails_a_build() {
+        // OFF by default, and that is a decision rather than an oversight:
+        // this is the first change that could make the fleet faster instead
+        // of merely correct, and a speedup that defaults on before it is
+        // measured cannot be distinguished from one that does not work.
+        //
+        // (The env is process-wide, so this asserts the shape of what is
+        // built when it IS set, and leaves the default to
+        // `fleet_cache_ref`'s own condition.)
+        let opts = super::cache_opts("r:5000");
+        if std::env::var("REBUCK2_FLEET_CACHE").as_deref() == Ok("1") {
+            let o = opts.expect("enabled means Some");
+            assert_eq!(o.imports.len(), 1);
+            assert_eq!(o.exports.len(), 1);
+            let ex = &o.exports[0].attrs;
+            assert_eq!(
+                ex.get("ignore-error").map(String::as_str),
+                Some("true"),
+                "a cache that cannot publish must not fail the build - the \
+                 whole feature is an optimisation, and an optimisation that \
+                 turns a green build red is a liability"
+            );
+            assert_eq!(
+                ex.get("mode").map(String::as_str),
+                Some("max"),
+                "min caches final layers only, which would not warm a go mod download"
+            );
+            assert_eq!(o.imports[0].attrs.get("ref"), ex.get("ref"));
+        } else {
+            assert!(opts.is_none(), "must be off unless REBUCK2_FLEET_CACHE=1");
+        }
+    }
 
     #[test]
     fn a_digest_ref_keeps_the_registry_port_and_drops_the_tag() {
