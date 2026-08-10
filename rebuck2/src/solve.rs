@@ -84,6 +84,27 @@ fn publish_attrs(name: String) -> HashMap<String, String> {
     ])
 }
 
+/// A legal OCI tag naming one context within one build.
+///
+/// An OCI tag is `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`, and earthly names its
+/// contexts by relative path - `./buildkitd`, `./tests/config`. Interpolating
+/// the name made the reference illegal and the push failed with `invalid
+/// reference format`, which the gateway then reported as the context simply
+/// being unmirrored. 686 of 1326 solves on `+test-no-qemu`, over half the
+/// target, blocked on that.
+///
+/// HASHED, not sanitised. Any scheme that substitutes illegal characters
+/// collapses `./a/b` and `./a-b` onto one tag, and two contexts sharing a tag
+/// is a build that silently uses the wrong files.
+pub fn context_tag(session: &str, local_name: &str) -> String {
+    // The session stays readable: it is already tag-legal, and being able to
+    // see which build a tag belongs to is worth the length.
+    format!(
+        "{session}-{}",
+        &crate::store::sha256_hex(local_name.as_bytes())[..32]
+    )
+}
+
 /// The request that builds `def` and publishes it where a peer can get it.
 pub fn solve_request(
     job: u64,
@@ -200,7 +221,10 @@ pub async fn publish_context(
 
     // Named by the session, so two concurrent builds do not publish over
     // each other, and a rebuild of the same context is the same ref.
-    let name = format!("{registry}/rebuck2/context:{session}-{local_name}");
+    let name = format!(
+        "{registry}/rebuck2/context:{}",
+        context_tag(session, local_name)
+    );
     let attrs = publish_attrs(name.clone());
 
     let mut c = connect(bk_addr).await?;
@@ -445,6 +469,55 @@ pub fn published_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_context_tag_survives_a_context_name_with_a_slash_in_it() {
+        // Measured on `earthly +test-no-qemu`: 686 solves - over half the
+        // target - were reported as "context unmirrored" because the push
+        // failed with
+        //
+        //     failed to push .../rebuck2/context:<session>-./buildkitd:
+        //     invalid reference format
+        //
+        // An OCI tag is [a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}. Earthly names its
+        // contexts by relative path - `./buildkitd`, `./tests/config` - so
+        // the slash and the leading dot make the reference illegal. Exactly
+        // one context in that build had a name that happened to be legal.
+        //
+        // Hashed rather than sanitised: two different names must not
+        // collapse to one tag, and `./a/b` and `./a-b` both sanitise to the
+        // same thing under any character-substitution scheme.
+        for name in [
+            "./buildkitd",
+            "./tests/config",
+            "plain",
+            "./a/b",
+            "UPPER/Case",
+        ] {
+            let tag = context_tag("sess1", name);
+            assert!(
+                tag.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)),
+                "tag for {name:?} is not a legal OCI tag: {tag}"
+            );
+            assert!(
+                tag.chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric()),
+                "a tag may not start with a separator: {tag}"
+            );
+            assert!(tag.len() <= 128, "tag too long: {tag}");
+        }
+
+        // Distinct names, distinct tags - including the pair that any
+        // substitution scheme would collide.
+        assert_ne!(context_tag("s", "./a/b"), context_tag("s", "./a-b"));
+        // Distinct sessions, distinct tags: two concurrent builds must not
+        // publish over each other.
+        assert_ne!(context_tag("s1", "./x"), context_tag("s2", "./x"));
+        // Same inputs, same tag - a rebuild must reuse the reference.
+        assert_eq!(context_tag("s", "./x"), context_tag("s", "./x"));
+    }
 
     #[test]
     fn the_exporter_is_named_the_old_way_too_or_a_fork_ignores_it() {
