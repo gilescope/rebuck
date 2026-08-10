@@ -1512,11 +1512,20 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 // touches source identifiers, so the original graph gives
                 // the same verdict for nothing.
                 let verdict = crate::dispatch::inspect(&def);
-                let allowed = verdict.dispatchable_when(crate::dispatch::Allow {
+                let policy = crate::dispatch::Allow {
                     secrets: can_serve_secrets(&def),
                     caches: local_caches(),
                     agent: forwarding_agent(),
-                });
+                };
+                // ONCE MIRRORED, not as it stands. A git source grounds this
+                // graph today and will not once the driver has fetched it
+                // with the session it holds - and `make_portable`, which
+                // does that, only runs if we decide the graph is worth it.
+                //
+                // Judging strictly here shipped a git mirror that fired zero
+                // times on a target with 407 git-grounded solves. The graph
+                // is re-inspected strictly after the rewrite, below.
+                let allowed = verdict.dispatchable_once_mirrored(policy);
                 if !allowed {
                     // Name the secret, not just its kind. A build that
                     // declares none can still be full of them: a frontend
@@ -1730,7 +1739,24 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                             .collect();
                         println!("[proxy] context unmirrored, still local: {stuck:?}");
                     }
-                    if local_clear && bases_clear {
+                    // And now STRICTLY. Mirroring is best effort: a git
+                    // source we failed to publish leaves the subtree exactly
+                    // as grounded as it was, and offering it anyway sends a
+                    // peer at content nobody has.
+                    let mirrored = crate::dispatch::inspect(&portable);
+                    let sources_clear = mirrored.dispatchable_when(policy);
+                    if !sources_clear {
+                        *self
+                            .wire
+                            .held()
+                            .rejected
+                            .entry(format!(
+                                "still not portable: {:?}",
+                                mirrored.exclusions.first().map(|(_, e)| e)
+                            ))
+                            .or_default() += 1;
+                    }
+                    if local_clear && bases_clear && sources_clear {
                         use prost::Message;
                         let t = std::time::Instant::now();
                         // Empty frontier: a portable graph names every input

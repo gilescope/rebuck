@@ -155,6 +155,21 @@ impl Verdict {
         let blocked = self.exclusions.iter().any(|(_, e)| !lifted_by(e, allow));
         !blocked && !matches!(self.platform, Platform::Conflict(_))
     }
+
+    /// As [`Verdict::dispatchable_when`], but ignoring hazards the driver is
+    /// about to mirror away.
+    ///
+    /// For the decision of whether a graph is WORTH making portable. The
+    /// graph must be inspected again afterwards and pass the strict test:
+    /// mirroring is best-effort, and a source we failed to publish leaves
+    /// the subtree exactly as grounded as it was.
+    pub fn dispatchable_once_mirrored(&self, allow: Allow) -> bool {
+        let blocked = self
+            .exclusions
+            .iter()
+            .any(|(_, e)| !lifted_by(e, allow) && !fixable_by_mirroring(e));
+        !blocked && !matches!(self.platform, Platform::Conflict(_))
+    }
 }
 
 /// The fleet's standing policy on which hazards may travel.
@@ -172,6 +187,22 @@ pub fn policy() -> Allow {
         caches: std::env::var("REBUCK2_PEER_CACHE_MOUNTS").as_deref() == Ok("1"),
         ..Default::default()
     })
+}
+
+/// Can the DRIVER fix this hazard by republishing content, rather than the
+/// operator lifting it by policy?
+///
+/// A git source is not a property of the build the way a cache mount is: the
+/// driver holds a session, so it can fetch the tree and publish it as an
+/// image, and the hazard simply stops existing. Judging it on the raw graph
+/// refuses the subtree before the fix has a chance to run.
+///
+/// This distinction did not exist while every hazard lived on an ExecOp -
+/// rewriting only ever touched source identifiers, so the pre-rewrite
+/// verdict was the post-rewrite verdict. Adding source hazards broke that,
+/// silently: git mirroring was written, committed, and fired zero times.
+pub fn fixable_by_mirroring(e: &Exclusion) -> bool {
+    matches!(e, Exclusion::SessionSource(_))
 }
 
 /// Does `allow` lift this hazard?
@@ -1810,6 +1841,47 @@ mod tests {
             ),
             vec![7],
             "the gateway was allowed to offer this; the driver must agree"
+        );
+    }
+
+    #[test]
+    fn a_git_source_must_not_be_refused_before_the_mirror_runs() {
+        // The bug this encodes shipped: git mirroring was written, tested,
+        // committed, and fired ZERO times on a target with 407 git-grounded
+        // solves. `inspect` refused the graph before `make_portable` was
+        // ever called, so the code that would have fixed it never ran.
+        //
+        // The stale assumption was written down one line above the check:
+        // "hazards live on ExecOps and rewriting only touches source
+        // identifiers, so the original graph gives the same verdict". True
+        // until source hazards existed.
+        let mut g = plain();
+        g.op = Some(OpKind::Source(pb::SourceOp {
+            identifier: "git://github.com/example/repo.git#main".to_owned(),
+            ..Default::default()
+        }));
+        let v = inspect(&def(vec![g]));
+
+        assert!(
+            !v.dispatchable_when(Allow::default()),
+            "strictly, a raw git source is not dispatchable"
+        );
+        assert!(
+            v.dispatchable_once_mirrored(Allow::default()),
+            "but it is worth making portable, which is a different question"
+        );
+
+        // A hazard the driver CANNOT fix is still refused by both. Mirroring
+        // republishes content; it does not grant privileges.
+        let mut i = plain();
+        i.op = Some(OpKind::Exec(pb::ExecOp {
+            security: pb::SecurityMode::Insecure as i32,
+            ..exec_of(&plain())
+        }));
+        let iv = inspect(&def(vec![i]));
+        assert!(
+            !iv.dispatchable_once_mirrored(Allow::default()),
+            "no amount of republishing makes a peer's --privileged safe"
         );
     }
 
