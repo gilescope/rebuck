@@ -1229,3 +1229,51 @@ when the first solve arrives.
 That makes persistence across runs the next piece of work, not another
 scheduling idea - and on a GitHub runner it means the coordinator's registry
 store surviving between runs, with care about what a restored layer may carry.
+
+## The bank works, and grafts the wrong ops
+
+Four generations on `group10`, three workers, one bank carried between them:
+
+| generation | bank | wall | grafts | max ops/lead |
+| ---------- | ---- | ---: | -----: | -----------: |
+| gen1 | empty | 450s | 0 | 109 |
+| gen2 | 201 objects, no map | 431s | 0 | 109 |
+| gen3 | + map written (31 ops) | 459s | 50 | 109 |
+| gen4 | map restored (31 ops) | 444s | 61 | 109 |
+
+Everything works. The store persists, the map persists, 61 grafts fire on the
+first wave. And the wall clock does not move, because **the max stayed 109
+through all four**.
+
+### Why, and it is structural
+
+The driver records an op as built when a peer publishes a SUBTREE ROOT - the
+terminal's input. The shared prefix is interior to every dispatched graph: it
+is never itself a dispatch unit, so it is never published, so it never enters
+the map, so it can never be grafted. The graft replaces whole
+previously-dispatched subtrees, and those are the leaves.
+
+So the bank holds 43 leaf results and none of the ancestry that costs.
+
+Grafting a leaf saves rebuilding a leaf, which is cheap and already deduped
+within a worker. Grafting the PREFIX is the thing worth doing and is
+unreachable by construction.
+
+### What is left, stated precisely
+
+The prefix has to become a dispatch unit:
+
+```text
+1. analyse() already finds cuts - it is used for a log line and nothing else
+2. cut at the boundary many solves share
+3. build THAT as a subtree, publish it by digest
+4. it is now in the map, and every later graph grafts it
+```
+
+Step 1 exists. Steps 2-4 are the work, and they are the same work whether the
+prefix is built this run (1 prefix) or restored from the bank (0) - the bank
+only decides whether step 3 has already happened.
+
+Eight measured attempts have now converged on this one gap. None of them was
+wasted in the sense of being unmeasured, and all of them were chosen ahead of
+the measurement that would have pointed here.
