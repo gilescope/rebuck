@@ -538,6 +538,41 @@ registries contending for the same cores. `routed` and the peer:driver ratio
 are meaningful there; wall-clock is not, and has got monotonically WORSE with
 each honesty fix, because each one made the fleet do more real work.
 
+### M4.9 - across machines, on runners (DONE 2026-08-10)
+
+The thing this project is for, at one third of the intended size.
+
+**Four machines**, `+code`: 6 of 6 solves routed off-box, nothing built at
+home, nothing refused, and three blobs moved worker-to-worker.
+
+**Seven machines** (one coordinator, six workers), `+test-no-qemu-group2`,
+123 solves: 84 routed, 39 refused as `Insecure`, which is all of them - and
+the driver's share of blob traffic fell from 80% at three machines to 23% at
+six.
+
+**Locally, 11 of 12 test groups reach PARITY through the fleet** - the same
+set of targets fails with and without it, and for ten of the twelve that set
+is empty. group1's single failure is
+`./t/autocompletion+test-no-parent-at-root-from-home`, which fails on a bare
+daemon too.
+
+What it took, beyond the earlier milestones: three separate fixes for one
+idea. Subtree results, base images and contexts each crossed a machine named
+by TAG, and each was found only after fixing the one before, because a graph
+stops at the first thing it cannot pull.
+
+> Anything a peer must fetch is named by CONTENT. A tag is a name in one
+> machine's namespace, and a fleet has no namespace.
+
+None of the three is observable on one host, where every participant shares a
+registry and every tag resolves. A single-machine fleet cannot test the
+property that makes a fleet worth having - which is the argument for having
+run CI and local in parallel, and against the weeks spent not doing so.
+
+Remaining before nineteen: a baseline in the multi workflow (there is no
+wall-clock comparison yet), and the offer order, which gave one worker 38
+leads and another 2.
+
 ### M5 - coalesce CI to one build
 
 `+test-no-qemu` already BUILDs all twelve groups; no repo reorganisation. One
