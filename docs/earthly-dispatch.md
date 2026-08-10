@@ -816,3 +816,42 @@ chance.
 
 Worth fixing only if it costs wall clock, which needs the baseline this
 workflow does not yet run.
+
+## The fleet cache made it worse
+
+Six machines, `+test-no-qemu-group2`, one variable:
+
+| fleet cache | baseline | fleet | delta |
+| ----------- | -------: | ----: | ----: |
+| off | 307s | 590s | +283s |
+| on | 321s | 755s | +434s |
+
+Sharing a buildkit registry cache across the fleet cost a further **165s**.
+
+The reasoning behind it was sound and is worth keeping, because the numbers
+that motivated it have not changed: `go-mod` costs ~24.2s per lead and
+`go-build` ~24.7s, a cache mount does not travel, and six machines therefore
+pay six times what one machine pays once. That is still where the 283s goes.
+
+What was wrong was the remedy. `mode=max` exports the whole layer set after
+EVERY solve, and there were 84 of them: eighty-four uploads of a cache that
+grows as it goes, plus eighty-four imports of a manifest that grows with it.
+The cache costs more to move than the download it saves.
+
+Things this rules out, and things it does not:
+
+- **Ruled out**: export-per-solve to a shared ref. The write amplification is
+  proportional to the number of leads, which is the number this fleet is
+  trying to increase.
+- **Not ruled out**: import-only, from a cache somebody else populated once.
+  A worker that reads a warm `go-mod` and never writes one pays the transfer
+  a single time.
+- **Not ruled out**: `mode=min`, which caches far less and might move fast
+  enough to be worth it.
+- **Not addressed at all**: between-generation seeding. Every run here starts
+  from nothing; the cost of a FRESH runner is the one the bank was meant for,
+  and nothing above touches it.
+
+Defaulted off before measuring, which is the only reason this is a finding
+rather than a regression. A speedup that ships on cannot be distinguished
+from one that does not work.
