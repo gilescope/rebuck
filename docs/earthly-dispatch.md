@@ -644,3 +644,28 @@ addressed by anything in this repo yet.
 Measured on one machine and one group. Before building a seeding mechanism
 the same table should come off a runner, because a laptop with a warm
 `~/.cache` is the environment least able to see this cost.
+
+## Group by group, against a baseline
+
+Upstream runs `+test-no-qemu` as twelve separate jobs, so that is how it is
+measured here. `scripts/parity.sh` runs each group twice - once against a bare
+daemon, once through three workers - and compares the SET of failed targets.
+
+| group | baseline | fleet | routed / solves |
+| ------ | -------- | -------- | --------------: |
+| group1 | 1 failed | 1 failed, the same one | 248 / 286 |
+| group2 | green | **green** | 84 / 123 |
+| group3 | green | **green** | 88 / 136 |
+| group4 | green | **green** | 215 / 341 |
+
+Three groups pass through the distributed builder outright. group1's single
+failure is `./t/autocompletion+test-no-parent-at-root-from-home`, which diffs
+a directory listing and disagrees about `../run/` on arm64 - it fails
+identically with no proxy at all.
+
+The comparison is what makes this worth anything. "The build is green" would
+have been a claim about this laptop; "the fleet did not change the answer" is
+a claim about the fleet, and it is the only one a distributed builder can
+support. It also catches the opposite error: a target failing only WITHOUT
+the fleet means the two runs were not like-for-like and the comparison proves
+nothing.
