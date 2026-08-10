@@ -61,6 +61,18 @@ pub enum Exclusion {
     ///
     /// Carries the number - having no name for it is the entire point.
     UnknownMount(i32),
+    /// A source scheme a sessionless solve cannot be trusted to fetch.
+    ///
+    /// `git` is the measured one: buildkit resolves git credentials through
+    /// the client session's auth provider, and a worker has no session, so
+    /// the solve dies with `no active sessions` AFTER the fleet accepted the
+    /// lead. On earthly's fork the error path then nil-derefs and takes the
+    /// daemon down with it.
+    ///
+    /// An ALLOW-LIST, for the same reason `UnknownMount` exists: the schemes
+    /// we can prove portable are few and known, and everything else is a
+    /// guess. Guessing cost a day on mount type 101.
+    SessionSource(String),
 }
 
 /// Where the subtree can run.
@@ -225,6 +237,14 @@ fn plat_str(p: &pb::Platform) -> String {
 /// secrets and no security mode. Grounding those would ground exactly the
 /// `FROM <registry image>` chains principle 11 calls the BEST handover -
 /// the ones whose whole frontier is a digest any machine can fetch.
+/// Source schemes a peer can fetch with no session at all.
+///
+/// `docker-image` is here because `make_portable` mirrors every image into a
+/// registry the fleet can reach; `local` because the same pass republishes
+/// contexts as content, and what survives that is counted separately as an
+/// unmirrored context rather than as a hazard.
+const PORTABLE_SCHEMES: [&str; 4] = ["docker-image", "local", "http", "https"];
+
 /// The mount types buildkit itself declares. Anything else is a fork's.
 const KNOWN_MOUNTS: [i32; 5] = [
     pb::MountType::Bind as i32,
@@ -236,6 +256,19 @@ const KNOWN_MOUNTS: [i32; 5] = [
 
 fn hazards(op: &pb::Op) -> Vec<Exclusion> {
     let mut out = Vec::new();
+    // Sources first: an op that is not an Exec can still ground a subtree.
+    // This used to return early on anything that was not an Exec, which is
+    // how a lone `source: git` reached a worker with no session.
+    if let Some(pb::op::Op::Source(src)) = op.op.as_ref() {
+        let scheme = src
+            .identifier
+            .split_once("://")
+            .map(|(s, _)| s)
+            .unwrap_or("");
+        if !PORTABLE_SCHEMES.contains(&scheme) {
+            out.push(Exclusion::SessionSource(scheme.to_owned()));
+        }
+    }
     let Some(pb::op::Op::Exec(e)) = op.op.as_ref() else {
         return out;
     };
@@ -1759,6 +1792,61 @@ mod tests {
             ),
             vec![7],
             "the gateway was allowed to offer this; the driver must agree"
+        );
+    }
+
+    #[test]
+    fn a_git_source_needs_the_session_a_worker_does_not_have() {
+        // Found the same way as mount 101, one layer up: `inspect` had
+        // opinions about MOUNTS and none at all about source schemes.
+        //
+        // A worker solves with no session, because a dispatched subtree is
+        // supposed to need none. buildkit's git source resolves credentials
+        // through the session's auth provider, so the solve dies with
+        //
+        //     build failed: solve: Unknown error no active sessions
+        //
+        // after the fleet has already accepted the lead - and on earthly's
+        // fork the error path then nil-derefs and takes the daemon with it.
+        // Measured on `earthly +test-no-qemu`: the graph carried exactly
+        // one `source: git` and nothing else remarkable.
+        //
+        // Public or private makes no difference here. We cannot tell from
+        // the identifier whether the fetch will reach for a credential, and
+        // a subtree that MIGHT need a session is not dispatchable.
+        let mut op = plain();
+        op.op = Some(OpKind::Source(pb::SourceOp {
+            identifier: "git://github.com/example/repo.git#main".to_owned(),
+            ..Default::default()
+        }));
+        let v = inspect(&def(vec![op]));
+        assert!(
+            v.exclusions
+                .iter()
+                .any(|(_, x)| matches!(x, Exclusion::SessionSource(s) if s == "git")),
+            "a git source sailed through: {:?}",
+            v.exclusions
+        );
+        assert!(
+            !v.dispatchable_when(Allow {
+                caches: true,
+                secrets: true,
+                agent: true,
+            }),
+            "no flag may lift a source we cannot fetch without a session"
+        );
+
+        // A mirrored image is the case this must NOT catch: it is precisely
+        // what `make_portable` produces, and excluding it would ground
+        // every graph in the fleet.
+        let mut ok = plain();
+        ok.op = Some(OpKind::Source(pb::SourceOp {
+            identifier: "docker-image://reg:5000/rebuck2/base:abc".to_owned(),
+            ..Default::default()
+        }));
+        assert!(
+            inspect(&def(vec![ok])).dispatchable(),
+            "a mirrored image must stay dispatchable"
         );
     }
 

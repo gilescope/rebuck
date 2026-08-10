@@ -1705,9 +1705,29 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                                 // once: a refusal with no shape attached is
                                 // how two wrong theories got as far as they
                                 // did today.
-                                if self.wire.held().routed == 0 {
+                                // Two cases deserve the shape, and only
+                                // these two.
+                                //
+                                // routed == 0: nothing has ever moved, so
+                                // whatever is in this graph is the reason.
+                                //
+                                // A refusal that says "build failed": the
+                                // fleet AGREED to take it and could not do
+                                // it. That is inspect being wrong, which is
+                                // the only kind of wrong the report cannot
+                                // otherwise show - a graph declined for a
+                                // hazard we named is working as intended,
+                                // and a graph that dies after being accepted
+                                // is a hazard we failed to name.
+                                let inspect_was_wrong = why.contains("build failed");
+                                if self.wire.held().routed == 0 || inspect_was_wrong {
                                     println!(
-                                        "[proxy] nothing taken; graph carries {:?}",
+                                        "[proxy] {} graph carries {:?}",
+                                        if inspect_was_wrong {
+                                            "ACCEPTED THEN FAILED;"
+                                        } else {
+                                            "nothing taken;"
+                                        },
                                         crate::dispatch::session_shape(&portable)
                                     );
                                 }
