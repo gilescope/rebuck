@@ -821,15 +821,53 @@ impl RemoteBlobs {
     }
 
     /// The same question to the driver, on the connection we already hold.
+    ///
+    /// Names this worker, so the driver can answer `Provider` and point at a
+    /// peer that has since acquired the blob. Its view of who holds what is
+    /// fresher than ours: it collects every worker's bloom, and we act on the
+    /// last copy it broadcast. On a cold fleet that difference is most of the
+    /// coordinator's traffic - measured driver=47 against peer=5 per worker.
     async fn fetch_by_hash_driver(&self, hash: &str) -> Result<Vec<u8>> {
         let (mut send, mut recv) = self.conn.open_bi().await?;
-        mesh::send_frame(&mut send, &BlobReq::GetByHash(hash.to_owned())).await?;
+        mesh::send_frame(
+            &mut send,
+            &BlobReq::GetByHashAs {
+                hash: hash.to_owned(),
+                me: self.my_id.clone(),
+            },
+        )
+        .await?;
         send.finish()?;
         match mesh::recv_frame::<BlobResp>(&mut recv)
             .await?
             .context("driver closed blob stream")?
         {
             BlobResp::Found { size } => Ok(mesh::recv_raw(&mut recv, size).await?),
+            // Sent to a peer instead. Try it, and fall back to asking the
+            // driver for the BYTES if that fails.
+            //
+            // The fallback is not optional: a bloom lies in the "have it"
+            // direction, so the driver can name a peer that does not have the
+            // blob. Without this, one false positive turns a fetch into a
+            // failed build - the trade for taking the coordinator off the
+            // data path.
+            BlobResp::Provider { endpoint } => {
+                if let Ok(bytes) = self.fetch_by_hash_from(&endpoint, hash).await {
+                    self.hits_peer
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(bytes);
+                }
+                let (mut send, mut recv) = self.conn.open_bi().await?;
+                mesh::send_frame(&mut send, &BlobReq::GetByHash(hash.to_owned())).await?;
+                send.finish()?;
+                match mesh::recv_frame::<BlobResp>(&mut recv)
+                    .await?
+                    .context("driver closed blob stream on fallback")?
+                {
+                    BlobResp::Found { size } => Ok(mesh::recv_raw(&mut recv, size).await?),
+                    other => bail!("driver fallback for {hash}: {other:?}"),
+                }
+            }
             other => bail!("driver for {hash}: {other:?}"),
         }
     }

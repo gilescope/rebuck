@@ -273,6 +273,24 @@ pub enum BlobReq {
     /// by index, so inserting in the middle reinterprets every later variant
     /// on a mixed-version fleet.
     TagGet(String),
+    /// `GetByHash`, but saying who is asking.
+    ///
+    /// The driver keeps every worker's bloom and rebroadcasts them, but a
+    /// worker acts on the copy it last received. On a cold fleet all workers
+    /// need the same base layers at once, nobody holds them yet, and every
+    /// one of them asks the DRIVER - measured at driver=47 against peer=5 per
+    /// worker, 9.4 GiB served, with the coordinator squarely on the data path
+    /// it is supposed to stay off.
+    ///
+    /// The driver's view is fresher than any worker's. Told who is asking, it
+    /// can answer `Provider` and name a peer that has since acquired the blob,
+    /// instead of sending the bytes a third time.
+    ///
+    /// Appended last: postcard encodes by index.
+    GetByHashAs {
+        hash: String,
+        me: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

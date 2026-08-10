@@ -2730,6 +2730,40 @@ async fn serve_blob_stream(
             mesh::send_frame(&mut send, &BlobResp::Tag(found)).await?;
             send.finish().ok();
         }
+        // Same as GetByHash, except the asker is named - so we can send it
+        // to a peer that already has the bytes rather than sending them again.
+        BlobReq::GetByHashAs { hash, me } => {
+            let holder = {
+                let blooms = driver.blooms.lock().await;
+                blooms
+                    .iter()
+                    .find(|(who, b)| **who != me && b.contains(&hash))
+                    .map(|(who, _)| who.clone())
+            };
+            match holder {
+                Some(endpoint) => {
+                    // A bloom only lies in the "have it" direction, so this
+                    // can send the asker somewhere that does not have it. That
+                    // costs one dial, and the caller falls back to asking us
+                    // for the bytes - which is why this reply is safe to make
+                    // without confirming.
+                    mesh::send_frame(&mut send, &BlobResp::Provider { endpoint }).await?;
+                }
+                None => match driver.store.get_by_hash(&hash).await {
+                    Ok(Some(bytes)) => {
+                        mesh::send_frame(
+                            &mut send,
+                            &BlobResp::Found {
+                                size: bytes.len() as u64,
+                            },
+                        )
+                        .await?;
+                        send.write_all(&bytes).await?;
+                    }
+                    _ => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
+                },
+            }
+        }
         BlobReq::GetByHash(hash) => match driver.store.get_by_hash(&hash).await {
             Ok(Some(bytes)) => {
                 mesh::send_frame(
