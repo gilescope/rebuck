@@ -118,6 +118,20 @@ pub struct Proxy {
     /// the other way first.
     client: Client,
     channel: Chan,
+    /// One dispatch at a time until something has been BUILT.
+    ///
+    /// The barrier that grafting needs and did not have. On a cold fleet the
+    /// first wave of solves is dispatched simultaneously, nothing is
+    /// published, and every worker builds the shared ancestor chain - so
+    /// grafting fired 50 times and never touched a 109-op graph, because
+    /// those all went out before anything existed to graft.
+    ///
+    /// Holding the first dispatch alone costs one solve's worth of
+    /// serialisation and buys every later subtree an ancestry it can import
+    /// rather than rebuild. That is the step from N prefixes to 1; the bank
+    /// is the same sequence with this step already paid for by a previous
+    /// generation, which is why 0 beats 1.
+    warmup: std::sync::Arc<tokio::sync::Semaphore>,
     /// Who places dispatched work. The gateway holds the client's Solve; the
     /// driver decides which machine builds it, using the arbitration workers
     /// already get. Not a peer list of our own - see M4.5.
@@ -188,6 +202,7 @@ impl Proxy {
         Ok(Proxy {
             client: control::control_client::ControlClient::new(channel.clone()),
             channel,
+            warmup: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             driver,
             wire: Default::default(),
             mirror: None,
@@ -1982,6 +1997,35 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         // Empty frontier: a portable graph names every input
                         // by digest, so the builder fetches what it needs and
                         // there is nothing for us to enumerate.
+                        // THE BARRIER. Until something has been built and
+                        // published there is nothing to graft, so letting the
+                        // whole first wave go at once guarantees every worker
+                        // rebuilds the same ancestry - measured as 675s of
+                        // lead-work against a 144s baseline.
+                        //
+                        // One permit means the first dispatch runs alone. The
+                        // moment it reports a built op the gate stops being
+                        // taken at all, and the rest of the wave goes out
+                        // grafted onto its result.
+                        //
+                        // TIMED OUT rather than awaited forever: if the first
+                        // lead is declined by every peer, nothing will ever be
+                        // published, and a barrier waiting on an event that
+                        // cannot happen is a hung build. 60s then proceed
+                        // ungrafted, which is exactly today's behaviour.
+                        let _gate = if std::env::var("REBUCK2_WARMUP").as_deref() == Ok("1")
+                            && self.driver.built_ops().await.is_empty()
+                        {
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(60),
+                                self.warmup.clone().acquire_owned(),
+                            )
+                            .await
+                            .ok()
+                            .and_then(|r| r.ok())
+                        } else {
+                            None
+                        };
                         let led = self
                             .driver
                             .lead_subtree(portable.encode_to_vec(), Vec::new())
