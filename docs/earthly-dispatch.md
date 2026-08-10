@@ -471,3 +471,43 @@ three registries are contending for the same cores and the same page cache.
 The number to carry forward is 24:17, not 333s. Whether distribution PAYS is
 a question for hardware that can genuinely be in three places, and nothing
 measured on this machine can answer it.
+
+## The biggest target, and what actually blocks it
+
+`+test-no-qemu` is the target M5 cares about - it BUILDs all twelve test
+groups. Through the gateway it is 1018 solves and 74,246 ops, roughly a
+hundred times `+code`.
+
+| run | routed | built at home | change |
+| ---- | -----: | ------------: | ------------------------------- |
+| tnq5 | 269 | 673 | git sources excluded |
+| tnq7 | 254 | 250 | git sources MIRRORED |
+
+Built-at-home fell by nearly two thirds. One mirror did it:
+`git://github.com/EarthBuild/buildkit.git#51fe8fb` is named by many solves
+and fetched once, because the `OnceCell` that dedupes base images dedupes
+this too.
+
+Three defects were found getting there, and all three had the same shape -
+something reporting a state it had not verified:
+
+1. **The mirror never ran.** `inspect` refused git-bearing graphs before
+   `make_portable` could fix them. The stale assumption was in a comment one
+   line above: "rewriting only touches source identifiers, so the original
+   graph gives the same verdict" - true until source hazards existed.
+2. **The blocker column was fiction.** The report named
+   `exclusions.first()`, whichever hazard sorted earliest, INCLUDING ones the
+   operator had lifted. It printed `CacheMount: 194` for graphs whose cache
+   mounts were explicitly allowed.
+3. **`SAVE IMAGE` failed as `Unimplemented`.** earthly's fork adds
+   `rpc Export` to the gateway; upstream has none, so our generated service
+   has none, so tonic refused it and every run died at the end of an
+   otherwise successful build.
+
+The third is worth keeping as a rule, because it looks like a contradiction
+of the other two:
+
+> `dispatch` fails CLOSED on anything it does not recognise. The proxy fails
+> OPEN. "May this graph run on someone else's machine" must be conservative;
+> "may the client talk to its own daemon" must be transparent. Each default
+> is a bug in the other's place.
