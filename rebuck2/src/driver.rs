@@ -348,6 +348,17 @@ pub struct Driver {
     /// and the fleet divides the work, 10.0 means ten machines would each
     /// build nine tenths of the same graph.
     dispatched_ops: tokio::sync::Mutex<(std::collections::HashSet<String>, u64)>,
+    /// Distinct `(op, worker)` pairs - what the fleet will actually EXECUTE.
+    ///
+    /// Dispatch duplication is an upper bound and not the cost: a worker's
+    /// buildkit caches an op it has already built, so sending the same op to
+    /// the same worker twice is free the second time. Sending it to a
+    /// different worker is not.
+    ///
+    /// distinct pairs / distinct ops is therefore the honest multiplier, and
+    /// it should approach the number of WORKERS if every worker is rebuilding
+    /// the same ancestry.
+    op_by_worker: tokio::sync::Mutex<std::collections::HashSet<(String, u64)>>,
     /// Cross-machine single-flight. One per driver: it is the fleet's single
     /// coordinator, so there is no consensus problem to solve, only a
     /// liveness one.
@@ -431,6 +442,7 @@ impl Driver {
             cache_cost: Default::default(),
             peak_inflight: Default::default(),
             dispatched_ops: Default::default(),
+            op_by_worker: Default::default(),
             store,
             cfg,
             jobs: Mutex::new(HashMap::new()),
@@ -1527,6 +1539,17 @@ impl Driver {
         // instead of choosing, and `grep -o -- '-> worker [0-9]*' | uniq -c`
         // is how spread is read in CI.
         println!("[driver] subtree job {job} -> worker {first}");
+        // Which ops THIS worker will now have to have. A pair it already
+        // holds is free - buildkit caches it - so only new pairs are work.
+        {
+            use prost::Message;
+            if let Ok(d) = bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice()) {
+                let mut pairs = self.op_by_worker.lock().await;
+                for bytes in &d.def {
+                    pairs.insert((crate::store::sha256_hex(bytes), first));
+                }
+            }
+        }
         self.tell(
             first,
             D2W::Lead {
@@ -1612,9 +1635,10 @@ impl Driver {
     /// seeding would buy. Frequency in the Earthfile is a different number
     /// and points somewhere else.
     /// `(distinct ops ever dispatched, total ops dispatched)`.
-    pub async fn op_duplication(&self) -> (usize, u64) {
+    pub async fn op_duplication(&self) -> (usize, u64, usize) {
         let d = self.dispatched_ops.lock().await;
-        (d.0.len(), d.1)
+        let pairs = self.op_by_worker.lock().await.len();
+        (d.0.len(), d.1, pairs)
     }
 
     /// The most subtrees in flight at once, over the whole run.

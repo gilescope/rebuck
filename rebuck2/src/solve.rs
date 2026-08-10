@@ -203,6 +203,33 @@ fn cache_opts(registry: &str) -> Option<control::CacheOptions> {
     })
 }
 
+/// Cache options for the ONE build that populates the fleet's cache.
+///
+/// Export only. The client's build runs once on peer 0, so exporting from it
+/// costs one write; the 84 dispatched subtrees then import what it wrote.
+/// That asymmetry is the whole point - exporting from every subtree instead
+/// made six machines 165s slower than no cache at all.
+pub fn reference_export(registry: &str) -> Option<control::CacheOptions> {
+    let r = fleet_cache_ref(registry)?;
+    Some(control::CacheOptions {
+        exports: vec![control::CacheOptionsEntry {
+            r#type: "registry".to_owned(),
+            attrs: [
+                ("ref", r.as_str()),
+                ("registry.insecure", "true"),
+                // max, or the cache holds final layers only and warms
+                // nothing a worker actually needs.
+                ("mode", "max"),
+                ("ignore-error", "true"),
+            ]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+        }],
+        ..Default::default()
+    })
+}
+
 /// The request that builds `def` and publishes it where a peer can get it.
 pub fn solve_request(
     job: u64,

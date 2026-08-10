@@ -42,8 +42,8 @@ on:
         description: "slots peer 0 keeps for itself - 0 forces dispatch"
         default: "0"
       fleet_cache:
-        description: "off | read | readwrite - both cache modes measured SLOWER"
-        default: "off"
+        description: "off | read | readwrite. read = one reference export + N imports"
+        default: "read"
       earthly_flags:
         description: "flags for earthly - upstream uses --ci -P"
         default: "--ci -P"
@@ -92,7 +92,7 @@ env:
   # Measured HERE rather than on a laptop, where a run of this size fills
   # the Docker VM's disk and both legs fail for a reason that has nothing
   # to do with caching.
-  REBUCK2_FLEET_CACHE: ${{ inputs.fleet_cache || 'off' }}
+  REBUCK2_FLEET_CACHE: ${{ inputs.fleet_cache || 'read' }}
   # Written before `earthly bootstrap` in BOTH jobs. earthly hands this to the
   # buildkitd container as EARTHLY_ADDITIONAL_BUILDKIT_CONFIG, and a daemon
   # that does not trust the registry it is told to pull from fails the SILENT

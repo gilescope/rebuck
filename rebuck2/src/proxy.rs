@@ -305,6 +305,30 @@ impl control::control_server::Control for Proxy {
         // ref in ~1ms, and `return` merely registers it. The client blocks
         // on the Control.Solve response, so timing it is the only way the
         // proxy sees a build's duration at all.
+        // ONE reference export, from the client's own build.
+        //
+        // This is the shape the prior art converges on and the shape neither
+        // leg of the cache A/B tested: `read` had no writer, so every import
+        // fetched nothing; `readwrite` had 84 writers, and exporting after
+        // every solve cost more than it saved.
+        //
+        // The client's build runs here, on peer 0, ONCE. Exporting from it
+        // populates the ref that every dispatched subtree imports - one
+        // writer, N readers - so a worker can skip executing an ancestor
+        // instead of rebuilding it. Ahmad & Kwok's rule says that is the
+        // right side of the line for this workload by two orders of
+        // magnitude: an apt-layer costs 30-120s to execute and 40-400ms to
+        // pull.
+        //
+        // `ignore-error` because an optimisation that can fail the client's
+        // build is not one.
+        let mut req = req;
+        if let (Some(m), true) = (
+            self.mirror.as_ref(),
+            crate::solve::fleet_cache_mode() != "off",
+        ) {
+            req.cache = crate::solve::reference_export(&m.registry);
+        }
         let t = std::time::Instant::now();
         let out = self
             .client()
@@ -1436,7 +1460,7 @@ pub async fn serve(
         // four minutes is.
         let costs = driver_for_report.cache_costs().await;
         let peak = driver_for_report.peak_inflight();
-        let (uniq, total_ops) = driver_for_report.op_duplication().await;
+        let (uniq, total_ops, pairs) = driver_for_report.op_duplication().await;
         wire.held().report();
         let solo = solo.held();
         let medians: std::collections::BTreeMap<usize, u64> = solo
@@ -1456,9 +1480,14 @@ pub async fn serve(
             // 1.0x means the subtrees are disjoint and a fleet divides the
             // work. Higher means every machine is rebuilding the same
             // ancestry, which is why two workers beat six on this target.
-            let factor = total_ops as f64 / uniq as f64;
+            let sent = total_ops as f64 / uniq as f64;
+            // The EXECUTED multiplier, which is the one that costs. It
+            // approaches the worker count when every worker rebuilds the
+            // same ancestry, and sits at 1.0 when the subtrees are disjoint.
+            let built = pairs as f64 / uniq as f64;
             println!(
-                "[wire] op duplication : {total_ops} ops dispatched, {uniq} distinct = {factor:.1}x"
+                "[wire] op duplication : {total_ops} sent / {uniq} distinct = {sent:.1}x sent, \
+                 {pairs} (op,worker) pairs = {built:.1}x built"
             );
         }
         if !costs.is_empty() {
