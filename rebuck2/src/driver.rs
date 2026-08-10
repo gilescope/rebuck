@@ -337,6 +337,17 @@ pub struct Driver {
     /// cannot be made faster by any number of machines, and every second
     /// spent tuning the mesh for it is spent on the wrong problem.
     peak_inflight: std::sync::atomic::AtomicUsize,
+    /// Every distinct op digest ever dispatched, and the running total.
+    ///
+    /// The ratio between them IS the duplication factor. Two machines beat
+    /// six on the same target, which only happens when work is multiplied
+    /// rather than divided - but "the prefix is rebuilt per worker" was
+    /// inferred from subtree SIZES and a duration histogram, not counted.
+    ///
+    /// `sum / unique` says it outright: 1.0 means the subtrees are disjoint
+    /// and the fleet divides the work, 10.0 means ten machines would each
+    /// build nine tenths of the same graph.
+    dispatched_ops: tokio::sync::Mutex<(std::collections::HashSet<String>, u64)>,
     /// Cross-machine single-flight. One per driver: it is the fleet's single
     /// coordinator, so there is no consensus problem to solve, only a
     /// liveness one.
@@ -419,6 +430,7 @@ impl Driver {
             subtrees: Mutex::new(std::collections::HashMap::new()),
             cache_cost: Default::default(),
             peak_inflight: Default::default(),
+            dispatched_ops: Default::default(),
             store,
             cfg,
             jobs: Mutex::new(HashMap::new()),
@@ -1476,6 +1488,19 @@ impl Driver {
         // the peak here where the lock is already held.
         self.peak_inflight
             .fetch_max(open.len() + 1, Ordering::Relaxed);
+        // Count what this subtree carries, against everything dispatched so
+        // far. An op is identified the way buildkit identifies it: the
+        // digest of its encoded bytes.
+        {
+            use prost::Message;
+            if let Ok(d) = bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice()) {
+                let mut seen = self.dispatched_ops.lock().await;
+                for bytes in &d.def {
+                    seen.0.insert(crate::store::sha256_hex(bytes));
+                    seen.1 += 1;
+                }
+            }
+        }
         open.insert(
             job,
             Subtree {
@@ -1586,6 +1611,12 @@ impl Driver {
     /// Ranked by TIME, because that is the only ordering that says what
     /// seeding would buy. Frequency in the Earthfile is a different number
     /// and points somewhere else.
+    /// `(distinct ops ever dispatched, total ops dispatched)`.
+    pub async fn op_duplication(&self) -> (usize, u64) {
+        let d = self.dispatched_ops.lock().await;
+        (d.0.len(), d.1)
+    }
+
     /// The most subtrees in flight at once, over the whole run.
     pub fn peak_inflight(&self) -> usize {
         self.peak_inflight.load(Ordering::Relaxed)

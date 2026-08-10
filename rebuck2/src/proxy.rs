@@ -1436,6 +1436,7 @@ pub async fn serve(
         // four minutes is.
         let costs = driver_for_report.cache_costs().await;
         let peak = driver_for_report.peak_inflight();
+        let (uniq, total_ops) = driver_for_report.op_duplication().await;
         wire.held().report();
         let solo = solo.held();
         let medians: std::collections::BTreeMap<usize, u64> = solo
@@ -1451,6 +1452,15 @@ pub async fn serve(
         // comparison is against the number of workers, not against the
         // number of solves.
         println!("[wire] peak in flight : {peak} subtree(s) at once");
+        if uniq > 0 {
+            // 1.0x means the subtrees are disjoint and a fleet divides the
+            // work. Higher means every machine is rebuilding the same
+            // ancestry, which is why two workers beat six on this target.
+            let factor = total_ops as f64 / uniq as f64;
+            println!(
+                "[wire] op duplication : {total_ops} ops dispatched, {uniq} distinct = {factor:.1}x"
+            );
+        }
         if !costs.is_empty() {
             let total: u64 = costs.iter().map(|(_, ms, _)| ms).sum();
             println!("[wire] cache cost ms  : {total} total, worst first:");
