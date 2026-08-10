@@ -560,3 +560,44 @@ architectural limit:
 
 Both reported as capability limits of the fleet - "context unmirrored", "not
 portable" - and both were format strings.
+
+## Parity, which is the only "green" this machine can show
+
+`+test-no-qemu-group1`, upstream's own invocation (`--ci -P`, with
+`EARTHLY_VERSION_FLAG_OVERRIDES`), run twice: once against a bare daemon,
+once through three workers.
+
+```text
+baseline (no proxy):  1 failed target
+through the fleet:    1 failed target - THE SAME ONE
+                      286 solves, 248 routed, 28 built at home
+```
+
+The failure is `./t/autocompletion+test-no-parent-at-root-from-home`, which
+diffs a directory listing and disagrees about `../run/`. It fails on
+macOS/arm64 with or without any of this.
+
+**That is the result, and chasing an absolute green here would have been
+chasing someone else's bug.** The baseline was measured first precisely
+because "the build is red through the proxy" is worthless without knowing
+whether it is red without one.
+
+### What absolute green actually needs
+
+1. **Per GROUP, not the aggregate.** Upstream runs
+   `+test-no-qemu-group1` .. `group12` as twelve separate jobs and never
+   builds `+test-no-qemu` itself. The aggregate cancels every sibling when
+   one target fails, which is why earlier runs of it reported 118 passes and
+   then stopped.
+2. **`--ci -P` and the flag overrides.** `--ci` changes output and strictness;
+   `-P` is what makes earthly request `security.insecure`, without which
+   WITH DOCKER dies as `failed to load LLB`. `EARTHLY_VERSION_FLAG_OVERRIDES`
+   comes from `.earthly_version_flag_overrides` in the repo root - thirteen
+   feature flags the tests assume.
+3. **ubuntu/amd64.** The autocompletion group is arm64-sensitive.
+4. **Registry credentials.** Some groups push; upstream's reusable-test
+   workflow logs in to GHCR and Docker Hub first. Those groups cannot pass on
+   a laptop with no tokens, and should be excluded rather than pretended at.
+
+Only (1) and (2) were ours to get wrong, and both were. (3) and (4) are why
+this measurement belongs on a runner.
