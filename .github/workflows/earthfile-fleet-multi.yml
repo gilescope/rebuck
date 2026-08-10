@@ -359,9 +359,9 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/rebuck2/coord
-          key: rebuck2-bank-${{ inputs.target || '+test-no-qemu-group2' }}-${{ github.run_id }}
+          key: rebuck2-bank-${{ inputs.target || '+test-no-qemu' }}-${{ github.run_id }}
           restore-keys: |
-            rebuck2-bank-${{ inputs.target || '+test-no-qemu-group2' }}-
+            rebuck2-bank-${{ inputs.target || '+test-no-qemu' }}-
 
       - name: what the bank brought
         run: |
