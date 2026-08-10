@@ -1629,6 +1629,13 @@ pub async fn serve(
                 hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
             builder
                 .http2()
+                // A TIMER, because the keepalive settings below need one and
+                // hyper does not check at build time - it panics inside the
+                // connection task with "You must supply a timer", which the
+                // client sees only as `Unavailable: error reading from
+                // server: EOF`. Every proxied scenario in the fixture suite
+                // failed in one second with an empty placement map.
+                .timer(hyper_util::rt::TokioTimer::new())
                 // None = unlimited, matching tonic. A gateway that refuses
                 // the 201st stream mid-build fails the build.
                 .max_concurrent_streams(None)
