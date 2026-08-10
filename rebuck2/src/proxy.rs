@@ -1630,7 +1630,14 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                             _ => true,
                         }
                     });
-                    if !local_clear && self.wire.held().routed == 0 {
+                    // ONCE, on the first occurrence - not "only while
+                    // nothing has routed yet", which was the first attempt
+                    // and never fired: on a big target other solves route
+                    // long before the interesting one arrives.
+                    static SAID_LOCAL: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !local_clear && !SAID_LOCAL.swap(true, std::sync::atomic::Ordering::Relaxed)
+                    {
                         // WHICH local sources survived the rewrite. 22 of 38
                         // solves stopped here on a real target and the report
                         // said only "context unmirrored" - true of a context
