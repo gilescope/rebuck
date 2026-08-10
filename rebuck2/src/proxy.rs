@@ -1404,6 +1404,7 @@ pub async fn serve(
     driver: std::sync::Arc<crate::driver::Driver>,
 ) -> anyhow::Result<()> {
     println!("[proxy] buildkit control on {addr} -> {upstream}");
+    let relay_target = upstream.clone();
     let mut proxy = Proxy::connect(upstream.clone(), driver).await?;
     proxy.mirror = std::env::var("REBUCK2_MIRROR").ok().map(|registry| Mirror {
         registry,
@@ -1433,11 +1434,60 @@ pub async fn serve(
         );
         std::process::exit(0);
     });
-    tonic::transport::Server::builder()
-        .add_service(control::control_server::ControlServer::new(proxy.clone()))
-        .add_service(gw::llb_bridge_server::LlbBridgeServer::new(proxy))
-        .serve(addr)
-        .await?;
+    // A FALLBACK that relays methods we do not implement.
+    //
+    // earthly's buildkit fork adds `rpc Export` to the gateway service -
+    // upstream buildkit has no such method, so the generated LLBBridge
+    // service has no such method, so tonic answered SAVE IMAGE with
+    // `Unimplemented` and every target that saves an image died at the end
+    // of an otherwise successful build.
+    //
+    // Implementing Export by hand would fix Export. A proxy that refuses
+    // what it does not recognise is the actual bug: transparency is the
+    // whole contract, and the next fork-only method would cost another day
+    // of the same. This relays the raw HTTP/2 request, so we neither parse
+    // nor understand it - which is precisely the point.
+    //
+    // Note the asymmetry with `dispatch`, which fails CLOSED on anything it
+    // does not recognise. Different questions: "may this graph run on
+    // someone else's machine" must be conservative, "may the client talk to
+    // its own daemon" must be transparent.
+    let raw = tonic::transport::Endpoint::from_shared(relay_target.clone())?.connect_lazy();
+    let router =
+        tonic::service::Routes::new(control::control_server::ControlServer::new(proxy.clone()))
+            .add_service(gw::llb_bridge_server::LlbBridgeServer::new(proxy))
+            .into_axum_router()
+            .fallback(axum::routing::any(move |req: axum::extract::Request| {
+                let mut raw = raw.clone();
+                async move {
+                    let (mut parts, body) = req.into_parts();
+                    println!("[proxy] relaying unimplemented method {}", parts.uri.path());
+                    // Only the PATH matters to the upstream connection; the channel
+                    // already knows where it is going.
+                    parts.uri = axum::http::Uri::builder()
+                        .path_and_query(
+                            parts
+                                .uri
+                                .path_and_query()
+                                .map(|p| p.as_str())
+                                .unwrap_or("/"),
+                        )
+                        .build()
+                        .map_err(|e| format!("relay uri: {e}"))?;
+                    // axum's Body and tonic's differ only in name here; both are
+                    // the same http-body stream, so this re-wraps rather than
+                    // buffers - a SAVE IMAGE payload must not be held in memory.
+                    let out = axum::http::Request::from_parts(parts, tonic::body::Body::new(body));
+                    // `connect_lazy` yields a Channel that is always ready, so
+                    // there is nothing to poll before calling it.
+                    tower::Service::call(&mut raw, out)
+                        .await
+                        .map(|r| r.map(axum::body::Body::new))
+                        .map_err(|e| format!("relay: {e}"))
+                }
+            }));
+
+    axum::serve(tokio::net::TcpListener::bind(addr).await?, router).await?;
     Ok(())
 }
 
