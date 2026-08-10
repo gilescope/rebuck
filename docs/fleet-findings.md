@@ -1553,3 +1553,37 @@ All nine methods, including the streams. `Session` in particular is
 BIDIRECTIONAL and carries filesync and credentials — a proxy that
 forwards Solve but not Session works for exactly the builds that need no
 local context, which is not the workload we care about.
+
+## Grafting is correct, measured, and slower
+
+A/B on `+test-no-qemu-group10`, six GitHub runners, same commit, only
+`REBUCK2_GRAFT` moved:
+
+| grafting | baseline (1 machine) | fleet (6 machines) | solves routed | grafts |
+| -------- | -------------------- | ------------------ | ------------- | ------ |
+| off      | 216s                 | 504s               | 44            | 0      |
+| on       | 212s                 | 611s               | 37            | 31     |
+
+Both legs at parity with their baseline - zero failed targets either
+way. So grafting works: 31 subtrees started from an ancestor somebody
+else had already built, rather than rebuilding it. It costs 107s.
+
+That is worth stating plainly because the model said the opposite. The
+duplicate-vs-transfer rule (Ahmad & Kwok 1998) says duplicate when
+communication dominates computation, and the measured CCR here is
+0.003-0.013 - three orders below the crossover, an emphatic "transfer".
+The rule is not wrong; the input was. CCR was computed from BYTES, and a
+handover in this system is not a byte copy: it is a registry publish
+(compress, push) followed by a pull (fetch, decompress, unpack into the
+snapshotter) on every machine that wants it. Those constants are large
+and they do not appear in a byte count.
+
+The consequence for what to build next: the lever is not smarter
+placement, it is a cheaper handover. Placement has now been measured
+nine ways and every one has come back null or negative, which is a
+consistent enough result to stop testing. A snapshot moved peer to peer
+as content, without a registry round trip on either end, changes the
+constant that the model was missing. Nothing above it needs to change.
+
+Grafting stays in the code and stays off by default. It is not a bug to
+be fixed, it is a mechanism whose price is now known.

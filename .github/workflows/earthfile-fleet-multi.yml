@@ -154,7 +154,18 @@ env:
   #
   # Measured with both fixes: 42 nil errors -> 0, and the fleet passed a
   # target (`builtin-args-test`) that the single-machine baseline failed.
-  REBUCK2_GRAFT: ${{ inputs.graft || '1' }}
+  #
+  # OFF as a default all the same, and for a different reason than before -
+  # not broken, PRICED. Same commit, six runners, only this moved:
+  #
+  #   off  216s baseline  504s fleet  44 routed   0 grafts
+  #   on   212s baseline  611s fleet  37 routed  31 grafts
+  #
+  # 31 subtrees really did start from an ancestor someone else had built,
+  # and it cost 107s: a handover here is a registry publish plus a pull on
+  # every machine that wants it, and those constants dwarf the bytes. See
+  # docs/fleet-findings.md.
+  REBUCK2_GRAFT: ${{ inputs.graft || '0' }}
   REBUCK2_CUT_PREFIX: ${{ inputs.cut_prefix || '1' }}
   # Written before `earthly bootstrap` in BOTH jobs. earthly hands this to the
   # buildkitd container as EARTHLY_ADDITIONAL_BUILDKIT_CONFIG, and a daemon
