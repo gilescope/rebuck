@@ -46,9 +46,9 @@ on:
       earthly_flags:
         description: "flags for earthly - upstream uses --ci -P"
         default: "--ci -P"
-      target:
-        description: "earthbuild target to build"
-        default: "+code"
+      targets:
+        description: "earthbuild targets, JSON array - one JOB each"
+        default: '["+test-no-qemu-group1","+test-no-qemu-group2","+test-no-qemu-group3","+code"]'
       workers:
         description: "workers on the runner"
         default: "2"
@@ -75,6 +75,19 @@ permissions:
 jobs:
   earthfile:
     runs-on: ubuntu-latest
+    # ONE JOB PER TARGET, which is how upstream runs these and not an
+    # optimisation. `+test-no-qemu` aggregates twelve groups with BUILD, and
+    # earthly cancels every sibling when one target fails - so an aggregate
+    # run reports the first failure and nothing about the other eleven.
+    # Measured: 118 targets passed and then the whole thing said "Canceled".
+    #
+    # Separate jobs also give a per-group dispatch figure, which is the
+    # number this workflow exists to produce.
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(inputs.targets || '["+test-no-qemu-group1","+test-no-qemu-group2","+test-no-qemu-group3","+code"]') }}
+    name: ${{ matrix.target }}
     # A real target, cold, on four cores. The fixture suite takes 11 minutes;
     # this has no prior measurement at all, so the bound is generous and the
     # run reports its own elapsed time to replace the guess.
@@ -310,7 +323,7 @@ jobs:
       - name: baseline - the same target with no fleet
         working-directory: earthbuild
         env:
-          TARGET: ${{ inputs.target || '+code' }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           start=$SECONDS
@@ -322,7 +335,7 @@ jobs:
       - name: through the fleet
         working-directory: earthbuild
         env:
-          TARGET: ${{ inputs.target || '+code' }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           start=$SECONDS
