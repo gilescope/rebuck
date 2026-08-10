@@ -554,8 +554,18 @@ fi
 say "output digests"
 : >"$RUN/digests.txt"
 for i in $(seq 0 $((BUILDS - 1))); do
-  d=$(find "$RUN/out-$i" -type f -exec sh -c 'for f; do sha256sum "$f" 2>/dev/null \
-    || shasum -a 256 "$f"; done' _ {} + 2>/dev/null |
+  # `|| true` on the find, and it is load-bearing.
+  #
+  # A build that FAILED leaves no out-$i, find exits non-zero, and under
+  # `set -euo pipefail` the whole script dies here - before printing a single
+  # digest. On CI that turned every "outputs identical" assertion into a
+  # failure whose real cause was three sections earlier, and the digest
+  # section into something that had apparently never run.
+  #
+  # A missing output directory is not an error to this loop. It is a build
+  # that failed, which the failure count already reports.
+  d=$({ find "$RUN/out-$i" -type f -exec sh -c 'for f; do sha256sum "$f" 2>/dev/null \
+    || shasum -a 256 "$f"; done' _ {} + 2>/dev/null || true; } |
     sed "s|$RUN/out-$i||" | sort | sha256 | cut -d' ' -f1)
   echo "build $i: $d" | tee -a "$RUN/digests.txt"
 done
