@@ -593,12 +593,28 @@ async fn lead_reply(
     //
     // Three remedies have been aimed at this without anyone knowing which
     // shape it has.
+    // FETCH versus EXECUTE, which is the split every remedy so far has been
+    // chosen without.
+    //
+    // This worker's registry is in THIS process and serves its daemon's
+    // pulls, so the bytes it hands out during a lead are exactly the mirror
+    // hop - the inputs a worker must fetch where home reads its own content
+    // store. Sampling the counter either side attributes them per lead.
+    //
+    // It is not a clean fetch/execute split: buildkit interleaves the two.
+    // But bytes-per-lead beside duration-per-lead distinguishes "this lead
+    // moved 400MB" from "this lead computed for 90 seconds", and those want
+    // opposite fixes.
+    let bytes_before = crate::registry::SERVED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
     let t = std::time::Instant::now();
     let out = crate::solve::build_subtree(bk, reg, job, def).await;
+    let moved =
+        crate::registry::SERVED_BYTES.load(std::sync::atomic::Ordering::Relaxed) - bytes_before;
     println!(
-        "[worker] job {job} took {}ms ({} ops)",
+        "[worker] job {job} took {}ms ({} ops, {} KiB fetched)",
         t.elapsed().as_millis(),
-        verdict.ops
+        verdict.ops,
+        moved / 1024
     );
     match out {
         Ok(image_ref) => W2D::Led { job, image_ref },

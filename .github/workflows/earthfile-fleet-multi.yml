@@ -465,6 +465,12 @@ jobs:
           # workflow was grepping only the [wire] summary out of proxy.log,
           # so the per-job timings the driver already prints never left the
           # runner.
+          echo "=== what a lead cost, and in what"
+          # Duration and BYTES side by side. A lead that moved 400MB and one
+          # that computed for 90s both show as "24s average" and want
+          # opposite fixes; four remedies have been chosen without this.
+          grep -oE 'job [0-9]+ took [0-9]+ms \([0-9]+ ops, [0-9]+ KiB' proxy.log | head -10 || true
+
           echo "=== lead durations"
           grep -oE 'in [0-9]+ms' proxy.log | grep -oE '[0-9]+' > /tmp/leads.txt || true
           if [ -s /tmp/leads.txt ]; then
