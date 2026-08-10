@@ -73,16 +73,37 @@ jobs:
         working-directory: rebuck2-repo/rebuck2
         run: cargo build --release
 
-      - name: install earthly
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
+        with:
+          go-version-file: earthbuild/go.mod
+          cache: false
+
+      - name: build earthly, PATCHED
         run: |
           set -euo pipefail
-          # The released binary, not a from-source build: this measures
-          # rebuck2 against earthbuild's Earthfile, not earthbuild's own
-          # bootstrap - and bootstrapping earthly with earthly would need a
-          # working buildkit before the thing under test exists.
-          curl -fsSL -o /usr/local/bin/earthly \
-            https://github.com/EarthBuild/earthbuild/releases/latest/download/earthly-linux-amd64
-          chmod +x /usr/local/bin/earthly
+          # A released binary would measure ZERO, and would look like the
+          # fleet does not work.
+          #
+          # Stock earthly attaches the interactive debugger's secret, host
+          # bind and two fork-only sockets to every non-LOCALLY RUN, and each
+          # of those pins the solve to the machine holding earthly's session.
+          # Measured: 0 of 6 solves dispatchable on `+code` as shipped, 6 of
+          # 6 with the patch. See rebuck2/patches/README.md and
+          # EarthBuild/earthbuild#784.
+          #
+          # Built from source rather than downloaded because the patch has to
+          # be IN it. Plain `go build` - bootstrapping earthly with earthly
+          # would need a working buildkit before the thing under test exists.
+          git -C earthbuild apply --verbose \
+            "$GITHUB_WORKSPACE/rebuck2-repo/rebuck2/patches/earthbuild-784-four-sites.patch" || {
+              echo "::error::the #784 patch no longer applies to earthbuild"
+              echo "at $(git -C earthbuild rev-parse --short HEAD). Re-derive it"
+              echo "rather than forcing it: gate on whatever the surrounding"
+              echo "code already uses for the debugger. See"
+              echo "rebuck2/patches/README.md."
+              exit 1
+            }
+          ( cd earthbuild && go build -o /usr/local/bin/earthly ./cmd/earthly )
           earthly --version
 
       - name: start the fleet
