@@ -1606,8 +1606,49 @@ pub async fn serve(
                 axum::routing::any(relay_export),
             );
 
-    axum::serve(tokio::net::TcpListener::bind(addr).await?, router).await?;
-    Ok(())
+    // Serve with the HTTP/2 limits UNSET, which is what tonic's own server
+    // does and `axum::serve` does not.
+    //
+    // hyper's auto builder caps concurrent streams at 200. That was invisible
+    // until daemon consolidation: before it, one earthly client talked to
+    // this gateway; after it, every nested earthly inside every test dials it
+    // too. The build then died with
+    //
+    //     Error: h2 protocol error: error reading a body from connection
+    //
+    // reported by the CLIENT, naming nothing on this side. Seen once locally
+    // and written off as a flake, which it was not - it is load-dependent,
+    // and consolidation is what supplied the load.
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    loop {
+        let (stream, _peer) = listener.accept().await?;
+        let router = router.clone();
+        tokio::spawn(async move {
+            let io = hyper_util::rt::TokioIo::new(stream);
+            let mut builder =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+            builder
+                .http2()
+                // None = unlimited, matching tonic. A gateway that refuses
+                // the 201st stream mid-build fails the build.
+                .max_concurrent_streams(None)
+                // Keepalive, because a nested earthly can sit idle while its
+                // own build runs and a dropped control stream is a dead
+                // build.
+                .keep_alive_interval(std::time::Duration::from_secs(20))
+                .keep_alive_timeout(std::time::Duration::from_secs(60));
+            let svc = hyper_util::service::TowerToHyperService::new(router);
+            if let Err(e) = builder.serve_connection_with_upgrades(io, svc).await {
+                // A client that hangs up mid-stream is normal; anything else
+                // is worth seeing, because the client's own error names
+                // nothing on this side.
+                let m = e.to_string();
+                if !m.contains("connection reset") && !m.contains("NotConnected") {
+                    println!("[proxy] connection ended: {m}");
+                }
+            }
+        });
+    }
 }
 
 /// The GATEWAY, which is where the graph is.

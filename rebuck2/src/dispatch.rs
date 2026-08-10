@@ -978,6 +978,50 @@ pub fn subgraph(def: &pb::Definition, root: usize) -> Option<pb::Definition> {
 ///
 /// The replaced op keeps no inputs. That is the point - the ancestry stops
 /// being work and becomes a pull.
+/// Does a round trip through OUR proto types preserve these bytes?
+///
+/// Op bytes come from earthly's FORK of the buildkit proto. prost keeps only
+/// the fields it models and drops the rest without complaint, so any
+/// re-encode is potentially lossy - and the loss surfaces far away: an
+/// ExecOp that lost its platform is reported by buildkit as
+///
+///     no support for running processes with <nil> platform
+///
+/// which earthly truncates to `no support for <nil>`, naming neither the op
+/// nor the field. Three field-loss bugs have cost a day between them - the
+/// dropped exporter, the unmodelled SOCKET=101 mount, and this.
+#[cfg(debug_assertions)]
+fn reencode_is_lossless(bytes: &[u8]) -> bool {
+    match pb::Op::decode(bytes) {
+        // Undecodable is not loss: both rewrites carry those verbatim and
+        // never re-encode them.
+        Err(_) => true,
+        Ok(op) => op.encode_to_vec() == bytes,
+    }
+}
+
+/// Assert an op carried VERBATIM would have survived a round trip.
+///
+/// Checked exactly where both forms are in hand. It does not protect the
+/// verbatim path - that path is already safe - it detects that some OTHER
+/// path which re-encodes would be lossy, at the point where the op is
+/// available to name. Debug-only: the answer cannot change at runtime.
+macro_rules! debug_assert_lossless {
+    ($bytes:expr, $where:literal) => {
+        #[cfg(debug_assertions)]
+        {
+            debug_assert!(
+                reencode_is_lossless($bytes),
+                "{}: a round trip through our proto types CHANGED these op \
+                 bytes. Carrying verbatim here is correct; the warning is \
+                 that any path re-encoding this op silently drops whatever \
+                 earthly's fork added to it.",
+                $where
+            );
+        }
+    };
+}
+
 pub fn graft_built(def: &pb::Definition, built: &dyn Fn(&str) -> Option<String>) -> pb::Definition {
     let digest = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
 
@@ -1058,6 +1102,7 @@ pub fn graft_built(def: &pb::Definition, built: &dyn Fn(&str) -> Option<String>)
         // does not know, quietly.
         let touched = op.inputs.iter().any(|i| remap.contains_key(&i.digest));
         if !touched {
+            debug_assert_lossless!(bytes, "graft_built");
             out.push(bytes.clone());
             continue;
         }
@@ -1158,6 +1203,7 @@ fn rewrite_sources(
         // the fork added. Long-standing here and never observed to bite,
         // which is not the same as safe.
         if !changed {
+            debug_assert_lossless!(bytes, "rewrite_sources");
             out.push(bytes.clone());
             continue;
         }
