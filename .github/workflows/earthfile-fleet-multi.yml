@@ -41,6 +41,9 @@ on:
       home_slots:
         description: "slots peer 0 keeps for itself - 0 forces dispatch"
         default: "0"
+      fleet_cache:
+        description: "share a buildkit cache across the fleet (1 = yes)"
+        default: "1"
       earthly_flags:
         description: "flags for earthly - upstream uses --ci -P"
         default: "--ci -P"
@@ -81,6 +84,15 @@ env:
   #                      has room, which on an idle runner is always.
   REBUCK2_PEER_CACHE_MOUNTS: ${{ inputs.peer_cache_mounts || '1' }}
   REBUCK2_HOME_SLOTS: ${{ inputs.home_slots || '0' }}
+  # The A/B this exists to settle: six machines took 590s against 307s on
+  # one, and go-mod (~24.2s/lead) plus go-build (~24.7s/lead) account for
+  # the gap. A cache mount does not travel, so one machine pays that once
+  # and six pay it six times.
+  #
+  # Measured HERE rather than on a laptop, where a run of this size fills
+  # the Docker VM's disk and both legs fail for a reason that has nothing
+  # to do with caching.
+  REBUCK2_FLEET_CACHE: ${{ inputs.fleet_cache || '1' }}
   # Written before `earthly bootstrap` in BOTH jobs. earthly hands this to the
   # buildkitd container as EARTHLY_ADDITIONAL_BUILDKIT_CONFIG, and a daemon
   # that does not trust the registry it is told to pull from fails the SILENT
