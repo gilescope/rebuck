@@ -768,3 +768,51 @@ than a claim about it.
 68s of wall on `+code` against 12s for the baseline. Distribution still costs
 more than it saves at this size, which is what a six-solve target should be
 expected to show.
+
+## Six machines, a real test group
+
+`+test-no-qemu-group2` - 123 solves - across one coordinator runner and six
+worker runners, all separate GitHub-hosted machines:
+
+```text
+workers joined : 6/6
+solves routed  : 84        built at home: 39
+not routed     : {"considered": 123, "excluded: Insecure []": 39}
+spread         : 38 / 23 / 10 / 5 / 6 / 2
+blobs          : worker 1  peer=61 driver=14
+                 worker 2  peer=64 driver=5
+                 worker 3  peer=37 driver=30
+wall           : 773s
+```
+
+84 routed plus 39 refused is 123: **everything that could legitimately move,
+moved**, and every refusal is `Insecure` - privileged exec, which is a trust
+decision and never lifted.
+
+### The ratio inverts as the fleet grows
+
+| machines | peer fetches | driver fetches | driver's share |
+| -------: | -----------: | -------------: | -------------: |
+| 3 | 3 | 12 | 80% |
+| 6 | 162 | 49 | 23% |
+
+This is the claim the whole design rests on - the driver arbitrates and
+carries as little as possible - and it is the first evidence that the
+carrying part improves rather than degrades with fleet size. A coordinator
+that served every blob would be the bottleneck that makes nineteen workers
+pointless.
+
+Not proof that it scales to nineteen. It is two points, on one target, and
+the second is far more favourable than the first partly because six cold
+workers give each other more to find.
+
+### What the spread says
+
+38 / 23 / 10 / 5 / 6 / 2 is not balance. `offer_order` sorts emptiest-first
+and offers one peer at a time, so the worker that answers earliest keeps
+winning while the others are still starting their daemons. On a longer target
+that self-corrects as load accrues; on a 123-solve group it does not get the
+chance.
+
+Worth fixing only if it costs wall clock, which needs the baseline this
+workflow does not yet run.
