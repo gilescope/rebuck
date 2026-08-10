@@ -568,7 +568,38 @@ async fn lead_reply(
         Ok(image_ref) => W2D::Led { job, image_ref },
         // A failed subtree is the requester's to rebuild. Reporting it as a
         // decline rather than swallowing it is what stops them waiting.
-        Err(e) => decline(format!("build failed: {e:#}")),
+        Err(e) => {
+            // Did the DAEMON survive the attempt?
+            //
+            // earthly's buildkit fork nil-derefs on the error path for
+            // `no active sessions` (llbsolver.(*resultProxy).wrapError,
+            // bridge.go:318) and takes the whole daemon with it. Measured:
+            // three worker daemons dead inside a minute, while all three
+            // workers stayed in the fleet advertising slots and accepting
+            // leads they could no longer build.
+            //
+            // A worker with no daemon is not a slow worker, it is a hole
+            // that silently eats every subtree the driver sends it. Leaving
+            // is the honest move: the mesh connection drops, the driver
+            // stops offering, and the requester builds at home.
+            if crate::solve::daemon_platforms(bk).await.is_empty() {
+                eprintln!(
+                    "[worker] buildkit at {bk} is gone after job {job} - taking no more \
+                     work. Last error: {e:#}"
+                );
+                // Close the slots. Every later offer then declines through
+                // the `acquire` above, which is the mechanism that already
+                // existed for a worker that cannot build.
+                //
+                // Closing rather than EXITING, deliberately: this worker's
+                // registry still holds blobs the fleet may want, and a
+                // process that leaves takes them with it. It stops building
+                // and keeps serving.
+                slots.close();
+                return decline(format!("build failed and daemon died: {e:#}"));
+            }
+            decline(format!("build failed: {e:#}"))
+        }
     }
 }
 

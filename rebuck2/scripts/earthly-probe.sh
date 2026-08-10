@@ -21,7 +21,11 @@ TARGET=${1:-+code}
 WORKERS=${2:-1}
 EB=${EB:-$HOME/git/EarthBuild/earthbuild}
 RUN=${RUN:-${TMPDIR:-/tmp}/earthly-probe}
-BIN=$(cd "$(dirname "$0")/.." && pwd)/target/release/rebuck2
+# Overridable, because this script gets run from a FROZEN COPY: editing it
+# while it runs corrupts the running shell (bash reads by byte offset), so a
+# long probe is launched from a copy elsewhere - and then $0 no longer sits
+# next to the binary.
+BIN=${BIN:-$(cd "$(dirname "$0")/.." && pwd)/target/release/rebuck2}
 SESSION="probe-$$"
 # Ports above the fleet rig's, so this can run while that does.
 PROXY_PORT=${PROXY_PORT:-21234}
