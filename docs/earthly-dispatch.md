@@ -434,3 +434,40 @@ whether that improves as stores warm - is finally askable.
 Every dispatch number recorded before this section was measured on a fleet
 where the handover cost nothing, because nothing moved. The placement figures
 stand; any inference from them about transfer cost does not.
+
+## The mesh carrying more than the driver
+
+`+all-binaries`, three workers, each with its own daemon and its own
+registry:
+
+```text
+build: yes in 333s      solves routed: 33 of 33
+worker 1: local=0 peer=11 driver=9
+worker 2: local=0 peer=1  driver=5
+worker 3: local=0 peer=12 driver=3
+```
+
+**24 peer fetches against 17 driver fetches.** Most of the content that had
+to move between machines moved between workers, without passing through the
+coordinator. That is principle 6 - the driver arbitrates and carries as
+little as possible - showing up as a number for the first time rather than as
+a design intention.
+
+The wall clock went the other way, and the comparison is worth setting out
+because it is easy to quote the wrong column:
+
+| topology | wall | peer fetches | what it actually measures |
+| ----------------------------- | ---: | -----------: | ------------------------- |
+| 4 workers, shared daemon | 194s | n/a | placement only; no transfer exists |
+| 3 workers, own daemon, shared registry | 297s | 0 | transfer, but to where the requester already looks |
+| 3 workers, own daemon, own registry | 333s | 24 | the real thing |
+
+Each row is slower than the last, and each is more honest than the last. The
+first has nothing to transfer; the second transfers into a registry the
+requester was going to read anyway; only the third pays what distribution
+costs. On one laptop that cost buys nothing, because three cold daemons and
+three registries are contending for the same cores and the same page cache.
+
+The number to carry forward is 24:17, not 333s. Whether distribution PAYS is
+a question for hardware that can genuinely be in three places, and nothing
+measured on this machine can answer it.
