@@ -1042,6 +1042,25 @@ pub fn graft_built(def: &pb::Definition, built: &dyn Fn(&str) -> Option<String>)
             out.push(bytes.clone());
             continue;
         };
+        // RE-ENCODE ONLY WHAT CHANGED. prost drops fields it does not model,
+        // and these bytes come from earthly's FORK of the buildkit proto -
+        // so a round trip through our types is lossy for anything the fork
+        // added. An op whose inputs were not remapped must travel verbatim.
+        //
+        // Measured: re-encoding every op stripped the ExecOp platform, and
+        // buildkit refused the graph with
+        //
+        //     no support for running processes with <nil> platform
+        //
+        // which earthly truncates to `no support for <nil>`, naming neither
+        // the op nor the field. Same class as the exporter that was dropped
+        // for being an unknown field this morning: protobuf loses what it
+        // does not know, quietly.
+        let touched = op.inputs.iter().any(|i| remap.contains_key(&i.digest));
+        if !touched {
+            out.push(bytes.clone());
+            continue;
+        }
         for input in &mut op.inputs {
             if let Some(new) = remap.get(&input.digest) {
                 input.digest = new.clone();
@@ -1102,9 +1121,11 @@ fn rewrite_sources(
         };
         let before = digest(bytes);
 
+        let mut changed = false;
         for input in &mut op.inputs {
             if let Some(new) = remap.get(&input.digest) {
                 input.digest = new.clone();
+                changed = true;
             }
         }
         if let Some(pb::op::Op::Source(src)) = &mut op.op {
@@ -1122,6 +1143,7 @@ fn rewrite_sources(
                     continue;
                 };
                 src.identifier = new;
+                changed = true;
                 // Local sources carry filesync attrs - include patterns,
                 // session ids - that mean nothing to a registry source and
                 // would be a stale reference to a session the peer has no
@@ -1130,6 +1152,15 @@ fn rewrite_sources(
             }
         }
 
+        // Verbatim when nothing changed, for the same reason as
+        // `graft_built`: these bytes come from earthly's FORK of the
+        // buildkit proto and a round trip through our types drops whatever
+        // the fork added. Long-standing here and never observed to bite,
+        // which is not the same as safe.
+        if !changed {
+            out.push(bytes.clone());
+            continue;
+        }
         let rebuilt = op.encode_to_vec();
         let after = digest(&rebuilt);
         if after != before {
