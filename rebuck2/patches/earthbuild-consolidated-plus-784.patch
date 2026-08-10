@@ -1,0 +1,66 @@
+diff --git a/earthfile2llb/converter.go b/earthfile2llb/converter.go
+index 2669ab2a..834c1c22 100644
+--- a/earthfile2llb/converter.go
++++ b/earthfile2llb/converter.go
+@@ -2717,7 +2717,7 @@ func (c *Converter) internalRun(ctx context.Context, opts ConvertRunOpts) (pllb.
+ 			} else {
+ 				c.opt.Console.Warnf("failed to check LLBCaps for CapExecMountSock: %v", err) // keep going
+ 			}
+-		} else {
++		} else if c.opt.InteractiveDebuggerEnabled || isInteractive {
+ 			runOpts = append(
+ 				runOpts,
+ 				llb.SocketTarget("earthly_interactive", debuggercommon.DebuggerDefaultSocketPath, 0o666, 0, 0),
+@@ -2794,13 +2794,16 @@ func (c *Converter) internalRun(ctx context.Context, opts ConvertRunOpts) (pllb.
+ 		debuggerMount := pllb.AddMount(debuggerPath, pllb.Scratch(),
+ 			llb.HostBind(), llb.SourcePath("/usr/bin/earth_debugger"))
+ 
+-		runOpts = append(runOpts, debuggerSecretMount, debuggerMount)
++		if c.opt.InteractiveDebuggerEnabled || isInteractive {
++			runOpts = append(runOpts, debuggerSecretMount, debuggerMount)
++		}
++
+ 		if opts.WithSSH {
+ 			runOpts = append(runOpts, llb.AddSSHSocket())
+ 		}
+ 	}
+ 	// Shell and debugger wrap.
+-	prependDebugger := !opts.Locally
++	prependDebugger := !opts.Locally && (c.opt.InteractiveDebuggerEnabled || isInteractive)
+ 
+ 	if opts.WithShell {
+ 		finalArgs = opts.shellWrap(finalArgs, extraEnvVars, opts.WithShell, prependDebugger, isInteractive)
+diff --git a/earthly-entrypoint.sh b/earthly-entrypoint.sh
+index 183773b9..e0e18e49 100755
+--- a/earthly-entrypoint.sh
++++ b/earthly-entrypoint.sh
+@@ -24,9 +24,18 @@ if [ ! -f "$earthly_config" ]; then
+   fi
+ fi
+ 
+-# If no host specified, start an internal buildkit. If it is specified, rely on external setup
++# If no host specified, start an internal buildkit. If it is specified, rely on external setup.
++#
++# "Specified" has to mean the same thing here as it does to earthly, which reads
++# EARTH_BUILDKIT_HOST first and falls back to the deprecated EARTHLY_ prefix
++# (internal/env.Lookup). A nested earthly is handed the prefixed form by its
++# caller, so deciding on the bare variable alone makes the two disagree: this
++# script starts an internal daemon, then earthly ignores it and builds against
++# the caller's anyway. The container pays for a buildkitd nobody uses, and the
++# TLS branch below generates certs for it that the external daemon does not want.
++buildkit_host="${BUILDKIT_HOST:-${EARTH_BUILDKIT_HOST:-${EARTHLY_BUILDKIT_HOST:-}}}"
+ if [ -z "$NO_BUILDKIT" ]; then
+-  if [ -z "$BUILDKIT_HOST" ]; then
++  if [ -z "$buildkit_host" ]; then
+     if ! captest --text | grep sys_admin > /dev/null; then
+       echo 1>&2 "Container appears to be running unprivileged. Currently, privileged mode is required when buildkit runs inside the container."
+       echo 1>&2 "To run this image without buildkit, set the environment variable NO_BUILDKIT=1"
+@@ -70,7 +79,7 @@ if [ -z "$NO_BUILDKIT" ]; then
+     EARTHLY_BUILDKIT_HOST="tcp://$(hostname):8372" # hostname is not recognized as local for this reason
+     export EARTHLY_BUILDKIT_HOST
+   else
+-    export EARTHLY_BUILDKIT_HOST="$BUILDKIT_HOST"
++    export EARTHLY_BUILDKIT_HOST="$buildkit_host"
+   fi
+   ! "$EARTHLY_DEBUG" || echo 1>&2 "Using $EARTHLY_BUILDKIT_HOST as buildkit daemon"
+ fi

@@ -1,0 +1,151 @@
+From b8f3a4e9780c104fc8d2d15be6cd65e7ae878c86 Mon Sep 17 00:00:00 2001
+From: Giles Cope <gilescope@gmail.com>
+Date: Sun, 2 Aug 2026 06:34:19 +0100
+Subject: [PATCH] fix(solver): never single-flight a vertex that asked not to
+ be cached
+
+VertexOptions are deliberately not part of the vertex digest (types.go:49), and
+the lease key is derived from the cache key -- so `RUN --no-cache` and the same
+RUN without it produce the SAME key. A follower then adopts the leader's layer
+for a step whose entire contract is "execute me again, the answer may differ".
+
+Caught by earthbuild's own suite, which has a test built for exactly this:
+tests+no-cache-local-artifact-test writes /dev/urandom into a file twice under
+--no-cache and asserts the two differ. Same target, same tree, same box:
+
+    single-flight off (CONTROL=1)   PASS 118s
+    single-flight on                FAIL 130s   files identical
+
+Declining to coordinate costs a duplicate execution, which is precisely what
+--no-cache asked for. That is the correct direction to degrade, and the same one
+singleflight.go already argues for an unreachable coordinator: duplicate work is
+always safe, handing back a result someone said not to reuse is not.
+
+The test asserts both halves. Skipping the key is trivially satisfied by a
+feature that has silently stopped keying anything, so the control case pins that
+an ordinary vertex still coordinates.
+
+Not fixed here, and worth naming: the same reasoning applies to any vertex whose
+execution has effects beyond its result. --no-cache is the case with a test.
+
+Assisted-by: Claude:claude-opus-5 claude-code
+---
+ solver/edge.go                          | 16 ++++-
+ solver/singleflight_ignorecache_test.go | 81 +++++++++++++++++++++++++
+ 2 files changed, 96 insertions(+), 1 deletion(-)
+ create mode 100644 solver/singleflight_ignorecache_test.go
+
+diff --git a/solver/edge.go b/solver/edge.go
+index e6b6bf7b3..b574aaf82 100644
+--- a/solver/edge.go
++++ b/solver/edge.go
+@@ -973,7 +973,21 @@ func (e *edge) execOp(ctx context.Context) (any, error) {
+ 	// LeaseKey returns "" when the graph has no cross-machine identity (a dep whose
+ 	// only key is a per-run random: one). Then there is nothing to coordinate on,
+ 	// and we simply build it — exactly as unmodified buildkit would.
+-	if len(cacheKeys) > 0 {
++	//
++	// IgnoreCache is the other reason not to coordinate, and it is a CORRECTNESS
++	// one rather than a "there is nothing to gain" one. VertexOptions are
++	// deliberately not part of the vertex digest (types.go:49), so `RUN
++	// --no-cache` and the same RUN without it produce the SAME lease key. Claim
++	// on it and a follower is handed the leader's layer for a step whose entire
++	// contract is "execute me again, the answer may differ". Measured on
++	// earthbuild's tests+no-cache-local-artifact-test, which writes /dev/urandom
++	// to a file twice under --no-cache and asserts the two differ: passed with
++	// single-flight off, failed with it on.
++	//
++	// Declining costs a duplicate execution, which is precisely what --no-cache
++	// asked for. Degrading to duplicate work is always correct here; handing back
++	// a result someone said not to reuse is not.
++	if len(cacheKeys) > 0 && !e.op.IgnoreCache() {
+ 		if key := LeaseKey(cacheKeys[0]); key != "" {
+ 			ctx = WithSingleFlightKey(ctx, key)
+ 		}
+diff --git a/solver/singleflight_ignorecache_test.go b/solver/singleflight_ignorecache_test.go
+new file mode 100644
+index 000000000..4ff9f9c58
+--- /dev/null
++++ b/solver/singleflight_ignorecache_test.go
+@@ -0,0 +1,81 @@
++package solver
++
++import (
++	"context"
++	"testing"
++
++	digest "github.com/opencontainers/go-digest"
++	"github.com/stretchr/testify/require"
++)
++
++// buildCapturingSingleFlightKey builds a one-vertex graph and reports the
++// single-flight key that reached the op, or "" if the edge declined to
++// coordinate.
++func buildCapturingSingleFlightKey(t *testing.T, ignoreCache bool) digest.Digest {
++	t.Helper()
++	ctx := t.Context()
++
++	s := NewSolver(SolverOpt{ResolveOpFunc: testOpResolver})
++	defer s.Close()
++
++	j, err := s.NewJob("sf-ignorecache")
++	require.NoError(t, err)
++	defer func() {
++		if j != nil {
++			require.NoError(t, j.Discard())
++		}
++	}()
++
++	var seen digest.Digest
++	g := Edge{
++		Vertex: vtx(vtxOpt{
++			name:         "v0",
++			cacheKeySeed: "seed0",
++			value:        "result0",
++			ignoreCache:  ignoreCache,
++			execPreFunc: func(ctx context.Context) error {
++				seen = SingleFlightKey(ctx)
++				return nil
++			},
++		}),
++	}
++
++	_, err = j.Build(ctx, g)
++	require.NoError(t, err)
++	require.NoError(t, j.Discard())
++	j = nil
++	return seen
++}
++
++// THE correctness property for --no-cache.
++//
++// VertexOptions are explicitly NOT part of the vertex digest (types.go:49), and
++// the lease key is derived from the cache key -- so `RUN --no-cache` and the
++// same RUN without it produce the SAME key. Coordinate on it and a follower is
++// handed the leader's layer for a step whose entire contract is "execute me
++// again, the answer may differ".
++//
++// Measured on earthbuild's own suite before this fix.
++// tests+no-cache-local-artifact-test builds a file from /dev/urandom twice with
++// --no-cache and asserts the two differ:
++//
++//	single-flight off, one shared daemon   PASS 118s
++//	single-flight on,  one shared daemon   FAIL 130s  (files identical)
++//
++// Declining to coordinate costs a duplicate execution, which is what --no-cache
++// asked for anyway. That is the correct direction to degrade -- the same
++// argument singleflight.go already makes for an unreachable coordinator.
++func TestSingleFlightSkipsIgnoreCache(t *testing.T) {
++	t.Parallel()
++	require.Empty(t, buildCapturingSingleFlightKey(t, true),
++		"a vertex with IgnoreCache must not coordinate: adoption is exactly what --no-cache forbids")
++}
++
++// The control. Without it the test above passes just as well if single-flight
++// stopped keying anything at all, and a silently inert feature is the failure
++// mode this whole file exists to catch.
++func TestSingleFlightKeysAnOrdinaryVertex(t *testing.T) {
++	t.Parallel()
++	require.NotEmpty(t, buildCapturingSingleFlightKey(t, false),
++		"an ordinary vertex must still coordinate, or single-flight is inert")
++}
