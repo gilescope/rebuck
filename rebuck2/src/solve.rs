@@ -84,6 +84,26 @@ fn publish_attrs(name: String) -> HashMap<String, String> {
     ])
 }
 
+/// `host:port/repo:tag` + digest -> `host:port/repo@sha256:...`
+///
+/// The tag has to come off, and the host's port must not. Both are colons,
+/// and only the LAST one separates the tag - `rsplit_once` rather than
+/// `split_once`, which would truncate `127.0.0.1:5000/x:t` to `127.0.0.1`
+/// and produce a reference naming a registry that does not exist.
+fn by_digest_ref(name: &str, digest: &str) -> String {
+    // The tag colon is the one AFTER the last slash. `rsplit_once(':')`
+    // alone gets the common case right and quietly eats the PORT of a
+    // registry named without a tag - `registry:5000/repo` becomes
+    // `registry@sha256:...`. Constructed names here always carry a tag, so
+    // that would have sat unexercised until something else called this.
+    let cut = name.rfind('/').map_or(0, |i| i + 1);
+    let repo = match name[cut..].rfind(':') {
+        Some(i) => &name[..cut + i],
+        None => name,
+    };
+    format!("{repo}@{digest}")
+}
+
 /// A legal OCI tag naming one context within one build.
 ///
 /// An OCI tag is `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`, and earthly names its
@@ -332,31 +352,64 @@ pub async fn mirror_image(
     let attrs = publish_attrs(name.clone());
 
     let mut c = connect(bk_addr).await?;
-    c.solve(control::SolveRequest {
-        r#ref: format!(
-            "rebuck2-base.{}.{}",
-            std::process::id(),
-            SOLVE_SEQ.fetch_add(1, Ordering::Relaxed)
-        ),
-        definition: Some(def),
-        // The CLIENT's session, for the same reason the context needs it.
-        // Registry auth travels over the session, and buildkit cannot do
-        // even an ANONYMOUS Docker Hub pull without it - the token comes
-        // from the session's auth service. A warm cache hid this once:
-        // the copy succeeded because the image was already local, and
-        // failed the moment it actually had to fetch.
-        session: session.to_owned(),
-        exporter_deprecated: "image".to_owned(),
-        exporter_attrs_deprecated: attrs.clone(),
-        exporters: vec![control::Exporter {
-            r#type: "image".to_owned(),
-            attrs,
-        }],
-        ..Default::default()
+    let resp = c
+        .solve(control::SolveRequest {
+            r#ref: format!(
+                "rebuck2-base.{}.{}",
+                std::process::id(),
+                SOLVE_SEQ.fetch_add(1, Ordering::Relaxed)
+            ),
+            definition: Some(def),
+            // The CLIENT's session, for the same reason the context needs it.
+            // Registry auth travels over the session, and buildkit cannot do
+            // even an ANONYMOUS Docker Hub pull without it - the token comes
+            // from the session's auth service. A warm cache hid this once:
+            // the copy succeeded because the image was already local, and
+            // failed the moment it actually had to fetch.
+            session: session.to_owned(),
+            exporter_deprecated: "image".to_owned(),
+            exporter_attrs_deprecated: attrs.clone(),
+            exporters: vec![control::Exporter {
+                r#type: "image".to_owned(),
+                attrs,
+            }],
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("mirror {reference}: {} {}", e.code(), e.message()))?;
+
+    // BY DIGEST where the daemon gives us one, and this is what makes a
+    // second machine work at all.
+    //
+    // A tag lives in ONE registry's mutable namespace. `172.17.0.1:15000`
+    // resolves on every GitHub runner and points at a DIFFERENT registry on
+    // each, so a worker handed `172.17.0.1:15000/rebuck2/base:<tag>` asks its
+    // own registry, which has never heard of it:
+    //
+    //     failed to load cache key: 172.17.0.1:15000/rebuck2/base:<tag>
+    //
+    // Measured across three runners: subtrees were offered, taken, and every
+    // one of them died there. Tags are not gossiped - `registry.rs` has
+    // called that the next step for a while, and this is the step.
+    //
+    // A digest needs no gossip. The worker's registry misses, asks the mesh
+    // by hash, and whoever mirrored it serves it.
+    let by_digest = resp
+        .into_inner()
+        .exporter_response
+        .get("containerimage.digest")
+        .filter(|d| d.starts_with("sha256:"))
+        .cloned();
+    Ok(match by_digest {
+        // `repo@sha256:...`, which is what an OCI client resolves without
+        // consulting the tag namespace at all.
+        Some(d) => format!("docker-image://{}", by_digest_ref(&name, &d)),
+        // A daemon that reports no digest has published under the tag and
+        // nothing else. On one machine that still works, so this degrades
+        // rather than failing - unlike `build_subtree`, where the same
+        // fallback named a reference that did not exist.
+        None => format!("docker-image://{name}"),
     })
-    .await
-    .map_err(|e| anyhow::anyhow!("mirror {reference}: {} {}", e.code(), e.message()))?;
-    Ok(format!("docker-image://{name}"))
 }
 
 /// Build an offered subtree and publish it where a peer can fetch it.
@@ -469,6 +522,38 @@ pub fn published_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_digest_ref_keeps_the_registry_port_and_drops_the_tag() {
+        // Two colons, and only the last one is the tag separator. Using
+        // `split_once` here would turn
+        //
+        //     127.0.0.1:5000/rebuck2/base:abc  ->  127.0.0.1@sha256:...
+        //
+        // which names a registry that does not exist, on a code path that
+        // only runs when a SECOND machine is involved - so it would have
+        // looked like a cross-machine networking problem.
+        let d = "sha256:".to_owned() + &"ab".repeat(32);
+        assert_eq!(
+            by_digest_ref("127.0.0.1:5000/rebuck2/base:abc", &d),
+            format!("127.0.0.1:5000/rebuck2/base@{d}")
+        );
+        assert_eq!(
+            by_digest_ref("host.docker.internal:25000/rebuck2/base:x-linux-arm64", &d),
+            format!("host.docker.internal:25000/rebuck2/base@{d}")
+        );
+        // No tag at all: leave it alone rather than eating the port. The
+        // second of these is the one that catches a lone `rsplit_once`.
+        assert_eq!(
+            by_digest_ref("registry.example.com/rebuck2/base", &d),
+            format!("registry.example.com/rebuck2/base@{d}")
+        );
+        assert_eq!(
+            by_digest_ref("registry:5000/rebuck2/base", &d),
+            format!("registry:5000/rebuck2/base@{d}"),
+            "a port is not a tag"
+        );
+    }
 
     #[test]
     fn a_context_tag_survives_a_context_name_with_a_slash_in_it() {
