@@ -999,3 +999,35 @@ Not, on this evidence, mostly into rebuilt ancestry. Still unaccounted:
 The next measurement is a breakdown of one lead into fetch versus execute.
 That has been the next measurement for a while, and three remedies have been
 attempted ahead of it.
+
+## How noisy is any of this? 18%
+
+Three identical runs - same target, same three workers, same flags, nothing
+changed between them:
+
+```text
+129s   154s   135s      range 25s on a 139s mean = 18%
+```
+
+Scaled to the `group2` fleet numbers (400-660s), that is 70-120 seconds of
+noise. Which re-sorts every A/B reported today:
+
+| comparison | delta | verdict |
+| ---------------------------- | ----: | ------------------- |
+| 6 workers vs 2 workers | 259s | holds, comfortably |
+| readwrite cache vs off | 165s | probably holds |
+| one reference export vs off | 97s | NOT established |
+| read-only vs off | 68s | NOT established |
+
+Two of the four regressions I reported are indistinguishable from noise. The
+ARGUMENT against each still stands on its own - a run cannot import a cache it
+is itself producing, and exporting after all 84 solves is 84 writes for one
+read - but the numbers were presented as evidence and were not.
+
+**The rule this earns**: on this rig, a difference under ~20% needs at least
+three runs before it is written down. That is cheap for `+code` at ~2 minutes
+and expensive for `group2` at ~10, which is an argument for developing against
+the small target and confirming on the large one, not for skipping the
+repeats.
+
+Measured after four remedies had already been chosen and reported.
