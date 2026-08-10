@@ -1463,39 +1463,58 @@ pub async fn serve(
     // someone else's machine" must be conservative, "may the client talk to
     // its own daemon" must be transparent.
     let raw = tonic::transport::Endpoint::from_shared(relay_target.clone())?.connect_lazy();
+    let relay = move |req: axum::extract::Request| {
+        let mut raw = raw.clone();
+        async move {
+            let (mut parts, body) = req.into_parts();
+            println!("[proxy] relaying unimplemented method {}", parts.uri.path());
+            // Only the PATH matters to the upstream connection; the channel
+            // already knows where it is going.
+            parts.uri = axum::http::Uri::builder()
+                .path_and_query(
+                    parts
+                        .uri
+                        .path_and_query()
+                        .map(|p| p.as_str())
+                        .unwrap_or("/"),
+                )
+                .build()
+                .map_err(|e| format!("relay uri: {e}"))?;
+            // axum's Body and tonic's differ only in name here; both are
+            // the same http-body stream, so this re-wraps rather than
+            // buffers - a SAVE IMAGE payload must not be held in memory.
+            let out = axum::http::Request::from_parts(parts, tonic::body::Body::new(body));
+            // `connect_lazy` yields a Channel that is always ready, so
+            // there is nothing to poll before calling it.
+            tower::Service::call(&mut raw, out)
+                .await
+                .map(|r| r.map(axum::body::Body::new))
+                .map_err(|e| format!("relay: {e}"))
+        }
+    };
+    let relay_export = relay.clone();
     let router =
         tonic::service::Routes::new(control::control_server::ControlServer::new(proxy.clone()))
             .add_service(gw::llb_bridge_server::LlbBridgeServer::new(proxy))
             .into_axum_router()
-            .fallback(axum::routing::any(move |req: axum::extract::Request| {
-                let mut raw = raw.clone();
-                async move {
-                    let (mut parts, body) = req.into_parts();
-                    println!("[proxy] relaying unimplemented method {}", parts.uri.path());
-                    // Only the PATH matters to the upstream connection; the channel
-                    // already knows where it is going.
-                    parts.uri = axum::http::Uri::builder()
-                        .path_and_query(
-                            parts
-                                .uri
-                                .path_and_query()
-                                .map(|p| p.as_str())
-                                .unwrap_or("/"),
-                        )
-                        .build()
-                        .map_err(|e| format!("relay uri: {e}"))?;
-                    // axum's Body and tonic's differ only in name here; both are
-                    // the same http-body stream, so this re-wraps rather than
-                    // buffers - a SAVE IMAGE payload must not be held in memory.
-                    let out = axum::http::Request::from_parts(parts, tonic::body::Body::new(body));
-                    // `connect_lazy` yields a Channel that is always ready, so
-                    // there is nothing to poll before calling it.
-                    tower::Service::call(&mut raw, out)
-                        .await
-                        .map(|r| r.map(axum::body::Body::new))
-                        .map_err(|e| format!("relay: {e}"))
-                }
-            }));
+            .fallback(axum::routing::any(relay))
+            // EXPLICIT, because a fallback is not enough.
+            //
+            // tonic's generated LlbBridgeServer owns the whole
+            // `/moby.buildkit.v1.frontend.LLBBridge/` prefix and answers
+            // Unimplemented itself for any method in it that upstream buildkit
+            // does not declare, so the router's fallback never sees the request.
+            // Measured: the fallback relayed 10 calls to earthly's own registry
+            // service and ZERO calls to Export, while SAVE IMAGE kept failing
+            // with the error the fallback was written to fix.
+            //
+            // A more specific axum route beats the service's wildcard, so name
+            // the fork's extra method directly. Anything on a service we do not
+            // register at all still reaches the fallback.
+            .route(
+                "/moby.buildkit.v1.frontend.LLBBridge/Export",
+                axum::routing::any(relay_export),
+            );
 
     axum::serve(tokio::net::TcpListener::bind(addr).await?, router).await?;
     Ok(())
