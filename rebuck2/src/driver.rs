@@ -2646,6 +2646,16 @@ async fn serve_blob_stream(
         // should not: the asker is walking the fleet itself, and a driver
         // that fetched on its behalf would put the coordinator back on the
         // data path it is meant to stay off (principle 6).
+        // The driver answers tag lookups from its own registry store, for
+        // the same reason it answers by-hash ones: it is a participant with
+        // content, not a router. It does not go looking on the asker's
+        // behalf - that would put the coordinator back on the data path
+        // (principle 6).
+        BlobReq::TagGet(key) => {
+            let found = driver.store.tag_get(&key).await;
+            mesh::send_frame(&mut send, &BlobResp::Tag(found)).await?;
+            send.finish().ok();
+        }
         BlobReq::GetByHash(hash) => match driver.store.get_by_hash(&hash).await {
             Ok(Some(bytes)) => {
                 mesh::send_frame(

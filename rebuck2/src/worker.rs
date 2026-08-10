@@ -418,6 +418,15 @@ async fn serve_get(
         // A registry asks by hash: buildkit's URL is the digest and the size
         // is what the reply is meant to supply. Served only from what this
         // worker holds - it does not walk the fleet on someone else's behalf.
+        // A worker answers tag lookups from its own registry store. This
+        // is what makes buildkit's registry cache usable across machines:
+        // the cache ref is a tag, one worker exported it, and the others
+        // have no way to find it otherwise.
+        BlobReq::TagGet(key) => {
+            let found = store.tag_get(&key).await;
+            mesh::send_frame(&mut send, &BlobResp::Tag(found)).await?;
+            send.finish().ok();
+        }
         BlobReq::GetByHash(hash) => match store.get_by_hash(&hash).await {
             Ok(Some(bytes)) => {
                 mesh::send_frame(
@@ -727,6 +736,47 @@ impl RemoteBlobs {
         }
     }
 
+    /// Ask ONE peer to resolve a tag.
+    ///
+    /// A tag cannot be bloom-routed: a bloom filter answers "do you hold
+    /// this content hash", and a tag is a name whose content is exactly what
+    /// we are trying to learn. So this asks, rather than knowing where to.
+    async fn tag_from(&self, endpoint: &str, key: &str) -> Result<Option<String>> {
+        let id: iroh::EndpointId = endpoint
+            .parse()
+            .map_err(|_| anyhow::anyhow!("bad peer endpoint {endpoint:?} for tag {key}"))?;
+        let conn = self.ep.connect(id, mesh::ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        mesh::send_frame(&mut send, &BlobReq::TagGet(key.to_owned())).await?;
+        send.finish()?;
+        match mesh::recv_frame::<BlobResp>(&mut recv)
+            .await?
+            .context("peer closed tag stream")?
+        {
+            BlobResp::Tag(found) => Ok(found),
+            // A peer too old to know TagGet answers Err. That is a miss,
+            // not a fault: mixed-version fleets are the normal case during
+            // a rollout.
+            BlobResp::Err(_) => Ok(None),
+            other => bail!("peer {endpoint} for tag {key}: {other:?}"),
+        }
+    }
+
+    /// The same question to the driver, on the connection we already hold.
+    async fn tag_driver(&self, key: &str) -> Result<Option<String>> {
+        let (mut send, mut recv) = self.conn.open_bi().await?;
+        mesh::send_frame(&mut send, &BlobReq::TagGet(key.to_owned())).await?;
+        send.finish()?;
+        match mesh::recv_frame::<BlobResp>(&mut recv)
+            .await?
+            .context("driver closed tag stream")?
+        {
+            BlobResp::Tag(found) => Ok(found),
+            BlobResp::Err(_) => Ok(None),
+            other => bail!("driver for tag {key}: {other:?}"),
+        }
+    }
+
     /// The same question to the driver, on the connection we already hold.
     async fn fetch_by_hash_driver(&self, hash: &str) -> Result<Vec<u8>> {
         let (mut send, mut recv) = self.conn.open_bi().await?;
@@ -844,6 +894,32 @@ impl crate::registry::FleetBlobs for RemoteBlobs {
         let bytes = self.fetch_by_hash_driver(hash).await.ok()?;
         self.hits_driver.fetch_add(1, Relaxed);
         Some(bytes)
+    }
+
+    async fn tag(&self, key: &str) -> Option<String> {
+        // The DRIVER first, and this is the opposite order to `by_hash`.
+        //
+        // Blobs go peer-first because a bloom filter says which peer has
+        // them and the driver should carry as little as possible. A tag has
+        // no bloom, so peer-first means asking every worker in turn for
+        // something most of them do not have - N dials to learn one string,
+        // on the critical path of every cache lookup.
+        //
+        // The driver is one dial on a connection already open, and for the
+        // cache ref specifically it is the likeliest holder anyway.
+        if let Ok(Some(h)) = self.tag_driver(key).await {
+            return Some(h);
+        }
+        let peers: Vec<String> = {
+            let p = self.peers.lock().await;
+            p.keys().filter(|id| **id != self.my_id).cloned().collect()
+        };
+        for who in &peers {
+            if let Ok(Some(h)) = self.tag_from(who, key).await {
+                return Some(h);
+            }
+        }
+        None
     }
 }
 

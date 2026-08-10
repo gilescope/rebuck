@@ -255,6 +255,24 @@ pub enum BlobReq {
     /// fleet. A peer that predates this replies `Err`, which the caller
     /// treats as "not here" - the same as a miss.
     GetByHash(String),
+    /// Resolve a TAG the fleet may hold, when this registry does not.
+    ///
+    /// Content moves by digest everywhere it can, and three separate fixes
+    /// went into making that true - a tag is a name in one machine's
+    /// namespace and the fleet has no namespace. But buildkit's own registry
+    /// CACHE is addressed by tag and nothing else (`type=registry,ref=...`),
+    /// and warm caches are the measured reason six machines are slower than
+    /// one: go-mod and go-build cost ~24s per lead, paid once by a single
+    /// machine and once PER WORKER by a fleet.
+    ///
+    /// So the tag namespace has to be shared after all, for this one purpose.
+    /// Resolution, not replication: the answer is a manifest hash, and the
+    /// manifest and its blobs then travel by content as everything else does.
+    ///
+    /// LAST, for the same reason `GetByHash` is: postcard encodes a variant
+    /// by index, so inserting in the middle reinterprets every later variant
+    /// on a mixed-version fleet.
+    TagGet(String),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -274,6 +292,15 @@ pub enum BlobResp {
     /// Reply to ListShard.
     HashList(Vec<Dig>),
     Err(String),
+    /// Reply to TagGet: the manifest hash this tag names, if the peer has it.
+    ///
+    /// AFTER `Err`, not before it. Appending means appending: postcard
+    /// encodes by index, and putting this one variant above `Err` renumbers
+    /// `Err` for every peer that has not been restarted - so an old node's
+    /// error frame would decode as a tag answer. Written as "appended last"
+    /// and placed second-to-last on the first attempt, which is precisely
+    /// how that mistake gets made.
+    Tag(Option<String>),
 }
 
 pub async fn send_frame<T: Serialize>(s: &mut SendStream, v: &T) -> Result<()> {

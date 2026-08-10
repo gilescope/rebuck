@@ -180,6 +180,19 @@ pub trait FleetBlobs: Send + Sync + 'static {
     /// turns both into 404 and there is nothing useful it could do
     /// differently, so the distinction is not worth carrying up.
     async fn by_hash(&self, hash: &str) -> Option<Vec<u8>>;
+
+    /// Resolve a TAG the fleet may hold.
+    ///
+    /// Only buildkit's registry CACHE needs this - it is addressed by tag
+    /// and nothing else - and warm caches are the measured reason six
+    /// machines take longer than one. Everything else moves by digest, and
+    /// should keep doing so.
+    ///
+    /// Default `None`: a fleet backend that cannot resolve tags is not
+    /// broken, it just has no cache to share.
+    async fn tag(&self, _key: &str) -> Option<String> {
+        None
+    }
 }
 
 /// A local store, with the fleet behind it.
@@ -253,7 +266,26 @@ impl<S: RegistryStore> RegistryStore for MeshBacked<S> {
         self.local.upload_finish(up, expected).await
     }
     async fn tag_get(&self, key: &str) -> Option<String> {
-        self.local.tag_get(key).await
+        if let Some(h) = self.local.tag_get(key).await {
+            return Some(h);
+        }
+        // Ask the fleet. ONLY a miss reaches here, so a local answer is
+        // never delayed by the mesh.
+        //
+        // This is the one place a tag crosses a machine, and it is here
+        // because buildkit's registry cache is addressed by tag and by
+        // nothing else. The answer is a manifest HASH - resolution, not
+        // replication - and the manifest and its blobs then travel by
+        // content like everything else.
+        //
+        // Not cached back into the local tag namespace: a cache ref is
+        // mutable by design, and remembering yesterday's answer is how a
+        // fleet ends up building against a cache nobody else can see.
+        let found = self.fleet.tag(key).await;
+        if found.is_some() {
+            println!("[registry] tag {key} resolved from the fleet");
+        }
+        found
     }
     async fn tag_put(&self, key: &str, manifest_hash: &str) -> Result<()> {
         self.local.tag_put(key, manifest_hash).await
@@ -1654,6 +1686,69 @@ mod tests {
         bytes: Vec<u8>,
         hash: String,
         asked: std::sync::atomic::AtomicUsize,
+    }
+
+    /// A fleet that knows one TAG and nothing else.
+    struct OneTag {
+        key: String,
+        manifest: String,
+        asked: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl FleetBlobs for OneTag {
+        async fn by_hash(&self, _hash: &str) -> Option<Vec<u8>> {
+            None
+        }
+        async fn tag(&self, key: &str) -> Option<String> {
+            self.asked
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (key == self.key).then(|| self.manifest.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tag_the_fleet_holds_resolves_and_a_local_one_does_not_ask() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // buildkit's registry CACHE is addressed by tag and by nothing else,
+        // and warm caches are the measured reason six machines take longer
+        // than one: go-mod and go-build cost ~24s per lead, paid once by a
+        // single machine and once PER WORKER by a fleet.
+        //
+        // Everything else in this system moves by digest, deliberately and
+        // at the cost of three separate fixes. This is the exception, and it
+        // is resolution rather than replication: the answer is a manifest
+        // hash, and the manifest then travels by content like anything else.
+        let fleet = Arc::new(OneTag {
+            key: "rebuck2/cache:go".to_owned(),
+            manifest: "sha256:".to_owned() + &"cd".repeat(32),
+            asked: Default::default(),
+        });
+        let reg = MeshBacked::new(store(), fleet.clone());
+
+        assert_eq!(
+            reg.tag_get("rebuck2/cache:go").await,
+            Some(fleet.manifest.clone()),
+            "a tag only the fleet holds must resolve"
+        );
+        assert_eq!(reg.tag_get("rebuck2/cache:absent").await, None);
+
+        // A LOCAL tag must never reach the mesh: this sits on the critical
+        // path of every cache lookup, and a dial per hit would cost more
+        // than the cache saves.
+        reg.tag_put("rebuck2/cache:local", "sha256:local")
+            .await
+            .unwrap();
+        let before = fleet.asked.load(Relaxed);
+        assert_eq!(
+            reg.tag_get("rebuck2/cache:local").await.as_deref(),
+            Some("sha256:local")
+        );
+        assert_eq!(
+            fleet.asked.load(Relaxed),
+            before,
+            "a local hit asked the fleet anyway"
+        );
     }
 
     #[async_trait::async_trait]
