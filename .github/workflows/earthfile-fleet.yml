@@ -31,6 +31,16 @@
 name: earthfile-fleet
 
 on:
+  # A push trigger on a DEDICATED branch, because workflow_dispatch is not
+  # reachable from here: the API resolves a workflow by its presence on the
+  # DEFAULT branch, and these live only on giles-dispatch. Adding them to
+  # main to make a button appear would put unproven, hour-long jobs in
+  # everyone's face.
+  #
+  # To run: `git push -f origin HEAD:giles-dispatch-ci`. Nothing fires on a
+  # normal push to giles-dispatch, so committing stays cheap.
+  push:
+    branches: [giles-dispatch-ci]
   workflow_dispatch:
     inputs:
       earthly_flags:
@@ -57,7 +67,7 @@ env:
   #
   # Not --no-cache, which this used to pass: upstream does not, and on a
   # test group it turns a measurable run into an unmeasurable one.
-  EARTHLY_FLAGS: ${{ inputs.earthly_flags }}
+  EARTHLY_FLAGS: ${{ inputs.earthly_flags || '--ci -P' }}
 
 permissions:
   contents: read
@@ -76,7 +86,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: EarthBuild/earthbuild
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || 'main' }}
           path: earthbuild
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
@@ -131,7 +141,7 @@ jobs:
       - name: start the fleet
         id: fleet
         env:
-          WORKERS: ${{ inputs.workers }}
+          WORKERS: ${{ inputs.workers || '2' }}
         run: |
           set -euo pipefail
           BIN=rebuck2-repo/rebuck2/target/release/rebuck2
@@ -270,7 +280,7 @@ jobs:
       - name: baseline - the same target with no fleet
         working-directory: earthbuild
         env:
-          TARGET: ${{ inputs.target }}
+          TARGET: ${{ inputs.target || '+code' }}
         run: |
           set -euo pipefail
           start=$SECONDS
@@ -282,7 +292,7 @@ jobs:
       - name: through the fleet
         working-directory: earthbuild
         env:
-          TARGET: ${{ inputs.target }}
+          TARGET: ${{ inputs.target || '+code' }}
         run: |
           set -euo pipefail
           start=$SECONDS
