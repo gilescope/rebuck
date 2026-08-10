@@ -528,7 +528,11 @@ fn forwarding_agent() -> bool {
 /// broken, and being right about that is not the same as being entitled to
 /// prove it on someone's CI.
 fn local_caches() -> bool {
-    std::env::var("REBUCK2_PEER_CACHE_MOUNTS").as_deref() == Ok("1")
+    // Delegated, not re-read. This function and the driver's arbitration
+    // both used to consult the environment; they agreed by coincidence and
+    // stopped agreeing the moment one of them grew a policy the other did
+    // not have.
+    crate::dispatch::policy().caches
 }
 
 /// Can we serve every secret THIS graph asks for?

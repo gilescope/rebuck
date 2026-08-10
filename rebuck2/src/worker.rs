@@ -541,7 +541,12 @@ async fn lead_reply(
             .unwrap_or_else(|| format!("{}/{}", std::env::consts::OS, arch())),
         None => format!("{}/{}", std::env::consts::OS, arch()),
     };
-    if let Err(why) = crate::dispatch::consider(load, &verdict, &me) {
+    // The fleet's policy, not this worker's opinion. Three components ask
+    // this question - the gateway before offering, the driver before
+    // choosing a peer, and here - and for a while they asked three different
+    // versions of it: the first two agreed to route a cache-mount subtree
+    // and the worker refused every offer of it.
+    if let Err(why) = crate::dispatch::consider(load, &verdict, &me, crate::dispatch::policy()) {
         return decline(format!("{why:?}"));
     }
 

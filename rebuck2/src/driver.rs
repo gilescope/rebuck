@@ -1390,10 +1390,34 @@ impl Driver {
                 .collect()
         };
 
-        let mut placement = crate::dispatch::Placement::new(&verdict, &candidates);
+        let mut placement = crate::dispatch::Placement::new(
+            &verdict,
+            &candidates,
+            // The SAME policy the gateway used to decide this was worth
+            // offering. Two answers to one question is what left four idle
+            // workers looking like the reason nothing moved.
+            crate::dispatch::policy(),
+        );
         let Some(first) = placement.offer() else {
             drop(open);
-            self.unplaced(requester, job, "no peer can take it").await;
+            // WHICH peers, and why each was no good. "no peer can take it"
+            // was reported five times with three workers idle, and named
+            // nothing that could be checked - platform mismatch, saturation
+            // and an empty fleet all print the same sentence.
+            let who: Vec<String> = candidates
+                .iter()
+                .map(|c| format!("{}:{} {}/{}", c.id, c.platform, c.load.driver, c.load.slots))
+                .collect();
+            let why = format!(
+                "no peer can take it (wanted {:?}; had {})",
+                verdict.platform,
+                if who.is_empty() {
+                    "nobody".to_owned()
+                } else {
+                    who.join(", ")
+                }
+            );
+            self.unplaced(requester, job, &why).await;
             return;
         };
         open.insert(

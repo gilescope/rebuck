@@ -140,17 +140,44 @@ impl Verdict {
     /// same bytes. Off by default anyway, because "already broken" is a
     /// reason to allow it, not a reason to assume nobody depends on it.
     pub fn dispatchable_when(&self, allow: Allow) -> bool {
-        let blocked = self.exclusions.iter().any(|(_, e)| match e {
-            Exclusion::Secret => !allow.secrets,
-            Exclusion::CacheMount => !allow.caches,
-            Exclusion::SshAgent => !allow.agent,
-            // Insecure exec and host networking are never lifted. Granting a
-            // privilege is a trust decision, not a scheduling one, and there
-            // is no session service that makes a peer's `--privileged` mean
-            // what the client's would have meant.
-            _ => true,
-        });
+        let blocked = self.exclusions.iter().any(|(_, e)| !lifted_by(e, allow));
         !blocked && !matches!(self.platform, Platform::Conflict(_))
+    }
+}
+
+/// The fleet's standing policy on which hazards may travel.
+///
+/// ONE reader of the environment, because the gateway and the driver used to
+/// have their own and disagreed: the gateway offered cache-mount subtrees
+/// that the driver then refused as undispatchable, and the report blamed the
+/// workers.
+///
+/// Read once - a policy that changes halfway through a build would place two
+/// identical subtrees differently.
+pub fn policy() -> Allow {
+    static P: std::sync::OnceLock<Allow> = std::sync::OnceLock::new();
+    *P.get_or_init(|| Allow {
+        caches: std::env::var("REBUCK2_PEER_CACHE_MOUNTS").as_deref() == Ok("1"),
+        ..Default::default()
+    })
+}
+
+/// Does `allow` lift this hazard?
+///
+/// One table, because `dispatchable_when` and `consider` used to answer
+/// it separately and a subtree the first would offer was refused by the
+/// second.
+fn lifted_by(e: &Exclusion, allow: Allow) -> bool {
+    match e {
+        Exclusion::Secret => allow.secrets,
+        Exclusion::CacheMount => allow.caches,
+        Exclusion::SshAgent => allow.agent,
+        // Insecure exec and host networking are never lifted. Granting a
+        // privilege is a trust decision, not a scheduling one, and there is
+        // no session service that makes a peer's `--privileged` mean what
+        // the client's would have meant. An unknown mount type is not lifted
+        // either - opting in means having weighed it.
+        _ => false,
     }
 }
 
@@ -393,13 +420,33 @@ pub enum Next {
 }
 
 /// Should this worker accept an offered subtree?
-pub fn consider(load: Load, v: &Verdict, my_platform: &str) -> Result<(), Refusal> {
+/// Against a stated policy.
+///
+/// The policy is a PARAMETER because two components were deciding this same
+/// question by different rules: the gateway lifted cache mounts from the
+/// environment and offered the subtree, the driver's `offer_order` asked
+/// `consider` - which had no policy - and refused it. Four idle workers of
+/// the right platform, and the offer died on the arbiter.
+///
+/// Whoever decides to offer and whoever decides where must be asking the
+/// same question. This is that question.
+pub fn consider(load: Load, v: &Verdict, my_platform: &str, allow: Allow) -> Result<(), Refusal> {
     // Checked in this order on purpose. "This should never have been
     // offered" and "I can never run this" must outrank "not right now":
     // Saturated invites the offer back, and an offer that can never be
     // accepted would then circulate forever.
-    if let Some((_, why)) = v.exclusions.first() {
-        return Err(Refusal::Undispatchable(why.clone()));
+    if !v.dispatchable_when(allow) {
+        // Report the first blocker the POLICY did not lift, so the message
+        // names something the operator can act on rather than whichever
+        // hazard happens to sort first.
+        let why = v
+            .exclusions
+            .iter()
+            .map(|(_, e)| e)
+            .find(|e| !lifted_by(e, allow))
+            .cloned()
+            .unwrap_or(Exclusion::Undecodable);
+        return Err(Refusal::Undispatchable(why));
     }
     let wants = match &v.platform {
         Platform::Any => None,
@@ -478,7 +525,7 @@ pub fn worth_offering(
 }
 
 /// Who to offer this subtree to, best first. Empty means build it yourself.
-pub fn offer_order(v: &Verdict, cands: &[Candidate]) -> Vec<u64> {
+pub fn offer_order(v: &Verdict, cands: &[Candidate], allow: Allow) -> Vec<u64> {
     let mut able: Vec<&Candidate> = cands
         .iter()
         .filter(|c| {
@@ -486,7 +533,7 @@ pub fn offer_order(v: &Verdict, cands: &[Candidate]) -> Vec<u64> {
             // decline is a wasted round trip, and a saturated one says so
             // in its own load without being asked.
             !matches!(
-                consider(c.load, v, &c.platform),
+                consider(c.load, v, &c.platform, allow),
                 Err(Refusal::Undispatchable(_)) | Err(Refusal::WrongPlatform { .. })
             ) && c.load.free() > 0
         })
@@ -517,9 +564,9 @@ pub struct Placement {
 }
 
 impl Placement {
-    pub fn new(v: &Verdict, cands: &[Candidate]) -> Self {
+    pub fn new(v: &Verdict, cands: &[Candidate], allow: Allow) -> Self {
         Placement {
-            order: offer_order(v, cands),
+            order: offer_order(v, cands, allow),
             next: 0,
             outstanding: None,
         }
@@ -932,12 +979,15 @@ mod tests {
     #[test]
     fn a_worker_may_refuse_and_that_is_the_backpressure() {
         let v = ok_verdict();
-        assert_eq!(consider(load(4, 1, 1), &v, "linux/arm64"), Ok(()));
+        assert_eq!(
+            consider(load(4, 1, 1), &v, "linux/arm64", Allow::default()),
+            Ok(())
+        );
 
         // Saturated is the signal principle 12 is built on: a driver that
         // cannot place work has learned the fleet is full without a metric.
         assert_eq!(
-            consider(load(2, 1, 1), &v, "linux/arm64"),
+            consider(load(2, 1, 1), &v, "linux/arm64", Allow::default()),
             Err(Refusal::Saturated)
         );
 
@@ -954,15 +1004,21 @@ mod tests {
             inspect(&def(vec![o]))
         };
         assert_eq!(
-            consider(load(4, 0, 0), &pinned, "linux/amd64"),
+            consider(load(4, 0, 0), &pinned, "linux/amd64", Allow::default()),
             Err(Refusal::WrongPlatform {
                 wants: "linux/arm64".into(),
                 have: "linux/amd64".into()
             })
         );
-        assert_eq!(consider(load(4, 0, 0), &pinned, "linux/arm64"), Ok(()));
+        assert_eq!(
+            consider(load(4, 0, 0), &pinned, "linux/arm64", Allow::default()),
+            Ok(())
+        );
         // An unpinned subtree runs anywhere.
-        assert_eq!(consider(load(4, 0, 0), &v, "windows/amd64"), Ok(()));
+        assert_eq!(
+            consider(load(4, 0, 0), &v, "windows/amd64", Allow::default()),
+            Ok(())
+        );
 
         // The offerer already checked dispatchability. Checking again costs
         // one comparison and means a bug there cannot ship us a secret.
@@ -974,14 +1030,14 @@ mod tests {
             }]
         })]));
         assert_eq!(
-            consider(load(4, 0, 0), &bad, "linux/arm64"),
+            consider(load(4, 0, 0), &bad, "linux/arm64", Allow::default()),
             Err(Refusal::Undispatchable(Exclusion::Secret))
         );
 
         // Refusing an undispatchable subtree outranks being saturated: the
         // offer was wrong, and saying "try me later" invites it back.
         assert_eq!(
-            consider(load(1, 1, 0), &bad, "linux/arm64"),
+            consider(load(1, 1, 0), &bad, "linux/arm64", Allow::default()),
             Err(Refusal::Undispatchable(Exclusion::Secret))
         );
     }
@@ -1124,6 +1180,7 @@ mod tests {
                 cand(2, "linux/arm64", load(4, 0, 0)),
                 cand(3, "linux/arm64", load(4, 1, 0)),
             ],
+            Allow::default(),
         );
         assert_eq!(got, vec![2, 3, 1]);
 
@@ -1135,6 +1192,7 @@ mod tests {
                 cand(1, "linux/arm64", load(2, 1, 1)),
                 cand(2, "linux/arm64", load(4, 0, 0)),
             ],
+            Allow::default(),
         );
         assert_eq!(got, vec![2]);
 
@@ -1158,16 +1216,21 @@ mod tests {
                 cand(2, "darwin/arm64", load(8, 0, 0)),
                 cand(3, "linux/arm64", load(4, 3, 0)),
             ],
+            Allow::default(),
         );
         assert_eq!(got, vec![3], "the only peer that can run it, busy or not");
 
         // Nobody able => build it yourself. Duplicate work is always
         // correct; a stall is worse than the work we set out to avoid.
         assert_eq!(
-            offer_order(&pinned, &[cand(1, "linux/amd64", load(8, 0, 0))]),
+            offer_order(
+                &pinned,
+                &[cand(1, "linux/amd64", load(8, 0, 0))],
+                Allow::default()
+            ),
             Vec::<u64>::new()
         );
-        assert_eq!(offer_order(&v, &[]), Vec::<u64>::new());
+        assert_eq!(offer_order(&v, &[], Allow::default()), Vec::<u64>::new());
 
         // An undispatchable subtree is offered to NOBODY, however idle the
         // fleet is - the exclusion is about the work, not the capacity.
@@ -1175,7 +1238,11 @@ mod tests {
             e.mounts = vec![mount(pb::MountType::Cache)]
         })]));
         assert_eq!(
-            offer_order(&bad, &[cand(1, "linux/arm64", load(8, 0, 0))]),
+            offer_order(
+                &bad,
+                &[cand(1, "linux/arm64", load(8, 0, 0))],
+                Allow::default()
+            ),
             Vec::<u64>::new()
         );
 
@@ -1187,6 +1254,7 @@ mod tests {
                 cand(9, "linux/arm64", load(4, 0, 0)),
                 cand(2, "linux/arm64", load(4, 0, 0)),
             ],
+            Allow::default(),
         );
         assert_eq!(got, vec![2, 9]);
     }
@@ -1206,6 +1274,7 @@ mod tests {
                 c(2, load(4, 0, 0)),
                 c(3, load(4, 1, 0)),
             ],
+            Allow::default(),
         );
 
         // Emptiest first, and ONE at a time. Broadcasting would have two
@@ -1236,7 +1305,7 @@ mod tests {
             platform: "linux/arm64".into(),
             load: load(4, 0, 0),
         };
-        let mut p = Placement::new(&ok_verdict(), &[c(1), c(2), c(3)]);
+        let mut p = Placement::new(&ok_verdict(), &[c(1), c(2), c(3)], Allow::default());
         assert_eq!(p.offer(), Some(1));
         assert_eq!(p.declined(1), Some(2));
 
@@ -1257,11 +1326,11 @@ mod tests {
         let bad = inspect(&def(vec![with_exec(plain(), |e| {
             e.mounts = vec![mount(pb::MountType::Cache)]
         })]));
-        let mut p = Placement::new(&bad, &[c(1), c(2)]);
+        let mut p = Placement::new(&bad, &[c(1), c(2)], Allow::default());
         assert_eq!(p.offer(), None);
 
         // An empty fleet is the same answer by a different route.
-        let mut p = Placement::new(&ok_verdict(), &[]);
+        let mut p = Placement::new(&ok_verdict(), &[], Allow::default());
         assert_eq!(p.offer(), None);
     }
 
@@ -1643,6 +1712,53 @@ mod tests {
                 ..Default::default()
             }),
             "lifting the cache mount let an ssh mount travel"
+        );
+    }
+
+    #[test]
+    fn the_driver_offers_what_the_gateway_was_allowed_to_offer() {
+        // Two components deciding the same question by different rules.
+        //
+        // The gateway asks `dispatchable_when(Allow { caches: true })` when
+        // REBUCK2_PEER_CACHE_MOUNTS=1 and offers the subtree. The driver then
+        // asks `consider`, which took no Allow at all, saw a CacheMount
+        // exclusion and refused - so the offer died on the arbiter with four
+        // idle workers of exactly the right platform in front of it:
+        //
+        //   no peer can take it (wanted Pinned("linux/arm64"); had
+        //     1:linux/arm64 0/16, 2:linux/arm64 0/16,
+        //     3:linux/arm64 0/16, 4:linux/arm64 0/16)
+        //
+        // Measured on `earthly +code`: 1 of 6 solves routed, and the 5 that
+        // did not were exactly the 5 carrying cache mounts.
+        let mut e = exec_of(&plain());
+        e.mounts = vec![mount(pb::MountType::Cache)];
+        let mut op = plain();
+        op.op = Some(OpKind::Exec(e));
+        let v = inspect(&def(vec![op]));
+
+        let idle = Candidate {
+            id: 7,
+            platform: "linux/arm64".to_owned(),
+            load: load(16, 0, 0),
+        };
+        // Same graph, same worker. The ONLY difference is the policy, and it
+        // must be the one thing that decides.
+        assert!(
+            offer_order(&v, std::slice::from_ref(&idle), Allow::default()).is_empty(),
+            "a cache mount is excluded by default and must not be offered"
+        );
+        assert_eq!(
+            offer_order(
+                &v,
+                std::slice::from_ref(&idle),
+                Allow {
+                    caches: true,
+                    ..Default::default()
+                }
+            ),
+            vec![7],
+            "the gateway was allowed to offer this; the driver must agree"
         );
     }
 
