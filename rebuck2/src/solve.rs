@@ -248,32 +248,55 @@ pub async fn publish_context(
     let attrs = publish_attrs(name.clone());
 
     let mut c = connect(bk_addr).await?;
-    c.solve(control::SolveRequest {
-        r#ref: format!(
-            "rebuck2-ctx.{}.{}",
-            std::process::id(),
-            SOLVE_SEQ.fetch_add(1, Ordering::Relaxed)
-        ),
-        definition: Some(def),
-        // The client's session, not ours: it is the only one with the files.
-        session: session.to_owned(),
-        // BOTH forms. `exporters` is the current field; older daemons -
-        // earthbuild ships a v0.8.17-era buildkitd - read only
-        // `exporter_deprecated`, IGNORE the plural silently, and return a
-        // successful solve having exported nothing. A push that no-ops
-        // while reporting success is the worst possible failure mode, and
-        // it cost an iteration to find.
-        exporter_deprecated: "image".to_owned(),
-        exporter_attrs_deprecated: attrs.clone(),
-        exporters: vec![control::Exporter {
-            r#type: "image".to_owned(),
-            attrs,
-        }],
-        ..Default::default()
+    let resp = c
+        .solve(control::SolveRequest {
+            r#ref: format!(
+                "rebuck2-ctx.{}.{}",
+                std::process::id(),
+                SOLVE_SEQ.fetch_add(1, Ordering::Relaxed)
+            ),
+            definition: Some(def),
+            // The client's session, not ours: it is the only one with the files.
+            session: session.to_owned(),
+            // BOTH forms. `exporters` is the current field; older daemons -
+            // earthbuild ships a v0.8.17-era buildkitd - read only
+            // `exporter_deprecated`, IGNORE the plural silently, and return a
+            // successful solve having exported nothing. A push that no-ops
+            // while reporting success is the worst possible failure mode, and
+            // it cost an iteration to find.
+            exporter_deprecated: "image".to_owned(),
+            exporter_attrs_deprecated: attrs.clone(),
+            exporters: vec![control::Exporter {
+                r#type: "image".to_owned(),
+                attrs,
+            }],
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("publish context: {} {}", e.code(), e.message()))?;
+    // BY DIGEST, the third and last kind of source that has to cross a
+    // machine. Subtree results, base images, and now contexts: each was
+    // fixed separately and each failed the same way, because on ONE machine
+    // a tag in the local registry resolves perfectly and nothing is wrong.
+    //
+    // Measured across three runners, in this order, each fix revealing the
+    // next: base first, then
+    //
+    //     failed to load cache key: 172.17.0.1:15000/rebuck2/context:<tag>
+    //
+    // `172.17.0.1:15000` exists on every runner and is a different registry
+    // on each. A digest is content and needs no gossip; a tag is a name in
+    // one machine's namespace.
+    let by_digest = resp
+        .into_inner()
+        .exporter_response
+        .get("containerimage.digest")
+        .filter(|d| d.starts_with("sha256:"))
+        .cloned();
+    Ok(match by_digest {
+        Some(d) => format!("docker-image://{}", by_digest_ref(&name, &d)),
+        None => format!("docker-image://{name}"),
     })
-    .await
-    .map_err(|e| anyhow::anyhow!("publish context: {} {}", e.code(), e.message()))?;
-    Ok(format!("docker-image://{name}"))
 }
 
 /// Copy a registry image into the mirror, so a peer can fetch it without
