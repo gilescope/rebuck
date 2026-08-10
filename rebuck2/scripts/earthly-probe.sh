@@ -44,6 +44,20 @@ REG_PORT=${REG_PORT:-25000}
 BK_PORT=${BK_PORT:-28371}
 OWN_BK=${OWN_BK:-rebuck2-earthly-bk}
 
+# Every registry in this run, trusted by every daemon.
+#
+# A worker publishes into its OWN registry now, and any daemon may be asked
+# to pull from any of them. A daemon that does not trust a registry pushes
+# happily over HTTP and then refuses to pull from it - the silent
+# half-failure this project has already been caught by once, because the push
+# is the loud half.
+trust_block() {
+  local p
+  for p in $(seq "$REG_PORT" $((REG_PORT + WORKERS))); do
+    printf '[registry."%s:%s"]\n  http = true\n  insecure = true\n' "$MIRROR_HOST" "$p"
+  done
+}
+
 [ -d "$EB" ] || { echo "no earthbuild checkout at $EB (set EB=)"; exit 1; }
 [ -n "$LAN" ] || { echo "no non-loopback address found (set LAN=)"; exit 1; }
 [ -x "$BIN" ] || { echo "build rebuck2 --release first"; exit 1; }
@@ -89,9 +103,10 @@ MIRROR_HOST=${MIRROR_HOST:-host.docker.internal}
   echo "  tls_enabled: false"
   if [ -n "${EARTHLY_TRUST_CONFIG:-}" ]; then
     echo "  buildkit_additional_config: |"
-    echo "    [registry.\"$MIRROR_HOST:$REG_PORT\"]"
-    echo "      http = true"
-    echo "      insecure = true"
+    # Every worker's registry, not just the coordinator's: the graph earthly
+    # gets back names whichever registry the requester pulls from, and with
+    # per-worker registries that is not one fixed host.
+    trust_block | sed 's/^/    /'
   fi
 } >"$RUN/earthly.yml"
 export EARTHLY_CONFIG="$RUN/earthly.yml"
@@ -127,9 +142,7 @@ docker run -d --name "$OWN_BK" --privileged \
   -p "$BK_PORT:8372" \
   -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
   -e BUILDKIT_TLS_ENABLED=false \
-  -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG="[registry.\"$MIRROR_HOST:$REG_PORT\"]
-  http = true
-  insecure = true" \
+  -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG="$(trust_block)" \
   "$BK_IMAGE" >/dev/null
 BK_ADDR="127.0.0.1:$BK_PORT"
 for _ in $(seq 1 90); do
@@ -171,17 +184,34 @@ for i in $(seq 1 "$WORKERS"); do
       -p "$w_port:8372" \
       -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
       -e BUILDKIT_TLS_ENABLED=false \
-      -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG="[registry.\"$MIRROR_HOST:$REG_PORT\"]
-  http = true
-  insecure = true" \
+      -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG="$(trust_block)" \
       "$BK_IMAGE" >/dev/null
     w_bk="127.0.0.1:$w_port"
     bk_names+=("$OWN_BK-$i")
   fi
+  # A REGISTRY PER WORKER, which is what makes the mesh do anything.
+  #
+  # Every worker used to publish into the coordinator's registry, so a
+  # subtree's layers were already where the requester would look and the
+  # fleet's blob path was never asked a question. With its own registry a
+  # worker publishes locally and anyone else has to FETCH - local, then a
+  # bloom-matched peer, then the driver. That is the code `hits_peer`
+  # counts, and it has never once been exercised in this repo.
+  #
+  # WORKER_REG=shared restores the old behaviour.
+  if [ "${WORKER_REG:-own}" = shared ]; then
+    w_reg="$MIRROR_HOST:$REG_PORT"
+    reg_args=()
+  else
+    w_regport=$((REG_PORT + i))
+    w_reg="$MIRROR_HOST:$w_regport"
+    reg_args=(--registry-bind "0.0.0.0:$w_regport")
+  fi
   "$BIN" worker --session "$SESSION" \
     --store "$RUN/worker-$i" \
     --buildkit-addr "http://$w_bk" \
-    --registry-addr "$MIRROR_HOST:$REG_PORT" >"$RUN/worker-$i.log" 2>&1 &
+    "${reg_args[@]}" \
+    --registry-addr "$w_reg" >"$RUN/worker-$i.log" 2>&1 &
   pids+=("$!")
 done
 
@@ -244,7 +274,10 @@ echo "== where each worker's blobs came from"
 # Reported per worker and not summed: one worker serving everything looks
 # identical to a healthy fleet once you add the columns up.
 for i in $(seq 1 "$WORKERS"); do
-  line=$(grep -E '^\[cas\] fetches' "$RUN/worker-$i.log" 2>/dev/null | tail -1)
+  # `|| line=` and not bare: under `set -e` an assignment from a grep that
+  # matches nothing EXITS the script. That killed the previous run after the
+  # build had succeeded and before it printed a single number.
+  line=$(grep -E '^\[cas\] fetches' "$RUN/worker-$i.log" 2>/dev/null | tail -1) || line=
   echo "   worker $i: ${line:-no fetches (nothing crossed a boundary)}"
 done
 echo

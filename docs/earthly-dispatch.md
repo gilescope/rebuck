@@ -396,3 +396,41 @@ blank line fixed it and `+lint` went green.
 Which is the argument for running a project's real targets rather than
 fixtures: the fleet linted the patch that makes the fleet possible, and found
 it wanting. No synthetic graph was ever going to do that.
+
+## The first time a blob moved between two workers
+
+2026-08-10. `earthly +code`, three workers, each with its OWN buildkitd and
+its OWN registry:
+
+```text
+build: yes in 128s      solves routed: 6 of 6
+worker 1: local=0 peer=0 driver=5
+worker 2: no fetches
+worker 3: local=0 peer=6 driver=2
+```
+
+`peer=6` is the first non-zero `hits_peer` this repo has ever recorded.
+
+It had never been zero because the mesh was broken. Every worker was pointed
+at the COORDINATOR's registry, so a subtree's layers were already sitting
+where the requester would look, and the fetch path - local, then a
+bloom-matched peer, then the driver - was never asked a question it could
+answer with "peer". The fleet had nowhere to move anything to.
+
+Two topology facts had to be true together, and each was a separate change:
+
+| change | without it |
+| ------------------------- | ------------------------------------------ |
+| one buildkitd per worker | a "peer" build lands in the requester's own content store |
+| one registry per worker | the layers are already at the address the requester pulls from |
+
+Worker 1 still took all five of its blobs from the driver. That is the
+fallback working, not the mesh failing: on a cold fleet the bloom filters
+have little in them, and the driver is the correct answer when no peer
+advertises the content. What matters is that `peer` is now a column that can
+be non-zero, so the next question - how OFTEN it beats the driver, and
+whether that improves as stores warm - is finally askable.
+
+Every dispatch number recorded before this section was measured on a fleet
+where the handover cost nothing, because nothing moved. The placement figures
+stand; any inference from them about transfer cost does not.
