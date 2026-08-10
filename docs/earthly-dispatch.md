@@ -897,3 +897,51 @@ the multiplier is the thing to explain. Candidates, none measured:
 The next measurement is a breakdown of one lead - fetch versus build - not
 another remedy. Three remedies have now been tried against a number that did
 not mean what it was taken to mean.
+
+## Fewer machines are faster, which is the whole diagnosis
+
+`+test-no-qemu-group2`, same everything, only the fleet size changed:
+
+| workers | baseline | fleet | penalty |
+| ------: | -------: | ----: | ------: |
+| 6 | 277s | 660s | +383s |
+| 2 | 299s | 401s | +102s |
+
+A parallel graph that gets SLOWER with more machines is not a scheduling
+problem. It is work being multiplied.
+
+The lead durations say it again:
+
+```text
+n=40  min=918ms  p50=21679ms  p90=96000ms  max=159877ms  mean=30155ms
+```
+
+A 170x spread between the fastest lead and the slowest. The early leads on
+each worker take up to 160 seconds; once that worker is warm they drop below
+a second.
+
+### What is actually happening
+
+Every solve's LLB graph is a DAG rooted at its target and contains its whole
+ancestor chain. Dispatched subtrees measure ~106-109 ops out of a 123-solve
+build, and every lead reports `0 frontier blobs` - nothing is handed over
+pre-built, so the worker executes the chain from the base image up.
+
+BuildKit dedupes within one daemon, so a worker pays that prefix ONCE and its
+remaining leads are nearly free. Which means:
+
+| | one machine | N machines |
+| ----------------- | ----------- | ---------------------- |
+| the shared prefix | built once | built N times |
+| the leaf work | once | genuinely divided by N |
+| transfer | none | base + context per worker |
+
+The leaf work is the small remainder. Adding a machine adds a prefix rebuild
+and subtracts a fraction of the remainder, and the first term is larger - so
+the curve goes the wrong way, exactly as measured.
+
+This also retires the cache investigation as a fix rather than a symptom. A
+warm `go-mod` would shave part of a prefix that should not be built six times
+in the first place.
+
+The unit being distributed is the problem, not the algorithm that places it.
