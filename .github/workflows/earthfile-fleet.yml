@@ -327,8 +327,24 @@ jobs:
         run: |
           set -euo pipefail
           start=$SECONDS
+          # tls_enabled defaults TRUE, and a REMOTE buildkit is expected to
+          # present a certificate: earthly goes looking for
+          # ~/.earthly/certs/ca_cert.pem and fails with
+          #
+          #     TLS CA file ".../certs/ca_cert.pem" not found
+          #
+          # Our daemons speak plain gRPC, so it has to be off - for the
+          # BASELINE as much as for the fleet. Known locally since the first
+          # probe; never carried into CI, because the baseline step was
+          # written before the local rig learned it.
+          #
+          # And the LAN address, not $BK0's loopback: earthly's IsLocal
+          # counts 127.0.0.1 as "a buildkit I manage" and tries to start its
+          # own container instead of connecting.
+          printf 'global:\n  tls_enabled: false\n' > "$RUNNER_TEMP/earthly.yml"
           # shellcheck disable=SC2086 # a flag LIST: word-splitting is the point
-          EARTHLY_BUILDKIT_HOST="tcp://$BK0" \
+          EARTHLY_CONFIG="$RUNNER_TEMP/earthly.yml" \
+          EARTHLY_BUILDKIT_HOST="tcp://${LAN}:18372" \
             earthly $EARTHLY_FLAGS "$TARGET" 2>&1 | tail -40
           echo "BASELINE_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
 
@@ -339,7 +355,11 @@ jobs:
         run: |
           set -euo pipefail
           start=$SECONDS
+          # Same tls_enabled: false as the baseline - the gateway speaks
+          # plain gRPC too.
+          printf 'global:\n  tls_enabled: false\n' > "$RUNNER_TEMP/earthly.yml"
           # shellcheck disable=SC2086 # a flag LIST: word-splitting is the point
+          EARTHLY_CONFIG="$RUNNER_TEMP/earthly.yml" \
           EARTHLY_BUILDKIT_HOST="tcp://${LAN}:1234" \
             earthly $EARTHLY_FLAGS "$TARGET" 2>&1 | tail -40
           echo "FLEET_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
