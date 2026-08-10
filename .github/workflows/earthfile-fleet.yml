@@ -250,7 +250,21 @@ jobs:
             printf '%s\n' "$TRUST"
             docker logs --tail 30 own-bk
             exit 1; }
-          echo "BK0=127.0.0.1:18372" >> "$GITHUB_ENV"
+          # BOTH: a shell variable for THIS step, and $GITHUB_ENV for the
+          # later ones. Writing only to $GITHUB_ENV set it for every step
+          # except the one that needed it, and `set -u` then killed the
+          # proxy command with
+          #
+          #     line 127: BK0: unbound variable
+          #
+          # Everything after that was a consequence with a more interesting
+          # error message: workers logging `No addressing information
+          # available` because there was no driver to discover, and earthly
+          # reporting `failed to list workers: Unavailable` against a
+          # gateway that had never started. One unset variable, three
+          # plausible wrong diagnoses.
+          BK0=127.0.0.1:18372
+          echo "BK0=$BK0" >> "$GITHUB_ENV"
 
           # One more daemon per worker, same image, same env earthly uses.
           for i in $(seq 1 "$WORKERS"); do

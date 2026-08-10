@@ -192,7 +192,12 @@ jobs:
           done
           docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 || {
             echo "our buildkitd never became ready:"; docker logs --tail 20 own-bk; exit 1; }
-          echo "BK_ADDR=127.0.0.1:18372" >> "$GITHUB_ENV"
+          # Shell variable AND $GITHUB_ENV: the latter only reaches LATER
+          # steps, and this one uses it below. See the single-runner
+          # workflow, where writing only the env file left `set -u` to kill
+          # the proxy with `BK0: unbound variable`.
+          BK_ADDR=127.0.0.1:18372
+          echo "BK_ADDR=$BK_ADDR" >> "$GITHUB_ENV"
 
       - name: serve until the coordinator goes
         env:
@@ -316,8 +321,12 @@ jobs:
           done
           docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 || {
             echo "our buildkitd never became ready:"; docker logs --tail 20 own-bk; exit 1; }
-          echo "BK_ADDR=127.0.0.1:18372" >> "$GITHUB_ENV"
+          # Shell variable AND $GITHUB_ENV: the latter only reaches LATER
+          # steps, and this one uses it below. See the single-runner
+          # workflow, where writing only the env file left `set -u` to kill
+          # the proxy with `BK0: unbound variable`.
           BK_ADDR=127.0.0.1:18372
+          echo "BK_ADDR=$BK_ADDR" >> "$GITHUB_ENV"
 
           # NOT loopback. earthly's `IsLocal` counts 127.0.0.1, localhost and
           # ::1 as "a buildkit I manage", so a gateway on loopback makes it
