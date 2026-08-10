@@ -1031,3 +1031,53 @@ the small target and confirming on the large one, not for skipping the
 repeats.
 
 Measured after four remedies had already been chosen and reported.
+
+## Daemon consolidation, recovered - and it moves the goalposts
+
+earthbuild's tests are earthly-in-earthly: `RUN_EARTH` runs
+`/usr/bin/earthly-entrypoint.sh` INSIDE a container, and that entrypoint
+starts its own buildkitd unless a host is given. Every test's real build
+therefore ran on a nested daemon this gateway never saw - and the 39 solves
+refused as `Insecure` ARE those nested runs. The fleet was distributing the
+cheap 84 and leaving the whole critical path at home.
+
+Solved once already on `giles-single-buildkit-with-dist` and lost. Recovered
+as four source patches plus an escape hatch, re-derived onto 3380dc20 because
+0005 patches `RUN_EARTHLY`, which upstream renamed to `RUN_EARTH`.
+
+Three things had to be true together, and only the first was in the patches:
+
+1. **0004** - the entrypoint must decide internal-vs-external on the variable
+   EARTHLY reads (`EARTH_` first, `EARTHLY_` fallback), not the bare
+   `BUILDKIT_HOST`. Without it the container starts a daemon earthly then
+   ignores, which is worse than not forwarding.
+2. **`force_internal_buildkit`** on the six call sites whose inner Earthfile
+   contains `LOCALLY` - re-derived by grep, not copied.
+3. **`EARTHLY_TLS_ENABLED=false` in the ENVIRONMENT.** We had TLS off in a
+   config FILE, which lives in one container and cannot travel. The nested
+   earthly inherited the host and nothing else, defaulted to TLS, and exited
+   6. This is what made patch 0001 look redundant.
+
+### The result, and it is not the one expected
+
+| | unconsolidated | consolidated |
+| ------------------ | -------------: | -----------: |
+| baseline, 1 machine | ~300s | **141s** |
+| fleet, 3 workers | 401s | 451s |
+
+**Consolidation more than halves the single machine and barely moves the
+fleet.** It is a 2x win, and it is a win for the thing the fleet has to beat.
+Removing 39 nested daemon startups helps whoever was paying for them, and on
+one machine that is one process paying 39 times; spread over three workers it
+was already partly amortised.
+
+The fleet now sees the nested work - 160 gateway solves against 123, and 129
+routed - so the mechanism did what it was for. It just did not pay.
+
+### And the fleet changed the answer
+
+`./tests+copy-test-verbose-output` passes on one machine and fails through the
+fleet. That is the parity check earning its place: a test asserting on
+earthly's own output is exactly the kind that a distributed build can break
+without breaking anything real, and it needs diagnosis rather than a
+`force_internal_buildkit` sprinkled on it to make the red go away.

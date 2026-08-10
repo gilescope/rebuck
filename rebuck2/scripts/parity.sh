@@ -80,8 +80,15 @@ done
 printf 'global:\n  tls_enabled: false\n' > "$RUN/earthly.yml"
 start=$SECONDS
 # shellcheck disable=SC2086 # deliberate word-splitting: FLAGS is a flag list
+# TLS off by ENV, not only by config file, for the SAME reason the fleet leg
+# needs it: under daemon consolidation a nested earthly inherits its settings
+# through the forwarded environment, and a config file lives in one container.
+# Without this the baseline's nested builds dial the shared daemon, default to
+# TLS, and exit 6 - so the baseline fails while the fleet leg passes and the
+# comparison measures the difference between two rigs rather than one variable.
 ( cd "$EB" && EARTHLY_CONFIG="$RUN/earthly.yml" \
     EARTHLY_BUILDKIT_HOST="tcp://$LAN:$BASE_PORT" \
+    EARTHLY_TLS_ENABLED=false EARTH_TLS_ENABLED=false \
     EARTHLY_VERSION_FLAG_OVERRIDES="$OVERRIDES" \
     "$EARTHLY_BIN" $FLAGS "$TARGET" >"$RUN/baseline.log" 2>&1 ) && b_ok=yes || b_ok=no
 echo "   baseline: $b_ok in $((SECONDS - start))s"
