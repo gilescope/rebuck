@@ -573,7 +573,34 @@ async fn lead_reply(
         verdict.ops,
         frontier.len()
     );
-    match crate::solve::build_subtree(bk, reg, job, def).await {
+    // Where does a lead's time GO?
+    //
+    // 84 leads at ~24s each is most of the 383s by which six machines lose
+    // to one, and three remedies have now been aimed at that number without
+    // anyone knowing what is inside it. A lead is: the daemon fetching what
+    // it needs (base, context, cache), then executing, then pushing the
+    // result. Those have very different fixes and the report cannot tell
+    // them apart.
+    //
+    // `fetched` is what THIS worker's registry served during the build -
+    // the mirror hop, which is the difference between a worker and home.
+    // The DISTRIBUTION is the discriminator, and it needs nothing but a
+    // clock. If the first lead on a worker is slow and the rest are quick,
+    // the cost is a cold cache paid once per machine. If every lead costs
+    // the same, it is per-lead overhead - a mirror hop, or earthly's own
+    // per-solve work paid 84 times instead of inline - and no amount of
+    // cache seeding touches it.
+    //
+    // Three remedies have been aimed at this without anyone knowing which
+    // shape it has.
+    let t = std::time::Instant::now();
+    let out = crate::solve::build_subtree(bk, reg, job, def).await;
+    println!(
+        "[worker] job {job} took {}ms ({} ops)",
+        t.elapsed().as_millis(),
+        verdict.ops
+    );
+    match out {
         Ok(image_ref) => W2D::Led { job, image_ref },
         // A failed subtree is the requester's to rebuild. Reporting it as a
         // decline rather than swallowing it is what stops them waiting.
