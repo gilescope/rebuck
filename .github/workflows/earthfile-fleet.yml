@@ -204,6 +204,11 @@ jobs:
           # Built from source rather than downloaded because the patch has to
           # be IN it. Plain `go build` - bootstrapping earthly with earthly
           # would need a working buildkit before the thing under test exists.
+          # Plain apply, then three-way. The patch ADDS two test files,
+          # and `git apply -3` cannot three-way a file with no blob in the
+          # index - it reports "does not exist in index" and drops the whole
+          # patch. Plain apply handles additions; -3 is the fallback for
+          # drift in the files that already exist.
           git -C earthbuild apply --verbose \
             "$GITHUB_WORKSPACE/rebuck2-repo/rebuck2/patches/earthbuild-consolidated-plus-784.patch" || {
               echo "::error::the #784 patch no longer applies to earthbuild"

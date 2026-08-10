@@ -238,6 +238,11 @@ jobs:
           # coordinator can disagree about which daemon to run - the exact
           # version skew `earthly bootstrap` was used here to make
           # impossible. Same commit, same patch, same image, everywhere.
+          # Plain apply, then three-way. The patch ADDS two test files,
+          # and `git apply -3` cannot three-way a file with no blob in the
+          # index - it reports "does not exist in index" and drops the whole
+          # patch. Plain apply handles additions; -3 is the fallback for
+          # drift in the files that already exist.
           git -C earthbuild apply --verbose \
             "$GITHUB_WORKSPACE/rebuck2/patches/earthbuild-consolidated-plus-784.patch" || {
               echo "::error::the #784 patch no longer applies to earthbuild"
@@ -374,6 +379,11 @@ jobs:
           # coordinator can disagree about which daemon to run - the exact
           # version skew `earthly bootstrap` was used here to make
           # impossible. Same commit, same patch, same image, everywhere.
+          # Plain apply, then three-way. The patch ADDS two test files,
+          # and `git apply -3` cannot three-way a file with no blob in the
+          # index - it reports "does not exist in index" and drops the whole
+          # patch. Plain apply handles additions; -3 is the fallback for
+          # drift in the files that already exist.
           git -C earthbuild apply --verbose \
             "$GITHUB_WORKSPACE/rebuck2-repo/rebuck2/patches/earthbuild-consolidated-plus-784.patch" || {
               echo "::error::the #784 patch no longer applies to earthbuild"
