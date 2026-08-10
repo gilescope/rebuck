@@ -68,8 +68,16 @@ on:
         description: "workers on the runner"
         default: "2"
       ref:
-        description: "earthbuild ref to check out"
-        default: "main"
+        # PINNED to the commit the vendored patch was cut against, not a
+        # branch. `main` moves: the six-machine run failed with
+        # `patch failed: builder/builder.go:338` because upstream had drifted
+        # past it, and a patch that half-applies is worse than one that fails
+        # - the previous attempt lost a day to exactly that.
+        #
+        # A pin also makes the measurement reproducible: every number in
+        # earthly-dispatch.md is against this tree.
+        description: "earthbuild ref - pinned so the vendored patch applies"
+        default: "3380dc206e463365c865857b32427b6768f93af2"
 
 env:
   # What upstream's reusable-test.yml passes, and neither is optional.
@@ -170,7 +178,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           repository: EarthBuild/earthbuild
-          ref: ${{ inputs.ref || 'main' }}
+          ref: ${{ inputs.ref || '3380dc206e463365c865857b32427b6768f93af2' }}
           path: earthbuild
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
