@@ -64,3 +64,111 @@ index 183773b9..e0e18e49 100755
    fi
    ! "$EARTHLY_DEBUG" || echo 1>&2 "Using $EARTHLY_BUILDKIT_HOST as buildkit daemon"
  fi
+diff --git a/tests/Earthfile b/tests/Earthfile
+index df3185b5..b1a67250 100644
+--- a/tests/Earthfile
++++ b/tests/Earthfile
+@@ -1218,16 +1218,16 @@ arg-set:
+ 
+ if:
+     RUN touch exists-locally
+-    DO +RUN_EARTH --earthfile=if.earth
++    DO +RUN_EARTH --earthfile=if.earth --force_internal_buildkit=true
+ 
+ for:
+-    DO +RUN_EARTH --earthfile=for.earth
++    DO +RUN_EARTH --earthfile=for.earth --force_internal_buildkit=true
+ 
+ first-command:
+-    DO +RUN_EARTH --earthfile=first-command.earth --target=+all-positive
+-    DO +RUN_EARTH --earthfile=first-command.earth --should_fail=true --target=+start-with-run
+-    DO +RUN_EARTH --earthfile=first-command.earth --should_fail=true --target=+start-with-if
+-    DO +RUN_EARTH --earthfile=first-command.earth --should_fail=true --target=+start-with-non-from-target
++    DO +RUN_EARTH --earthfile=first-command.earth --target=+all-positive --force_internal_buildkit=true
++    DO +RUN_EARTH --earthfile=first-command.earth --should_fail=true --target=+start-with-run --force_internal_buildkit=true
++    DO +RUN_EARTH --earthfile=first-command.earth --should_fail=true --target=+start-with-if --force_internal_buildkit=true
++    DO +RUN_EARTH --earthfile=first-command.earth --should_fail=true --target=+start-with-non-from-target --force_internal_buildkit=true
+ 
+ platform-output:
+     DO +RUN_EARTH --earthfile=platform-output.earth
+@@ -1703,11 +1703,29 @@ RUN_EARTH:
+     ARG output_does_not_contain=""
+     ARG grep_flags=""
+     ARG verbose=1
++    # One buildkit, not one per test - except where a test's meaning depends on
++    # having its own.
++    #
++    # earthly forwards its buildkit settings into every RUN, so a nested earthly
++    # reaches the daemon that started it instead of standing up another. That is
++    # the point: a daemon per test is a daemon per test's worth of cold base
++    # image pulls.
++    #
++    # It changes the meaning of exactly one command. LOCALLY runs on the DAEMON's
++    # host, so a nested LOCALLY under a shared daemon writes its files on the
++    # OUTER machine, where the assertion that follows cannot see them. Tests
++    # whose inner Earthfile contains LOCALLY set this, and declare themselves by
++    # doing so.
++    ARG force_internal_buildkit=false
+     IF [ ! -z "$earthfile" ]
+         COPY "$earthfile" "$earthfile_dest"
+     END
+     RUN echo "
+         set -ex
++        if $force_internal_buildkit; then
++            unset EARTH_BUILDKIT_HOST EARTHLY_BUILDKIT_HOST BUILDKIT_HOST
++            unset EARTH_TLS_ENABLED EARTHLY_TLS_ENABLED
++        fi
+         export EARTHLY_VERBOSE=$verbose
+         if $use_tmpfs; then
+             export EARTHLY_TMP_DIR=/tmp/earthbuild-tmpfs
+diff --git a/tests/command-to-function-rename/Earthfile b/tests/command-to-function-rename/Earthfile
+index 89df40b2..93a72d67 100644
+--- a/tests/command-to-function-rename/Earthfile
++++ b/tests/command-to-function-rename/Earthfile
+@@ -32,7 +32,12 @@ RUN_EARTH_ARGS:
+     ARG earthfile
+     ARG target
+     ARG should_fail=false
++    # LOCALLY runs on the DAEMON's host, and this suite asserts on files
++    # the nested build wrote HERE - so it needs its own daemon, not the
++    # caller's. Without this the assertion reads an empty directory on
++    # the wrong machine.
+     DO --pass-args tests+RUN_EARTH \
++        --force_internal_buildkit=true \
+         --earthfile=$earthfile \
+         --target=$target \
+         --should_fail=$should_fail
+diff --git a/tests/locally-in-command/Earthfile b/tests/locally-in-command/Earthfile
+index 39e0009d..8796c59b 100644
+--- a/tests/locally-in-command/Earthfile
++++ b/tests/locally-in-command/Earthfile
+@@ -52,7 +52,12 @@ RUN_EARTH_ARGS:
+     ARG earthfile
+     ARG target
+     ARG should_fail=false
++    # LOCALLY runs on the DAEMON's host, and this suite asserts on files
++    # the nested build wrote HERE - so it needs its own daemon, not the
++    # caller's. Without this the assertion reads an empty directory on
++    # the wrong machine.
+     DO --pass-args tests+RUN_EARTH \
++        --force_internal_buildkit=true \
+         --earthfile=$earthfile \
+         --target=$target \
+         --should_fail=$should_fail
+diff --git a/tests/locally-in-function/Earthfile b/tests/locally-in-function/Earthfile
+index 6583d5a9..2e183b16 100644
+--- a/tests/locally-in-function/Earthfile
++++ b/tests/locally-in-function/Earthfile
+@@ -52,7 +52,12 @@ RUN_EARTH_ARGS:
+     ARG earthfile
+     ARG target
+     ARG should_fail=false
++    # LOCALLY runs on the DAEMON's host, and this suite asserts on files
++    # the nested build wrote HERE - so it needs its own daemon, not the
++    # caller's. Without this the assertion reads an empty directory on
++    # the wrong machine.
+     DO --pass-args tests+RUN_EARTH \
++        --force_internal_buildkit=true \
+         --earthfile=$earthfile \
+         --target=$target \
+         --should_fail=$should_fail
