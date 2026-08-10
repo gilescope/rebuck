@@ -237,7 +237,13 @@ jobs:
             [ "${j:-0}" -ge "$WORKERS" ] && break
             sleep 1
           done
-          echo "workers joined: $(grep -c joined /tmp/proxy.log || echo 0)/$WORKERS"
+          # Captured, not inlined: `grep -c ... || echo 0` prints "0\n0" when
+          # nothing matches, because grep writes its own 0 and ALSO exits 1.
+          joined=$(grep -c joined /tmp/proxy.log) || joined=0
+          echo "workers joined: $joined/$WORKERS"
+          if [ "$joined" -eq 0 ]; then
+            echo "::warning::no worker joined - this run measures one machine"
+          fi
 
       - name: baseline - the same target with no fleet
         working-directory: earthbuild

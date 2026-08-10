@@ -294,9 +294,14 @@ jobs:
             [ "${j:-0}" -ge "$WANT" ] && break
             sleep 5
           done
-          echo "workers joined: $(grep -c joined proxy.log || echo 0)/$WANT"
-          grep -c joined proxy.log | grep -qv '^0$' || {
-            echo "no worker ever joined - the rest measures one machine"; }
+          # `grep -c ... || echo 0` prints "0\n0" when there are no matches:
+          # grep writes its own 0 AND exits 1, so the fallback fires too. The
+          # count has to be captured before it is judged.
+          joined=$(grep -c joined proxy.log) || joined=0
+          echo "workers joined: $joined/$WANT"
+          if [ "$joined" -eq 0 ]; then
+            echo "::warning::no worker ever joined - the rest measures one machine"
+          fi
 
       - name: the Earthfile, through the fleet
         working-directory: earthbuild
