@@ -183,7 +183,23 @@ jobs:
         run: |
           set -euo pipefail
           BIN=rebuck2-repo/rebuck2/target/release/rebuck2
-          SESSION="earthfile-${GITHUB_RUN_ID}"
+          # The TARGET is in the session, and it has to be.
+          #
+          # Every job in a matrix shares GITHUB_RUN_ID, and the mesh derives
+          # the driver's identity from the session string by
+          # `mesh::secret(session, "driver")`. Four matrix jobs therefore
+          # advertised and searched for the SAME driver, on four different
+          # runners, and iroh happily connected them across job boundaries.
+          #
+          # Measured in one run: `+code` reported three workers joined when
+          # two were started - it had adopted a stranger's - and group2
+          # reported 0/2, having lost both of its own to someone else's
+          # driver. One job stealing another's fleet looks exactly like a
+          # discovery bug, and the fix is a unique rendezvous per fleet.
+          #
+          # Sanitised: a target is `+test-no-qemu-group2`, and the session
+          # string wants no shell-special characters in it.
+          SESSION="earthfile-${GITHUB_RUN_ID}-$(echo '${{ matrix.target }}' | tr -c 'A-Za-z0-9' '-')"
           echo "SESSION=$SESSION" >> "$GITHUB_ENV"
 
           # One buildkitd per participant: the coordinator's own, plus one
