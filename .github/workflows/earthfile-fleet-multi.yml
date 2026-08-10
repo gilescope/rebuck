@@ -44,6 +44,12 @@ on:
       fleet_cache:
         description: "off | read | readwrite. ALL THREE measured slower - see docs"
         default: "off"
+      graft:
+        description: "import an already-built ancestor instead of rebuilding it"
+        default: "1"
+      cut_prefix:
+        description: "publish the shared ancestry as its own subtree, once"
+        default: "1"
       earthly_flags:
         description: "flags for earthly - upstream uses --ci -P"
         default: "--ci -P"
@@ -93,6 +99,21 @@ env:
   # the Docker VM's disk and both legs fail for a reason that has nothing
   # to do with caching.
   REBUCK2_FLEET_CACHE: ${{ inputs.fleet_cache || 'off' }}
+  # Cut the shared ancestry out as its own dispatch unit, publish it once,
+  # and graft it into everything that follows.
+  #
+  # Local trend across three configurations, group10, three workers:
+  #     graft only          444s
+  #     cut, 32 duplicates  407s
+  #     cut once            373s   17 prefixes, median ops/lead 82 -> 32
+  #
+  # Monotone, and the shape moves - which nothing else in nine attempts did.
+  # But a laptop running four buildkitds on the cores the baseline gets to
+  # itself measures CONTENTION, not capacity: there the same target's
+  # baseline fell to 122s while the fleet sat at 389s. Separate machines are
+  # the only place the question can be answered.
+  REBUCK2_GRAFT: ${{ inputs.graft || '1' }}
+  REBUCK2_CUT_PREFIX: ${{ inputs.cut_prefix || '1' }}
   # Written before `earthly bootstrap` in BOTH jobs. earthly hands this to the
   # buildkitd container as EARTHLY_ADDITIONAL_BUILDKIT_CONFIG, and a daemon
   # that does not trust the registry it is told to pull from fails the SILENT
