@@ -1551,10 +1551,28 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                     }
                     detail.sort();
                     detail.dedup();
+                    // The first blocker THIS POLICY did not lift, not the
+                    // first hazard in op order.
+                    //
+                    // `.first()` reported whichever exclusion happened to
+                    // sort earliest, including ones the operator had already
+                    // lifted. With REBUCK2_PEER_CACHE_MOUNTS=1 set, a run
+                    // reported "excluded: CacheMount" 194 times for graphs
+                    // whose cache mounts were explicitly allowed - the real
+                    // blocker was further down the list and never named.
+                    //
+                    // The same mistake was fixed in `consider` this morning.
+                    // Fixing it in one of the two places that answer a
+                    // question is the theme of the week.
                     let why = verdict
                         .exclusions
-                        .first()
-                        .map(|(_, e)| format!("excluded: {e:?} {detail:?}"))
+                        .iter()
+                        .map(|(_, e)| e)
+                        .find(|e| {
+                            !crate::dispatch::lifted_by_policy(e, policy)
+                                && !crate::dispatch::fixable_by_mirroring(e)
+                        })
+                        .map(|e| format!("excluded: {e:?} {detail:?}"))
                         .unwrap_or_else(|| "excluded: platform".to_owned());
                     *self.wire.held().rejected.entry(why).or_default() += 1;
                 }

@@ -210,6 +210,10 @@ pub fn fixable_by_mirroring(e: &Exclusion) -> bool {
 /// One table, because `dispatchable_when` and `consider` used to answer
 /// it separately and a subtree the first would offer was refused by the
 /// second.
+pub fn lifted_by_policy(e: &Exclusion, allow: Allow) -> bool {
+    lifted_by(e, allow)
+}
+
 fn lifted_by(e: &Exclusion, allow: Allow) -> bool {
     match e {
         Exclusion::Secret => allow.secrets,
