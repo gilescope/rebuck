@@ -508,6 +508,36 @@ Next rungs, in order: bigger targets from the same Earthfile (`+lint`,
 `+unit-test`), then more than one machine, then the 19-worker shape the
 whole thing is for.
 
+### M4.8 - the whole test target, and what refuses (DONE 2026-08-10)
+
+`earthly +test-no-qemu` - 786 solves, 54,000 ops, the target M5 is about -
+now puts **two thirds of itself on other daemons**, with the mesh carrying
+84% of every byte that crosses a machine boundary (peer 205, driver 39).
+
+Everything still refusing to move is refusing correctly: 170 privileged
+execs, 68 `WITH DOCKER` host binds, 2 unmirrored bases.
+
+Four fixes got from 269 routed to 537, and the two biggest were format
+strings wearing the costume of architectural limits:
+
+| reported as | actually |
+| ------------------------ | ------------------------------------------ |
+| context unmirrored (686) | `./buildkitd` is not a legal OCI tag |
+| not portable (397) | mirror keyed `git://h/r`, read back as `h/r` |
+| Unimplemented SAVE IMAGE | fork-only `rpc Export` we refused to relay |
+| CacheMount (194) | the report naming a hazard the flag had lifted |
+
+The build is still RED, and no further proxy work will change that:
+`+test-no-qemu` wants an ssh-agent, `test-remote` over git matchers, and a
+push registry. 118 targets pass and the suite then cancels. That is a
+question about credentials on the machine running it.
+
+**What is now the binding constraint: hardware.** Every number above comes
+from three workers sharing one laptop, three cold buildkitds and three
+registries contending for the same cores. `routed` and the peer:driver ratio
+are meaningful there; wall-clock is not, and has got monotonically WORSE with
+each honesty fix, because each one made the fleet do more real work.
+
 ### M5 - coalesce CI to one build
 
 `+test-no-qemu` already BUILDs all twelve groups; no repo reorganisation. One
