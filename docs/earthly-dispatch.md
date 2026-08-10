@@ -359,3 +359,29 @@ to call. `dispatch::policy()` is the only reader of the environment.
 The general shape, which cost most of a day in three separate places: a
 question with a default answer will be asked by more components than you
 intended, and they will diverge silently. Delete the default.
+
+## A bigger target: `+lint`, 9 of 9
+
+Same fleet, same day, the next rung up:
+
+| target | ops | solves | routed | at home | build |
+| ------------ | --: | -----: | -----: | ------: | ----- |
+| `+code` | 64 | 6 | 6 | 0 | yes, 114s |
+| `+lint` | 143 | 9 | 9 | 0 | yes, 149s |
+
+The first `+lint` attempt failed, and the failure was worth having: two
+subtrees came back with `golangci-lint ... exit code: 1`, which is a real
+build failure faithfully reported through the mesh rather than anything
+going wrong in the fleet. The offending line was **ours** -
+
+```text
+earthfile2llb/converter.go:2798:3: missing whitespace above this line
+  (invalid statement above if) (wsl_v5)
+```
+
+- the local EarthBuild#784 patch, rejected by earthbuild's own linter. A
+blank line fixed it and `+lint` went green.
+
+Which is the argument for running a project's real targets rather than
+fixtures: the fleet linted the patch that makes the fleet possible, and found
+it wanting. No synthetic graph was ever going to do that.
