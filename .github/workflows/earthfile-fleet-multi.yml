@@ -336,6 +336,43 @@ jobs:
             echo "EARTHLY_VERSION_FLAG_OVERRIDES=$(tr -d '\n' < earthbuild/.earthly_version_flag_overrides)"
           } >> "$GITHUB_ENV"
 
+      # THE BANK. The coordinator's registry store, carried between runs.
+      #
+      # Six mechanisms have been measured inside a single run - a shared
+      # cache in three configurations, peer-to-peer transfer, grafting a
+      # built ancestor, and a warm-up barrier - and every one was null or
+      # worse. They share a cause: each needs something built EARLIER, and a
+      # cold run has nothing. The prefix has to already exist when the first
+      # solve arrives, and only a previous generation can have made it.
+      #
+      # SECRETS. A restored layer outlives the run that produced it, so this
+      # is the one cache in the system where a leak persists. Two guards:
+      # the store holds only what `make_portable` published - mirrored base
+      # images, contexts and subtree results, all content-addressed - and
+      # `dispatch::inspect` refuses to dispatch any graph carrying a secret
+      # mount or secretenv in the first place, so a secret-bearing op is
+      # never built by a peer and never reaches this store.
+      #
+      # Keyed by target and week: a bank that never rotates accumulates
+      # layers nothing references, and one keyed by commit never hits.
+      - name: restore the bank
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/rebuck2/coord
+          key: rebuck2-bank-${{ inputs.target || '+test-no-qemu-group2' }}-${{ github.run_id }}
+          restore-keys: |
+            rebuck2-bank-${{ inputs.target || '+test-no-qemu-group2' }}-
+
+      - name: what the bank brought
+        run: |
+          set -euo pipefail
+          d="$HOME/.cache/rebuck2/coord"
+          if [ -d "$d" ]; then
+            echo "bank: $(find "$d" -type f | wc -l | tr -d ' ') objects, $(du -sh "$d" 2>/dev/null | cut -f1)"
+          else
+            echo "bank: EMPTY - this run builds every prefix from nothing"
+          fi
+
       - name: coordinator - gateway, driver and registry
         env:
           WANT_JSON: ${{ inputs.workers || '[1,2,3,4,5,6]' }}
