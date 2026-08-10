@@ -457,6 +457,28 @@ jobs:
           grep -E '^\[wire\] (gateway solves|solves routed|built at home|placed|not routed)' proxy.log || true
           echo "=== which RUNNER took what"
           grep -oE -- '-> worker [0-9]+' proxy.log | sort | uniq -c || true
+
+          # The SHAPE of the lead durations, which is the open question:
+          # 84 leads at ~24s each is most of the gap to a single machine,
+          # and whether that is a cold cache paid once per worker or a
+          # per-lead overhead paid 84 times decides what to fix. The
+          # workflow was grepping only the [wire] summary out of proxy.log,
+          # so the per-job timings the driver already prints never left the
+          # runner.
+          echo "=== lead durations"
+          grep -oE 'in [0-9]+ms' proxy.log | grep -oE '[0-9]+' > /tmp/leads.txt || true
+          if [ -s /tmp/leads.txt ]; then
+            sort -n /tmp/leads.txt | awk '
+              {a[NR]=$1; s+=$1}
+              END {
+                printf "n=%d min=%dms p50=%dms p90=%dms max=%dms mean=%dms\n",
+                  NR, a[1], a[int(NR*0.5)+1], a[int(NR*0.9)+1], a[NR], s/NR
+              }'
+            echo "in dispatch order (first 15):"
+            head -15 /tmp/leads.txt | tr '\n' ' '; echo
+          else
+            echo "(no lead timings - nothing was dispatched)"
+          fi
           echo "=== the coordinator's registry"
           grep -E '^\[registry\] served' proxy.log || true
           echo "   uploads far below blobs served means results were fetched"
