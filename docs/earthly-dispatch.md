@@ -574,8 +574,14 @@ through the fleet:    1 failed target - THE SAME ONE
 ```
 
 The failure is `./t/autocompletion+test-no-parent-at-root-from-home`, which
-diffs a directory listing and disagrees about `../run/`. It fails on
-macOS/arm64 with or without any of this.
+diffs a directory listing and disagrees about `../run/`. It fails with or
+without any of this.
+
+**Correction.** This was first written up as arm64-sensitive. It is not: the
+same target fails in the BASELINE on ubuntu/amd64 CI runners too. Whatever it
+depends on - `$HOME`, the container rootfs, how the runner mounts things - is
+not the architecture, and calling it that was a guess dressed as a finding
+because macOS was the only place it had been seen.
 
 **That is the result, and chasing an absolute green here would have been
 chasing someone else's bug.** The baseline was measured first precisely
@@ -594,7 +600,9 @@ whether it is red without one.
    WITH DOCKER dies as `failed to load LLB`. `EARTHLY_VERSION_FLAG_OVERRIDES`
    comes from `.earthly_version_flag_overrides` in the repo root - thirteen
    feature flags the tests assume.
-3. **ubuntu/amd64.** The autocompletion group is arm64-sensitive.
+3. ~~**ubuntu/amd64.** The autocompletion group is arm64-sensitive.~~
+   Wrong - it fails in the baseline on amd64 runners too. Environment, not
+   architecture.
 4. **Registry credentials.** Some groups push; upstream's reusable-test
    workflow logs in to GHCR and Docker Hub first. Those groups cannot pass on
    a laptop with no tokens, and should be excluded rather than pretended at.
