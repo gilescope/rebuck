@@ -1334,6 +1334,21 @@ pub async fn serve_with_upstream<S: RegistryStore>(
             // event cannot be used to answer the only question being asked
             // of it.
             let st = res.status();
+            // Content-Length, set by every blob and manifest response.
+            //
+            // This increment was written once, its edit silently failed to
+            // apply, and only the PRINT was repaired - so two runs reported
+            // "0 KiB" across 160 blob GETs and I read that as an
+            // architectural finding about who serves a worker's inputs. It
+            // was a counter that counted nothing.
+            if let Some(n) = res
+                .headers()
+                .get(axum::http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                SERVED_BYTES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            }
             let key = if st.is_success() || st.is_redirection() {
                 k
             } else {
