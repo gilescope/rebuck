@@ -364,10 +364,20 @@ intended, and they will diverge silently. Delete the default.
 
 Same fleet, same day, the next rung up:
 
-| target | ops | solves | routed | at home | build |
-| ------------ | --: | -----: | -----: | ------: | ----- |
-| `+code` | 64 | 6 | 6 | 0 | yes, 114s |
-| `+lint` | 143 | 9 | 9 | 0 | yes, 149s |
+| target | ops | solves | routed | at home | build | spread |
+| --------------- | --: | -----: | -----: | ------: | --------- | ------------ |
+| `+code` | 64 | 6 | 6 | 0 | yes, 114s | 4/2 |
+| `+unit-test` | 113 | 8 | 8 | 0 | yes, 126s | 4/2 |
+| `+lint` | 143 | 9 | 9 | 0 | yes, 149s | 6/3 |
+| `+all-binaries` | 638 | 33 | 33 | 0 | yes, 194s | 12/8/7/6 |
+
+`+all-binaries` is ten times the graph of `+code` and every solve of it was
+built by a peer, spread across all four workers. It cross-compiles five
+platforms, which turns out to say nothing about platform pinning: earthly
+cross-compiles with `GOOS`/`GOARCH` inside one `linux/arm64` image, so the
+whole graph is single-platform and the placement logic is never asked the
+interesting question. Worth knowing before anyone quotes this as evidence
+that heterogeneous placement works - it is not.
 
 The first `+lint` attempt failed, and the failure was worth having: two
 subtrees came back with `golangci-lint ... exit code: 1`, which is a real
