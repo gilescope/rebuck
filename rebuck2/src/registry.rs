@@ -1363,8 +1363,12 @@ pub async fn serve_with_upstream<S: RegistryStore>(
             let _ = tokio::signal::ctrl_c().await;
             if let Some(m) = TRAFFIC.held().as_ref() {
                 let total: u64 = m.values().sum();
-                let mib = SERVED_BYTES.load(std::sync::atomic::Ordering::Relaxed) / (1 << 20);
-                println!("[registry] served {total} requests, {mib} MiB: {m:?}");
+                // KiB, because the first run of this reported "0 MiB"
+                // against 89 blob GETs and that reads like a broken counter
+                // rather than a coordinator that genuinely served under a
+                // megabyte. It was the truncation.
+                let kib = SERVED_BYTES.load(std::sync::atomic::Ordering::Relaxed) / 1024;
+                println!("[registry] served {total} requests, {kib} KiB: {m:?}");
             }
         })
         .await?;

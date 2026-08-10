@@ -49,10 +49,10 @@ on:
         default: "--ci -P"
       target:
         description: "earthbuild target to build"
-        default: "+test-no-qemu-group2"
+        default: "+test-no-qemu"
       workers:
         description: "worker runners, as a JSON array - matrix AND barrier read this"
-        default: "[1,2]"
+        default: "[1,2,3,4,5,6]"
       ref:
         description: "earthbuild ref"
         default: "main"
@@ -130,7 +130,7 @@ jobs:
       # workers=5 against a fixed [1,2,3] and the coordinator waits out its
       # timeout for two runners nobody launched.
       matrix:
-        n: ${{ fromJSON(inputs.workers || '[1,2]') }}
+        n: ${{ fromJSON(inputs.workers || '[1,2,3,4,5,6]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -322,7 +322,7 @@ jobs:
 
       - name: coordinator - gateway, driver and registry
         env:
-          WANT_JSON: ${{ inputs.workers || '[1,2]' }}
+          WANT_JSON: ${{ inputs.workers || '[1,2,3,4,5,6]' }}
         run: |
           set -euo pipefail
           WANT=$(echo "$WANT_JSON" | tr -cd '0-9,' | awk -F, '{print NF}')
@@ -416,7 +416,7 @@ jobs:
       - name: baseline - the same target on one machine
         working-directory: earthbuild
         env:
-          TARGET: ${{ inputs.target || '+test-no-qemu-group2' }}
+          TARGET: ${{ inputs.target || '+test-no-qemu' }}
         run: |
           set -euo pipefail
           start=$SECONDS
@@ -434,7 +434,7 @@ jobs:
       - name: the Earthfile, through the fleet
         working-directory: earthbuild
         env:
-          TARGET: ${{ inputs.target || '+test-no-qemu-group2' }}
+          TARGET: ${{ inputs.target || '+test-no-qemu' }}
         run: |
           set -euo pipefail
           start=$SECONDS
