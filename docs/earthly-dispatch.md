@@ -601,3 +601,46 @@ whether it is red without one.
 
 Only (1) and (2) were ours to get wrong, and both were. (3) and (4) are why
 this measurement belongs on a runner.
+
+## What is actually expensive, measured rather than counted
+
+`+test-no-qemu-group1`, three workers, `--ci -P`:
+
+```text
+[wire] cache cost ms  : 9335980 total, worst first
+   2423490ms   144 leads  go-mod
+   2307286ms   138 leads  go-build
+   2302602ms   137 leads  //go/pkg/mod
+   2302602ms   137 leads  //root/.cache
+```
+
+Go module download and Go build are the whole story. `//go/pkg/mod` and
+`//root/.cache` are the same leads again under earthly's path-derived cache
+ids, not separate costs.
+
+**The total is not wall time.** A lead naming four cache ids adds its
+milliseconds to all four rows, so they overlap by construction. The ranking
+is sound and the per-lead figure is sound - about 16.8s behind `go-mod` -
+the sum is not.
+
+Counting the Earthfile would have pointed elsewhere: `npm` and `go-build`
+appear eighteen times each and `go-mod` eleven, which ranks `npm` joint-first
+on frequency and last on cost. Frequency in the source says nothing about
+seconds.
+
+### What this does and does not justify
+
+A cache mount PERSISTS on a worker's daemon across leads, so within one run
+the first lead pays and the rest are warm. The figure above is an average
+over both, which means it is NOT a cold-start penalty and should not be sold
+as one.
+
+The cost that seeding would remove is the one paid at the start of every
+FRESH run - a CI runner begins with nothing, and three of them each download
+the Go module graph before the first test executes. That is a
+between-generations problem, which is what the bank is for, and it is not
+addressed by anything in this repo yet.
+
+Measured on one machine and one group. Before building a seeding mechanism
+the same table should come off a runner, because a laptop with a warm
+`~/.cache` is the environment least able to see this cost.
