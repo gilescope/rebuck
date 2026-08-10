@@ -33,6 +33,9 @@ name: earthfile-fleet
 on:
   workflow_dispatch:
     inputs:
+      earthly_flags:
+        description: "flags for earthly - upstream uses --ci -P"
+        default: "--ci -P"
       target:
         description: "earthbuild target to build"
         default: "+code"
@@ -42,6 +45,19 @@ on:
       ref:
         description: "earthbuild ref to check out"
         default: "main"
+
+env:
+  # What upstream's reusable-test.yml passes, and neither is optional.
+  #
+  #   -P    is what makes earthly request the security.insecure
+  #         entitlement. Without it every WITH DOCKER target dies as
+  #         `failed to load LLB: security.insecure is not allowed`, which
+  #         reads like the proxy stripped something and does not.
+  #   --ci  changes output mode and strictness.
+  #
+  # Not --no-cache, which this used to pass: upstream does not, and on a
+  # test group it turns a measurable run into an unmeasurable one.
+  EARTHLY_FLAGS: ${{ inputs.earthly_flags }}
 
 permissions:
   contents: read
@@ -105,6 +121,12 @@ jobs:
             }
           ( cd earthbuild && go build -o /usr/local/bin/earthly ./cmd/earthly )
           earthly --version
+          # Thirteen feature flags the test targets assume. Missing it does
+          # not fail loudly - it fails as individual tests behaving
+          # differently, which is indistinguishable from a fleet bug.
+          {
+            echo "EARTHLY_VERSION_FLAG_OVERRIDES=$(tr -d '\n' < earthbuild/.earthly_version_flag_overrides)"
+          } >> "$GITHUB_ENV"
 
       - name: start the fleet
         id: fleet
@@ -252,8 +274,9 @@ jobs:
         run: |
           set -euo pipefail
           start=$SECONDS
+          # shellcheck disable=SC2086 # a flag LIST: word-splitting is the point
           EARTHLY_BUILDKIT_HOST="tcp://$BK0" \
-            earthly --no-cache "$TARGET" 2>&1 | tail -40
+            earthly $EARTHLY_FLAGS "$TARGET" 2>&1 | tail -40
           echo "BASELINE_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
 
       - name: through the fleet
@@ -263,8 +286,9 @@ jobs:
         run: |
           set -euo pipefail
           start=$SECONDS
+          # shellcheck disable=SC2086 # a flag LIST: word-splitting is the point
           EARTHLY_BUILDKIT_HOST="tcp://${LAN}:1234" \
-            earthly --no-cache "$TARGET" 2>&1 | tail -40
+            earthly $EARTHLY_FLAGS "$TARGET" 2>&1 | tail -40
           echo "FLEET_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
 
       - name: what the fleet actually did
