@@ -573,6 +573,59 @@ Remaining before nineteen: a baseline in the multi workflow (there is no
 wall-clock comparison yet), and the offer order, which gave one worker 38
 leads and another 2.
 
+### M4.10 - dispatch is solved; speed is not (2026-08-10)
+
+Where this actually stands, stated so the next person does not repeat the
+afternoon.
+
+**Working, measured, on real machines:**
+
+- 11 of 12 earthbuild test groups reach PARITY through the fleet locally; ten
+  of them fail nothing at all.
+- Seven separate GitHub runners build a real test group with 84 of 123 solves
+  routed off-box and every refusal correct.
+- The mesh carries 77% of cross-machine blob traffic at six machines, up from
+  20% at three - the driver's share FALLS as the fleet grows.
+- Three kinds of source (subtree results, base images, contexts) travel by
+  digest, which is what makes any of it work across a machine boundary.
+
+**Not working: distribution does not pay.**
+
+| | baseline | fleet |
+| ---------------------- | -------: | ----: |
+| 6 workers, group2 | 277s | 660s |
+| 2 workers, group2 | 299s | 401s |
+| 2 workers, group2 again | 300s | 358s |
+
+Fewer machines are faster, and the same configuration varies by 44s between
+runs.
+
+**Four remedies attempted, four failures, and the pattern in them:**
+
+| remedy | result | why it was wrong |
+| ---------------------- | ------ | ---------------- |
+| shared cache readwrite | +165s | export per solve, 84 writers |
+| shared cache read-only | worse | no writer existed, so nothing to import |
+| one reference export | +97s* | export ran inside the measured window |
+| suspecting a serial graph | n/a | peak concurrency was 9 with 6 workers |
+
+\* within about twice the run-to-run spread, so not established.
+
+Every one of them was chosen before the measurement that would have ruled it
+out. The measurements that finally arrived - peak concurrency, op duplication,
+lead-duration distribution, bytes served - each took under an hour to build
+and would each have prevented at least one of the four.
+
+**What is actually known about the gap**, after all that: execution
+duplication is 1.7x against a ceiling of 2.0, which is real but too small to
+explain a 20-60% slowdown. So most of the gap is elsewhere - transfer,
+earthly's per-solve overhead paid through a gateway, or the mirror hop - and
+none of those has been measured yet.
+
+**The next honest step is not a fifth remedy.** It is a breakdown of one lead
+into fetch versus execute, and repeated runs so a 50s difference means
+something.
+
 ### M5 - coalesce CI to one build
 
 `+test-no-qemu` already BUILDs all twelve groups; no repo reorganisation. One
