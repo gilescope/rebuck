@@ -1435,6 +1435,7 @@ pub async fn serve(
         // two seconds is not worth seeding; one appearing twice and costing
         // four minutes is.
         let costs = driver_for_report.cache_costs().await;
+        let peak = driver_for_report.peak_inflight();
         wire.held().report();
         let solo = solo.held();
         let medians: std::collections::BTreeMap<usize, u64> = solo
@@ -1445,6 +1446,11 @@ pub async fn serve(
                 (*p, v[v.len() / 2])
             })
             .collect();
+        // The ceiling on what ANY fleet could do for this build. One means
+        // the graph is a chain and more machines cannot help; the useful
+        // comparison is against the number of workers, not against the
+        // number of solves.
+        println!("[wire] peak in flight : {peak} subtree(s) at once");
         if !costs.is_empty() {
             let total: u64 = costs.iter().map(|(_, ms, _)| ms).sum();
             println!("[wire] cache cost ms  : {total} total, worst first:");

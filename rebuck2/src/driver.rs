@@ -328,6 +328,15 @@ pub struct Driver {
     /// appear eighteen times each, which says nothing about whether either
     /// costs a minute or a second.
     cache_cost: tokio::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
+    /// The most subtrees ever in flight at once.
+    ///
+    /// The question that outranks every transfer optimisation: can this
+    /// build use a fleet at all? Six machines took 590s against 307s on one,
+    /// and before blaming cold caches it is worth knowing whether more than
+    /// one worker was ever busy. A graph whose critical path IS its total
+    /// cannot be made faster by any number of machines, and every second
+    /// spent tuning the mesh for it is spent on the wrong problem.
+    peak_inflight: std::sync::atomic::AtomicUsize,
     /// Cross-machine single-flight. One per driver: it is the fleet's single
     /// coordinator, so there is no consensus problem to solve, only a
     /// liveness one.
@@ -409,6 +418,7 @@ impl Driver {
             leases: crate::lease::Leases::default(),
             subtrees: Mutex::new(std::collections::HashMap::new()),
             cache_cost: Default::default(),
+            peak_inflight: Default::default(),
             store,
             cfg,
             jobs: Mutex::new(HashMap::new()),
@@ -1462,6 +1472,10 @@ impl Driver {
             self.unplaced(requester, job, &why).await;
             return;
         };
+        // After the insert below there will be `len() + 1` in flight; record
+        // the peak here where the lock is already held.
+        self.peak_inflight
+            .fetch_max(open.len() + 1, Ordering::Relaxed);
         open.insert(
             job,
             Subtree {
@@ -1572,6 +1586,11 @@ impl Driver {
     /// Ranked by TIME, because that is the only ordering that says what
     /// seeding would buy. Frequency in the Earthfile is a different number
     /// and points somewhere else.
+    /// The most subtrees in flight at once, over the whole run.
+    pub fn peak_inflight(&self) -> usize {
+        self.peak_inflight.load(Ordering::Relaxed)
+    }
+
     pub async fn cache_costs(&self) -> Vec<(String, u64, u64)> {
         let c = self.cache_cost.lock().await;
         let mut v: Vec<(String, u64, u64)> =
