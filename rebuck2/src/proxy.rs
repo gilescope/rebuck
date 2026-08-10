@@ -881,7 +881,13 @@ pub struct Wire {
     /// placement.
     pub peak_home: usize,
     pub slots: usize,
-    /// Where each solve was placed: key 0 is home, 1.. are peers.
+    /// Home versus the fleet: key 0 is home, key 1 is "went to a peer".
+    ///
+    /// TWO keys, not one per peer - WHICH machine took it is the driver's
+    /// business and the driver reports it. Read as peer indices, `{1: 70}`
+    /// says every job landed on one overloaded machine; it actually says 70
+    /// jobs left home, and the six runners had 52/47/36/38/37/33 of them.
+    /// Cost half an hour of chasing a load-balancing bug that was not there.
     ///
     /// Added because "round 2 was fast" is not evidence of avoidance - a
     /// control run showed a uniform fleet reaching the same wall clock purely
@@ -1074,7 +1080,14 @@ impl Wire {
         println!("[wire] gateway calls  : {counts:?}");
         println!("[wire] solves routed  : {} to other daemons", self.routed);
         println!("[wire] built at home  : {} (peer 0's own share)", self.home);
-        println!("[wire] placed         : {:?} (0 = home)", self.placed);
+        // The map stays - `fleet-check.sh` parses `<key>: <n>` out of this
+        // line - but it no longer travels alone. Two keys, not one per peer.
+        println!(
+            "[wire] placed         : {:?} = home {}, fleet {} (WHICH peer is the driver's line)",
+            self.placed,
+            self.placed.get(&0).copied().unwrap_or(0),
+            self.placed.get(&1).copied().unwrap_or(0),
+        );
         self.diagnose();
         if let (Some(&first), Some(&last)) = (self.arrivals.first(), self.arrivals.last()) {
             println!(
