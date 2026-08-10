@@ -987,13 +987,36 @@ pub fn graft_built(def: &pb::Definition, built: &dyn Fn(&str) -> Option<String>)
         return def.clone();
     }
 
+    // Only ops every consumer reads at INDEX 0 may be grafted.
+    //
+    // An image source has one output. An ExecOp has one per mount, so a
+    // consumer can legitimately reference index 1, 2, ... - and replacing
+    // that op with a source leaves those inputs pointing at an output that
+    // does not exist. buildkit reports it three steps later as
+    //
+    //     failed to load cache key: no support for <nil>
+    //
+    // which names neither the op nor the index. Measured on six machines:
+    // every worker declined, the fleet leg failed, and the message pointed
+    // nowhere near the graft that caused it.
+    let mut multi_output: std::collections::BTreeSet<String> = Default::default();
+    for bytes in &def.def {
+        if let Ok(op) = pb::Op::decode(bytes.as_slice()) {
+            for input in &op.inputs {
+                if input.index != 0 {
+                    multi_output.insert(input.digest.clone());
+                }
+            }
+        }
+    }
+
     let mut remap: BTreeMap<String, String> = BTreeMap::new();
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(def.def.len());
     let mut metadata = def.metadata.clone();
 
     for bytes in &def.def {
         let before = digest(bytes);
-        if let Some(reference) = built(&before) {
+        if let Some(reference) = built(&before).filter(|_| !multi_output.contains(&before)) {
             // Grafted: an image source in place of the op and everything it
             // depended on. Its inputs are dropped, so the ops above it become
             // unreachable - harmless, buildkit walks from the terminal.
@@ -2098,6 +2121,39 @@ mod tests {
             seen.into_inner(),
             vec!["example.com/r.git#main".to_owned()],
             "the replacement is called WITHOUT the scheme"
+        );
+    }
+
+    #[test]
+    fn an_op_read_at_a_nonzero_index_must_not_be_grafted() {
+        // An image source has ONE output. An ExecOp has one per mount, so a
+        // consumer may read index 1, 2, ... - and grafting that op leaves
+        // those inputs pointing at an output that does not exist.
+        //
+        // buildkit reports it as `failed to load cache key: no support for
+        // <nil>`, three steps from the cause and naming neither the op nor
+        // the index. Measured on six machines: every worker declined and the
+        // fleet leg failed.
+        let base = plain();
+        let base_b = base.encode_to_vec();
+        let base_d = format!("sha256:{}", crate::store::sha256_hex(&base_b));
+        // Reads the base's SECOND output - a second mount, say.
+        let mut consumer = plain();
+        consumer.inputs = vec![pb::Input {
+            digest: base_d.clone(),
+            index: 1,
+        }];
+        let d = pb::Definition {
+            def: vec![base_b, consumer.encode_to_vec()],
+            ..Default::default()
+        };
+
+        let out = graft_built(&d, &|dg| {
+            (dg == base_d).then(|| "docker-image://reg/x@sha256:beef".to_owned())
+        });
+        assert_eq!(
+            out.def, d.def,
+            "an op read at index 1 was grafted into a single-output source"
         );
     }
 
