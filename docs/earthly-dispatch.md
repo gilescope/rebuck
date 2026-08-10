@@ -316,3 +316,46 @@ is exactly what was happening and exactly what nothing was counting.
 
 The published figures were the optimistic column, and no run before today had
 a non-zero one in the other.
+
+## 6 of 6, and the three askers
+
+2026-08-10, later the same day. `earthly +code`, four workers, all four
+EarthBuild#784 sites gated, `REBUCK2_PEER_CACHE_MOUNTS=1`:
+
+```text
+build: yes in 114s
+gateway solves : 6      solves routed : 6
+built at home  : 0      not routed    : {}
+spread         : worker 1 x4, worker 2 x2
+```
+
+Every solve of earthbuild's root Earthfile target built by a peer.
+
+**114s against 87s for the single-worker run, and that is not a speedup.**
+All four workers drive one buildkitd on one laptop, so a second worker adds
+contention and no capacity. The number that matters here is `routed`; the
+wall clock is waiting on hardware that can actually be in more than one
+place.
+
+Getting from 1 to 6 was not a scheduling improvement. Three components
+decide whether a subtree may travel - the gateway before offering, the
+driver before choosing a peer, the worker before accepting - and each had
+its own answer:
+
+| asker | asked | answered |
+| ------------- | -------------------------------- | ----------------- |
+| gateway | `dispatchable_when(Allow{caches})` | yes, offer it |
+| driver | `consider` - which took no policy | no, undispatchable |
+| worker | `consider` - the same one | no, declined |
+
+So the gateway offered, the driver refused, and the report blamed the
+workers - naming four idle machines of exactly the right platform. Fixing
+the driver moved the refusal one hop to the worker, which refused the same
+way for the same reason.
+
+`consider` now requires an `Allow` and there is no policy-free version left
+to call. `dispatch::policy()` is the only reader of the environment.
+
+The general shape, which cost most of a day in three separate places: a
+question with a default answer will be asked by more components than you
+intended, and they will diverge silently. Delete the default.
