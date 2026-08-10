@@ -677,3 +677,49 @@ a claim about the fleet, and it is the only one a distributed builder can
 support. It also catches the opposite error: a target failing only WITHOUT
 the fleet means the two runs were not like-for-like and the comparison proves
 nothing.
+
+## On runners, at last
+
+`+code` through the fleet on a GitHub runner, with the same parity
+comparison the local harness uses:
+
+```text
+workers joined : 2/2
+PARITY         : the same 0 target(s) failed either way
+solves routed  : 6 of 6      worker 1: 4, worker 2: 2
+wall           : baseline 12s, fleet 68s
+```
+
+Getting there took eight CI rounds, and every failure was environmental
+rather than a defect in the fleet:
+
+| round | failure | cause |
+| ----- | ------------------------------- | ----------------------------------- |
+| 1 | `manifest unknown` | bootstrap discovered an unpublished image |
+| 2 | daemon never ready | `$(printf)` ate the newline between TOML stanzas |
+| 3 | 4 of 51 checks reported | `set -e` killed the reporter, not the tests |
+| 4 | `TLS CA file not found` | tls_enabled defaults true, in both workflows |
+| 5 | `BK0: unbound variable` | `$GITHUB_ENV` does not reach its own step |
+| 6 | green, `routed: 0` | the two policy env vars were never set |
+| 7 | `workers joined: 3/2` and `0/2` | matrix jobs shared one rendezvous |
+| 8 | group1 permanently red | CI demanded green instead of parity |
+
+Two are worth keeping.
+
+**Round 7** is the only bug in this list that a laptop could never have
+found. `SESSION="earthfile-${GITHUB_RUN_ID}"` is unique per run and NOT per
+matrix job, and the mesh derives the driver's identity from it - so four
+fleets on four runners advertised the same driver and iroh connected them
+across job boundaries, exactly as designed. One job reported three workers
+when two were started; another reported none. It presents as a discovery
+bug, a firewall, or a flaky barrier.
+
+**Round 6** is the one to be embarrassed about. Three targets went green with
+`solves routed: 0`, because `REBUCK2_PEER_CACHE_MOUNTS=1` and
+`REBUCK2_HOME_SLOTS=0` are in every local probe command in this repo and had
+never reached the workflow. A green run that measures nothing is worse than a
+red one: it looks like the answer and is not the question.
+
+The wall clock is worse through the fleet, and will stay worse while workers
+share a runner with the coordinator. Two workers on four cores is contention
+plus real transfer; `routed` is the number this measures.
