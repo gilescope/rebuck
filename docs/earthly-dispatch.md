@@ -723,3 +723,48 @@ red one: it looks like the answer and is not the question.
 The wall clock is worse through the fleet, and will stay worse while workers
 share a runner with the coordinator. Two workers on four cores is contention
 plus real transfer; `routed` is the number this measures.
+
+## Four machines, one build
+
+`+code`, one coordinator runner and three worker runners, each a separate
+GitHub-hosted machine:
+
+```text
+workers joined : 3/3
+solves routed  : 6 of 6      built at home: 0     not routed: {}
+spread         : worker 1: 3, worker 2: 2, worker 3: 1
+blobs          : worker 3  local=0 peer=3 driver=12
+wall           : 68s
+```
+
+Every solve of a real earthbuild target built on a machine other than the one
+that asked for it, and three of the blobs moved worker-to-worker without
+touching the coordinator.
+
+Getting here needed one idea applied three times, and the first two
+applications did not reveal the third:
+
+| what crosses a machine | was named by | now |
+| ---------------------- | ------------ | ------- |
+| subtree results | tag | digest |
+| base images | tag | digest |
+| contexts | tag | digest |
+
+Each fix exposed the next, because a graph stops at the first thing it cannot
+pull. And **none of them is visible on one machine**: there,
+`172.17.0.1:15000` is the same registry for every participant and every tag
+resolves. A single-host fleet cannot test the property that makes a fleet
+worth having.
+
+> Anything a peer must fetch is named by CONTENT. A tag is a name in one
+> machine's namespace, and a fleet has no namespace.
+
+The driver still serves most blobs - 12 against 3 on the worker that used the
+mesh at all - because the fleet is cold and the bloom filters have almost
+nothing in them on a first run. That ratio is the thing to watch as runs
+accumulate, and it is the argument for banking between generations rather
+than a claim about it.
+
+68s of wall on `+code` against 12s for the baseline. Distribution still costs
+more than it saves at this size, which is what a six-solve target should be
+expected to show.
