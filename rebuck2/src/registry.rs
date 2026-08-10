@@ -1274,6 +1274,15 @@ pub async fn serve<S: RegistryStore>(addr: SocketAddr, store: Arc<S>) -> Result<
 /// them - and "the wire" is not one thing. Round trips and bytes are
 /// different problems with different fixes, and a tally by shape says which
 /// one this is.
+/// Bytes this registry has served, ever.
+///
+/// A lead is fetch + execute + push, and the report cannot tell them apart -
+/// which is why three remedies have been aimed at the gap between 300s on one
+/// machine and 400-660s on a fleet without anyone knowing which part it is in.
+/// A worker reads its inputs from a registry where home reads its own content
+/// store, so this is the size of the difference.
+pub static SERVED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub static TRAFFIC: std::sync::Mutex<Option<std::collections::BTreeMap<String, u64>>> =
     std::sync::Mutex::new(None);
 
@@ -1354,7 +1363,8 @@ pub async fn serve_with_upstream<S: RegistryStore>(
             let _ = tokio::signal::ctrl_c().await;
             if let Some(m) = TRAFFIC.held().as_ref() {
                 let total: u64 = m.values().sum();
-                println!("[registry] served {total} requests: {m:?}");
+                let mib = SERVED_BYTES.load(std::sync::atomic::Ordering::Relaxed) / (1 << 20);
+                println!("[registry] served {total} requests, {mib} MiB: {m:?}");
             }
         })
         .await?;
