@@ -1277,3 +1277,55 @@ only decides whether step 3 has already happened.
 Eight measured attempts have now converged on this one gap. None of them was
 wasted in the sense of being unmeasured, and all of them were chosen ahead of
 the measurement that would have pointed here.
+
+## Nine attempts, and the ceiling is the granularity
+
+Prefix-cutting was the ninth, and the only one to move the shape of a run:
+leads 50 -> 96, dispatched ops 2025 -> 4788, median ops per lead 82 -> 32,
+wall 444s -> 373s.
+
+Then the noise-free instrument answered:
+
+| configuration | executed duplication (ceiling 3.0) |
+| ------------------ | ---: |
+| graft only | 2.4x |
+| cut, 32 duplicates | 2.4x |
+| cut once | 2.3x |
+| everything on | 2.3x |
+
+**It did not reduce executed duplication.** 2.4 to 2.3 is nothing, and the 71s
+wall improvement sits exactly on the 72s noise threshold. Null, on the
+measurement that cannot be fooled by a busy laptop.
+
+The arithmetic of why: the built map holds 43 ops and the graphs contain 300
+distinct ones. One cut per graph publishes one ancestor; the other ~85% still
+travel to every worker and are executed there.
+
+### What would actually work, and why it is not available here
+
+Duplication reaches 1.0 only when every op is either built once and imported,
+or dispatched to exactly one builder. That means publishing EVERY boundary -
+which is action-level dispatch against a content-addressed store, and is what
+Bazel's Remote Execution API, BuildFarm and Buildbarn all do.
+
+The prior-art survey said this on day one and it took nine measured attempts
+to believe it:
+
+> Dispatching a 106-op DAG bypasses the cache for every op inside it - the 106
+> ops are re-executed because they are never given the chance to be a cache
+> hit. You are distributing the wrong unit and no scheduler fixes that.
+
+`Control.Solve()` takes a whole Definition. A worker is a buildkitd, and
+buildkitd's unit is a solve. Making the unit an op means workers that are not
+buildkitd - which is a different system, and loses the layer handling, secrets
+and cache mounts that made earthly's graphs buildable at all.
+
+### So what is this good for
+
+Dispatch works, correctly, across machines: 11 of 12 test groups at parity,
+84 of 123 solves routed on six runners, the mesh carrying 77% of
+cross-machine traffic with the driver's share FALLING as the fleet grows.
+Consolidation halved the single-machine time. None of that is nothing.
+
+What it does not do is beat one good machine on one test group, and the reason
+is structural rather than a missing optimisation.
