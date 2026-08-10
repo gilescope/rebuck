@@ -60,7 +60,11 @@ trap cleanup EXIT
 # `\*failed\*` is earthly's own marker for a target that failed, one line per
 # occurrence; sorted and deduped it is the set of targets that did not pass.
 failed_set() {
-  grep -ao "^[^ ]* \*failed\*" "$1" 2>/dev/null | sed 's/ \*failed\*//' | sort -u
+  # `|| true`, and the reason is worth stating: a build with NO failures
+  # makes grep exit 1, and under `set -e` that killed this script - right
+  # after the baseline came back green. The harness for measuring success
+  # could only survive failure.
+  grep -ao "^[^ ]* \*failed\*" "$1" 2>/dev/null | sed 's/ \*failed\*//' | sort -u || true
 }
 
 echo "== baseline: $TARGET with no fleet at all"
