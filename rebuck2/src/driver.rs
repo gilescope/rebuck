@@ -308,10 +308,26 @@ struct Subtree {
     subtree: Vec<u8>,
     frontier: Vec<Dig>,
     placement: crate::dispatch::Placement,
+    /// When this subtree was first offered, and which caches it names.
+    ///
+    /// Together these answer the only question that decides what is worth
+    /// seeding: not which cache ids appear most often in the Earthfile -
+    /// frequency in the source says nothing about time - but which ones the
+    /// fleet actually SPENDS its seconds behind.
+    started: std::time::Instant,
+    caches: std::collections::BTreeSet<String>,
 }
 
 pub struct Driver {
     pub store: Arc<Store>,
+    /// Milliseconds and lead-count spent behind each cache id.
+    ///
+    /// The question this exists to answer is which caches are worth SEEDING
+    /// on a cold worker. Counting how often an id appears in the Earthfile
+    /// answers a different question and gets it wrong: `npm` and `go-build`
+    /// appear eighteen times each, which says nothing about whether either
+    /// costs a minute or a second.
+    cache_cost: tokio::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
     /// Cross-machine single-flight. One per driver: it is the fleet's single
     /// coordinator, so there is no consensus problem to solve, only a
     /// liveness one.
@@ -392,6 +408,7 @@ impl Driver {
         Arc::new(Self {
             leases: crate::lease::Leases::default(),
             subtrees: Mutex::new(std::collections::HashMap::new()),
+            cache_cost: Default::default(),
             store,
             cfg,
             jobs: Mutex::new(HashMap::new()),
@@ -663,7 +680,32 @@ impl Driver {
                     // holds no bytes: principle 6, and the test for it is
                     // to look at this machine's disk afterwards.
                     W2D::Led { job, image_ref } => {
-                        println!("[driver] subtree job {job} built at {image_ref}");
+                        // Read the open record BEFORE `led` consumes it: the
+                        // timing and the cache ids live there, and the whole
+                        // point is to attribute this job's seconds.
+                        let (ms, caches) = {
+                            let open = self.subtrees.lock().await;
+                            match open.get(&job) {
+                                Some(st) => {
+                                    (st.started.elapsed().as_millis() as u64, st.caches.clone())
+                                }
+                                None => (0, Default::default()),
+                            }
+                        };
+                        println!("[driver] subtree job {job} built at {image_ref} in {ms}ms");
+                        // Attribute the SECONDS to the cache ids the graph
+                        // named. A subtree with no cache mount contributes
+                        // to nothing here, which is the point: this table
+                        // ranks what seeding a warm cache would actually
+                        // buy, and cannot be derived from the Earthfile.
+                        {
+                            let mut c = self.cache_cost.lock().await;
+                            for id in &caches {
+                                let e = c.entry(id.clone()).or_insert((0u64, 0u64));
+                                e.0 += ms;
+                                e.1 += 1;
+                            }
+                        }
                         self.subtree_built(job, image_ref).await;
                     }
                     // Refusal is not a failure - it is how the driver learns
@@ -1427,6 +1469,15 @@ impl Driver {
                 subtree: subtree.clone(),
                 frontier: frontier.clone(),
                 placement,
+                started: std::time::Instant::now(),
+                // From the graph, not the verdict: `inspect` answers
+                // may-it-travel and does not carry the ids.
+                caches: {
+                    use prost::Message;
+                    bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice())
+                        .map(|d| crate::dispatch::cache_ids(&d))
+                        .unwrap_or_default()
+                },
             },
         );
         // Claim recorded; `tell` needs the workers lock and must not hold
@@ -1514,6 +1565,19 @@ impl Driver {
                 let _ = tx.send(Err(why.to_owned()));
             }
         }
+    }
+
+    /// What each cache id cost the fleet: total ms, and how many leads.
+    ///
+    /// Ranked by TIME, because that is the only ordering that says what
+    /// seeding would buy. Frequency in the Earthfile is a different number
+    /// and points somewhere else.
+    pub async fn cache_costs(&self) -> Vec<(String, u64, u64)> {
+        let c = self.cache_cost.lock().await;
+        let mut v: Vec<(String, u64, u64)> =
+            c.iter().map(|(k, (ms, n))| (k.clone(), *ms, *n)).collect();
+        v.sort_by_key(|(id, ms, _)| (std::cmp::Reverse(*ms), id.clone()));
+        v
     }
 
     /// Offer a subtree on behalf of the gateway in this process, and wait.

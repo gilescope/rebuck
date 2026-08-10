@@ -1424,8 +1424,17 @@ pub async fn serve(
     // asked to stop rather than per Solve.
     let wire = proxy.wire.clone();
     let solo = proxy.solo_ms.clone();
+    let driver_for_report = proxy.driver.clone();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
+        // BEFORE the std::Mutex guards below: this awaits, and a std guard
+        // held across an await makes the whole task non-Send.
+        //
+        // What a warm cache would be worth, ranked by the only measure that
+        // decides it. A cache id appearing in half the Earthfile and costing
+        // two seconds is not worth seeding; one appearing twice and costing
+        // four minutes is.
+        let costs = driver_for_report.cache_costs().await;
         wire.held().report();
         let solo = solo.held();
         let medians: std::collections::BTreeMap<usize, u64> = solo
@@ -1436,6 +1445,13 @@ pub async fn serve(
                 (*p, v[v.len() / 2])
             })
             .collect();
+        if !costs.is_empty() {
+            let total: u64 = costs.iter().map(|(_, ms, _)| ms).sum();
+            println!("[wire] cache cost ms  : {total} total, worst first:");
+            for (id, ms, n) in costs.iter().take(6) {
+                println!("[wire]   {ms:>8}ms  {n:>4} leads  {id}");
+            }
+        }
         println!(
             "[wire] peer solo ms   : {medians:?} (uncontended, n={:?})",
             solo.iter()

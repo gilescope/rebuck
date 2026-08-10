@@ -361,6 +361,35 @@ fn hazards(op: &pb::Op) -> Vec<Exclusion> {
     out
 }
 
+/// Which cache mounts a graph names, by the id buildkit keys them on.
+///
+/// A cache mount is scratch, so a peer builds correctly with a COLD one -
+/// correctly and slowly. On earthbuild's Earthfile four ids do nearly all
+/// the work (`go-mod`, `go-build`, `npm`, `littleredcorvette-id`), and a
+/// worker that has never seen them re-downloads the Go module graph before
+/// it can start.
+///
+/// Naming them is the first step to deciding which are worth seeding: the
+/// answer is not "all of them", and it cannot be guessed from the Earthfile
+/// because frequency in the source says nothing about time spent.
+pub fn cache_ids(def: &pb::Definition) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for bytes in &def.def {
+        let Ok(op) = pb::Op::decode(bytes.as_slice()) else {
+            continue;
+        };
+        let Some(pb::op::Op::Exec(e)) = op.op else {
+            continue;
+        };
+        for m in &e.mounts {
+            if let Some(c) = &m.cache_opt {
+                out.insert(c.id.clone());
+            }
+        }
+    }
+    out
+}
+
 /// Everything a graph carries that a SESSIONLESS solve cannot satisfy,
 /// spelled out for a human.
 ///
