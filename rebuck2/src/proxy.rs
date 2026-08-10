@@ -1217,8 +1217,75 @@ impl Proxy {
         // then rejects it as "base unmirrored" - a success and a failure that
         // never meet, with both printed.
         let key_ns = format!("base:{}", target.unwrap_or("default"));
-        crate::dispatch::rewrite_registry_sources(&out, &|r| {
+        let out = crate::dispatch::rewrite_registry_sources(&out, &|r| {
             self.resolved(&(key_ns.clone(), r.to_owned()))
+        });
+
+        // GIT, the third kind of source that pins a graph to this machine.
+        //
+        // 407 of 1018 solves on `+test-no-qemu` were grounded by one, which
+        // makes it the single largest reason earthbuild's own Earthfile does
+        // not dispatch. buildkit resolves git credentials through the client
+        // session; a worker has none, so it dies with `no active sessions`
+        // after taking the lead.
+        //
+        // We hold the session, so we fetch the tree once and publish it as
+        // an image. Same machinery as a base image - `mirror_image` builds a
+        // one-op source graph and exports it, and nothing in it is specific
+        // to `docker-image://`.
+        //
+        // Deliberately AFTER the base rewrite: mirroring emits
+        // `docker-image://` identifiers of its own, and running the base
+        // pass over those would try to mirror our own mirror.
+        let gits: std::collections::BTreeSet<String> = out
+            .def
+            .iter()
+            .filter_map(|b| {
+                use prost::Message;
+                match bollard_buildkit_proto::pb::Op::decode(b.as_slice())
+                    .ok()
+                    .and_then(|o| o.op)
+                {
+                    Some(bollard_buildkit_proto::pb::op::Op::Source(src))
+                        if src.identifier.starts_with("git://") =>
+                    {
+                        Some(src.identifier)
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        for g in gits {
+            let key = (format!("git:{}", target.unwrap_or("default")), g.clone());
+            let cell = self.cell(&key);
+            let g2 = g.clone();
+            cell.get_or_init(|| async move {
+                match crate::solve::mirror_image(
+                    &mirror.buildkit,
+                    &mirror.registry,
+                    session,
+                    &g2,
+                    target,
+                )
+                .await
+                {
+                    Ok(reference) => {
+                        println!("[proxy] git {g2} mirrored as {reference}");
+                        Some(reference)
+                    }
+                    Err(e) => {
+                        // Not fatal. An unmirrored git source leaves that
+                        // subtree where it already was - built at home.
+                        println!("[proxy] git {g2} not mirrored: {e:#}");
+                        None
+                    }
+                }
+            })
+            .await;
+        }
+        let git_ns = format!("git:{}", target.unwrap_or("default"));
+        crate::dispatch::rewrite_git_sources(&out, &|r| {
+            self.resolved(&(git_ns.clone(), r.to_owned()))
         })
     }
 

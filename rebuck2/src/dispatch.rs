@@ -805,6 +805,24 @@ pub fn rewrite_local_sources(
     rewrite_sources(def, "local://", replacement)
 }
 
+/// Swap `git://` sources for images the driver already fetched.
+///
+/// A git source is the largest single reason earthbuild's own Earthfile does
+/// not dispatch - 407 of 1018 solves on `+test-no-qemu`. buildkit resolves
+/// git credentials through the client session, and a worker has none, so the
+/// subtree is grounded by [`Exclusion::SessionSource`].
+///
+/// The driver DOES have the session. It can fetch the tree once and publish
+/// it as content, exactly as it already does for base images and local
+/// contexts, and then the graph names something any peer can pull. Same
+/// trick, third kind of source.
+pub fn rewrite_git_sources(
+    def: &pb::Definition,
+    replacement: &dyn Fn(&str) -> Option<String>,
+) -> pb::Definition {
+    rewrite_sources(def, "git://", replacement)
+}
+
 /// The cascade, shared by both rewrites.
 fn rewrite_sources(
     def: &pb::Definition,
@@ -1792,6 +1810,37 @@ mod tests {
             ),
             vec![7],
             "the gateway was allowed to offer this; the driver must agree"
+        );
+    }
+
+    #[test]
+    fn a_mirrored_git_source_stops_being_a_hazard() {
+        // The point of mirroring: the driver fetches with its session, and
+        // what the peer sees is an ordinary image. If this rewrite does not
+        // clear the exclusion it has bought nothing.
+        let mut op = plain();
+        op.op = Some(OpKind::Source(pb::SourceOp {
+            identifier: "git://github.com/example/repo.git#main".to_owned(),
+            ..Default::default()
+        }));
+        let before = def(vec![op]);
+        assert!(!inspect(&before).dispatchable(), "precondition");
+
+        let after = rewrite_git_sources(&before, &|_| {
+            Some("docker-image://reg:5000/rebuck2/base:deadbeef".to_owned())
+        });
+        assert!(
+            inspect(&after).dispatchable(),
+            "mirroring a git source must clear it: {:?}",
+            inspect(&after).exclusions
+        );
+
+        // An unmirrored one stays put rather than being dropped. Pointing a
+        // peer at content nobody published is worse than not dispatching.
+        let untouched = rewrite_git_sources(&before, &|_| None);
+        assert!(
+            !inspect(&untouched).dispatchable(),
+            "a git source we could not mirror must still ground the subtree"
         );
     }
 
