@@ -1457,6 +1457,10 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     println!("[proxy] buildkit control on {addr} -> {upstream}");
     let relay_target = upstream.clone();
+    // What a previous generation built, before the first solve arrives. This
+    // is the difference between a bank that holds artefacts and a bank that
+    // can be used: the store restores the bytes, this restores what they are.
+    driver.load_built().await;
     let mut proxy = Proxy::connect(upstream.clone(), driver).await?;
     proxy.mirror = std::env::var("REBUCK2_MIRROR").ok().map(|registry| Mirror {
         registry,
@@ -1476,6 +1480,9 @@ pub async fn serve(
         // decides it. A cache id appearing in half the Earthfile and costing
         // two seconds is not worth seeding; one appearing twice and costing
         // four minutes is.
+        // Bank it for the next generation, before anything else - the
+        // report below can be truncated by a signal, and this must not be.
+        driver_for_report.save_built().await;
         let costs = driver_for_report.cache_costs().await;
         let peak = driver_for_report.peak_inflight();
         let (uniq, total_ops, pairs) = driver_for_report.op_duplication().await;

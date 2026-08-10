@@ -63,6 +63,15 @@ trust_block() {
 [ -x "$BIN" ] || { echo "build rebuck2 --release first"; exit 1; }
 
 rm -rf "$RUN"; mkdir -p "$RUN"
+# BANK: a coordinator store that OUTLIVES the run.
+#
+# Six mechanisms measured inside a single run were null or worse, and they
+# share a cause - each needs something built earlier, and a cold run has
+# nothing. This is the only configuration where the prefix already exists when
+# the first solve arrives, so it is the only one that can be different.
+#
+# Deliberately NOT under $RUN, which is deleted above.
+[ -z "${BANK:-}" ] || mkdir -p "$BANK"
 pids=()
 bk_names=()
 cleanup() {
@@ -170,7 +179,7 @@ REBUCK2_MIRROR="$MIRROR_HOST:$REG_PORT" \
   "$BIN" buildkit-proxy --listen "0.0.0.0:$PROXY_PORT" \
     --upstream "http://$BK_ADDR" \
     --registry-bind "0.0.0.0:$REG_PORT" \
-    --session "$SESSION" --store "$RUN/coord" >"$RUN/proxy.log" 2>&1 &
+    --session "$SESSION" --store "${BANK:-$RUN/coord}" >"$RUN/proxy.log" 2>&1 &
 pids+=("$!")
 
 # ONE DAEMON PER WORKER, which is the whole point and was not what this did.

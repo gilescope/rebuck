@@ -1679,6 +1679,69 @@ impl Driver {
         self.built.lock().await.clone()
     }
 
+    /// Where the built-op map lives between runs, beside the store it
+    /// describes.
+    fn built_path(&self) -> std::path::PathBuf {
+        self.store.root_dir().join("built-ops.json")
+    }
+
+    /// Load the map a previous generation left.
+    ///
+    /// THE POINT OF THE BANK. Restoring the store alone gives a run the
+    /// artefacts and no idea what they are: measured, generation 2 with a
+    /// warm 201-object bank grafted nothing on its first wave and came in
+    /// 19s from cold, inside the noise. The bytes were there; the mapping
+    /// from op digest to published image was not, because it lived only in
+    /// memory.
+    ///
+    /// With it, the very first solve can graft - which is the difference
+    /// between 0 prefixes and N.
+    pub async fn load_built(&self) {
+        let p = self.built_path();
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            return;
+        };
+        // A line per entry rather than a format with a parser: this file is
+        // written by one process and read by the next, and a half-written
+        // line must cost one entry rather than the whole bank.
+        let mut m = self.built.lock().await;
+        let mut n = 0;
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('\t') {
+                m.insert(k.to_owned(), v.to_owned());
+                n += 1;
+            }
+        }
+        if n > 0 {
+            println!("[driver] bank: {n} built op(s) restored from a previous run");
+        }
+    }
+
+    /// Persist it for the next generation.
+    pub async fn save_built(&self) {
+        let m = self.built.lock().await;
+        if m.is_empty() {
+            return;
+        }
+        let mut out = String::with_capacity(m.len() * 96);
+        // Sorted, so two runs that built the same things produce the same
+        // file - a bank that churns on ordering is a bank that never hits in
+        // a content-addressed cache.
+        let mut keys: Vec<&String> = m.keys().collect();
+        keys.sort();
+        for k in keys {
+            out.push_str(k);
+            out.push('\t');
+            out.push_str(&m[k]);
+            out.push('\n');
+        }
+        let p = self.built_path();
+        let tmp = p.with_extension("tmp");
+        if std::fs::write(&tmp, out).is_ok() && std::fs::rename(&tmp, &p).is_ok() {
+            println!("[driver] bank: {} built op(s) saved", m.len());
+        }
+    }
+
     /// The most subtrees in flight at once, over the whole run.
     pub fn peak_inflight(&self) -> usize {
         self.peak_inflight.load(Ordering::Relaxed)
