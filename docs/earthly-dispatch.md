@@ -511,3 +511,52 @@ of the other two:
 > OPEN. "May this graph run on someone else's machine" must be conservative;
 > "may the client talk to its own daemon" must be transparent. Each default
 > is a bug in the other's place.
+
+## Where `+test-no-qemu` actually stands
+
+Four fixes later, on the target M5 cares about:
+
+| run | routed | at home | context unmirrored | git unportable |
+| ----- | -----: | ------: | -----------------: | -------------: |
+| tnq5 | 269 | 673 | 69 | 407 |
+| tnq8 | 323 | 311 | 686 | 397 |
+| tnq9 | 537 | 238 | 0 | 0 |
+| tnq10 | 498 | 241 | 0 | 0 |
+
+Blob provenance on tnq9: **peer 205, driver 39**. The mesh moves 84% of
+everything that crosses a machine boundary.
+
+What still refuses to travel is supposed to:
+
+```text
+170  excluded: Insecure            privileged exec - a trust decision
+ 68  excluded: UnknownMount(100)   WITH DOCKER's host bind - this host
+  2  base unmirrored
+```
+
+**The build is still red, and not for a reason the fleet can fix.**
+`+test-no-qemu` is earthbuild's integration suite: it reaches for an
+ssh-agent, clones `test-remote` over git matchers, and pushes to a registry.
+
+```text
+./tests+reject-privileged-import-test | failed to match earthly reference
+    test-remote/privileged with any git matchers
+./tests+command | failed to connect to ssh-agent ... dial unix: missing address
+```
+
+118 targets pass; the suite then cancels. Getting the remainder green is a
+question about credentials and network on the machine running it, not about
+distribution, and no amount of proxy work will change it. The honest claim is
+the dispatch column: two thirds of a 54,000-op graph built on other daemons,
+with every refusal accounted for.
+
+The two largest blockers this week were both ours, and neither was an
+architectural limit:
+
+- a context named `./buildkitd` is not a legal OCI tag, so 686 pushes failed
+  with `invalid reference format`
+- a mirror keyed by `git://host/repo` looked up by `host/repo`, so 397
+  rewrites silently found nothing
+
+Both reported as capability limits of the fleet - "context unmirrored", "not
+portable" - and both were format strings.
