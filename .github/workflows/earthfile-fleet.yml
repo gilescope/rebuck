@@ -145,7 +145,14 @@ env:
   # was applied and the mechanism was inert.
   EARTHLY_TLS_ENABLED: "false"
   EARTH_TLS_ENABLED: "false"
-  REBUCK2_GRAFT: ${{ inputs.graft || '1' }}
+  # GRAFT OFF while `no support for <nil>` is unexplained.
+  #
+  # The index-0 guard was a hypothesis - an image source has one output, an
+  # ExecOp has one per mount - and it did not fix the error, so the theory
+  # was wrong or incomplete. Two mechanisms rewrite graphs here; turning one
+  # off says which. Guessing at a second theory while a fleet declines every
+  # job is how the last several hours went.
+  REBUCK2_GRAFT: ${{ inputs.graft || '0' }}
   REBUCK2_CUT_PREFIX: ${{ inputs.cut_prefix || '1' }}
 
 permissions:
