@@ -132,6 +132,14 @@ jobs:
           # So it is not for this workflow to guess. `earthly bootstrap`
           # starts the daemon earthly wants; the workers then run the same
           # image, and any version skew is impossible by construction.
+          # Every registry in this run, trusted by every daemon. A daemon
+          # that does not trust one pushes happily over HTTP and then
+          # cannot pull from it - and the push is the loud half.
+          TRUST=""
+          for r in $(seq 15000 $((15000 + WORKERS))); do
+            TRUST="$TRUST$(printf '[registry."172.17.0.1:%s"]\n  http = true\n  insecure = true\n' "$r")"
+          done
+
           earthly bootstrap
           docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}'
           SEED=$(docker ps -a --filter 'name=buildkitd' --format '{{.Names}}' | head -1)
@@ -158,9 +166,7 @@ jobs:
           docker run -d --name own-bk --privileged -p 18372:8372 \
             -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
             -e BUILDKIT_TLS_ENABLED=false \
-            -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG='[registry."172.17.0.1:15000"]
-            http = true
-            insecure = true' \
+            -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG="$TRUST" \
             "$BK_IMAGE" >/dev/null
           for _ in $(seq 1 120); do
             docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers \
@@ -177,9 +183,7 @@ jobs:
               -p "$((18372 + i)):8372" \
               -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
               -e BUILDKIT_TLS_ENABLED=false \
-              -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG='[registry."172.17.0.1:15000"]
-            http = true
-            insecure = true' \
+              -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG="$TRUST" \
               -v "/tmp/earthbuild-$i:/tmp/earthbuild" \
               "$BK_IMAGE" >/dev/null
           done
@@ -210,11 +214,20 @@ jobs:
               --session "$SESSION" --store /tmp/coord > /tmp/proxy.log 2>&1 &
           echo $! > /tmp/proxy.pid
 
+          # A REGISTRY PER WORKER, not the coordinator's.
+          #
+          # Sharing one registry makes hits_peer structurally zero: a
+          # subtree's layers are already at the address the requester pulls
+          # from, so the fetch path - local, bloom-matched peer, driver - is
+          # never asked a question whose answer could be "peer". Measured
+          # locally: shared registry gave peer=0 every run; a registry per
+          # worker gave peer=6 on the first attempt.
           for i in $(seq 1 "$WORKERS"); do
             "$BIN" worker --session "$SESSION" \
               --store "/tmp/worker-$i" \
               --buildkit-addr "http://127.0.0.1:$((18372 + i))" \
-              --registry-addr 172.17.0.1:15000 > "/tmp/worker-$i.log" 2>&1 &
+              --registry-bind "0.0.0.0:$((15000 + i))" \
+              --registry-addr "172.17.0.1:$((15000 + i))" > "/tmp/worker-$i.log" 2>&1 &
           done
 
           # Barrier: a worker joins over iroh a moment after its process
