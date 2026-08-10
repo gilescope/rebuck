@@ -1256,6 +1256,29 @@ pub fn router_with_upstream<S: RegistryStore>(
         // apply — `drain_into` enforces MAX_UPLOAD as the bytes go past, and
         // the manifest arm bounds itself with MAX_MANIFEST.
         .layer(DefaultBodyLimit::disable())
+        // BYTES SERVED, counted here rather than in `serve`.
+        //
+        // It lived in a layer that `serve` added, so every test drove the
+        // router WITHOUT it - which is how an increment that was never
+        // written went unnoticed while two runs reported "0 KiB" across 160
+        // blob GETs, and I read that as an architectural finding about who
+        // serves a worker's inputs.
+        //
+        // A metric applied at the edge is a metric no test can see.
+        .layer(axum::middleware::from_fn(
+            |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                let res = next.run(req).await;
+                if let Some(n) = res
+                    .headers()
+                    .get(axum::http::header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    SERVED_BYTES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                }
+                res
+            },
+        ))
         .with_state(reg)
 }
 
@@ -1334,21 +1357,6 @@ pub async fn serve_with_upstream<S: RegistryStore>(
             // event cannot be used to answer the only question being asked
             // of it.
             let st = res.status();
-            // Content-Length, set by every blob and manifest response.
-            //
-            // This increment was written once, its edit silently failed to
-            // apply, and only the PRINT was repaired - so two runs reported
-            // "0 KiB" across 160 blob GETs and I read that as an
-            // architectural finding about who serves a worker's inputs. It
-            // was a counter that counted nothing.
-            if let Some(n) = res
-                .headers()
-                .get(axum::http::header::CONTENT_LENGTH)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-            {
-                SERVED_BYTES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-            }
             let key = if st.is_success() || st.is_redirection() {
                 k
             } else {
@@ -1787,6 +1795,42 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (hash == self.hash).then(|| self.bytes.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn serving_a_blob_counts_its_bytes() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // The counter that read 0 MiB across 160 blob GETs, twice, and was
+        // taken for an architectural finding about who serves a worker's
+        // inputs. The increment had never been written: an edit failed its
+        // assertion, only the PRINT was repaired, and `grep -c fetch_add`
+        // returned 0.
+        //
+        // It also lived in a layer that `serve` added, so no test could have
+        // seen it even if it had been there. A metric applied at the edge is
+        // a metric no test can reach.
+        let st = store();
+        let payload = vec![7u8; 4096];
+        let hash = st.blob_put(&payload).await.unwrap();
+        let r = router(st);
+
+        let before = SERVED_BYTES.load(Relaxed);
+        let (code, _h, body) = call(
+            &r,
+            Request::builder()
+                .uri(format!("/v2/x/blobs/sha256:{hash}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body.len(), payload.len());
+        assert!(
+            SERVED_BYTES.load(Relaxed) >= before + payload.len() as u64,
+            "serving {} bytes moved the counter by {}",
+            payload.len(),
+            SERVED_BYTES.load(Relaxed) - before
+        );
     }
 
     #[tokio::test]
