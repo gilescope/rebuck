@@ -945,3 +945,57 @@ warm `go-mod` would shave part of a prefix that should not be built six times
 in the first place.
 
 The unit being distributed is the problem, not the algorithm that places it.
+
+## The duplication, counted - and two claims of mine corrected
+
+`+test-no-qemu-group2`, two workers:
+
+```text
+2568 ops sent / 142 distinct = 18.1x sent
+238 (op,worker) pairs        =  1.7x built
+```
+
+**Correction 1: the prefix story was overstated.** "Every worker rebuilds the
+shared ancestry" predicts a multiplier near the worker count. Measured
+execution duplication is **1.7x against a ceiling of 2.0** - real, but 1.7x of
+the work spread over two machines is close to break-even and cannot on its own
+explain a 65% slowdown. The 18.1x is DISPATCH duplication, which costs almost
+nothing because buildkit dedupes within a daemon. The dramatic figure was
+quoted before the honest one existed.
+
+**Correction 2: three cache configurations, three regressions.**
+
+| configuration | baseline | fleet |
+| ---------------------------- | -------: | ----: |
+| no cache, 6 workers | 277s | 660s |
+| no cache, 2 workers | 299s | 401s |
+| read-only (no writer at all) | 307s | 658s |
+| export per solve (84 writers) | 321s | 755s |
+| one reference export + imports | 303s | 498s |
+
+The last was the shape the prior art recommends, and it still lost 97s to no
+cache at all - for a reason visible in the code as written: the export runs on
+the CLIENT's build, inside the measured window, pushing a mode=max cache
+before the run ends. **A single run cannot benefit from a cache it is itself
+producing.**
+
+Which is what this document said days ago - "between-generation seeding ...
+the cost of a FRESH runner is the one the bank was meant for" - and what three
+experiments have now confirmed by contradiction. Every run on a GitHub runner
+starts empty. There is nothing to import, and manufacturing something to
+import costs more than it returns within the same run.
+
+### So where does the 100-380s actually go?
+
+Not, on this evidence, mostly into rebuilt ancestry. Still unaccounted:
+
+- 1.7x duplicated execution - real, but small
+- transfer: base image and context pulled per worker
+- earthly's per-solve overhead, paid 84 times through a gateway rather than
+  inline
+- the mirror hop: a worker reads inputs from a registry where home reads its
+  own content store
+
+The next measurement is a breakdown of one lead into fetch versus execute.
+That has been the next measurement for a while, and three remedies have been
+attempted ahead of it.
