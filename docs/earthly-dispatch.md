@@ -1136,3 +1136,50 @@ peer-to-peer transfer (correct, and neutral), not scheduling (the graph is
 parallel, peak 9). The subtree has to arrive with its ancestry already built
 and named as content, which is this repo's own principle 10 - hand over trees,
 not vertices - unimplemented at the point where it matters.
+
+## Grafting fires, and cannot reach the graphs that cost
+
+`graft_built` replaces an already-published op with an import of its result.
+A/B on `group10`, three workers:
+
+| | wall | grafts | total ops dispatched | median ops | max ops |
+| -------- | ---: | -----: | -------------------: | ---------: | ------: |
+| graft off | 443s | 0 | 2088 | 14 | 109 |
+| graft on | 458s | 50 | 1810 | 10 | 109 |
+
+15 seconds apart, inside the 18% noise. Fifth remedy, fifth null result.
+
+**The max stayed 109, and that is the whole story.** You cannot graft what has
+not been built yet. On a cold fleet the first wave of 109-op graphs is
+dispatched simultaneously, nothing is published, and every worker builds the
+prefix. Grafting catches the later, smaller graphs - the tail - while the head
+is where the time is.
+
+This is the same shape as the cache result, and the two now explain each
+other:
+
+| mechanism | needs | has, in a cold run |
+| ---------------- | -------------------------------- | ------------------ |
+| registry cache | something exported earlier | nothing |
+| graft | something built and published earlier | nothing for the first wave |
+
+Both are BETWEEN-GENERATIONS mechanisms being asked to work within one cold
+run, which is the mistake this document recorded days ago and has now made
+twice more.
+
+### What "1 prefix" actually requires
+
+A barrier. The shared ancestry has to be built BEFORE the first wave is
+dispatched, not discovered while it is in flight:
+
+```text
+1. find the ops common to many pending solves
+2. build that prefix once - on one machine, blocking
+3. publish it
+4. graft it into every subtree, then dispatch
+```
+
+Step 2 is the part no current code does. Everything today dispatches the
+moment a solve arrives, which is exactly when nothing has been built. And the
+bank is the version of step 1-3 that costs nothing at all, because a previous
+generation already did it - which is why 0 prefixes beats 1.
