@@ -124,6 +124,19 @@ env:
   # itself measures CONTENTION, not capacity: there the same target's
   # baseline fell to 122s while the fleet sat at 389s. Separate machines are
   # the only place the question can be answered.
+  # TLS off by ENV, not only in a config file - and this is what makes
+  # daemon consolidation actually happen.
+  #
+  # A nested earthly inherits BUILDKIT_HOST through the forwarded
+  # environment and nothing else. A config file lives in one container and
+  # cannot travel, so without this the nested build dials the shared daemon,
+  # defaults to TLS, and exits 6.
+  #
+  # Its absence is visible in the numbers: this workflow's baseline is 292s
+  # where the same target on a laptop WITH consolidation is 141s. The patch
+  # was applied and the mechanism was inert.
+  EARTHLY_TLS_ENABLED: "false"
+  EARTH_TLS_ENABLED: "false"
   REBUCK2_GRAFT: ${{ inputs.graft || '1' }}
   REBUCK2_CUT_PREFIX: ${{ inputs.cut_prefix || '1' }}
 
