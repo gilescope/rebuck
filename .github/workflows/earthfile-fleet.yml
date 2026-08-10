@@ -23,8 +23,8 @@
 # runner's four cores, so a second worker adds contention and not capacity.
 #
 # UNPROVEN. This has never run. Three things are assumed and only the first
-# run will settle them: that `earthly bootstrap` publishes a port this
-# workflow can read, that a worker's daemon started from the same image is
+# run will settle them: that the pinned buildkitd image is one this earthly
+# accepts, that a worker's daemon started from the same image is
 # accepted by the same earthly binary, and that a real earthly graph gets
 # through `make_portable` at all. Expect the first run to be a probe rather
 # than a measurement, and read the logs step before the timings.
@@ -161,9 +161,8 @@ jobs:
           # image is compiled in as DefaultBuildkitdImage and it checks a
           # settings hash against the running container.
           #
-          # So it is not for this workflow to guess. `earthly bootstrap`
-          # starts the daemon earthly wants; the workers then run the same
-          # image, and any version skew is impossible by construction.
+          # That argument held while we used a RELEASED earthly. It does
+          # not survive building earthly from source - see the pin below.
           # Every registry in this run, trusted by every daemon. A daemon
           # that does not trust one pushes happily over HTTP and then
           # cannot pull from it - and the push is the loud half.
@@ -172,12 +171,27 @@ jobs:
             TRUST="$TRUST$(printf '[registry."172.17.0.1:%s"]\n  http = true\n  insecure = true\n' "$r")"
           done
 
-          earthly bootstrap
+          # PINNED, not discovered. This used to run `earthly bootstrap` and
+          # copy whichever image the binary chose, on the argument that the
+          # binary is the authority. That stopped being true the moment we
+          # started building earthly FROM SOURCE for the #784 patch: a source
+          # build has `ghcr.io/earthbuild/earthbuild:buildkitd-dev-main`
+          # compiled in as DefaultBuildkitdImage, and that tag is not
+          # published. The first CI run ever attempted died on
+          #
+          #     bootstrap | docker: Error response from daemon: manifest unknown
+          #
+          # It worked on a laptop only because a buildkitd container was
+          # already lying around from an earlier release install, so the
+          # discovery step found an image nobody had pulled that day.
+          #
+          # The image still has to be earthly's FORK - the converter emits
+          # host binds and earthly_interactive sockets that stock
+          # moby/buildkit rejects outright - so this pins the fork's last
+          # published tag rather than falling back to upstream.
+          BK_IMAGE=${BK_IMAGE:-earthbuild/buildkitd:v0.8.17}
+          docker pull "$BK_IMAGE"
           docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}'
-          SEED=$(docker ps -a --filter 'name=buildkitd' --format '{{.Names}}' | head -1)
-          if [ -z "$SEED" ]; then
-            echo "earthly started no buildkitd - nothing to copy an image from"; exit 1
-          fi
           # OUR OWN daemon, from the image earthly chose.
           #
           # earthly starts its buildkitd with BUILDKIT_TCP_TRANSPORT_ENABLED=false
@@ -192,8 +206,7 @@ jobs:
           # KNOWN, not discovered: the fork's own buildkitd.tcp.template sets
           # `[grpc] address = tcp://0.0.0.0:8372` and we are the ones turning
           # TCP on.
-          BK_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$SEED")
-          echo "earthly chose image: $BK_IMAGE"
+          echo "buildkitd image: $BK_IMAGE"
           docker rm -f own-bk >/dev/null 2>&1 || true
           docker run -d --name own-bk --privileged -p 18372:8372 \
             -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \

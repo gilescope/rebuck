@@ -152,16 +152,21 @@ jobs:
           # carries fork-only ops, so `earthly bootstrap` picks the daemon and
           # this copies its choice rather than guessing an image.
           mkdir -p ~/.earthly && printf '%s\n' "$TRUST_SNIPPET" > ~/.earthly/config.yml
-          earthly bootstrap
-          BK=$(docker ps --filter 'name=buildkitd' --format '{{.Names}}' | head -1)
-          [ -n "$BK" ] || { echo "no buildkitd started"; exit 1; }
-          # OUR OWN daemon from the image earthly chose. earthly starts its
-          # buildkitd with TCP disabled and speaks to it over a unix socket;
-          # the port it publishes is the embedded registry and answers
-          # HTTP/1.1, so nothing can proxy it. The image must still be
-          # earthly's - fork-only ops - so bootstrap picks it and we start it
-          # with gRPC on 8372, which the fork's own tcp template sets.
-          BK_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$BK")
+          # PINNED, not discovered by `earthly bootstrap`. A source-built
+          # earthly - which is what the #784 patch requires - has
+          # `ghcr.io/earthbuild/earthbuild:buildkitd-dev-main` compiled in as
+          # DefaultBuildkitdImage, and that tag is not published. The first
+          # CI run ever attempted died on `manifest unknown` before starting
+          # a single daemon.
+          #
+          # The image must still be earthly's FORK: the converter emits host
+          # binds and earthly_interactive sockets that stock moby/buildkit
+          # rejects. earthly's own daemon could not be proxied anyway - it
+          # runs with TCP disabled and the port it publishes is the embedded
+          # registry, which answers HTTP/1.1 to a gRPC client. So we start
+          # our own with gRPC on 8372, the port the fork's tcp template sets.
+          BK_IMAGE=${BK_IMAGE:-earthbuild/buildkitd:v0.8.17}
+          docker pull "$BK_IMAGE"
           docker rm -f own-bk >/dev/null 2>&1 || true
           docker run -d --name own-bk --privileged -p 18372:8372 \
             -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
@@ -271,16 +276,21 @@ jobs:
           WANT=$(echo "$WANT_JSON" | tr -cd '0-9,' | awk -F, '{print NF}')
           echo "expecting $WANT worker runner(s)"
           mkdir -p ~/.earthly && printf '%s\n' "$TRUST_SNIPPET" > ~/.earthly/config.yml
-          earthly bootstrap
-          BK=$(docker ps --filter 'name=buildkitd' --format '{{.Names}}' | head -1)
-          [ -n "$BK" ] || { echo "no buildkitd started"; exit 1; }
-          # OUR OWN daemon from the image earthly chose. earthly starts its
-          # buildkitd with TCP disabled and speaks to it over a unix socket;
-          # the port it publishes is the embedded registry and answers
-          # HTTP/1.1, so nothing can proxy it. The image must still be
-          # earthly's - fork-only ops - so bootstrap picks it and we start it
-          # with gRPC on 8372, which the fork's own tcp template sets.
-          BK_IMAGE=$(docker inspect -f '{{.Config.Image}}' "$BK")
+          # PINNED, not discovered by `earthly bootstrap`. A source-built
+          # earthly - which is what the #784 patch requires - has
+          # `ghcr.io/earthbuild/earthbuild:buildkitd-dev-main` compiled in as
+          # DefaultBuildkitdImage, and that tag is not published. The first
+          # CI run ever attempted died on `manifest unknown` before starting
+          # a single daemon.
+          #
+          # The image must still be earthly's FORK: the converter emits host
+          # binds and earthly_interactive sockets that stock moby/buildkit
+          # rejects. earthly's own daemon could not be proxied anyway - it
+          # runs with TCP disabled and the port it publishes is the embedded
+          # registry, which answers HTTP/1.1 to a gRPC client. So we start
+          # our own with gRPC on 8372, the port the fork's tcp template sets.
+          BK_IMAGE=${BK_IMAGE:-earthbuild/buildkitd:v0.8.17}
+          docker pull "$BK_IMAGE"
           docker rm -f own-bk >/dev/null 2>&1 || true
           docker run -d --name own-bk --privileged -p 18372:8372 \
             -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
