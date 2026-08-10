@@ -1256,7 +1256,17 @@ impl Proxy {
             })
             .collect();
         for g in gits {
-            let key = (format!("git:{}", target.unwrap_or("default")), g.clone());
+            // Keyed WITHOUT the scheme, because that is what
+            // `rewrite_git_sources` passes to the lookup - see
+            // `the_rewriter_hands_over_a_name_with_no_scheme`. Keying by the
+            // full identifier mirrored correctly, found nothing on the way
+            // back, and left 397 solves unportable with no error anywhere:
+            // both halves worked, they just did not meet.
+            //
+            // The same mistake, with the same symptom, is documented three
+            // lines above for base images.
+            let name = g.strip_prefix("git://").unwrap_or(&g).to_owned();
+            let key = (format!("git:{}", target.unwrap_or("default")), name);
             let cell = self.cell(&key);
             let g2 = g.clone();
             cell.get_or_init(|| async move {
@@ -1814,14 +1824,22 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                     let mirrored = crate::dispatch::inspect(&portable);
                     let sources_clear = mirrored.dispatchable_when(policy);
                     if !sources_clear {
+                        // The first blocker the POLICY did not lift.
+                        // `.first()` here reported "still not portable:
+                        // CacheMount" 185 times in a run where cache mounts
+                        // were explicitly allowed - the third appearance of
+                        // this exact mistake, and the first two were fixed
+                        // hours before this code was written.
+                        let blocker = mirrored
+                            .exclusions
+                            .iter()
+                            .map(|(_, e)| e)
+                            .find(|e| !crate::dispatch::lifted_by_policy(e, policy));
                         *self
                             .wire
                             .held()
                             .rejected
-                            .entry(format!(
-                                "still not portable: {:?}",
-                                mirrored.exclusions.first().map(|(_, e)| e)
-                            ))
+                            .entry(format!("still not portable: {blocker:?}"))
                             .or_default() += 1;
                     }
                     if local_clear && bases_clear && sources_clear {

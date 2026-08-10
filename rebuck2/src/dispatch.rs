@@ -1890,6 +1890,34 @@ mod tests {
     }
 
     #[test]
+    fn the_rewriter_hands_over_a_name_with_no_scheme() {
+        // The CONTRACT, pinned, because breaking it is silent and has now
+        // cost two bugs: a mirror keyed by the full `git://...` identifier
+        // was looked up by the scheme-less name, never matched, and 397
+        // solves stayed unportable while the mirror reported success.
+        //
+        // `make_portable` COLLECTS full identifiers and RESOLVES with
+        // whatever this passes. If the two ever disagree the failure is a
+        // rewrite that quietly does nothing - there is no error anywhere,
+        // because both halves worked.
+        let mut g = plain();
+        g.op = Some(OpKind::Source(pb::SourceOp {
+            identifier: "git://example.com/r.git#main".to_owned(),
+            ..Default::default()
+        }));
+        let seen = std::cell::RefCell::new(Vec::new());
+        rewrite_git_sources(&def(vec![g]), &|name| {
+            seen.borrow_mut().push(name.to_owned());
+            None
+        });
+        assert_eq!(
+            seen.into_inner(),
+            vec!["example.com/r.git#main".to_owned()],
+            "the replacement is called WITHOUT the scheme"
+        );
+    }
+
+    #[test]
     fn a_mirrored_git_source_stops_being_a_hazard() {
         // The point of mirroring: the driver fetches with its session, and
         // what the peer sees is an ordinary image. If this rewrite does not
