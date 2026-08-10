@@ -297,6 +297,71 @@ pub async fn connect(
     Ok(control::control_client::ControlClient::connect(addr.to_owned()).await?)
 }
 
+/// The one-source-and-a-terminal graph that pulls a context out of a client.
+///
+/// Separate from [`publish_context`] because the interesting part is the
+/// attrs, and they are worth asserting on without a daemon.
+///
+/// `local.sharedkeyhint` is the differ's baseline: buildkit keys the
+/// previously-transferred filesystem by it, and fsutil sends only what
+/// changed since. Omitting it is not a slow path, it is a full re-send of
+/// the whole context on every build - which is how earthbuild's
+/// `copy-test-verbose-output` caught it, that test asserting a file it had
+/// already sent was not sent again.
+///
+/// The hint is NAMESPACED rather than borrowed from the op we are
+/// materialising for, and that is a correctness point, not tidiness: a hint
+/// identifies a transferred filesystem, so sharing one with earthly's own
+/// `local.includepattern`-filtered transfers risks serving a filtered
+/// snapshot as if it were the whole context. We only ever publish the whole
+/// thing, so a prefix nobody else writes keeps the baseline honest.
+///
+/// Considered mixing earthly's own hint in to keep two projects that both
+/// call their context `context` off one baseline (rejected: their hint is
+/// only assumed stable across builds, and if it is not, ours resets every
+/// build and the re-send comes back). A shared baseline between projects
+/// costs a worse diff, never a wrong one - fsutil syncs, it does not trust.
+fn context_def(session: &str, local_name: &str) -> pb::Definition {
+    use prost::Message;
+
+    let src = pb::Op {
+        op: Some(pb::op::Op::Source(pb::SourceOp {
+            identifier: format!("local://{local_name}"),
+            attrs: [
+                ("local.session".to_owned(), session.to_owned()),
+                // NOT keyed by session: a second `earthly` invocation is a
+                // new session, and diffing against the previous BUILD is the
+                // point.
+                (
+                    "local.sharedkeyhint".to_owned(),
+                    format!("rebuck2-full:{local_name}"),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        })),
+        ..Default::default()
+    };
+    let src_b = src.encode_to_vec();
+    let term = pb::Op {
+        inputs: vec![pb::Input {
+            digest: format!("sha256:{}", crate::store::sha256_hex(&src_b)),
+            index: 0,
+        }],
+        ..Default::default()
+    };
+    pb::Definition {
+        metadata: [(
+            format!("sha256:{}", crate::store::sha256_hex(&src_b)),
+            pb::OpMetadata::default(),
+        )]
+        .into_iter()
+        .collect(),
+        def: vec![src_b, term.encode_to_vec()],
+        ..Default::default()
+    }
+}
+
 /// Materialise a client's build context as an image a peer can pull.
 ///
 /// The context reaches a daemon by filesync over the client's session, and
@@ -318,35 +383,7 @@ pub async fn publish_context(
     session: &str,
     local_name: &str,
 ) -> anyhow::Result<String> {
-    use prost::Message;
-
-    let src = pb::Op {
-        op: Some(pb::op::Op::Source(pb::SourceOp {
-            identifier: format!("local://{local_name}"),
-            attrs: [("local.session".to_owned(), session.to_owned())]
-                .into_iter()
-                .collect(),
-        })),
-        ..Default::default()
-    };
-    let src_b = src.encode_to_vec();
-    let term = pb::Op {
-        inputs: vec![pb::Input {
-            digest: format!("sha256:{}", crate::store::sha256_hex(&src_b)),
-            index: 0,
-        }],
-        ..Default::default()
-    };
-    let def = pb::Definition {
-        metadata: [(
-            format!("sha256:{}", crate::store::sha256_hex(&src_b)),
-            pb::OpMetadata::default(),
-        )]
-        .into_iter()
-        .collect(),
-        def: vec![src_b, term.encode_to_vec()],
-        ..Default::default()
-    };
+    let def = context_def(session, local_name);
 
     // Named by the session, so two concurrent builds do not publish over
     // each other, and a rebuild of the same context is the same ref.
@@ -654,6 +691,59 @@ pub fn published_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_published_context_diffs_against_the_last_one_it_published() {
+        use prost::Message;
+
+        // Why this exists: `copy-test-verbose-output` in earthbuild's own
+        // suite asserts that a second build does NOT re-send a file it
+        // already sent, and it failed ONLY through the fleet. The cause is
+        // here rather than anywhere clever - the synthetic `local://` op
+        // that materialises a context carried no `local.sharedkeyhint`, so
+        // fsutil had no previous transfer to diff against and the client
+        // re-sent every byte, every build.
+        let of = |d: &pb::Definition| -> pb::SourceOp {
+            d.def
+                .iter()
+                .filter_map(|b| pb::Op::decode(b.as_slice()).ok())
+                .find_map(|o| match o.op {
+                    Some(pb::op::Op::Source(s)) => Some(s),
+                    _ => None,
+                })
+                .expect("a context definition is a source and a terminal")
+        };
+
+        let a = of(&super::context_def("session-a", "context"));
+        let hint = a.attrs.get("local.sharedkeyhint").expect("a hint");
+
+        // NAMESPACED, and that is the load-bearing part. A hint is a cache
+        // key for a transferred filesystem: sharing one with earthly's own
+        // filtered transfers could serve a `local.includepattern`-filtered
+        // snapshot as though it were the whole context. We only ever publish
+        // the WHOLE context, so a prefix no other producer uses keeps our
+        // baseline honest.
+        assert!(hint.starts_with("rebuck2-full:"), "{hint}");
+        assert!(hint.contains("context"), "names the context: {hint}");
+
+        // Stable ACROSS sessions - a second `earthly` invocation is a new
+        // session, and diffing against the previous build is the whole
+        // point. (The tag stays per-session; only the differ's baseline is
+        // shared.)
+        let b = of(&super::context_def("session-b", "context"));
+        assert_eq!(b.attrs.get("local.sharedkeyhint"), Some(hint));
+        // ...but two different contexts must not share a baseline.
+        let c = of(&super::context_def("session-a", "other"));
+        assert_ne!(c.attrs.get("local.sharedkeyhint"), Some(hint));
+
+        // The session still has to be the CLIENT's: it is the only one
+        // serving the files.
+        assert_eq!(
+            a.attrs.get("local.session").map(String::as_str),
+            Some("session-a")
+        );
+        assert_eq!(a.identifier, "local://context");
+    }
 
     #[test]
     fn the_fleet_cache_is_off_unless_asked_for_and_never_fails_a_build() {
