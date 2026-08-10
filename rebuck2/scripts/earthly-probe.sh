@@ -110,6 +110,17 @@ MIRROR_HOST=${MIRROR_HOST:-host.docker.internal}
   fi
 } >"$RUN/earthly.yml"
 export EARTHLY_CONFIG="$RUN/earthly.yml"
+# TLS off by ENV as well as by config, and the env is the one that matters.
+#
+# A config file lives in one container. Under daemon consolidation the nested
+# earthly inherits BUILDKIT_HOST through the forwarded environment and nothing
+# else - so it dials the shared daemon, defaults to TLS, and dies with exit
+# code 6 while the harness then fails trying to cat a buildkitd log that no
+# longer exists because there is no internal daemon.
+#
+# That is what earthbuild patch 0001 is for: let TLS be set by environment.
+export EARTHLY_TLS_ENABLED=false
+export EARTH_TLS_ENABLED=false
 
 echo "== a buildkitd we can actually proxy"
 # Bootstrap to learn the IMAGE, then run our OWN container from it.
