@@ -192,7 +192,7 @@ jobs:
           # be IN it. Plain `go build` - bootstrapping earthly with earthly
           # would need a working buildkit before the thing under test exists.
           git -C earthbuild apply --verbose \
-            "$GITHUB_WORKSPACE/rebuck2-repo/rebuck2/patches/earthbuild-784-four-sites.patch" || {
+            "$GITHUB_WORKSPACE/rebuck2-repo/rebuck2/patches/earthbuild-consolidated-plus-784.patch" || {
               echo "::error::the #784 patch no longer applies to earthbuild"
               echo "at $(git -C earthbuild rev-parse --short HEAD). Re-derive it"
               echo "rather than forcing it: gate on whatever the surrounding"

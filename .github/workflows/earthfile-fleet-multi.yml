@@ -192,6 +192,19 @@ jobs:
       - name: build earthly, PATCHED
         run: |
           set -euo pipefail
+          # CONSOLIDATED patch, not the four #784 sites alone.
+          #
+          # earthbuild's tests are earthly-in-earthly: RUN_EARTH executes the
+          # entrypoint inside a container, which starts its OWN buildkitd
+          # unless a host is forwarded. Every test's real build then runs on a
+          # daemon the gateway never sees - and those are exactly the solves
+          # refused as `Insecure`, so the fleet was distributing the cheap
+          # prep and leaving the critical path at home.
+          #
+          # Measured locally: consolidation more than HALVES the single-machine
+          # time, ~300s -> 141s. CI has been running without it, which is why
+          # its baselines are 313s and 276s where a laptop now does 141s.
+          #
           # Released earthly measures ZERO: every non-LOCALLY RUN carries the
           # debugger's secret, host bind and two fork-only sockets, and each
           # pins the solve to whoever holds earthly's session. See
@@ -204,7 +217,7 @@ jobs:
           # version skew `earthly bootstrap` was used here to make
           # impossible. Same commit, same patch, same image, everywhere.
           git -C earthbuild apply --verbose \
-            "$GITHUB_WORKSPACE/rebuck2/patches/earthbuild-784-four-sites.patch" || {
+            "$GITHUB_WORKSPACE/rebuck2/patches/earthbuild-consolidated-plus-784.patch" || {
               echo "::error::the #784 patch no longer applies to earthbuild"
               echo "at $(git -C earthbuild rev-parse --short HEAD). Re-derive it"
               echo "rather than forcing it: gate on whatever the surrounding"
@@ -340,7 +353,7 @@ jobs:
           # version skew `earthly bootstrap` was used here to make
           # impossible. Same commit, same patch, same image, everywhere.
           git -C earthbuild apply --verbose \
-            "$GITHUB_WORKSPACE/rebuck2-repo/rebuck2/patches/earthbuild-784-four-sites.patch" || {
+            "$GITHUB_WORKSPACE/rebuck2-repo/rebuck2/patches/earthbuild-consolidated-plus-784.patch" || {
               echo "::error::the #784 patch no longer applies to earthbuild"
               echo "at $(git -C earthbuild rev-parse --short HEAD). Re-derive it"
               echo "rather than forcing it: gate on whatever the surrounding"
