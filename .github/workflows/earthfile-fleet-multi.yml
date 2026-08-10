@@ -64,6 +64,16 @@ env:
   # succeeds at home having distributed nothing.
   TRUST_SNIPPET: |
     global:
+      # tls_enabled defaults TRUE and a REMOTE buildkit is expected to
+      # present a certificate. The gateway speaks plain gRPC, so earthly
+      # spends its full 60s connect timeout looking for
+      # ~/.earthly/certs/ca_cert.pem and then reports
+      #
+      #     could not connect to buildkit: timeout 1m0s
+      #
+      # which names the symptom and not one word of the cause. Fixed in the
+      # single-runner workflow first; this file needed it too.
+      tls_enabled: false
       buildkit_additional_config: |
         [registry."172.17.0.1:15000"]
           http = true
