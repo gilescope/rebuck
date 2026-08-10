@@ -166,9 +166,23 @@ jobs:
           # Every registry in this run, trusted by every daemon. A daemon
           # that does not trust one pushes happily over HTTP and then
           # cannot pull from it - and the push is the loud half.
+          # The trailing $'\n' is load-bearing. Command substitution STRIPS
+          # trailing newlines, so `TRUST="$TRUST$(printf ...)"` glued each
+          # stanza to the next and produced
+          #
+          #     insecure = true[registry."172.17.0.1:15001"]
+          #
+          # which buildkitd rejected as
+          #
+          #     (33, 19): unexpected token no value can start with r,
+          #     was expecting a table key
+          #
+          # - the `r` being the start of `registry`. The daemon then never
+          # became ready and the step timed out two minutes later, naming a
+          # symptom three steps from the cause.
           TRUST=""
           for r in $(seq 15000 $((15000 + WORKERS))); do
-            TRUST="$TRUST$(printf '[registry."172.17.0.1:%s"]\n  http = true\n  insecure = true\n' "$r")"
+            TRUST="$TRUST$(printf '[registry."172.17.0.1:%s"]\n  http = true\n  insecure = true' "$r")"$'\n'
           done
 
           # PINNED, not discovered. This used to run `earthly bootstrap` and
@@ -219,7 +233,10 @@ jobs:
             sleep 1
           done
           docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 || {
-            echo "our buildkitd never became ready:"; docker logs --tail 20 own-bk; exit 1; }
+            echo "::error::our buildkitd never became ready - config it was given:"
+            printf '%s\n' "$TRUST"
+            docker logs --tail 30 own-bk
+            exit 1; }
           echo "BK0=127.0.0.1:18372" >> "$GITHUB_ENV"
 
           # One more daemon per worker, same image, same env earthly uses.
