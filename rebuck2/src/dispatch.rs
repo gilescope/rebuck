@@ -934,6 +934,26 @@ pub fn subgraph(def: &pb::Definition, root: usize) -> Option<pb::Definition> {
         return None;
     }
 
+    // Every op we keep must have an op union. The one op that legitimately
+    // has none is the terminal, and buildkit recognises exactly one of those:
+    // whichever entry is LAST. Hand it a graph containing a second - by
+    // cutting AT the terminal, so the synthetic one we append points at the
+    // original - and it resolves that original as a vertex, falls off the end
+    // of ResolveOp's switch, and reports
+    //
+    //     failed to load cache key: no support for <nil>
+    //
+    // naming neither the op nor the field, because `%T` of a nil interface is
+    // all it has to print. Cost three wrong theories: a lossy re-encode, then
+    // a dropped platform, then reading `worker/base/worker.go:385`.
+    if keep.iter().any(|&i| {
+        pb::Op::decode(def.def[i].as_slice())
+            .map(|o| o.op.is_none())
+            .unwrap_or(true)
+    }) {
+        return None;
+    }
+
     let root_digest = digest(def.def.get(root)?);
     let mut out: Vec<Vec<u8>> = Vec::with_capacity(keep.len() + 1);
     let mut metadata = BTreeMap::new();
@@ -1752,6 +1772,48 @@ mod tests {
             def: encoded,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_cut_never_makes_a_terminal_into_a_vertex() {
+        // The bug this pins, and it took three wrong theories to find:
+        //
+        //     failed to load cache key: no support for <nil>
+        //
+        // is `worker/base/worker.go`'s ResolveOp falling through its switch
+        // on the op union - `%T` of a nil interface prints `<nil>`. So an op
+        // with NO union reached the solver as a vertex, and the only op
+        // without one is the terminal.
+        //
+        // `loadLLB` deletes exactly one terminal: the LAST entry in `def`.
+        // Anything else reachable from it must be a real op. Cutting at the
+        // terminal produces a graph with two - the synthetic one at the end,
+        // and the original one it now points at - and buildkit tries to run
+        // the original.
+        let d = chain(vec![
+            (src("docker-image://docker.io/library/alpine:3.20"), vec![]),
+            (plain(), vec![0]),
+            // The terminal, as buildkit marshals it: inputs, no op.
+            (pb::Op::default(), vec![1]),
+        ]);
+        assert!(
+            subgraph(&d, 2).is_none(),
+            "the terminal is not a buildable root"
+        );
+
+        // A cut at a real op still works, and its own terminal is last.
+        let cut = subgraph(&d, 1).expect("a cut at the RUN");
+        let ops: Vec<pb::Op> = cut
+            .def
+            .iter()
+            .map(|b| pb::Op::decode(b.as_slice()).expect("decodes"))
+            .collect();
+        let (last, rest) = ops.split_last().expect("non-empty");
+        assert!(last.op.is_none(), "the last op is the terminal");
+        assert!(
+            rest.iter().all(|o| o.op.is_some()),
+            "every other op has a union, or the solver hits its default arm"
+        );
     }
 
     #[test]
