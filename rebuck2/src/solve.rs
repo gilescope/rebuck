@@ -1687,7 +1687,18 @@ mod tests {
             // point: it has to become content before the graph can travel.
             let ctx = pb::Op {
                 op: Some(pb::op::Op::Source(pb::SourceOp {
-                    identifier: "local://context".into(),
+                    // A name with a SLASH and a leading dot by default,
+                    // because that is what earthly emits - `./buildkitd`,
+                    // `./tests/config` - and because the old fixture name,
+                    // `context`, is one of the few that happens to be a
+                    // legal OCI tag. 686 solves on a real target failed to
+                    // publish with `invalid reference format` while all 51
+                    // fixture checks passed, on the strength of that.
+                    identifier: format!(
+                        "local://{}",
+                        std::env::var("REBUCK2_LLB_CONTEXT")
+                            .unwrap_or_else(|_| "./ctx/sub".to_owned())
+                    ),
                     // Without an attr that distinguishes them, all N local
                     // source vertices are one vertex, and buildkit syncs the
                     // FIRST client's directory and hands it to every other

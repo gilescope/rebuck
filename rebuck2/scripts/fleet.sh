@@ -443,8 +443,10 @@ for round in $(seq 1 "$ROUNDS"); do
         --local "context=$RUN/ctx/$n" --local "dockerfile=$RUN/ctx/$n" \
         --output "type=local,dest=$RUN/out-$n" >"$RUN/build-$n.log" 2>&1 &
     elif [ -n "$CONTEXT" ]; then
+      # The name must match the fixture's `local://` identifier exactly, and
+      # it deliberately contains a slash: see write_context_llb.
       bctl --addr "$addr" build --no-cache \
-        --local "context=$RUN/ctx/$n" \
+        --local "${REBUCK2_LLB_CONTEXT:-./ctx/sub}=$RUN/ctx/$n" \
         --output "type=local,dest=$RUN/out-$n" <"$f" >"$RUN/build-$n.log" 2>&1 &
     elif [ -n "$SSHM" ]; then
       # The CLIENT forwards its own agent for the home builds, exactly as it
