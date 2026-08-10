@@ -137,8 +137,27 @@ pub fn context_tag(session: &str, local_name: &str) -> String {
 /// for the gap. A cache mount does not travel, so one machine pays that once
 /// and six machines pay it six times.
 pub fn fleet_cache_ref(registry: &str) -> Option<String> {
-    (std::env::var("REBUCK2_FLEET_CACHE").as_deref() == Ok("1"))
-        .then(|| format!("{registry}/rebuck2/cache:fleet"))
+    (fleet_cache_mode() != "off").then(|| format!("{registry}/rebuck2/cache:fleet"))
+}
+
+/// `off` (default), `read`, or `readwrite`.
+///
+/// Three settings because the first measurement killed one of them and left
+/// the other two open. Six machines with `readwrite` took 755s against 590s
+/// without any cache at all - `mode=max` exports the whole layer set after
+/// EVERY solve, and there were 84 of them, so the write amplification grows
+/// with exactly the number this fleet exists to increase.
+///
+/// `read` keeps the half that could still pay: a worker that imports a warm
+/// `go-mod` and never exports one moves the cache once instead of 84 times.
+pub fn fleet_cache_mode() -> String {
+    std::env::var("REBUCK2_FLEET_CACHE")
+        .map(|v| match v.as_str() {
+            "1" | "readwrite" | "rw" => "readwrite".to_owned(),
+            "read" | "ro" => "read".to_owned(),
+            _ => "off".to_owned(),
+        })
+        .unwrap_or_else(|_| "off".to_owned())
 }
 
 /// Import from the fleet cache, and export back into it.
@@ -166,13 +185,20 @@ fn cache_opts(registry: &str) -> Option<control::CacheOptions> {
     };
     Some(control::CacheOptions {
         imports: vec![entry(&[("registry.insecure", "true")])],
-        exports: vec![entry(&[
-            ("registry.insecure", "true"),
-            // max: intermediate layers too, which is the whole point - a
-            // cache of final images would not warm a `go mod download`.
-            ("mode", "max"),
-            ("ignore-error", "true"),
-        ])],
+        // EXPORTS ONLY IN readwrite, and that is a measured decision:
+        // exporting per solve made six machines 165s SLOWER than no cache at
+        // all. Reading costs one transfer; writing cost 84.
+        exports: if fleet_cache_mode() == "readwrite" {
+            vec![entry(&[
+                ("registry.insecure", "true"),
+                // max: intermediate layers too - a cache of final images
+                // would not warm a `go mod download`.
+                ("mode", "max"),
+                ("ignore-error", "true"),
+            ])]
+        } else {
+            Vec::new()
+        },
         ..Default::default()
     })
 }
@@ -613,7 +639,7 @@ mod tests {
         // built when it IS set, and leaves the default to
         // `fleet_cache_ref`'s own condition.)
         let opts = super::cache_opts("r:5000");
-        if std::env::var("REBUCK2_FLEET_CACHE").as_deref() == Ok("1") {
+        if super::fleet_cache_mode() == "readwrite" {
             let o = opts.expect("enabled means Some");
             assert_eq!(o.imports.len(), 1);
             assert_eq!(o.exports.len(), 1);
@@ -631,8 +657,16 @@ mod tests {
                 "min caches final layers only, which would not warm a go mod download"
             );
             assert_eq!(o.imports[0].attrs.get("ref"), ex.get("ref"));
+        } else if super::fleet_cache_mode() == "read" {
+            let o = opts.expect("read means Some");
+            assert_eq!(o.imports.len(), 1);
+            assert!(
+                o.exports.is_empty(),
+                "read mode must not export: exporting per solve made six \
+                 machines 165s slower than no cache at all"
+            );
         } else {
-            assert!(opts.is_none(), "must be off unless REBUCK2_FLEET_CACHE=1");
+            assert!(opts.is_none(), "must be off unless asked for");
         }
     }
 
