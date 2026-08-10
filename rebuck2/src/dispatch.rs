@@ -887,6 +887,81 @@ pub fn rewrite_git_sources(
     rewrite_sources(def, "git://", replacement)
 }
 
+/// The subgraph rooted at `root`, as a Definition a peer can solve.
+///
+/// The missing dispatch unit. `analyse` has found cuts since the beginning and
+/// used them for a log line; nothing has ever BUILT one. That is why eight
+/// measured attempts to stop workers rebuilding the shared ancestry all
+/// failed the same way: the ancestry is interior to every dispatched graph,
+/// so it is never published, so it can never be grafted. A prefix has to be
+/// solved as a subtree in its own right before it can be imported as one.
+///
+/// Keeps only ops reachable from `root`, in their original order (buildkit
+/// marshals topologically, and preserving order keeps digests stable), and
+/// appends a terminal pointing at the root - which is buildkit's own
+/// convention for "this is the result".
+pub fn subgraph(def: &pb::Definition, root: usize) -> Option<pb::Definition> {
+    let digest = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
+    let by_digest: BTreeMap<String, usize> = def
+        .def
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (digest(b), i))
+        .collect();
+
+    let mut keep = std::collections::BTreeSet::new();
+    let mut stack = vec![root];
+    while let Some(i) = stack.pop() {
+        if !keep.insert(i) {
+            continue;
+        }
+        let Some(op) = def
+            .def
+            .get(i)
+            .and_then(|b| pb::Op::decode(b.as_slice()).ok())
+        else {
+            continue;
+        };
+        for input in &op.inputs {
+            if let Some(&j) = by_digest.get(&input.digest) {
+                stack.push(j);
+            }
+        }
+    }
+    // A cut of one op is the op itself: dispatching it buys nothing and costs
+    // a publish.
+    if keep.len() < 2 {
+        return None;
+    }
+
+    let root_digest = digest(def.def.get(root)?);
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(keep.len() + 1);
+    let mut metadata = BTreeMap::new();
+    for i in keep.iter().copied() {
+        let bytes = &def.def[i];
+        if let Some(m) = def.metadata.get(&digest(bytes)) {
+            metadata.insert(digest(bytes), m.clone());
+        }
+        out.push(bytes.clone());
+    }
+    // The terminal. No `op`, one input - exactly how buildkit marshals the
+    // end of a definition, and what `build_subtree` will export.
+    let term = pb::Op {
+        inputs: vec![pb::Input {
+            digest: root_digest,
+            index: 0,
+        }],
+        ..Default::default()
+    };
+    out.push(term.encode_to_vec());
+
+    Some(pb::Definition {
+        def: out,
+        metadata: metadata.into_iter().collect(),
+        ..def.clone()
+    })
+}
+
 /// Replace ops we have ALREADY BUILT with an import of their published result.
 ///
 /// This is the step from N prefixes to 1, and it is the only thing measurement
@@ -2024,6 +2099,49 @@ mod tests {
             vec!["example.com/r.git#main".to_owned()],
             "the replacement is called WITHOUT the scheme"
         );
+    }
+
+    #[test]
+    fn a_cut_becomes_a_definition_a_peer_can_solve() {
+        // The dispatch unit that was missing. `analyse` has found cuts since
+        // the beginning and used them for a log line; nothing built one. So
+        // the shared prefix stayed interior to every dispatched graph, never
+        // got published, and could never be grafted - which is why eight
+        // measured attempts to stop workers rebuilding it all failed the
+        // same way.
+        let base = plain();
+        let base_d = format!("sha256:{}", crate::store::sha256_hex(&base.encode_to_vec()));
+        let mut mid = plain();
+        mid.inputs = vec![pb::Input {
+            digest: base_d,
+            index: 0,
+        }];
+        let mid_b = mid.encode_to_vec();
+        let mid_d = format!("sha256:{}", crate::store::sha256_hex(&mid_b));
+        // A sibling that must NOT come along: it is not an ancestor of mid.
+        let mut other = plain();
+        other.inputs = vec![pb::Input {
+            digest: mid_d.clone(),
+            index: 0,
+        }];
+        let d = pb::Definition {
+            def: vec![base.encode_to_vec(), mid_b, other.encode_to_vec()],
+            ..Default::default()
+        };
+
+        let cut = subgraph(&d, 1).expect("a two-op cut is worth dispatching");
+        // base + mid + terminal, and NOT the consumer above it.
+        assert_eq!(cut.def.len(), 3, "took the wrong ops: {}", cut.def.len());
+        let term = pb::Op::decode(cut.def.last().unwrap().as_slice()).unwrap();
+        assert!(term.op.is_none(), "the terminal carries no op");
+        assert_eq!(
+            term.inputs[0].digest, mid_d,
+            "the terminal must point at the cut's root, or the peer builds \
+             something else"
+        );
+
+        // A single op is not worth a publish.
+        assert!(subgraph(&d, 0).is_none(), "a one-op cut must be refused");
     }
 
     #[test]

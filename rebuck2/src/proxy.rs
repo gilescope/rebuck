@@ -2004,6 +2004,76 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         // Empty frontier: a portable graph names every input
                         // by digest, so the builder fetches what it needs and
                         // there is nothing for us to enumerate.
+                        // PUBLISH THE PREFIX FIRST, so it can be grafted.
+                        //
+                        // Eight measured attempts failed the same way: the
+                        // shared ancestry is interior to every dispatched
+                        // graph, so it is never published, so it can never be
+                        // imported - and every worker rebuilds it. `analyse`
+                        // has found the cuts all along and used them for a log
+                        // line.
+                        //
+                        // Dispatch the largest cut BELOW this graph as a
+                        // subtree of its own. It comes back as an image, the
+                        // driver records it, and every later graph that shares
+                        // that ancestry grafts it instead of rebuilding.
+                        //
+                        // Costs one extra publish on the first graph that
+                        // carries the prefix, which is the 1-prefix trade.
+                        let portable = if std::env::var("REBUCK2_CUT_PREFIX").as_deref() == Ok("1")
+                        {
+                            let a = crate::dispatch::analyse(&portable, 8);
+                            // The BIGGEST cut that is not the whole graph: the
+                            // shared ancestry is the deep part, and cutting at
+                            // the terminal would just dispatch the same graph
+                            // under another name.
+                            let pick = a
+                                .cuts
+                                .iter()
+                                .filter(|c| c.ops + 1 < portable.def.len())
+                                .max_by_key(|c| c.ops)
+                                .map(|c| (c.root, c.ops));
+                            match pick {
+                                Some((root, ops)) => {
+                                    match crate::dispatch::subgraph(&portable, root) {
+                                        Some(pre) => {
+                                            println!(
+                                                "[proxy] publishing a {ops}-op prefix before the {}-op graph",
+                                                portable.def.len()
+                                            );
+                                            // Best effort: if nobody takes the
+                                            // prefix we dispatch the whole
+                                            // graph as before. A failed
+                                            // optimisation must not fail a
+                                            // build.
+                                            let _ = self
+                                                .driver
+                                                .lead_subtree(pre.encode_to_vec(), Vec::new())
+                                                .await;
+                                            let built = self.driver.built_ops().await;
+                                            crate::dispatch::graft_built(&portable, &|d| {
+                                                built.get(d).map(|r| {
+                                                    r.strip_prefix("sha256:")
+                                                        .map(|h| {
+                                                            format!(
+                                                                "docker-image://{}/{}@sha256:{h}",
+                                                                mirror.registry,
+                                                                crate::solve::SUBTREE_REPO
+                                                            )
+                                                        })
+                                                        .unwrap_or_else(|| r.clone())
+                                                })
+                                            })
+                                        }
+                                        None => portable,
+                                    }
+                                }
+                                None => portable,
+                            }
+                        } else {
+                            portable
+                        };
+
                         // THE BARRIER. Until something has been built and
                         // published there is nothing to graft, so letting the
                         // whole first wave go at once guarantees every worker
