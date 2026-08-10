@@ -2469,6 +2469,136 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
 
 #[cfg(test)]
 mod tests {
+    /// The gateway answers gRPC at all.
+    ///
+    /// One second, no docker, and it would have caught the bug that cost a
+    /// fixture-suite round and a CI round: configuring http2 keepalive
+    /// without a timer panics INSIDE the connection task
+    /// ("You must supply a timer"), so the server binds, accepts, and then
+    /// drops every stream. The client sees `Unavailable: error reading from
+    /// server: EOF` and the suite reports thirty-seven unrelated assertion
+    /// failures.
+    ///
+    /// The suite catches it in twelve minutes and names nothing. This names
+    /// it before the suite runs.
+    #[tokio::test]
+    async fn the_gateway_answers_grpc() {
+        use crate::proxy::control;
+        use tonic::{Request, Response, Status};
+
+        // A stub upstream, because the proxy dials one at startup and exits
+        // if it cannot. Answering ONE method is enough to prove the serving
+        // path end to end: accept, decode, forward, encode, reply.
+        #[derive(Default)]
+        struct Upstream;
+        #[tonic::async_trait]
+        impl control::control_server::Control for Upstream {
+            type StatusStream =
+                futures::stream::BoxStream<'static, Result<control::StatusResponse, Status>>;
+            type SessionStream =
+                futures::stream::BoxStream<'static, Result<control::BytesMessage, Status>>;
+            type PruneStream =
+                futures::stream::BoxStream<'static, Result<control::UsageRecord, Status>>;
+            type ListenBuildHistoryStream =
+                futures::stream::BoxStream<'static, Result<control::BuildHistoryEvent, Status>>;
+            async fn list_workers(
+                &self,
+                _r: Request<control::ListWorkersRequest>,
+            ) -> Result<Response<control::ListWorkersResponse>, Status> {
+                Ok(Response::new(control::ListWorkersResponse {
+                    record: vec![Default::default()],
+                }))
+            }
+            async fn solve(
+                &self,
+                _r: Request<control::SolveRequest>,
+            ) -> Result<Response<control::SolveResponse>, Status> {
+                Err(Status::unimplemented("stub"))
+            }
+            async fn status(
+                &self,
+                _r: Request<control::StatusRequest>,
+            ) -> Result<Response<Self::StatusStream>, Status> {
+                Err(Status::unimplemented("stub"))
+            }
+            async fn session(
+                &self,
+                _r: Request<tonic::Streaming<control::BytesMessage>>,
+            ) -> Result<Response<Self::SessionStream>, Status> {
+                Err(Status::unimplemented("stub"))
+            }
+            async fn disk_usage(
+                &self,
+                _r: Request<control::DiskUsageRequest>,
+            ) -> Result<Response<control::DiskUsageResponse>, Status> {
+                Err(Status::unimplemented("stub"))
+            }
+            async fn prune(
+                &self,
+                _r: Request<control::PruneRequest>,
+            ) -> Result<Response<Self::PruneStream>, Status> {
+                Err(Status::unimplemented("stub"))
+            }
+            async fn info(
+                &self,
+                _r: Request<control::InfoRequest>,
+            ) -> Result<Response<control::InfoResponse>, Status> {
+                Err(Status::unimplemented("stub"))
+            }
+            async fn listen_build_history(
+                &self,
+                _r: Request<control::BuildHistoryRequest>,
+            ) -> Result<Response<Self::ListenBuildHistoryStream>, Status> {
+                Err(Status::unimplemented("stub"))
+            }
+            async fn update_build_history(
+                &self,
+                _r: Request<control::UpdateBuildHistoryRequest>,
+            ) -> Result<Response<control::UpdateBuildHistoryResponse>, Status> {
+                Err(Status::unimplemented("stub"))
+            }
+        }
+
+        let up = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(control::control_server::ControlServer::new(Upstream))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(up))
+                .await;
+        });
+
+        let gw = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gw_addr = gw.local_addr().unwrap();
+        drop(gw); // serve() binds it itself
+        let driver = crate::driver::Driver::for_test();
+        tokio::spawn(async move {
+            let _ = super::serve(gw_addr, format!("http://{up_addr}"), driver).await;
+        });
+
+        // Poll: the server needs a moment, and a fixed sleep is either flaky
+        // or slow.
+        let mut last = String::new();
+        for _ in 0..100 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            match control::control_client::ControlClient::connect(format!("http://{gw_addr}")).await
+            {
+                Ok(mut c) => match c.list_workers(control::ListWorkersRequest::default()).await {
+                    Ok(r) => {
+                        assert_eq!(
+                            r.into_inner().record.len(),
+                            1,
+                            "the gateway answered, but not with the upstream's reply"
+                        );
+                        return;
+                    }
+                    Err(e) => last = e.to_string(),
+                },
+                Err(e) => last = e.to_string(),
+            }
+        }
+        panic!("the gateway never answered gRPC. Last error: {last}");
+    }
 
     /// Nothing known yet means ship it. A system that refused everything it
     /// had not measured would never measure anything.
