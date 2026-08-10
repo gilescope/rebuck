@@ -855,3 +855,45 @@ Things this rules out, and things it does not:
 Defaulted off before measuring, which is the only reason this is a finding
 rather than a regression. A speedup that ships on cannot be distinguished
 from one that does not work.
+
+## Two corrections, and where the time actually is not
+
+**The graph is parallel.** Peak concurrency on `group2` across six machines
+was **9 subtrees in flight at once** - more than the six workers available.
+The build is not a chain, the fleet is not starved of work, and the 383s gap
+is not a critical path. That was worth ruling out and it is now ruled out.
+
+**"go-mod costs 24.2s per lead" was an overstatement, and mine.** The cache
+table attributes each lead's ENTIRE duration to every cache id the subtree
+names. It says "leads mentioning go-mod average 24.2s", not "24.2s is spent
+on go-mod". Those are different claims and only the first is measured. A
+subtree naming four cache ids contributes its whole duration to all four -
+the overlap was flagged when the table was built, and then quietly dropped
+when the number got quoted.
+
+So the cache is a suspect, not a finding, and the cache A/B was aimed by a
+figure that could not support it.
+
+### What is actually known
+
+| | |
+| ---------------------------- | ------------------------------- |
+| baseline, one machine | 277s |
+| fleet, six machines | 660s |
+| leads dispatched | 84 |
+| peak concurrent subtrees | 9 |
+| average lead duration | ~24s |
+
+84 leads at ~24s each, run about six-wide, is ~336s of worker time - which
+is most of the gap on its own. The same work costs the baseline 277s in
+total, so **a unit of work costs far more on a worker than at home**, and
+the multiplier is the thing to explain. Candidates, none measured:
+
+- the mirror hop: a worker pulls base and context from a registry rather
+  than reading its own store
+- cold FS cache per worker for content the baseline touched once
+- earthly's own per-solve overhead paid 84 times instead of inline
+
+The next measurement is a breakdown of one lead - fetch versus build - not
+another remedy. Three remedies have now been tried against a number that did
+not mean what it was taken to mean.
