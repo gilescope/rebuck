@@ -389,6 +389,36 @@ jobs:
             echo "::warning::no worker ever joined - the rest measures one machine"
           fi
 
+      # BEFORE the fleet, on the coordinator's own daemon, so the two
+      # numbers come off the same machine in the same run.
+      #
+      # This workflow has never had a baseline, so every multi-machine
+      # figure so far is a dispatch count with no comparison: 773s for six
+      # machines is unreadable without knowing what one machine costs. The
+      # single-runner workflow has had one since it was written; this one is
+      # the topology where wall clock could actually improve, and it was the
+      # one that could not report it.
+      #
+      # It also gives the parity check something to compare, which is the
+      # only claim a distributed builder can really make.
+      - name: baseline - the same target on one machine
+        working-directory: earthbuild
+        env:
+          TARGET: ${{ inputs.target || '+test-no-qemu-group2' }}
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          printf 'global:\n  tls_enabled: false\n' > "$RUNNER_TEMP/base.yml"
+          # shellcheck disable=SC2086 # a flag LIST: word-splitting is the point
+          EARTHLY_CONFIG="$RUNNER_TEMP/base.yml" \
+          EARTHLY_BUILDKIT_HOST="tcp://${LAN}:18372" \
+            earthly $EARTHLY_FLAGS "$TARGET" > /tmp/baseline.log 2>&1 || true
+          tail -20 /tmp/baseline.log
+          grep -ao "^[^ ]* \*failed\*" /tmp/baseline.log | sed 's/ \*failed\*//' \
+            | sort -u > /tmp/baseline.failed || true
+          echo "BASELINE_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
+          echo "baseline: $((SECONDS - start))s, $(wc -l < /tmp/baseline.failed | tr -d ' ') failed"
+
       - name: the Earthfile, through the fleet
         working-directory: earthbuild
         env:
@@ -419,7 +449,19 @@ jobs:
           grep -E '^\[registry\] served' proxy.log || true
           echo "   uploads far below blobs served means results were fetched"
           echo "   from the runners that built them, which is the whole point."
-          echo "=== wall: ${FLEET_SECS:-?}s"
+          echo "=== wall"
+          echo "one machine ${BASELINE_SECS:-?}s   ${WANT:-?} machines ${FLEET_SECS:-?}s"
+          # The comparison, stated rather than left to the reader: a fleet
+          # that is slower has still proven dispatch and not yet proven
+          # worth, and saying so here stops the dispatch count being quoted
+          # as if it were a speedup.
+          if [ -n "${BASELINE_SECS:-}" ] && [ -n "${FLEET_SECS:-}" ]; then
+            if [ "$FLEET_SECS" -lt "$BASELINE_SECS" ]; then
+              echo "the fleet was FASTER by $((BASELINE_SECS - FLEET_SECS))s"
+            else
+              echo "the fleet was SLOWER by $((FLEET_SECS - BASELINE_SECS))s - dispatch works, distribution does not yet pay"
+            fi
+          fi
 
       - name: logs
         if: always()
