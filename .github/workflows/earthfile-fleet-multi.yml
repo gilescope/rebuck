@@ -54,8 +54,17 @@ on:
         description: "flags for earthly - upstream uses --ci -P"
         default: "--ci -P"
       target:
-        description: "earthbuild target to build"
-        default: "+test-no-qemu-group10"
+        # group2, not group10: group10 reaches ./integration-base, which
+        # builds github.com/EarthBuild/earthbuild/buildkitd:main+buildkitd and
+        # wants DOCKERHUB_AUTH. Upstream's reusable-test workflow logs in to
+        # Docker Hub and GHCR before running these; this one has no secrets,
+        # so that group dies in 2s at earthfile2llb resolution with a wall of
+        # empty --DOCKERHUB_* args.
+        #
+        # It passes on a laptop because the laptop is logged in. Noted as a
+        # caveat days ago and then ignored when picking a target.
+        description: "earthbuild target to build - avoid groups needing registry creds"
+        default: "+test-no-qemu-group2"
       workers:
         description: "worker runners, as a JSON array - matrix AND barrier read this"
         default: "[1,2,3,4,5,6]"
@@ -393,9 +402,9 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/rebuck2/coord
-          key: rebuck2-bank-${{ inputs.target || '+test-no-qemu-group10' }}-${{ github.run_id }}
+          key: rebuck2-bank-${{ inputs.target || '+test-no-qemu-group2' }}-${{ github.run_id }}
           restore-keys: |
-            rebuck2-bank-${{ inputs.target || '+test-no-qemu-group10' }}-
+            rebuck2-bank-${{ inputs.target || '+test-no-qemu-group2' }}-
 
       - name: what the bank brought
         run: |
@@ -503,7 +512,7 @@ jobs:
       - name: baseline - the same target on one machine
         working-directory: earthbuild
         env:
-          TARGET: ${{ inputs.target || '+test-no-qemu-group10' }}
+          TARGET: ${{ inputs.target || '+test-no-qemu-group2' }}
         run: |
           set -euo pipefail
           start=$SECONDS
@@ -521,7 +530,7 @@ jobs:
       - name: the Earthfile, through the fleet
         working-directory: earthbuild
         env:
-          TARGET: ${{ inputs.target || '+test-no-qemu-group10' }}
+          TARGET: ${{ inputs.target || '+test-no-qemu-group2' }}
         run: |
           set -euo pipefail
           start=$SECONDS
