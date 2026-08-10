@@ -46,6 +46,17 @@ limited() { echo "$1" | grep -q "^ratelimited: 1"; }
 # anything. A suite that cannot survive a failure cannot describe one.
 count() { echo "$1" | grep -c "$2" || true; }
 
+# The DISPLAY pipelines need the same treatment, and did not have it.
+#
+# `echo "$out" | grep -E '^wall' | tr -s ' '` under `set -e -o pipefail`
+# kills the suite whenever a round produces no `wall` line - which is
+# exactly what a round that failed early produces. On CI the suite reported
+# four checks out of fifty-one and stopped, and the four it printed made it
+# look like the other forty-seven had not been reached for a reason worth
+# investigating. They had not been reached because the reporter died.
+#
+# Same trap as `count`, in the half of the file that only prints.
+
 # Presence, not count. Counting occurrences of a message makes an assertion
 # brittle to unrelated output: adding the idle-fleet diagnosis, which quotes
 # the most common rejection reason, turned one "excluded: Secret" line into
@@ -111,13 +122,13 @@ leads() { echo "$1" | grep -cE -- '-> worker [0-9]+' || true; }
 
 echo "== baseline (one daemon, no proxy)"
 out=$(run NOPROXY=1 DAEMONS=1 RUN="$base" || true)
-echo "$out" | grep -E '^wall' | tr -s ' '
+echo "$out" | grep -E '^wall' | tr -s ' ' || true
 check "baseline builds succeed" "$(count "$out" '^failed  : 0')" 1
 
 echo
 echo "== two daemons: saturation places the surplus away"
 out=$(run DAEMONS=2 EXPECT="$base/digests.txt" || true)
-echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
+echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /' || true
 present "outputs identical to baseline" "$out" 'outputs identical'
 check "home takes exactly its slots" \
   "$(echo "$out" | grep -o '{0: [0-9]*' | grep -o '[0-9]*$')" "$slots"
@@ -127,7 +138,7 @@ absent "and a healthy fleet says nothing alarming" "$out" 'no solve completed on
 echo
 echo "== a peer destroyed mid-build"
 out=$(run DAEMONS=2 KILL_AFTER=2 EXPECT="$base/digests.txt" || true)
-echo "$out" | grep -E '^wall' | tr -s ' ' | sed 's/^/  /'
+echo "$out" | grep -E '^wall' | tr -s ' ' | sed 's/^/  /' || true
 guard "every build still finishes" "$out" && check "every build still finishes" "$(count "$out" '^failed  : 0')" 1 || true
 present "outputs still identical" "$out" 'outputs identical'
 # The proxy no longer keeps strikes - refusal IS the signal, and it is the
@@ -143,7 +154,7 @@ echo "== more than one peer"
 # home and a single peer and the multi-peer half - rotation, least-loaded,
 # strike deprioritisation - was only ever exercised by unit tests.
 out=$(run DAEMONS=3 || true)
-echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
+echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /' || true
 # Read from the DRIVER, not from `placed`. The gateway now reports only
 # home-or-fleet, so `placed {0: 8, 1: 4}` is true whether the four went to
 # one worker or two - which is exactly the failure this exists to catch, and
@@ -159,7 +170,7 @@ echo "== one peer of two destroyed mid-build"
 # The fleet must route around it rather than collapse back to home, and the
 # machine that died must be the only one that pays for it.
 out=$(run DAEMONS=3 KILL_AFTER=2 REBUCK2_HOME_SLOTS=4 EXPECT="$base/digests.txt" || true)
-echo "$out" | grep -E '^wall|placed|struck' | tr -s ' ' | sed 's/^/  /'
+echo "$out" | grep -E '^wall|placed|struck' | tr -s ' ' | sed 's/^/  /' || true
 guard "every build still finishes" "$out" && check "every build still finishes" "$(count "$out" '^failed  : 0')" 1 || true
 check "outputs still identical" "$(count "$out" 'outputs identical')" 1
 guard "the fleet keeps taking work" "$out" && {
@@ -186,7 +197,7 @@ echo "== a peer that is slow rather than dead"
 # TIME and not CORRECTNESS: --cpus 0.15 on the last daemon, and the build
 # still completes with the same bytes.
 out=$(run DAEMONS=3 SLOW=0.15 ROUNDS=2 REBUCK2_HOME_SLOTS=4 EXPECT="$base/digests.txt" || true)
-echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
+echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /' || true
 guard "a crawling worker still finishes the build" "$out" &&
   check "a crawling worker still finishes the build" "$(count "$out" '^failed  : 0')" 1 || true
 check "and the bytes are unchanged by its slowness" "$(count "$out" 'outputs identical')" 1
@@ -198,7 +209,7 @@ echo "== a named frontend cannot be distributed"
 # crosses the proxy and there is nothing to place. The point of the check is
 # that this stays a clean no-op: the build must still work.
 out=$(run DAEMONS=2 DOCKERFILE=1 || true)
-echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
+echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /' || true
 guard "the build still succeeds" "$out" && check "the build still succeeds" "$(count "$out" '^failed  : 0')" 1 || true
 guard "and nothing was placed on a peer" "$out" &&
   check "and nothing was placed on a peer" "$(placed "$out" 1)" "" || true
@@ -217,7 +228,7 @@ ctxbase="${TMPDIR:-/tmp}/rebuck2-check-ctx"
 out=$(run CONTEXT=1 NOPROXY=1 DAEMONS=1 RUN="$ctxbase" || true)
 check "context baseline succeeds" "$(count "$out" '^failed  : 0')" 1
 out=$(run CONTEXT=1 DAEMONS=2 EXPECT="$ctxbase/digests.txt" || true)
-echo "$out" | grep -E '^wall|contexts published|placed' | tr -s ' ' | sed 's/^/  /'
+echo "$out" | grep -E '^wall|contexts published|placed' | tr -s ' ' | sed 's/^/  /' || true
 present "outputs identical to the context baseline" "$out" 'outputs identical'
 check "every context was published" \
   "$(echo "$out" | grep -o 'contexts published: [0-9]*' | grep -o '[0-9]*$')" \
@@ -232,7 +243,7 @@ echo "== a secret-bearing graph"
 # placed away therefore means the peer got the right value, not merely that
 # it started.
 out=$(run SECRET=1 DAEMONS=2 REBUCK2_SERVE_SECRETS=1 || true)
-echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
+echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /' || true
 guard "every build finishes" "$out" && check "every build finishes" "$(count "$out" '^failed  : 0')" 1 || true
 check "the peer took the surplus" "$(placed "$out" 1)" "$((builds - slots))"
 
@@ -242,7 +253,7 @@ echo "== a secret the PROXY cannot resolve"
 # can. Nothing may be offered, or every dispatched solve fails on the peer
 # and fail-open rebuilds it at home having paid for the trip.
 out=$(run SECRET=1 UNRESOLVABLE=1 DAEMONS=2 REBUCK2_SERVE_SECRETS=1 || true)
-echo "$out" | grep -E '^wall|placed|not routed' | tr -s ' ' | sed 's/^/  /'
+echo "$out" | grep -E '^wall|placed|not routed' | tr -s ' ' | sed 's/^/  /' || true
 guard "every build still finishes" "$out" && check "every build still finishes" "$(count "$out" '^failed  : 0')" 1 || true
 check "nothing is offered to the peer" "$(placed "$out" 1)" ""
 present "and the refusal names the secret" "$out" 'excluded: Secret'
@@ -267,7 +278,7 @@ for priv in INSECURE:Insecure HOSTNET:HostNetwork; do
   want=${priv##*:}
   out=$(run DAEMONS=2 "$knob=1" \
     REBUCK2_PEER_CACHE_MOUNTS=1 REBUCK2_SERVE_SECRETS=1 REBUCK2_FORWARD_AGENT=1 || true)
-  echo "$out" | grep -E 'not routed' | tr -s ' ' | sed 's/^/  /'
+  echo "$out" | grep -E 'not routed' | tr -s ' ' | sed 's/^/  /' || true
   guard "$want: still works, at home" "$out" &&
     check "$want: still works, at home" "$(count "$out" '^failed  : 0')" 1 || true
   guard "$want: and no peer is offered it" "$out" &&
@@ -340,7 +351,7 @@ check "cache baseline succeeds" "$(count "$out" '^failed  : 0')" 1
 out=$(run CACHE=1 DAEMONS=2 EXPECT="$cachebase/digests.txt" || true)
 check "excluded while the flag is off" "$(placed "$out" 1)" ""
 out=$(run CACHE=1 DAEMONS=2 REBUCK2_PEER_CACHE_MOUNTS=1 EXPECT="$cachebase/digests.txt" || true)
-echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
+echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /' || true
 check "the peer takes it with the flag on" "$(placed "$out" 1)" "$((builds - slots))"
 present "and its colder cache changes nothing" "$out" 'outputs identical'
 
@@ -359,7 +370,7 @@ else
   out=$(run SSHM=1 DAEMONS=2 REBUCK2_HOME_SLOTS=0 || true)
   check "excluded while the flag is off" "$(placed "$out" 1)" ""
   out=$(run SSHM=1 DAEMONS=2 REBUCK2_HOME_SLOTS=0 REBUCK2_FORWARD_AGENT=1 || true)
-  echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
+  echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /' || true
   # The exec runs `ssh-add -l; test $? -ne 2`, so a build that reaches no
   # agent fails. Finishing means the peer talked to ours.
   guard "every build finishes" "$out" && check "every build finishes" "$(count "$out" '^failed  : 0')" 1 || true
@@ -391,7 +402,7 @@ else
 out=$(env -u REMOTE -u MIRROR_HOST REBUCK2_LLB_WORK="$work" \
   REBUCK2_HOME_SLOTS="$slots" \
   BUILDS="$builds" DAEMONS=2 FOREIGN="$foreign" "$fleet" 2>&1 || true)
-echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /'
+echo "$out" | grep -E '^wall|placed' | tr -s ' ' | sed 's/^/  /' || true
 # An emulated privileged buildkitd is the one scenario here with a real
 # environmental dependency: it can fail to START rather than fail an
 # assertion. Those are different facts and must not share a verdict - a
@@ -420,7 +431,7 @@ if [ -n "${REMOTE:-}" ]; then
     REBUCK2_HOME_SLOTS="$slots" BUILDS="$builds" DAEMONS=1 \
     REMOTE="$REMOTE" MIRROR_HOST="${MIRROR_HOST:?set MIRROR_HOST to an address both machines reach}" \
     EXPECT="$base/digests.txt" "$fleet" 2>&1)
-  echo "$out" | grep -E '^wall|placed|proxy\] peer [0-9]' | tr -s ' ' | sed 's/^/  /'
+  echo "$out" | grep -E '^wall|placed|proxy\] peer [0-9]' | tr -s ' ' | sed 's/^/  /' || true
   guard "every build finishes" "$out" && check "every build finishes" "$(count "$out" '^failed  : 0')" 1 || true
   present "outputs identical across the network" "$out" 'outputs identical'
   check "the remote peer took the surplus" "$(placed "$out" 1)" "$((builds - slots))"
