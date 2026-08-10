@@ -2037,19 +2037,44 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                                 Some((root, ops)) => {
                                     match crate::dispatch::subgraph(&portable, root) {
                                         Some(pre) => {
-                                            println!(
-                                                "[proxy] publishing a {ops}-op prefix before the {}-op graph",
-                                                portable.def.len()
+                                            // ONCE PER PREFIX, not once per
+                                            // graph. The first attempt
+                                            // published 32 of them - every
+                                            // graph re-dispatching the same
+                                            // ancestry because none had landed
+                                            // yet - which is N prefixes wearing
+                                            // a different hat.
+                                            //
+                                            // Same OnceCell the contexts and
+                                            // base images use: the first caller
+                                            // publishes, the rest await its
+                                            // answer. That is what makes this
+                                            // ONE prefix.
+                                            let key = (
+                                                "prefix".to_owned(),
+                                                format!(
+                                                    "sha256:{}",
+                                                    crate::store::sha256_hex(&portable.def[root])
+                                                ),
                                             );
-                                            // Best effort: if nobody takes the
-                                            // prefix we dispatch the whole
-                                            // graph as before. A failed
-                                            // optimisation must not fail a
-                                            // build.
-                                            let _ = self
-                                                .driver
-                                                .lead_subtree(pre.encode_to_vec(), Vec::new())
-                                                .await;
+                                            let cell = self.cell(&key);
+                                            let bytes = pre.encode_to_vec();
+                                            let n = portable.def.len();
+                                            cell.get_or_init(|| async move {
+                                                println!(
+                                                    "[proxy] publishing a {ops}-op prefix before a {n}-op graph"
+                                                );
+                                                // Best effort: if nobody takes
+                                                // it we dispatch the whole
+                                                // graph as before. A failed
+                                                // optimisation must not fail a
+                                                // build.
+                                                self.driver
+                                                    .lead_subtree(bytes, Vec::new())
+                                                    .await
+                                                    .ok()
+                                            })
+                                            .await;
                                             let built = self.driver.built_ops().await;
                                             crate::dispatch::graft_built(&portable, &|d| {
                                                 built.get(d).map(|r| {
