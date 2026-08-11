@@ -632,6 +632,25 @@ pub fn affinity() -> bool {
 }
 
 /// Who to offer this subtree to, best first. Empty means build it yourself.
+/// One peer's warmth for one subtree: ops it has built, mounts it has filled.
+///
+/// Two different things are being counted and they are not the same size.
+/// Reusing an op saves what that op cost. Meeting a warm cache MOUNT saves
+/// what a cold one costs, and one run measured 64 leads at ~24s each behind
+/// a cold `go-mod` against a p50 lead of 8.6s - so a warm mount is worth
+/// more than a whole median lead, and has to outrank any op overlap a single
+/// subtree can plausibly contain.
+///
+/// 64 is coarse on purpose (principle 13). It is not a calibration; it is
+/// "more ops than a subtree here has", so a shared mount always wins and op
+/// overlap breaks the ties between peers holding the same mounts. A finer
+/// number would need per-id costs the driver only learns at the END of a
+/// run, which is a generation too late to place anything.
+pub fn warmth(ops: u32, caches: u32) -> u32 {
+    const MOUNT: u32 = 64;
+    ops.saturating_add(caches.saturating_mul(MOUNT))
+}
+
 // Affinity-free form. The driver always passes a warmth function now, so
 // this survives as the definition of the default order and is what the
 // ordering tests pin.
@@ -1632,6 +1651,26 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// A warm cache MOUNT outranks a warm op, and by how much.
+    ///
+    /// The two are not the same size. Reusing an op saves whatever that op
+    /// cost; meeting a warm `go-mod` saves the ~24s that 64 leads in one
+    /// measured run each spent behind a cold one, against a p50 lead of
+    /// 8.6s. So one warm mount has to beat any plausible op overlap inside a
+    /// single subtree, and subtrees here run to tens of ops.
+    #[test]
+    fn cache_warmth_outranks_op_warmth() {
+        // Ten shared ops loses to one shared cache mount.
+        assert!(super::warmth(10, 0) < super::warmth(0, 1));
+        // And to be sure it is not merely ordered: it still loses at fifty.
+        assert!(super::warmth(50, 0) < super::warmth(0, 1));
+        // Op warmth still breaks ties between peers with the same mounts.
+        assert!(super::warmth(3, 1) > super::warmth(2, 1));
+        // Two mounts beat one, whatever the ops say.
+        assert!(super::warmth(0, 2) > super::warmth(60, 1));
+        assert_eq!(super::warmth(0, 0), 0);
+    }
+
     use super::*;
     use bollard_buildkit_proto::pb::{op::Op as OpKind, ExecOp, Meta, Mount, SecretEnv};
 

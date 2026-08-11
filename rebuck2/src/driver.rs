@@ -376,6 +376,13 @@ pub struct Driver {
     /// it should approach the number of WORKERS if every worker is rebuilding
     /// the same ancestry.
     op_by_worker: tokio::sync::Mutex<std::collections::HashSet<(String, u64)>>,
+    /// Which cache mount ids each worker has actually filled.
+    ///
+    /// Not which it has been SENT: a lead that was declined or died leaves
+    /// the mount as cold as it found it, and offering the next subtree to
+    /// that peer on the strength of it would be affinity pointed at nothing.
+    /// Recorded where the duration is, which is where a build finished.
+    cache_by_worker: tokio::sync::Mutex<std::collections::HashSet<(String, u64)>>,
     /// The terminal op of each dispatched subtree, so its result can be
     /// tested for sharing when it completes. Without it `prefetch_image_for`
     /// has no op to count consumers of, and the gate it was built for is
@@ -488,6 +495,7 @@ impl Driver {
             dispatched_ops: Default::default(),
             built: Default::default(),
             op_by_worker: Default::default(),
+            cache_by_worker: Default::default(),
             job_names: Default::default(),
             job_terminal: Default::default(),
             shared_ops: Default::default(),
@@ -818,6 +826,12 @@ impl Driver {
                             if !caches.is_empty() {
                                 self.cache_lead_ms.fetch_add(ms, Ordering::Relaxed);
                                 self.cache_leads.fetch_add(1, Ordering::Relaxed);
+                            }
+                            {
+                                let mut cw = self.cache_by_worker.lock().await;
+                                for id in &caches {
+                                    cw.insert((id.clone(), worker_id));
+                                }
                             }
                             let mut c = self.cache_cost.lock().await;
                             for id in &caches {
@@ -1557,11 +1571,22 @@ impl Driver {
         // same fact read for a decision instead of a report.
         let warm: std::collections::BTreeMap<u64, u32> = if crate::dispatch::affinity() {
             use prost::Message;
-            let ops: Vec<String> =
-                bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice())
-                    .map(|d| d.def.iter().map(|b| crate::store::sha256_hex(b)).collect())
-                    .unwrap_or_default();
+            let def = bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice()).ok();
+            let ops: Vec<String> = def
+                .as_ref()
+                .map(|d| d.def.iter().map(|b| crate::store::sha256_hex(b)).collect())
+                .unwrap_or_default();
+            // The mounts this subtree will want. Measured as the bigger half
+            // of affinity: a worker holding the ops saves a rebuild, a
+            // worker holding the MOUNT saves ~24s of `go mod download` that
+            // no amount of op reuse can avoid, because a lifted cache mount
+            // starts cold on whoever gets it.
+            let wants: std::collections::BTreeSet<String> = def
+                .as_ref()
+                .map(crate::dispatch::cache_ids)
+                .unwrap_or_default();
             let pairs = self.op_by_worker.lock().await;
+            let mounts = self.cache_by_worker.lock().await;
             candidates
                 .iter()
                 .map(|c| {
@@ -1569,7 +1594,11 @@ impl Driver {
                         .iter()
                         .filter(|o| pairs.contains(&((*o).clone(), c.id)))
                         .count();
-                    (c.id, n as u32)
+                    let m = wants
+                        .iter()
+                        .filter(|id| mounts.contains(&((*id).clone(), c.id)))
+                        .count();
+                    (c.id, crate::dispatch::warmth(n as u32, m as u32))
                 })
                 .collect()
         } else {
