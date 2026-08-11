@@ -1443,7 +1443,9 @@ impl Wire {
 
     /// The characterisation, as one block. Printed on shutdown because the
     /// interesting numbers are about the BUILD, not any one Solve.
-    pub fn report(&self) {
+    /// Returns `(peak, occupancy, ceiling)` so the caller can print the
+    /// one-line verdict beside the numbers only IT has.
+    pub fn report(&self) -> (usize, f64, f64) {
         let mut sizes = self.per_solve.clone();
         sizes.sort_unstable();
         let median = sizes.get(sizes.len() / 2).copied().unwrap_or(0);
@@ -1653,6 +1655,7 @@ impl Wire {
                  client driving the API, not shared work."
             );
         }
+        (peak, occupancy, ceiling)
     }
 }
 
@@ -2131,7 +2134,12 @@ pub async fn serve(
         let costs = driver_for_report.cache_costs().await;
         let peak = driver_for_report.peak_inflight();
         let (uniq, total_ops, pairs) = driver_for_report.op_duplication().await;
-        wire.held().report();
+        // `peak_solves` is NOT `peak` a few lines up. That one counts
+        // subtrees the driver had in flight; this counts client Solves
+        // overlapping. They differ - a solve can be waiting on a subtree
+        // somebody else is building - and conflating them would report the
+        // fleet as busier or idler than it was.
+        let (peak_solves, occupancy, ceiling) = wire.held().report();
         let solo = solo.held();
         let medians: std::collections::BTreeMap<usize, u64> = solo
             .iter()
@@ -2164,12 +2172,41 @@ pub async fn serve(
                  {pairs} (op,worker) pairs = {built:.1}x built"
             );
         }
+        let (lead_total_ms, lead_total_n) = driver_for_report.cache_lead_total();
+        {
+            let w = wire.held();
+            // ONE LINE with the numbers a run is compared on, because the ledger
+            // in docs/fleet-findings.md is assembled by hand from four greps and
+            // has already been assembled wrongly once - a per-id table was
+            // summed into a total seven times larger than the leg it described.
+            //
+            // Deliberately flat `k=v`, no punctuation to quote: `grep -o` in a
+            // workflow, `cut -d= -f2` afterwards, and it survives being pasted
+            // into a table.
+            println!(
+                "[wire] verdict        : target={} solves={} routed={} home={} peak_solves={peak_solves} \
+                 inflight={peak} \
+                 occupancy={occupancy:.2} ceiling={ceiling:.2} dup={:.1} mounts_ms={} \
+                 mount_leads={}",
+                std::env::var("REBUCK2_TARGET").unwrap_or_else(|_| "?".into()),
+                w.solves,
+                w.routed,
+                w.home,
+                if uniq > 0 {
+                    pairs as f64 / uniq as f64
+                } else {
+                    0.0
+                },
+                lead_total_ms,
+                lead_total_n,
+            );
+        }
         if !costs.is_empty() {
             // NOT the sum of the rows. Each lead is added to every cache id
             // it names, so the rows overlap and their total exceeded the
             // whole fleet leg by a factor of seven the first time it was
             // read out.
-            let (lead_ms, leads) = driver_for_report.cache_lead_total();
+            let (lead_ms, leads) = (lead_total_ms, lead_total_n);
             println!(
                 "[wire] cache cost ms  : {lead_ms} in {leads} lead(s) that named any cache \
                  mount; per-id below, and a lead counts under EVERY id it names, so these \
