@@ -2650,6 +2650,7 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+
     /// The proxy writes these and the harvest reads them, in two processes
     /// and often two runs apart. One function each way, tested together.
     #[test]

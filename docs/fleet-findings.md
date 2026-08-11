@@ -3429,31 +3429,50 @@ Same run, arithmetic on the same log lines.
 | total lead time                | 207s                                |
 | the whole single-machine build | **87s**                             |
 
-**Materialising layers cost 1.9 times the entire baseline**, and it accounts
+**Careful with that 162s: it is machine-seconds, not wall clock.** The six
+workers unpack concurrently, and the registry report settles whether they
+contend - the coordinator served **158 MiB** while the fleet fetched 1164,
+so 86% moved peer to peer and the joins really are parallel. A worker costs
+about 27 seconds of WALL to become useful, once, not 162.
+
+The first version of this section said "1.9x the entire baseline" and meant
+machine-seconds while reading like wall clock. It is corrected here rather
+than deleted because the mistake is the interesting part: machine-seconds
+and wall clock differ by exactly the occupancy, and this document quotes
+both.
+
+What survives is the composition: layer materialisation accounts
 for 162 of the 207 seconds of lead work. Duplication is 1.2x, so this is not
 the same op arriving twice - it is six machines each needing the base chain
 once, which is the irreducible shape of a cold fleet.
 
-That gives a much better model than "amplification", and a decision rule
-falls straight out of it:
+A worker pays `base_bytes / unpack_rate` to become useful - here about 27
+seconds - and it pays it in parallel with the others. So the naive model is
 
 ```text
-    a worker pays        base_bytes / unpack_rate      to join the work
-    a worker is worth it when the work it takes exceeds that
+wall  ~  join + work / N
 ```
 
-For `+lint-all`: a worker pays ~27s to materialise what it needs, and the
-whole build is 87s of single-machine work. Six workers therefore spend 162s
-buying access to 87s of work. **No scheduler can win that**, and every
-occupancy and ceiling figure in this document is describing how well the
-fleet divided a job it should not have taken on so many machines.
+which DECREASES in N, and says use every machine. That is what the fleet
+does, and on this evidence it is not obviously wrong.
+
+The tempting next step was a rule capping workers by how much work there is.
+It was written, tested, and removed before it shipped: it rests on treating
+162 machine-seconds as wall clock, and the coordinator-served figure says
+the joins are parallel rather than queued. A scheduling rule built on that
+confusion would have made things worse while looking principled.
+
+What the numbers DO support is narrower and still useful: 78% of lead time
+is layer materialisation, so anything that reduces bytes or speeds unpack
+attacks the largest term, and anything that reduces scheduling overhead
+attacks the smallest.
 
 Three ways out, in increasing order of how much they change:
 
-- **Fewer workers.** Two workers pay 54s to divide 87s. Still not a win here
-  but far closer, and the fleet currently uses every machine it has
-  regardless of whether the work justifies one. This is the cheapest thing
-  to try and nothing tests it.
+- **Fewer workers.** Cheap to test and NOT justified by anything measured
+  yet - see above. Worth a run precisely because the model says it should
+  not help: if fewer workers is faster, the joins contend more than the
+  registry figures suggest.
 - **Warm workers.** The 194 MiB is paid once per machine per RUN because a
   hosted runner is destroyed afterwards. A permanent fleet pays it once,
   ever - which is the cold-start bound already recorded, quantified.
@@ -3461,8 +3480,7 @@ Three ways out, in increasing order of how much they change:
   decompression on two cores, and zstd is several times quicker at similar
   size.
 
-The first is the interesting one, because it is a scheduling decision this
-project already has all the inputs for: base size is known before dispatch,
-the unpack rate is measurable, and the work available is the solve count.
-Using six machines because six exist is the one choice here that nothing has
-ever justified.
+The last is the one with evidence behind it. 7.2 MB/s is decompression on
+two cores, zstd is several times quicker at similar size, and every layer
+the fleet moves is one this project exported - so it is a setting rather
+than a redesign.
