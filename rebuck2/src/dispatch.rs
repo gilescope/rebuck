@@ -492,6 +492,42 @@ pub fn is_build_verdict(why: &str) -> bool {
     !(129..=192).contains(&code)
 }
 
+/// `id:path,id:path` as the workflow writes it.
+///
+/// In Rust because the shell version could not be tested and was wrong. It
+/// split on the FIRST colon and rejected `id == path` as malformed, which
+/// throws away every mount written without an `id=` - buildkit keys those on
+/// the destination, so the id is the path and the pair reads
+/// `/go/pkg/mod:/go/pkg/mod`. Two entries of exactly that shape had been
+/// added, deliberately, two commits before the guard ate them.
+///
+/// Split on the LAST colon, and check what actually separates a good pair
+/// from a bad one: there is a colon, the path is absolute, the id is not
+/// empty. Anything else is dropped with a line rather than guessed at.
+pub fn parse_seed_pairs(raw: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for pair in raw.split(',') {
+        let pair = pair.trim();
+        if pair.is_empty() {
+            continue;
+        }
+        let Some((id, path)) = pair.rsplit_once(':') else {
+            println!("[harvest] no colon in {pair:?}, wanted id:path");
+            continue;
+        };
+        if id.is_empty() {
+            println!("[harvest] empty id in {pair:?}");
+            continue;
+        }
+        if !path.starts_with('/') {
+            println!("[harvest] {path:?} is not an absolute mount path");
+            continue;
+        }
+        out.push((id.to_owned(), path.to_owned()));
+    }
+    out
+}
+
 /// An image name as an LLB source identifier buildkit will accept.
 ///
 /// `llb.Image("busybox:1")` normalises before building the op. Hand-built
@@ -2115,6 +2151,39 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// `id:path` pairs, and the shape that broke the shell version.
+    #[test]
+    fn seed_pairs_accept_an_id_that_is_a_path() {
+        let f = super::parse_seed_pairs;
+        assert_eq!(
+            f("go-mod:/go/pkg/mod"),
+            vec![("go-mod".to_owned(), "/go/pkg/mod".to_owned())]
+        );
+        // THE ONE THAT BROKE IT. A mount written without `id=` is keyed by
+        // buildkit on its destination, so the id IS the path. The shell
+        // version split on the first colon and then rejected id == path as
+        // malformed - a guard written before this case existed, which then
+        // threw away the two entries added to cover it.
+        assert_eq!(
+            f("/go/pkg/mod:/go/pkg/mod"),
+            vec![("/go/pkg/mod".to_owned(), "/go/pkg/mod".to_owned())]
+        );
+        assert_eq!(
+            f("/root/.cache/golangci_lint:/root/.cache/golangci_lint"),
+            vec![(
+                "/root/.cache/golangci_lint".to_owned(),
+                "/root/.cache/golangci_lint".to_owned()
+            )]
+        );
+        // Several, with the whitespace a human leaves in.
+        assert_eq!(f("a:/x, b:/y").len(), 2);
+        // Malformed shapes are dropped, not guessed at.
+        assert!(f("nocolon").is_empty());
+        assert!(f("id:relative/path").is_empty(), "a mount path is absolute");
+        assert!(f(":/x").is_empty(), "an empty id names no cache");
+        assert!(f("").is_empty());
+    }
+
     /// The shapes `image_identifier` has to get right.
     #[test]
     fn a_short_image_name_is_qualified_the_way_buildkit_expects() {

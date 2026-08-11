@@ -96,6 +96,27 @@ fn default_session() -> String {
     std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "local".into())
 }
 
+/// One cache mount, out of a daemon and into the registry.
+async fn harvest_one(
+    bk: &str,
+    registry: &str,
+    base: &str,
+    id: &str,
+    dest: &str,
+) -> anyhow::Result<()> {
+    let def = dispatch::harvest_graph(base, id, dest);
+    // Job 0: this is not a subtree and shares no numbering with one.
+    let digest = solve::build_subtree(bk, registry, 0, def).await?;
+    // PULLABLE, not the bare digest `build_subtree` answers with. A digest
+    // names content and not a location, which is what lets a result travel;
+    // a cache mount's input is an image reference and has to name somewhere,
+    // and `docker-image://sha256:...` parses nowhere.
+    let reference = solve::pullable(registry, &digest);
+    println!("[harvest] {id} at {dest} -> {reference}");
+    println!("REBUCK2_CACHE_SEEDS={id}={reference}");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -230,24 +251,40 @@ async fn main() -> Result<()> {
             let registry = args
                 .opt("--registry")
                 .ok_or_else(|| anyhow::anyhow!("harvest-cache: --registry <host:port>"))?;
-            let id = args
-                .opt("--id")
-                .ok_or_else(|| anyhow::anyhow!("harvest-cache: --id <cache id>"))?;
-            let dest = args
-                .opt("--dest")
-                .ok_or_else(|| anyhow::anyhow!("harvest-cache: --dest <mount path>"))?;
+            // `--pairs id:path,id:path`, or a single `--id`/`--dest`. The
+            // loop lives HERE and not in the workflow, because the shell
+            // version of it could not be tested and was wrong: it split on
+            // the first colon and rejected `id == path`, which is every
+            // mount buildkit keys on its destination.
+            let pairs = match args.opt("--pairs") {
+                Some(raw) => dispatch::parse_seed_pairs(&raw),
+                None => {
+                    let id = args.opt("--id").ok_or_else(|| {
+                        anyhow::anyhow!("harvest-cache: --pairs <id:path,...> or --id <cache id>")
+                    })?;
+                    let dest = args
+                        .opt("--dest")
+                        .ok_or_else(|| anyhow::anyhow!("harvest-cache: --dest <mount path>"))?;
+                    vec![(id, dest)]
+                }
+            };
+            if pairs.is_empty() {
+                anyhow::bail!("harvest-cache: no usable id:path pair");
+            }
             let base = args.opt("--base").unwrap_or_else(|| "busybox:1".into());
-            let def = dispatch::harvest_graph(&base, &id, &dest);
-            // Job 0: this is not a subtree and shares no numbering with one.
-            let digest = solve::build_subtree(&bk, &registry, 0, def).await?;
-            // PULLABLE, not the bare digest build_subtree answers with. A
-            // digest names content and not a location, which is what lets a
-            // result travel; a cache mount's input is an image reference and
-            // has to name somewhere. `docker-image://sha256:...` parses
-            // nowhere.
-            let reference = solve::pullable(&registry, &digest);
-            println!("[harvest] {id} at {dest} -> {reference}");
-            println!("REBUCK2_CACHE_SEEDS={id}={reference}");
+            // Best effort per pair, like the step it replaces: a cache that
+            // cannot be harvested leaves that mount cold, which is what it
+            // was anyway.
+            let mut failed = 0usize;
+            for (id, dest) in &pairs {
+                if let Err(e) = harvest_one(&bk, &registry, &base, id, dest).await {
+                    println!("[harvest] {id} at {dest} failed: {e:#}");
+                    failed += 1;
+                }
+            }
+            if failed == pairs.len() {
+                anyhow::bail!("harvest-cache: every pair failed");
+            }
             Ok(())
         }
         "registry" => {

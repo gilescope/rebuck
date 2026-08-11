@@ -1203,35 +1203,16 @@ jobs:
             echo "::warning::no base-bk to harvest from (fresh_fleet=0?) - the fleet stays cold"
             exit 0
           fi
-          IFS=',' read -ra pairs <<< "$REBUCK2_SEED_IDS"
-          for pair in "${pairs[@]}"; do
-            # SPLIT ON THE LAST COLON, not the first, and do not require
-            # the two halves to differ.
-            #
-            # A mount written without `id=` is keyed by buildkit on its
-            # destination, so the id IS the path and the pair reads
-            # `/go/pkg/mod:/go/pkg/mod`. The first version split on the
-            # first colon and then rejected id == path as malformed - a
-            # guard written before that case existed, which then threw away
-            # the two entries added specifically to cover it.
-            id=${pair%:*}; path=${pair##*:}
-            case "$pair" in *:*) ;; *)
-              echo "::warning::seed_ids: no colon in '$pair', wanted id:path"; continue ;; esac
-            case "$path" in /*) ;; *)
-              echo "::warning::seed_ids: '$path' is not an absolute mount path"; continue ;; esac
-            [ -n "$id" ] || { echo "::warning::seed_ids: empty id in '$pair'"; continue; }
-            # Best effort, one at a time. An empty cache harvests an empty
-            # layer and a missing one harvests nothing; either leaves the
-            # worker exactly as cold as it is today, which is the whole
-            # safety argument for doing this at all.
-            out=$("$RB" harvest-cache \
-                    --bk "$LAN:28372" --registry "172.17.0.1:15000" \
-                    --id "$id" --dest "$path" 2>&1) || {
-              echo "::warning::harvest $id failed"; echo "$out" | tail -5; continue; }
-            echo "$out" | tail -2
-            echo "$out" | grep -oE '^REBUCK2_CACHE_SEEDS=.*' | sed 's/^REBUCK2_CACHE_SEEDS=//' \
-              >> "$REBUCK2_CACHE_SEEDS_FILE"
-          done
+          # ONE CALL. The loop was here, in shell, and the shell version
+          # could not be tested and was wrong - it split `id:path` on the
+          # first colon and rejected `id == path`, which is every mount
+          # buildkit keys on its destination. It now lives in Rust with a
+          # test per shape.
+          "$RB" harvest-cache --bk "$LAN:28372" --registry "172.17.0.1:15000" \
+            --pairs "$REBUCK2_SEED_IDS" 2>&1 | tee harvest.out || \
+            echo "::warning::no cache mount could be harvested"
+          grep -oE '^REBUCK2_CACHE_SEEDS=.*' harvest.out \
+            | sed 's/^REBUCK2_CACHE_SEEDS=//' >> "$REBUCK2_CACHE_SEEDS_FILE" || true
           echo "=== seeds the fleet will start from"
           cat "$REBUCK2_CACHE_SEEDS_FILE" || true
           [ -s "$REBUCK2_CACHE_SEEDS_FILE" ] || \
