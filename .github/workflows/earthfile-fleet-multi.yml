@@ -48,6 +48,8 @@ on:
       - giles-dispatch-ci-binaries-seed
       - giles-dispatch-ci-ast
       - giles-dispatch-ci-ast-zstd
+      - giles-dispatch-ci-ast-nobase
+      - giles-dispatch-ci-ast-zstd-nobase
       - giles-dispatch-ci-ast-seed
       - giles-dispatch-ci-lint-graft
       - giles-dispatch-ci-buildkitd-arm
@@ -439,6 +441,7 @@ jobs:
       graft: ${{ steps.n.outputs.graft }}
       fleet: ${{ steps.n.outputs.fleet }}
       compression: ${{ steps.n.outputs.compression }}
+      nobase: ${{ steps.n.outputs.nobase }}
     steps:
       - id: n
         env:
@@ -480,6 +483,7 @@ jobs:
           workload=${workload%-graft}
           workload=${workload%-arm}
           workload=${workload%-zstd}
+          workload=${workload%-nobase}
           case "${T:-}" in
             "") case "$workload" in
                   *-binaries) target=+all-binaries ;;
@@ -540,6 +544,13 @@ jobs:
           case "$REF" in *-zstd) comp=zstd ;; *) comp="" ;; esac
           echo "compression: ${comp:-buildkit default}"
           echo "compression=$comp" >> "$GITHUB_OUTPUT"
+
+          # `-nobase`: skip the baseline leg. For comparing a MECHANISM
+          # against itself, where the control is another fleet leg and the
+          # baseline is dead weight.
+          case "$REF" in *-nobase) nobase=1 ;; *) nobase=0 ;; esac
+          echo "skip baseline: $nobase"
+          echo "nobase=$nobase" >> "$GITHUB_OUTPUT"
 
           # WHICH ARCHITECTURE each worker runs on.
           #
@@ -861,6 +872,7 @@ jobs:
       REBUCK2_TARGET: ${{ needs.plan.outputs.target }}
       REBUCK2_GRAFT: ${{ needs.plan.outputs.graft }}
       REBUCK2_COMPRESSION: ${{ needs.plan.outputs.compression }}
+      REBUCK2_SKIP_BASELINE: ${{ needs.plan.outputs.nobase }}
       # ONE path for the binary in this job. It was written out twice and
       # the copies disagreed: the proxy step had `./rebuck2-repo/...` and
       # the harvest step `./rebuck2/...`, which is the WORKER job's layout.
@@ -1190,7 +1202,18 @@ jobs:
       #
       # It also gives the parity check something to compare, which is the
       # only claim a distributed builder can really make.
+      # SKIPPABLE, for a mechanism A/B rather than a fleet-versus-one-machine
+      # one. Comparing `graft` on against `graft` off does not need a
+      # baseline at all: the comparison is fleet against fleet, and the
+      # baseline is half the run.
+      #
+      # Which matters because five mechanisms here have never been measured
+      # and the queue is runs, not code. Halving a run means two of them can
+      # be fired SIMULTANEOUSLY - and simultaneous is the control that
+      # matters, since a baseline measured alone and one measured beside two
+      # other fleet runs differed by a factor of nearly three.
       - name: baseline - the same target on one machine
+        if: env.REBUCK2_SKIP_BASELINE != '1'
         working-directory: earthbuild
         env:
           TARGET: ${{ needs.plan.outputs.target }}
@@ -1499,6 +1522,16 @@ jobs:
       - name: did the fleet change the answer
         run: |
           set -euo pipefail
+          # NO BASELINE, NO PARITY CLAIM. With the baseline skipped there is
+          # nothing to compare against, and reporting "the same 0 targets
+          # failed either way" from an empty file would be the most
+          # confidently wrong line in the whole rig.
+          if [ "${REBUCK2_SKIP_BASELINE:-0}" = "1" ]; then
+            echo "baseline skipped - this run compares a mechanism against"
+            echo "another fleet leg, so there is no parity to check here."
+            echo "fleet failed: $(wc -l < /tmp/fleet.failed | tr -d ' ') target(s)"
+            exit 0
+          fi
           # A target failing BOTH ways is the machine's problem. Failing only
           # WITH the fleet is ours - and one does:
           # `copy-test-verbose-output` asserts earthly did not transfer a file
@@ -1596,6 +1629,7 @@ jobs:
           # divides that across seven machines into a win. Parallelism is
           # then not the thing to fix.
           lead_ms=$(grep -oE 'lead_ms=[0-9]+' proxy.log | tail -1 | cut -d= -f2)
+          # Needs a baseline to divide by; silent when there is none.
           if [ -n "${lead_ms:-}" ] && [ "${BASELINE_SECS:-0}" -gt 0 ]; then
             awk -v l="$lead_ms" -v b="$BASELINE_SECS" \
               'BEGIN{printf "amplification : %.1fx - %.0fs of lead work against a %ss baseline\n", l/1000/b, l/1000, b}'
