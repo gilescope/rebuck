@@ -3141,3 +3141,37 @@ could never have found it - it reproduces MY writer, and my writer was
 consistent with my reader. Principle 23 says build the cheapest instrument
 first, and this is its limit: an instrument that reproduces your own
 assumptions confirms them.
+
+## What attempt nine should show, written before it does
+
+Three independent reasons every harvest was empty, all fixed, all found by
+reading rather than running:
+
+| # | fault                                                                                         | found in                         |
+| - | --------------------------------------------------------------------------------------------- | -------------------------------- |
+| 1 | the harvest mounted the cache with no INPUT, so it read a directory it created itself         | `runmount.go` + `getRefCacheDir` |
+| 2 | `seed_cache_mounts` filtered on `input < 0`, so it never applied to any earthly graph         | its own source                   |
+| 3 | an id with no `id=` is `/run/cache/<hash>/<target>`, so the name we asked for existed nowhere | `buildctl du -v`                 |
+
+Attempt nine carries 1 and 2. The id resolution landed after it started, so
+`golangci_lint` will still skip and `go-mod` and `go-build` are the test.
+
+The prediction, so the run has something to disagree with:
+
+- **`go-mod` and `go-build` harvest with real size.** Hundreds of MiB, not
+  0.0. If they do not, none of the three explanations was the whole story
+  and the next move is `du` again, after the harvest rather than before.
+- **`seed_mounts` appears in the mechanisms line with a non-zero count.** It
+  has never once been applied - fault 2 guaranteed that - so any number
+  above zero is new information on its own.
+- **Seeded leads drop from p50 ~24s.** That figure is what a cold `go-mod`
+  and `go-build` cost, and it has been stable across four runs. Halving it
+  would be a clear result; unchanged would mean seeding arrives but does not
+  help, which is finally the interesting question rather than a plumbing
+  report.
+- **Fleet wall 252s -> somewhere under 200s**, baseline unchanged at ~88s.
+  Amplification 3.9x should fall with it.
+
+And the honest bound, unchanged: this is a cold-start measurement. Seeding
+is the warm case simulated, so a result here is evidence about what a
+permanent fleet would already have, not about what a hosted runner does.
