@@ -2760,3 +2760,46 @@ Also confirmed in the same pair: the guard markers work.
 `read_retry=0 (never needed)` where the previous run said
 `read_retry=ON BUT NEVER APPLIED`, and `verdict_stops_retry=4` both times -
 the same four Go modules, the same four failing lints.
+
+## Every number here is a cold-start number, and a build farm is not cold
+
+Worth stating plainly, because it bounds what any of this proves.
+
+A GitHub hosted runner is fresh. Each worker joins with an empty
+snapshotter, an empty cache mount, and no image layers at all, and it is
+torn down at the end. So every measurement in this document is the **first
+build a fleet ever does**, repeated.
+
+That is the worst case for exactly the amplification sources principle 21
+lists:
+
+| source            | cold                                  | warm, a real farm                  |
+| ----------------- | ------------------------------------- | ---------------------------------- |
+| cold cache mounts | every worker fills its own, every run | filled once, then reused for weeks |
+| transfer          | every layer crosses the wire          | most layers already present        |
+| unpack            | every worker decompresses everything  | only what changed                  |
+| duplication       | unchanged - a property of the graph   | unchanged                          |
+
+Three of the four disappear on a second build. Duplication does not, which
+is why affinity was worth doing regardless.
+
+A permanent fleet - the thing this is for - is warm after its first hour.
+The honest statement of what has been measured is therefore: **the fleet is
+about 2.5x slower than one machine when every machine involved has never
+seen the project before.** Not "the fleet is slower".
+
+This rig cannot measure the warm case. Runners are destroyed after every
+job, and the bank (`~/.cache/rebuck2/coord`, restored per target) carries
+the coordinator's built-op refs across runs but nothing of a worker's
+snapshotter or its cache mounts - those live in a container that no longer
+exists.
+
+Two consequences worth keeping:
+
+- **Seeding is the warm case, simulated.** That is what makes it the right
+  thing to chase: it hands a cold worker the state a warm one would already
+  have, which is the difference between the two columns above.
+- **Do not fix the cold case at the warm case's expense.** Anything that
+  helps a first build by adding per-build work - re-shipping a cache every
+  run, say - is a loss on every build after it, and this rig would report it
+  as a win.
