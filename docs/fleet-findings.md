@@ -4690,3 +4690,67 @@ The clean version of this experiment would have been to run `+test-no-qemu`
 at `3b4271e` and again at HEAD. That is two more 45-minute runs to attribute
 a number I already have a mechanism-level explanation for, and the mandate
 is coverage. Noted as the shortcut it is.
+
+## The coverage run: died on h2, and named two real blockers first
+
+`+test-no-qemu`, six machines, `-balance`, no baseline. **It died** - and the
+died-check caught it, which is the one part of this that went to plan:
+
+```text
+Error: h2 protocol error: error reading a body from connection
+fleet failed targets: 0
+fleet touched 39 target(s)
+::error::the fleet leg neither succeeded nor named a failed target - it died
+```
+
+Zero failed targets and a non-zero exit is precisely the shape that once got
+reported as *beating* a baseline. It is now an error with a name.
+
+It reached 39 targets and 138 solves against the old run's 163, so this is
+not a comparison with 525s and I am not going to make one.
+
+What it did establish, and both are bigger than a clock.
+
+### Thirteen solves cannot be dispatched at all
+
+```text
+excluded: UnknownMount(100) ["env EARTHLY_DOCKER_LOAD_REGISTRY=..."]  x13
+excluded: Insecure []                                                  x4
+```
+
+`WITH DOCKER` targets carry a mount type the dispatcher does not know -
+buildkit mount type 100, holding earthly's docker-load registry handle - so
+seventeen solves are refused and build at home. That is `dispatchable`
+working exactly as designed: fail open, never fail wrong.
+
+It is also the ceiling. `+test-ast` has none of these, which is why every
+number in this document comes from a target that happens to contain nothing
+the dispatcher must refuse.
+
+### The coordinator did eleven minutes of building
+
+```text
+[wire] home vertices : 309 ran in 670427ms, 126 cache hit(s)
+```
+
+**670 seconds at home**, against seven seconds on `+test-ast`. The
+home-vertices instrument, built this morning to retire the suspicion that
+the coordinator was a bottleneck, has just found the case where it is one -
+and the cause is the exclusions above, not the gateway.
+
+`occupancy 1.41` against `ceiling 1.65`: this workload, as executed, barely
+parallelises. Not because the graph is serial - fourteen independent groups
+are not - but because a seventh of the solves cannot leave the machine, and
+they are the long ones.
+
+### And placement went bad again
+
+```text
+6 worker(s) took work, 122 placements: 2 2 3 5 41 69
+```
+
+Every machine took something, so `-balance` is doing its job in the sense it
+was measured for. But two machines took 90 of 122 placements. On this
+workload the queue penalty is not enough - which is the shape principle 27
+predicts when the preference is strong and the work is lumpy, and it is the
+first evidence that the 64 constant is target-specific.
