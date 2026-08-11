@@ -5141,3 +5141,37 @@ hold any of the 869 seconds of home vertex time. The dind setup may be
 cheap and the tests it runs expensive, in which case the prefix is
 dependency-building already shared with other targets, and cutting buys
 nothing. That measurement remains unbuilt.
+
+### The op-digest assumption, confirmed in buildkit's source
+
+Two mechanisms rest on a buildkit vertex digest being `sha256:<hex of the
+marshalled op bytes>`: grafting, which looks up built ancestors by that key,
+and the new `refused time`, which attributes home vertex timings to op
+positions. Neither had ever confirmed it - grafting has fired zero times in
+every run because it was switched off, so its silence proved nothing either
+way.
+
+`solver/llbsolver/vertex.go:337`, in the fork checked out three directories
+from this one:
+
+```go
+for _, dt := range def.Def {
+    dgst := digest.FromBytes(dt)
+```
+
+`digest.FromBytes` over each marshalled op, which is exactly
+`format!("sha256:{}", sha256_hex(b))`. **The assumption holds**, so the
+mapping works and grafting's key is sound - its zero was the flag and
+nothing else.
+
+Two minutes of reading a dependency, against eighteen minutes of run that
+would have answered the same question less definitively. The fork has been
+checked out the whole time and I spent much of today treating its behaviour
+as something only a fleet run could reveal.
+
+One caveat kept rather than dismissed: `vertex.go:305` computes a different
+digest on a rewrite path. The load path uses the bytes as received, and the
+proxy sees the definition the coordinator's daemon loads, so 337 is the one
+that applies - but a fork that rewrote ops before digesting would show up as
+partial matching, which is what the `Xms of Yms matched` figure exists to
+make visible.
