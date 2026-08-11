@@ -331,8 +331,15 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                 let n = digests.len();
                 let blobs = blobs.clone();
                 tokio::spawn(async move {
+                    // Only this worker's share. Six workers pulling the same
+                    // layers off the coordinator at once is the herd
+                    // `seeder_for` exists to prevent - and a prefetch makes
+                    // it arrive EARLIER, so it would hurt more than the lazy
+                    // path it replaces.
+                    let mine = blobs.my_share(digests).await;
+                    let share = mine.len();
                     let mut got = 0usize;
-                    for d in digests {
+                    for d in mine {
                         // `get` walks local, then peers by bloom, then the
                         // driver - the same path a lazy fetch takes, so a
                         // prefetch warms exactly what a build would have
@@ -341,7 +348,7 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                             got += 1;
                         }
                     }
-                    println!("[worker] prefetched {got}/{n}");
+                    println!("[worker] prefetched {got}/{share} of my share ({n} announced)");
                 });
                 continue;
             }
@@ -835,6 +842,35 @@ struct RemoteBlobs {
 }
 
 impl RemoteBlobs {
+    /// Of these blobs, the ones THIS worker is responsible for seeding.
+    ///
+    /// Without this, a prefetch announced to six workers makes six workers
+    /// pull the same layers off the coordinator at once - the thundering
+    /// herd that `seeder_for` exists to prevent, arriving earlier and
+    /// therefore hurting more. Each worker takes its own share; the rest
+    /// reach it from peers, at six times the width, which is principle 16.
+    async fn my_share(&self, digests: Vec<Dig>) -> Vec<Dig> {
+        let ids: Vec<String> = {
+            let p = self.peers.lock().await;
+            let mut v: Vec<String> = p.keys().cloned().collect();
+            if !v.contains(&self.my_id) {
+                v.push(self.my_id.clone());
+            }
+            v
+        };
+        // Alone, or before any gossip has arrived, "my share" is everything -
+        // there is nobody to split with, and fetching nothing would make the
+        // prefetch silently do nothing at exactly the moment it is most
+        // needed.
+        if ids.len() <= 1 {
+            return digests;
+        }
+        digests
+            .into_iter()
+            .filter(|d| seeder_for(&d.hash, &ids).as_deref() == Some(self.my_id.as_str()))
+            .collect()
+    }
+
     async fn upload_bytes(&self, d: &Dig, bytes: &[u8]) -> Result<()> {
         let (mut send, mut recv) = self.conn.open_bi().await?;
         mesh::send_frame(&mut send, &BlobReq::Put(d.clone())).await?;
@@ -1343,6 +1379,37 @@ async fn sync_shard(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_share_is_a_share_and_alone_means_everything() {
+        use super::seeder_for;
+
+        // The six shares must PARTITION the set: every blob seeded by
+        // exactly one worker. Miss one and it is never pre-positioned;
+        // duplicate one and the herd is back, arriving earlier than the lazy
+        // path it replaced and therefore hurting more.
+        let peers: Vec<String> = (1..=6).map(|n| format!("w{n}")).collect();
+        let blobs: Vec<String> = (0..600).map(|n| format!("{n:064x}")).collect();
+        let mut seeded = std::collections::BTreeMap::new();
+        for b in &blobs {
+            let who = seeder_for(b, &peers).expect("a seeder");
+            *seeded.entry(who).or_insert(0u32) += 1;
+        }
+        assert_eq!(
+            seeded.values().sum::<u32>(),
+            blobs.len() as u32,
+            "every blob seeded exactly once"
+        );
+        assert_eq!(seeded.len(), 6, "and by every worker");
+
+        // A fleet of one is not a fifth of a fleet. Before any gossip
+        // arrives the peer list is empty, and splitting then would prefetch
+        // nothing at exactly the moment it matters most.
+        assert_eq!(
+            seeder_for("abc", &["only".to_owned()]).as_deref(),
+            Some("only")
+        );
+    }
 
     #[test]
     fn every_blob_has_one_agreed_seeder_and_the_load_spreads() {
