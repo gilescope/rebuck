@@ -239,7 +239,13 @@ async fn main() -> Result<()> {
             let base = args.opt("--base").unwrap_or_else(|| "busybox:1".into());
             let def = dispatch::harvest_graph(&base, &id, &dest);
             // Job 0: this is not a subtree and shares no numbering with one.
-            let reference = solve::build_subtree(&bk, &registry, 0, def).await?;
+            let digest = solve::build_subtree(&bk, &registry, 0, def).await?;
+            // PULLABLE, not the bare digest build_subtree answers with. A
+            // digest names content and not a location, which is what lets a
+            // result travel; a cache mount's input is an image reference and
+            // has to name somewhere. `docker-image://sha256:...` parses
+            // nowhere.
+            let reference = solve::pullable(&registry, &digest);
             println!("[harvest] {id} at {dest} -> {reference}");
             println!("REBUCK2_CACHE_SEEDS={id}={reference}");
             Ok(())

@@ -2849,19 +2849,9 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         } else {
                             let before = portable.def.len();
                             let g = crate::dispatch::graft_built(&portable, &|d| {
-                                built.get(d).map(|r| {
-                                    if let Some(h) = r.strip_prefix("sha256:") {
-                                        format!(
-                                            "docker-image://{}/{}@sha256:{h}",
-                                            mirror.registry,
-                                            crate::solve::SUBTREE_REPO
-                                        )
-                                    } else if r.contains("://") {
-                                        r.clone()
-                                    } else {
-                                        format!("docker-image://{r}")
-                                    }
-                                })
+                                built
+                                    .get(d)
+                                    .map(|r| crate::solve::llb_source(&mirror.registry, r))
                             });
                             if g.def != portable.def {
                                 self.wire.held().grafted += 1;
@@ -3003,15 +2993,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                                             let built = self.driver.built_ops().await;
                                             crate::dispatch::graft_built(&portable, &|d| {
                                                 built.get(d).map(|r| {
-                                                    r.strip_prefix("sha256:")
-                                                        .map(|h| {
-                                                            format!(
-                                                                "docker-image://{}/{}@sha256:{h}",
-                                                                mirror.registry,
-                                                                crate::solve::SUBTREE_REPO
-                                                            )
-                                                        })
-                                                        .unwrap_or_else(|| r.clone())
+                                                    crate::solve::llb_source(&mirror.registry, r)
                                                 })
                                             })
                                         }
@@ -3096,17 +3078,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                                 // pull from, which fetches it from whoever
                                 // has it. Anything else is a full reference
                                 // from an older worker - take it as given.
-                                let src = if let Some(d) = reference.strip_prefix("sha256:") {
-                                    format!(
-                                        "docker-image://{}/{}@sha256:{d}",
-                                        mirror.registry,
-                                        crate::solve::SUBTREE_REPO
-                                    )
-                                } else if reference.contains("://") {
-                                    reference
-                                } else {
-                                    format!("docker-image://{reference}")
-                                };
+                                let src = crate::solve::llb_source(&mirror.registry, &reference);
                                 req.definition = Some(crate::dispatch::import_graph(&src));
                             }
                             // Nobody took it. Not a failure and not a

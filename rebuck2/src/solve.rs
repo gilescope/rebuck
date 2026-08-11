@@ -42,6 +42,45 @@ pub fn result_ref(registry: &str, job: u64) -> String {
     format!("{registry}/{SUBTREE_REPO}:job-{job}")
 }
 
+/// A published digest, as a reference a daemon can actually pull.
+///
+/// `build_subtree` answers with a BARE `sha256:...` on purpose - a digest
+/// names content and not a location, so whoever ends up holding it can serve
+/// it, and that is what let results travel between machines at all. Every
+/// consumer then has to prefix the registry IT will pull from, and each one
+/// had grown its own copy of that line.
+///
+/// The copy that did not exist was the one the cache-mount seed needed.
+/// `harvest-cache` printed the bare digest, `seed_cache_mounts` wrapped it as
+/// `docker-image://sha256:...`, and no daemon can parse that. It would have
+/// failed safe - the resolve check drops a seed it cannot read - so the run
+/// would have reported "seeding did not pay" for a mechanism that never
+/// addressed anything.
+/// [`pullable`], as an LLB source identifier.
+///
+/// An LLB source is a URL and buildkit rejects one without a scheme -
+/// `failed to parse ... invalid`. Three copies of this rule lived in
+/// proxy.rs and only two of them said so: the third handed a full unschemed
+/// reference straight through, which is the exact failure the comment beside
+/// it warned about.
+pub fn llb_source(registry: &str, reference: &str) -> String {
+    let r = pullable(registry, reference);
+    if r.contains("://") {
+        r
+    } else {
+        format!("docker-image://{r}")
+    }
+}
+
+pub fn pullable(registry: &str, reference: &str) -> String {
+    match reference.strip_prefix("sha256:") {
+        Some(d) => format!("{registry}/{SUBTREE_REPO}@sha256:{d}"),
+        // Already a full reference, from an older worker or an operator
+        // naming an image they published themselves.
+        None => reference.to_owned(),
+    }
+}
+
 /// Exporter attrs for everything this crate pushes to the mirror - adopted
 /// results, mirrored bases, published contexts, driver subtrees.
 ///
@@ -757,6 +796,52 @@ pub fn published_reference(
 
 #[cfg(test)]
 mod tests {
+    /// An LLB source identifier is a URL, and three copies of this rule
+    /// disagreed about that.
+    #[test]
+    fn every_reference_shape_becomes_a_valid_llb_source() {
+        let f = |r: &str| super::llb_source("172.17.0.1:15000", r);
+        assert_eq!(
+            f("sha256:abc"),
+            "docker-image://172.17.0.1:15000/rebuck2/subtree@sha256:abc"
+        );
+        // THE ONE THAT WAS WRONG. A full reference with no scheme, which is
+        // what an older worker sends, was passed through unchanged by one of
+        // the three copies - and buildkit rejects an unschemed identifier
+        // with "failed to parse ... invalid", which is precisely what the
+        // comment three lines above that copy warned about.
+        assert_eq!(f("ghcr.io/me/x:v1"), "docker-image://ghcr.io/me/x:v1");
+        // Already a URL: left alone, scheme and all.
+        assert_eq!(
+            f("docker-image://ghcr.io/me/x:v1"),
+            "docker-image://ghcr.io/me/x:v1"
+        );
+        assert_eq!(
+            f("git://example.com/r.git#main"),
+            "git://example.com/r.git#main"
+        );
+    }
+
+    #[test]
+    fn a_bare_digest_becomes_something_a_daemon_can_pull() {
+        let p = |r: &str| super::pullable("172.17.0.1:15000", r);
+        assert_eq!(
+            p("sha256:abc"),
+            "172.17.0.1:15000/rebuck2/subtree@sha256:abc"
+        );
+        // Not `docker-image://sha256:abc`, which is what the seeding path
+        // built and no daemon can parse. It would have failed SAFE - the
+        // resolve check drops a seed it cannot read - and the run would have
+        // reported that seeding did not pay for a mechanism that never
+        // addressed anything.
+        assert!(!p("sha256:abc").starts_with("sha256:"));
+        // An operator's own image is left alone, scheme or no scheme.
+        assert_eq!(p("ghcr.io/me/seed:v1"), "ghcr.io/me/seed:v1");
+        assert_eq!(
+            p("docker-image://ghcr.io/me/seed:v1"),
+            "docker-image://ghcr.io/me/seed:v1"
+        );
+    }
 
     #[test]
     fn a_manifest_names_its_config_and_layers_or_nothing() {
