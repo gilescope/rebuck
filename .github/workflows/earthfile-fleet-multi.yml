@@ -709,6 +709,9 @@ jobs:
       OTEL_EXPORTER_OTLP_PROTOCOL: grpc
       OTEL_EXPORTER_OTLP_ENDPOINT: http://127.0.0.1:4317
       REBUCK2_SEED_CACHES: ${{ needs.plan.outputs.seed }}
+      # Only so the one-line verdict can name itself. Nothing dispatches on
+      # it - a target name is an earthly concept and the proxy sees LLB.
+      REBUCK2_TARGET: ${{ needs.plan.outputs.target }}
     # 150, not 60. Sized for ONE group when that is what this built; the
     # whole `+test-no-qemu` is twelve of them and runs TWICE - baseline then
     # fleet. The first attempt was killed at 60 minutes, 51 of them into a
@@ -1339,7 +1342,7 @@ jobs:
           # against a 1.4x ceiling is a graph with no seam; the same 1.8x
           # against a 5x ceiling is a dispatcher with a problem, and until
           # these two lines existed the two were indistinguishable.
-          grep -E '^\[wire\] (concurrency|amdahl ceiling)' proxy.log || true
+          grep -E '^\[wire\] (concurrency|amdahl ceiling|verdict)' proxy.log || true
           # A WARNING, deliberately not an error. Peak 1 across N machines is
           # usually the graph and occasionally us, and a gate that cannot
           # tell the difference would go red on a correct run of a serial
