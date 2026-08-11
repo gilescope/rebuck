@@ -1559,10 +1559,11 @@ local context, which is not the workload we care about.
 A/B on `+test-no-qemu-group10`, six GitHub runners, same commit, only
 `REBUCK2_GRAFT` moved:
 
-| grafting | baseline (1 machine) | fleet (6 machines) | solves routed | grafts |
-| -------- | -------------------- | ------------------ | ------------- | ------ |
-| off      | 216s                 | 504s               | 44            | 0      |
-| on       | 212s                 | 611s               | 37            | 31     |
+| mechanism          | baseline (1 machine) | fleet (6 machines) | routed | mean lead |
+| ------------------ | -------------------- | ------------------ | ------ | --------- |
+| neither            | 216s                 | 504s               | 44     | 18.6s     |
+| grafting           | 212s                 | 611s               | 37     | -         |
+| fleet cache (rw)   | 211s                 | 838s               | 37     | 27.6s     |
 
 Both legs at parity with their baseline - zero failed targets either
 way. So grafting works: 31 subtrees started from an ancestor somebody
@@ -1587,3 +1588,38 @@ constant that the model was missing. Nothing above it needs to change.
 
 Grafting stays in the code and stays off by default. It is not a bug to
 be fixed, it is a mechanism whose price is now known.
+
+### And the same again for the shared cache
+
+`REBUCK2_FLEET_CACHE=readwrite` - buildkit's own registry-backed cache,
+imported and exported by every worker - is the third mechanism measured
+and the worst: 838s against 504s, with the mean lead going 18.6s ->
+27.6s and the longest 134s -> 194s. It is the purest test of the
+handover hypothesis, because a shared cache is nothing BUT handover, and
+it made every lead slower rather than fewer.
+
+Three mechanisms, one direction. Grafting, prefix cutting and the shared
+cache all move built state between machines through an OCI registry, and
+each one costs more than the work it avoids. That is no longer three
+results; it is one result measured three ways.
+
+### What the numbers say the unit should be
+
+The arithmetic that matters is per-lead, not per-build. 56 leads at a
+mean of 18.6s is 1041s of lead time; the same target on one machine is
+216s, so an equivalent unit of work costs ~3.9s at home. The dispatched
+unit is therefore ~4.8x more expensive than the local one, and average
+concurrency across six runners was 2.1 (peak 8). Six machines running at
+2.1x concurrency against a 4.8x tax lose, and no placement policy
+changes either number.
+
+Both numbers are properties of the UNIT. A fixed per-lead cost - pull the
+base, unpack it, warm nothing, throw it away - is amortised by making
+leads bigger, and only by that. At earthly's gateway granularity a lead
+is one `RUN`-ish subtree, which is far too small to carry it.
+
+Which is the same conclusion the prior-art survey reached from the other
+end, and it points somewhere specific: the distribution unit should be
+the TARGET, not the LLB subtree. That is also the unit earthbuild's own
+CI already uses - twelve `+test-no-qemu-groupN` jobs on twelve runners -
+and it is why that arrangement beats this one.
