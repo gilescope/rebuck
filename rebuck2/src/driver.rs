@@ -284,12 +284,34 @@ const SPECULATE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 /// buildkit proxy runs in THIS process, holding a client's Solve open, and
 /// answering it over a wire to ourselves would be a second transport for a
 /// question we can answer with a channel.
+/// Why a subtree came back without a result.
+///
+/// A string could not carry this. The gateway's two responses are opposite -
+/// build it here, or tell the client it failed - and until now both arrived
+/// as `Err(String)` and the first was the only one implemented.
+pub enum LeadRefusal {
+    /// Nobody took it, or nobody could. Build it at home: fail open.
+    Unplaced(String),
+    /// A peer ran the CLIENT'S OWN graph and the build failed. Rebuilding it
+    /// here would fail identically, ~40s later. Only produced when
+    /// [`crate::dispatch::trust_verdict`] allows it.
+    Verdict(String),
+}
+
+impl LeadRefusal {
+    pub fn why(&self) -> &str {
+        match self {
+            LeadRefusal::Unplaced(w) | LeadRefusal::Verdict(w) => w,
+        }
+    }
+}
+
 enum Requester {
     Worker(u64),
     /// The gateway in-process. Resolves to the image ref a peer published,
     /// or `None` for "nobody took it" - which the caller treats as "build it
     /// here", exactly as a worker does with `Unplaced`.
-    Gateway(tokio::sync::oneshot::Sender<Result<String, String>>),
+    Gateway(tokio::sync::oneshot::Sender<Result<String, LeadRefusal>>),
 }
 
 impl Requester {
@@ -316,6 +338,11 @@ struct Subtree {
     /// fleet actually SPENDS its seconds behind.
     started: std::time::Instant,
     caches: std::collections::BTreeSet<String>,
+    /// Did this go out byte-identical to what the client sent?
+    ///
+    /// Decides whether a peer's failure may be reported as the client's. See
+    /// [`crate::dispatch::trust_verdict`].
+    verbatim: bool,
 }
 
 pub struct Driver {
@@ -762,7 +789,7 @@ impl Driver {
                     // straight back out in a Lead, and the result never
                     // comes near this machine.
                     W2D::Offer { subtree, frontier } => {
-                        self.place_subtree(Requester::Worker(worker_id), subtree, frontier)
+                        self.place_subtree(Requester::Worker(worker_id), subtree, frontier, false)
                             .await;
                     }
                     // The subtree built somewhere else and is fetchable from
@@ -1511,13 +1538,21 @@ impl Driver {
         requester: Requester,
         subtree: Vec<u8>,
         frontier: Vec<Dig>,
+        // Whether this is byte-for-byte what the client sent. A worker's own
+        // Offer is never verbatim from the CLIENT's point of view: it is a
+        // branch of a graph we already rewrote.
+        verbatim: bool,
     ) {
         use prost::Message;
 
         let job = self.next_job.fetch_add(1, Ordering::Relaxed);
         let Ok(def) = bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice()) else {
-            self.unplaced(requester, job, "subtree is not a buildkit Definition")
-                .await;
+            self.unplaced(
+                requester,
+                job,
+                LeadRefusal::Unplaced("subtree is not a buildkit Definition".to_owned()),
+            )
+            .await;
             return;
         };
         let verdict = crate::dispatch::inspect(&def);
@@ -1632,7 +1667,8 @@ impl Driver {
                     who.join(", ")
                 }
             );
-            self.unplaced(requester, job, &why).await;
+            self.unplaced(requester, job, LeadRefusal::Unplaced(why.to_owned()))
+                .await;
             return;
         };
         // After the insert below there will be `len() + 1` in flight; record
@@ -1668,6 +1704,7 @@ impl Driver {
                         .map(|d| crate::dispatch::cache_ids(&d))
                         .unwrap_or_default()
                 },
+                verbatim,
             },
         );
         // Claim recorded; `tell` needs the workers lock and must not hold
@@ -1865,14 +1902,34 @@ impl Driver {
         // and must never make one wrong.
         if crate::dispatch::is_build_verdict(why) {
             crate::mech::applied("verdict_stops_retry");
-            println!(
-                "[driver] subtree job {job} FAILED on worker {who} - not re-offering, \
-                 the build itself did not succeed"
-            );
             let Some(st) = self.subtrees.lock().await.remove(&job) else {
                 return;
             };
-            self.unplaced(st.requester, job, why).await;
+            // May we hand this straight to the client, or must it be rebuilt
+            // at home to be sure? See `trust_verdict`: only a graph that
+            // went out untouched, with no cache mount travelling, and only
+            // when asked for.
+            let trusted = crate::dispatch::trust_verdict(
+                crate::dispatch::trust_peer_verdicts(),
+                st.verbatim,
+                !st.caches.is_empty(),
+            );
+            println!(
+                "[driver] subtree job {job} FAILED on worker {who} - not re-offering, the \
+                 build itself did not succeed{}",
+                if trusted {
+                    "; reporting it as the client's own"
+                } else {
+                    "; rebuilding at home to be sure"
+                }
+            );
+            let refusal = if trusted {
+                crate::mech::applied("trust_verdict");
+                LeadRefusal::Verdict(why.to_owned())
+            } else {
+                LeadRefusal::Unplaced(why.to_owned())
+            };
+            self.unplaced(st.requester, job, refusal).await;
             return;
         }
         let (next, subtree, frontier) = {
@@ -1899,14 +1956,16 @@ impl Driver {
                 let Some(st) = self.subtrees.lock().await.remove(&job) else {
                     return;
                 };
-                self.unplaced(st.requester, job, why).await;
+                self.unplaced(st.requester, job, LeadRefusal::Unplaced(why.to_owned()))
+                    .await;
             }
         }
     }
 
     /// Nobody took it. A worker hears `Unplaced` and builds it itself; the
     /// gateway gets `None` and does the same. Fail open, never fail wrong.
-    async fn unplaced(self: &Arc<Self>, requester: Requester, job: u64, why: &str) {
+    async fn unplaced(self: &Arc<Self>, requester: Requester, job: u64, refusal: LeadRefusal) {
+        let why = refusal.why();
         match requester {
             Requester::Worker(id) => {
                 self.tell(
@@ -1923,7 +1982,12 @@ impl Driver {
                 // branch used to discard, which is how the gateway came to
                 // report every refusal as "fleet took nothing" - one string
                 // covering saturation, exclusion and an empty fleet alike.
-                let _ = tx.send(Err(why.to_owned()));
+                //
+                // A WORKER requester always hears Unplaced and builds it
+                // itself, whatever the shape: telling it otherwise needs a
+                // new field on a wire message, and the cost this exists to
+                // remove is the GATEWAY's home rebuild.
+                let _ = tx.send(Err(refusal));
             }
         }
     }
@@ -2050,7 +2114,8 @@ impl Driver {
         subtree: Vec<u8>,
         frontier: Vec<Dig>,
         shared: bool,
-    ) -> Result<String, String> {
+        verbatim: bool,
+    ) -> Result<String, LeadRefusal> {
         // Keyed by the op this subtree PRODUCES, not by a job id: the id is
         // assigned inside place_subtree and reading it back afterwards is a
         // race. subtree_built already extracts the same op.
@@ -2071,9 +2136,10 @@ impl Driver {
             }
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.place_subtree(Requester::Gateway(tx), subtree, frontier)
+        self.place_subtree(Requester::Gateway(tx), subtree, frontier, verbatim)
             .await;
-        rx.await.unwrap_or_else(|_| Err("driver went away".into()))
+        rx.await
+            .unwrap_or_else(|_| Err(LeadRefusal::Unplaced("driver went away".into())))
     }
 
     /// Dispatch a subtree without a sharing hint - assume not shared.
@@ -2082,14 +2148,14 @@ impl Driver {
         self: &Arc<Self>,
         subtree: Vec<u8>,
         frontier: Vec<Dig>,
-    ) -> Result<String, String> {
+    ) -> Result<String, LeadRefusal> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.place_subtree(Requester::Gateway(tx), subtree, frontier)
+        self.place_subtree(Requester::Gateway(tx), subtree, frontier, false)
             .await;
         // A dropped sender is a driver that forgot the job; treat it as
         // unplaced rather than hanging on a Solve that will never answer.
         rx.await
-            .unwrap_or_else(|_| Err("driver dropped the job".to_owned()))
+            .unwrap_or_else(|_| Err(LeadRefusal::Unplaced("driver dropped the job".to_owned())))
     }
 
     /// A peer built it. Tell the requester where, and forget the placement -
@@ -4116,10 +4182,17 @@ mod tests {
 
         // And SAY SO. A bare no is what let five refusals across four idle
         // workers all report as "fleet took nothing".
-        let why = answer.expect_err("an empty fleet must answer, and answer no");
+        let refusal = answer.expect_err("an empty fleet must answer, and answer no");
         assert!(
-            !why.is_empty(),
+            !refusal.why().is_empty(),
             "the refusal must carry the driver's reason"
+        );
+        // And it must be UNPLACED, not a verdict. An empty fleet has not
+        // judged the build - it has not seen it - and sending a Verdict here
+        // would report a red target for a fleet that simply had no workers.
+        assert!(
+            matches!(refusal, super::LeadRefusal::Unplaced(_)),
+            "nobody took it is not the same as it failed"
         );
     }
 

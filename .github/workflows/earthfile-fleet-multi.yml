@@ -64,6 +64,10 @@ on:
         description: the baseline gets its own daemon, so the fleet's coordinator starts cold (1/0)
         type: string
         default: '1'
+      trust_verdict:
+        description: report a peer's failure as the client's when it ran the client's exact graph (1/0)
+        type: string
+        default: '0'
       seed_caches:
         description: harvest the baseline's cache mounts and start the fleet's from them (1/0)
         type: string
@@ -266,6 +270,13 @@ env:
   # Resolved in `plan` and set on the coordinator job, because it is chosen
   # by branch and a workflow-level `env:` cannot see `needs`. One place
   # states it, which is the rule the graft episode bought.
+  # OFF. The remaining +lint-all gap is four home rebuilds of a target that
+  # already failed on a peer, ~40s each - and this removes them by reporting
+  # the peer's error instead. It can also report red for a build that is
+  # green, so it is measured rather than assumed: see `trust_verdict` in
+  # dispatch.rs for the three conditions, one of which +lint-all does not
+  # meet.
+  REBUCK2_TRUST_VERDICT: ${{ inputs.trust_verdict || '0' }}
   REBUCK2_SEED_IDS: ${{ inputs.seed_ids || 'go-mod:/go/pkg/mod,go-build:/root/.cache/go-build' }}
   # A FILE, not a variable. The seeds are harvested after the proxy is
   # already running, so a variable set at that point would never reach it;

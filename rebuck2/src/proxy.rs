@@ -1486,6 +1486,7 @@ impl Wire {
                 ("read_retry", true),
                 // Also always on. A verdict is not a policy.
                 ("verdict_stops_retry", true),
+                ("trust_verdict", crate::dispatch::trust_peer_verdicts()),
                 ("min_siblings", min_siblings() > 0),
                 (
                     "prefetch",
@@ -2982,7 +2983,9 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                                                 // placements to prove it.
                                                 let r = self
                                                     .driver
-                                                    .lead_subtree_shared(bytes, Vec::new(), true)
+                                                    // A PREFIX is a graph we cut ourselves, so it is
+                                                    // by definition not what the client sent.
+                                                    .lead_subtree_shared(bytes, Vec::new(), true, false)
                                                     .await
                                                     .ok();
                                                 // A PREFIX exists precisely
@@ -3066,7 +3069,14 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         let shared_graph = self.wire.held().shared_as_sent(&def);
                         let led = self
                             .driver
-                            .lead_subtree_shared(portable.encode_to_vec(), Vec::new(), shared_graph)
+                            .lead_subtree_shared(
+                                portable.encode_to_vec(),
+                                Vec::new(),
+                                shared_graph,
+                                // Untouched? Then a peer's failure is a
+                                // statement about the client's own build.
+                                portable.def == def.def,
+                            )
                             .await;
                         t_adopt = t.elapsed().as_millis() as u64;
                         match led {
@@ -3130,8 +3140,26 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                                 // somewhere completely different: a refusal
                                 // is ours to fix, a failing build is the
                                 // build's.
+                                let refusal = why;
+                                let why = refusal.why().to_owned();
                                 let verdict = crate::dispatch::is_build_verdict(&why);
                                 let inspect_was_wrong = !verdict && why.contains("build failed");
+                                // TRUSTED means the peer ran the client's own
+                                // graph and it failed, so there is nothing to
+                                // learn from running it here again - forty
+                                // seconds a time on +lint-all, four times.
+                                // The error goes back as the answer.
+                                if let crate::driver::LeadRefusal::Verdict(_) = refusal {
+                                    self.wire.held().routed += 1;
+                                    *self
+                                        .wire
+                                        .held()
+                                        .rejected
+                                        .entry("the BUILD failed on a peer, reported as-is".into())
+                                        .or_default() += 1;
+                                    println!("[proxy] peer's verdict is the answer: {why}");
+                                    return Err(Status::unknown(why));
+                                }
                                 if self.wire.held().routed == 0 || inspect_was_wrong {
                                     println!(
                                         "[proxy] {} graph carries {:?}",

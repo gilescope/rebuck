@@ -390,6 +390,43 @@ pub fn cache_ids(def: &pb::Definition) -> BTreeSet<String> {
     out
 }
 
+/// May a peer's failure be reported to the client as the client's own?
+///
+/// The second half of [`is_build_verdict`], and the expensive half. Stopping
+/// the retry took `+lint-all` from 628s to 252s; the ~160s still left is
+/// four home rebuilds of a target that already failed on a peer.
+///
+/// Three conditions, and each removes a way of being wrong.
+///
+/// * `enabled` - off by default. A needless rebuild costs seconds; a false
+///   red costs trust in the whole rig, and those are not the same size.
+/// * `verbatim` - the dispatched definition was byte-identical to the
+///   client's. Making a graph portable rewrites local contexts into images
+///   and repoints base images at our mirror, and this project has produced
+///   failures from exactly that (`no active sessions`,
+///   `security.insecure is not allowed`). A verdict on a graph we altered
+///   is a verdict about OUR graph.
+/// * `lifted_cache` - whether a cache mount travelled. If one did, the peer
+///   ran the client's exact graph against a COLD cache, and a cold `go-mod`
+///   fetches over the network: a blip there is `exit code: 1` from `go mod
+///   download` on a build that passes everywhere else. Principle 20 from the
+///   other side - seeding a self-keying cache is safe because a wrong entry
+///   is never found, and trusting a verdict produced against a cold one is
+///   a different claim entirely.
+///
+/// Platform needs no condition: `consider` already refuses a candidate whose
+/// platform does not match the graph, so a peer that took the work matched
+/// it.
+pub fn trust_peer_verdicts() -> bool {
+    static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("REBUCK2_TRUST_VERDICT").as_deref() == Ok("1"))
+}
+
+/// See [`trust_peer_verdicts`] for the switch; this is the rule.
+pub fn trust_verdict(enabled: bool, verbatim: bool, lifted_cache: bool) -> bool {
+    enabled && verbatim && !lifted_cache
+}
+
 /// Did the BUILD fail, as opposed to the peer failing to build it?
 ///
 /// The distinction the fleet was missing. `subtree_declined` re-offers to
@@ -2014,6 +2051,36 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// When may a peer's failure be reported as the client's?
+    ///
+    /// Only when the peer ran what the client asked for. Making a graph
+    /// portable rewrites local contexts into images and repoints base images
+    /// at our mirror, and this project has produced failures from exactly
+    /// that - `no active sessions`, `security.insecure is not allowed`. A
+    /// verdict on a rewritten graph could be red where the truth is green,
+    /// which is the one direction principle 5 forbids outright.
+    #[test]
+    fn a_peers_verdict_is_the_clients_only_if_it_ran_the_clients_graph() {
+        let t = super::trust_verdict;
+        // Off unless asked for. The default has to be the safe one: a
+        // needless rebuild costs seconds, a false red costs trust in the
+        // whole rig.
+        assert!(!t(false, true, false));
+        assert!(!t(false, true, true));
+        // On, and the graph went out untouched.
+        assert!(t(true, true, false));
+        // On, but we rewrote it - so its failure is about OUR graph, not the
+        // client's.
+        assert!(!t(true, false, false));
+        // On, untouched, but a cache mount was LIFTED, so the peer ran
+        // against a cold one. `go mod download` on a cold cache needs the
+        // network, and a blip there is exit code 1 on a build that passes
+        // anywhere else. Principle 20 from the other side: seeding a
+        // self-keying cache is safe because a wrong entry is never found,
+        // and trusting a verdict from a cold one is a different claim.
+        assert!(!t(true, true, true));
+    }
+
     /// A build that FAILED is not a peer that could not.
     ///
     /// `+lint-all`: baseline 92s, fleet 628s, and four solves of ~470s each
