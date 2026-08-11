@@ -1654,3 +1654,44 @@ less because those seconds overlap other work.
 Worth recording as a hypothesis KILLED rather than a fix shipped. It cost
 one instrumented run to close, which is the point of paying for the
 instrument: the count alone had pointed the opposite way.
+
+## The whole of `+test-no-qemu`, at parity
+
+All fourteen groups, six runners, the largest target attempted:
+
+```text
+one machine 186s   6 machines 525s
+PARITY: the same 1 target(s) failed either way
+gateway solves 163 · routed 130 · peak in flight 14
+leads n=148 p50=2943ms p90=17479ms max=209141ms mean=12691ms
+op duplication 8.0x sent, 2.3x built
+```
+
+It took two fixes to get here and neither was about placement.
+
+The first was the h2 one. earthly cancels every solve still in flight the
+moment a target fails, and hyper's `max_pending_accept_reset_streams`
+defaults to TWENTY - so with 16 solves in flight plus a nested earthly per
+group, one red test produced a RST_STREAM burst, a GOAWAY, and a build
+that died everywhere at once with `transport error`. Group-sized targets
+never reached the threshold, which is exactly why the bug waited for the
+biggest target to appear.
+
+The second was in the measurement, not the code: a leg that DIES prints no
+`*failed*` markers at all, so it scored zero failed targets and beat a
+baseline that had one. The first full run was recorded as a win for the
+fleet. It is now judged on the exit code.
+
+### Why this target is the interesting one
+
+Everything before it was measured on a single group, and a single group is
+too serial to distribute: demand peaked at 8 concurrent solves, which two
+workers (4 slots each) already satisfy. That is the whole explanation for
+flat scaling - six machines were never asked for more than two machines'
+worth of work.
+
+`+test-no-qemu` is fourteen independent groups and asks for more: peak 14-17
+in flight, 148 leads against 56. It is the first workload whose shape could
+pay for six machines. It still does not - 525s against 186s - because the
+per-lead tax is unchanged, but the ceiling that made the question moot is
+gone.
