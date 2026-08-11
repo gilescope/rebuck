@@ -4288,3 +4288,28 @@ fatal; it now protects a target nobody had in mind.
 
 The remaining risk is context publishing volume in group 1, which is
 measurable and has no exclusion behind it.
+
+### `-imports` must be tested on top of `-balance`, not against the reference
+
+Noticed before spending a run on it, which is the only place noticing is
+worth anything.
+
+The imports term adds warmth mass: a candidate holding the parent scores
+another 64. Under the comparator as it stands, warmth is the FIRST sort key,
+so a bigger warmth number does not just break ties differently - it
+concentrates work harder onto whichever machine already holds the popular
+parents. That is precisely the fault `-balance` exists to fix, and it is
+worse for the machines that were already idle.
+
+So `-imports` alone can only make the 65% worse, however sound the idea is.
+Composed with `-balance` it becomes a fair question: does knowing WHERE a
+parent lives improve placement, once warmth is being traded against the
+queue rather than ranked above it?
+
+The suffixes compose in either order - verified by running the selection
+shell against `-ast-balance-imports` and `-ast-imports-balance`, which is
+how the `-ast-zstd-nobase` ordering bug was found and the only way I trust
+that loop.
+
+Sequence, then: `-balance` alone (in flight), then
+`-balance-imports`, then `-bcast`. `-minops` stays off - measured harmful.

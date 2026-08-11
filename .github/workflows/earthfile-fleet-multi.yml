@@ -60,6 +60,13 @@ on:
       - giles-dispatch-ci-ast-imports
       - giles-dispatch-ci-ast-bcast
       - giles-dispatch-ci-ast-balance
+      # -imports COMPOSED with -balance, deliberately. The imports term adds
+      # warmth mass, and under the old comparator warmth is the first sort
+      # key - so scoring parent images would concentrate work harder onto
+      # the machine already holding them, which is the fault -balance exists
+      # to fix. Tested alone it could only regress; tested on top of
+      # -balance it is a fair question.
+      - giles-dispatch-ci-ast-balance-imports
       - giles-dispatch-ci-tests-nobase
       - giles-dispatch-ci-ast-minops-nobase
       - giles-dispatch-ci-ast-seed
