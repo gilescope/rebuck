@@ -809,3 +809,49 @@ opaque until the harvested layer was pulled out of the registry with curl
 and untarred - 1.9 MB of `/bin` where a cache should have been, which named
 the bug immediately. Three earlier attempts had reasoned about the same
 symptom and got nowhere.
+
+## 24. Seed a cache only when its MISS costs more than its SHIP
+
+Pre-positioning a cache mount is not free and the bill lands per worker.
+Fourteen faults went into making it work; the first run where it worked
+shipped 300 MiB and changed nothing, which is the more useful result.
+
+The trade, in the only two numbers that matter:
+
+        worth seeding  when   miss_cost  >  ship_cost
+                              per worker    per worker
+
+Both are measurable and neither is intuitive.
+
+**Miss cost** is what a cold mount makes the build do. It is in the cost
+table already - `cache_cost` charges each lead to every id it names - and it
+divides into two kinds:
+
+| cache                                | miss path                               | seed?   |
+| ------------------------------------ | --------------------------------------- | ------- |
+| `go-build`                           | recompiling the dependency tree, on CPU | **yes** |
+| `golangci_lint`                      | re-type-checking every package, on CPU  | **yes** |
+| `go-mod`                             | `go mod download` from a fast proxy     | **no**  |
+| any download cache on a good network | a download                              | **no**  |
+
+**Ship cost** is transfer plus unpack, per worker, every run. Measured
+locally at about 3.5ms per MiB for unpack alone, so a 300 MiB seed is
+seconds - and in the one fleet run that shipped it, leads naming a seeded
+mount went from ~24s to ~29s, which is the right order for the cost and had
+nothing to show against it.
+
+A cache whose miss is a download fails this test almost always. The network
+that would fetch the modules is the same network that ships the seed, and
+the seed is bigger: 171.8 MiB of `go-mod` to avoid a `go mod download` that
+a hosted runner does in seconds is a straight loss, paid on every machine.
+
+Two corollaries worth having:
+
+- **Rank by seconds, not by size.** The biggest cache is the most tempting
+  and usually the worst candidate, because size drives ship cost directly
+  and miss cost not at all.
+- **A red target hides the answer.** `+lint-all` was chosen for this
+  measurement because it is cheap, and its golangci-lint cache harvested
+  0.0 MiB - the lint fails on the first module, so the cache that would have
+  paid never fills. The cheap target could not answer the question, and
+  nothing about the mechanism was wrong.
