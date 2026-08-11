@@ -541,6 +541,18 @@ jobs:
                   # whose four children each hide a chain. Only group2 has
                   # ever been run, and one group of fourteen is not a
                   # measurement of what distribution is worth here.
+                  #
+                  # Run it `-nobase` FIRST. The deliverable there is the
+                  # failed-target count, not a clock: fourteen groups with a
+                  # baseline leg is two hour-scale builds against a
+                  # 150-minute cap, and the last run to exceed a cap did not
+                  # degrade, it died. The cost is that a target failing under
+                  # the fleet cannot be told from one that fails anyway -
+                  # +test-ast was chosen precisely because nothing in it
+                  # fails on purpose, and that is not known to hold here. So:
+                  # -nobase for coverage, then chase individual failures, and
+                  # only pay for a baseline leg if the fleet leg comes in
+                  # well under the cap.
                   *-tests)    target=+test-no-qemu ;;
                   *-all)      target=+all ;;
                   *)          target=+test-no-qemu-group2 ;;
