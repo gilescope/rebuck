@@ -5618,3 +5618,48 @@ common ancestors rather than N independent chains.
 Recorded because a clean local run is exactly the kind of result that talks
 you into re-enabling something. The mechanism did not fire; nothing was
 tested; `-bcast` stays off.
+
+## `consumers_of` counts dissemination, not demand
+
+```rust
+async fn consumers_of(self: &Arc<Self>, op: &str) -> usize {
+    let pairs = self.op_by_worker.lock().await;
+    pairs.iter().filter(|(o, _)| o == op).map(|(_, w)| *w)
+        .collect::<BTreeSet<u64>>().len()
+}
+```
+
+`op_by_worker` is written when a subtree is **placed**. So this counts *how
+many workers have already been sent the op*, and `prefetch_image_for` gates
+on it being at least two:
+
+- an op sent to one worker scores 1, and is not prefetched
+- an op scores 2 only once **two workers already hold it**
+
+At which point pre-positioning it is pointless. **The gate opens exactly
+when the mechanism has nothing left to do.** It is not a threshold on
+demand, it is a threshold on how far the content has already spread.
+
+This explains two things that looked unrelated.
+
+**The local rig announces nothing.** Six independent builds, no op ever
+reaches a second worker, `consumers_of` never returns 2. Not because the rig
+lacks sharing in some deep sense - because the counter cannot see sharing
+that has not happened yet.
+
+**Prefetch still worked after the bare-digest fix**, firing 421 times. Those
+are the other call path: `prefetch_image_for(&image_ref, None)`, where
+`None` means "the caller already knows this is shared" - mirrored base
+images and cut prefixes. That path bypasses the gate entirely, and it is the
+only reason prefetch does anything at all.
+
+So the counting path has been dead weight since it was written, and its
+comment says the opposite:
+
+> ONE consumer is not shared content. Pushing it spends bandwidth to make
+> five machines hold what none will read.
+
+True of demand. This does not measure demand. The honest fix is to count
+what a graph NAMES rather than where it has been - `imported_images` already
+extracts exactly that, for affinity - but that is a mechanism change and it
+goes behind a flag, after a measurement, like everything else here.
