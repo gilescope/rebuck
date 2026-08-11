@@ -1273,7 +1273,7 @@ impl Wire {
     /// arrival, `spans` on completion, and eight solves run at once.
     /// Will more than one graph want this op? Asked of the SOLVES seen so
     /// far, so it is a prediction rather than a record of placements.
-    fn shared_graph(&self, def: &bollard_buildkit_proto::pb::Definition) -> bool {
+    fn shared_as_sent(&self, def: &bollard_buildkit_proto::pb::Definition) -> bool {
         def.def.iter().any(|b| {
             let d = crate::store::sha256_hex(b);
             let short = u64::from_str_radix(&d[..16], 16).unwrap_or_default();
@@ -2711,7 +2711,14 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         // it is placed. Counting placements instead lets
                         // affinity - whose job is one machine per op -
                         // suppress the pre-positioning that would help.
-                        let shared_graph = self.wire.held().shared_graph(&portable);
+                        // `&def`, NOT `&portable`, and the source guard
+                        // below enforces it: making a graph portable
+                        // rewrites every op that mentions a local context or
+                        // a base image, so the digests no longer match
+                        // anything `observe` counted and the answer comes
+                        // back a confident "not shared" for the graphs that
+                        // most are.
+                        let shared_graph = self.wire.held().shared_as_sent(&def);
                         let led = self
                             .driver
                             .lead_subtree_shared(portable.encode_to_vec(), Vec::new(), shared_graph)
@@ -3190,6 +3197,108 @@ mod tests {
         // Which must agree with the count the report already prints, or one
         // of the two numbers is wrong and nobody can tell which.
         assert_eq!(w.resends(), 2);
+    }
+
+    /// Sharedness must be asked of the graph that was OBSERVED.
+    ///
+    /// `op_solves` is keyed on the digest of each op as the client sent it.
+    /// Making a graph portable rewrites those ops - a local context becomes
+    /// an image reference, a base is repointed at our mirror - so every
+    /// digest changes and a lookup finds nothing. The answer is then a
+    /// confident "not shared" for the very graphs that are.
+    ///
+    /// The same trap cost four "warming did not help" results: a rewritten
+    /// op cannot match a cache key built from the original, for exactly this
+    /// reason.
+    #[test]
+    fn sharedness_is_a_property_of_the_graph_as_sent() {
+        use bollard_buildkit_proto::pb;
+        use prost::Message;
+
+        let stem = pb::Op {
+            op: Some(pb::op::Op::Source(pb::SourceOp {
+                identifier: "docker-image://alpine:3".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let leaf = |n: u32| pb::Op {
+            op: Some(pb::op::Op::Source(pb::SourceOp {
+                identifier: format!("local://ctx{n}"),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let sent = |n: u32| pb::Definition {
+            def: vec![stem.encode_to_vec(), leaf(n).encode_to_vec()],
+            ..Default::default()
+        };
+
+        let mut w = super::Wire::default();
+        w.observe(&sent(1));
+        assert!(
+            !w.shared_as_sent(&sent(1)),
+            "one solve is not sharing with anybody"
+        );
+        w.observe(&sent(2));
+        assert!(
+            w.shared_as_sent(&sent(1)),
+            "two solves carry the same stem, so it is shared"
+        );
+
+        // And the trap: the SAME graph, rewritten the way dispatch rewrites
+        // it before handing it to a peer.
+        let mut portable = sent(1);
+        portable.def[1] = pb::Op {
+            op: Some(pb::op::Op::Source(pb::SourceOp {
+                identifier: "docker-image://mirror/ctx@sha256:dead".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert!(
+            !w.shared_as_sent(&pb::Definition {
+                def: vec![portable.def[1].clone()],
+                ..Default::default()
+            }),
+            "a rewritten op has a digest nobody has ever counted"
+        );
+    }
+
+    /// ...and the guard that the test above cannot be.
+    ///
+    /// The invariant lives at a call site buried in a gRPC handler, where a
+    /// unit test cannot reach it, and passing the wrong `Definition` there
+    /// is silent: the answer is `false`, which is also what a genuinely
+    /// unshared graph gets. So check the source. The same shape as
+    /// `mech::source_consistency` - and for the same reason, which is that
+    /// the mechanism guard once reported OFF for a counter that was simply
+    /// never called.
+    #[test]
+    fn sharedness_is_only_ever_asked_of_the_graph_as_sent() {
+        let src = include_str!("proxy.rs");
+        let calls: Vec<&str> = src
+            .match_indices("shared_as_sent(")
+            // Method calls only: that skips the `fn` definition and this
+            // test's own mention of the name in a string literal.
+            .filter(|(i, _)| src[..*i].ends_with('.'))
+            .map(|(i, _)| {
+                let rest = &src[i + "shared_as_sent(".len()..];
+                &rest[..rest.find([',', ')']).unwrap_or(0)]
+            })
+            // Not this test's own mention of the name, nor the unit test's
+            // literals - those are asking it of a graph they just built.
+            .filter(|a| !a.starts_with("&pb::") && !a.starts_with("&sent("))
+            .collect();
+        assert!(!calls.is_empty(), "the call disappeared, so did the guard");
+        for arg in &calls {
+            assert_eq!(
+                *arg, "&def",
+                "it must be asked of `def`, the graph the client sent and \
+                 `observe` counted, never of a rewritten one"
+            );
+        }
     }
 
     /// The gateway answers gRPC at all.
