@@ -5724,3 +5724,54 @@ The 12.5x remains open. What it needs is a per-vertex comparison against the
 SAME digests on the baseline - the join that is blocked because the baseline
 bypasses the proxy - and no amount of one-sided instrumentation substitutes
 for it.
+
+## `+all` runs through the fleet: 2,724s, zero failed targets
+
+The last unrun target in earthbuild's Earthfile. `-balance -sandbox
+-nobase`, six machines, 45 minutes, and every check green:
+
+```text
+16 success  the Earthfile, through the fleet
+20 success  a fleet that distributed nothing is not a pass
+fleet failed: 0 target(s)
+
+[wire] verdict : target=+all solves=119 routed=95 home=24 peak_solves=10
+                 occupancy=0.99 ceiling=4.03 ceiling_7m=2.81 dup=1.9
+[wire] lead phases : placing 3s (0%) waiting 391s (16%) building 2103s (84%)
+[wire] home vertices : 591 ran in 24947158ms, 293 cache hit(s)
+[wire] trapped ops : 7 refused solve(s), 1810 ops, 133 past the last exclusion
+```
+
+**Zero failed targets**, 95 of 119 solves routed, and step 20 - the guard
+against a green run that distributed nothing - passed on its own terms.
+
+With that, **every named target in this Earthfile has been through the
+fleet**: `+lint-all`, `+all-binaries`, `+all-buildkitd`, `+test-ast`,
+`+test-no-qemu` and now `+all`. That is the coverage half of the brief,
+finished.
+
+### What the numbers say about it
+
+**`occupancy 0.99`.** One solve in flight at a time, on average, across six
+machines. The release chain is a chain: `+all-buildkitd` then `+all-binaries`
+then `+earthly-docker` then `+prerelease`, each mostly waiting on the last.
+`ceiling_7m 2.81` is what the graph would permit and 0.99 is what it used,
+so this target is serial in a way `+test-no-qemu` is not - fourteen
+independent groups against four dependent stages.
+
+**`building` is 84%**, the highest of any target measured. `waiting` is 16%
+and `placing` is three seconds. There is nothing here for a scheduler to
+win: the work is serial, and what parallelism exists is already taken.
+
+**Seven refused solves against 1,810 ops** - far fewer exclusions than
+`+test-no-qemu`'s 35, because the release chain builds images rather than
+running tests in them. The host-bind ceiling barely applies here.
+
+**24,947 seconds of home vertex time** in a 2,724-second leg. Nine times the
+elapsed, so buildkit is running roughly nine vertices at once on the
+coordinator - which is where a serial chain's parallelism actually lives,
+inside each stage rather than between them.
+
+So `+all` is the target that most wants a fleet by size and least by shape.
+It ran, it produced the same artifacts, and no amount of distribution will
+make a four-link chain shorter than its longest link.
