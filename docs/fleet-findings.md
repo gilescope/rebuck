@@ -5531,3 +5531,33 @@ Recorded as blocked rather than worked around. The worker half is committed
 and costs nothing; the 12.5x stays the largest open number in this document,
 and the honest statement is that measuring it needs a baseline-side
 instrument nobody has built.
+
+### A discriminator that needs no baseline
+
+The join wanted worker-time against baseline-time for the same digest. There
+is a cheaper split available from the worker alone, and it addresses the
+same question.
+
+The worker already reports, per lead, `took Xms (Y ops, Z KiB fetched in
+Wms)`. It now also reports, once, `vertices: N ran in Mms`. So:
+
+| quantity | meaning |
+| -------- | ------- |
+| sum of `took` | everything a lead cost on this worker |
+| `M` (vertex time) | what buildkit spent actually executing ops |
+| the difference | solve setup, pull, unpack, export - everything else |
+
+**If vertex time is most of lead time**, the 12.5x is genuine building: the
+fleet runs ops the baseline did not, and the answer is in what gets
+dispatched. **If vertex time is a small fraction**, the difference is
+materialisation overhead paid per lead, and unpack is the first suspect -
+the registry serves a parent in milliseconds and nothing has ever timed what
+buildkit does with it afterwards.
+
+That is the same fork the baseline join would have resolved, from one side
+only, with no new instrument and no change to the baseline. It needs one run
+of the shipped configuration - which doubles as a third reference point for
+`+test-ast` at 1050s.
+
+Worth writing down that this was available before the join was designed. The
+join is a better instrument and it is blocked; this one is worse and works.
