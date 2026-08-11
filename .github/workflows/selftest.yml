@@ -93,14 +93,17 @@ jobs:
           #   http: server gave HTTP response to HTTPS client
           #
           # having silently tried https:// first.
-          mkdir -p bkcfg
-          # printf, not a heredoc: the terminator would have to sit at column
-          # zero to end one, and an indented `TOML` simply does not - the
-          # heredoc would swallow the rest of the step.
-          printf '[registry."172.17.0.1:15000"]\n  http = true\n  insecure = true\n' \
-            > bkcfg/buildkitd.toml
+          # EARTHLY's mechanism, not upstream buildkit's. This image has its
+          # own entrypoint: it runs `envsubst </etc/buildkitd.toml.template
+          # >/etc/buildkitd.toml` and appends
+          # ${EARTHLY_ADDITIONAL_BUILDKIT_CONFIG} to the end. There is no
+          # /etc/buildkit directory at all, so a bind mount there is a
+          # directory the daemon never opens - which is what the previous
+          # attempt did, silently.
           docker run -d --name smoke-bk --privileged -p 28372:8372 \
-            -v "$PWD/bkcfg:/etc/buildkit:ro" \
+            -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG='[registry."172.17.0.1:15000"]
+            http = true
+            insecure = true' \
             -e BUILDKIT_TCP_TRANSPORT_ENABLED=true -e BUILDKIT_TLS_ENABLED=false \
             earthbuild/buildkitd:v0.8.17 >/dev/null
           # PULL-THROUGH ON. A sessionless solve cannot reach Docker Hub -
