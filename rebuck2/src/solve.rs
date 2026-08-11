@@ -753,6 +753,53 @@ pub async fn daemon_platforms(bk_addr: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// What a failed solve actually printed, from `Control.Status`.
+///
+/// A `Solve` answers with a code and a sentence. The container's own output
+/// goes to the STATUS stream instead, keyed by the solve's ref: the
+/// `cp: can't stat` or the `go: module lookup failed` that says WHY. Nothing
+/// in this crate was reading it. So every failed subtree in every run so far has
+/// reported its exit code and thrown away its reason, and the seeding
+/// harvest spent three attempts on `exit code: 1` with nothing to read.
+///
+/// Best effort by construction: it is opened alongside the solve and
+/// whatever has arrived by the time the solve fails is what gets printed. A
+/// diagnostic that can fail a build is worse than no diagnostic.
+async fn tail_logs(addr: &str, solve_ref: &str, lines: usize) -> Vec<String> {
+    let Ok(mut c) = connect(addr).await else {
+        return Vec::new();
+    };
+    let Ok(stream) = c
+        .status(control::StatusRequest {
+            r#ref: solve_ref.to_owned(),
+        })
+        .await
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut stream = stream.into_inner();
+    // BOUNDED. A busy daemon can stream for as long as the build runs, and
+    // this is called after the build is already over - but "already over"
+    // is a race, so the wait is capped rather than trusted.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    while let Ok(Ok(Some(msg))) = tokio::time::timeout_at(deadline, stream.message()).await {
+        for l in &msg.logs {
+            let text = String::from_utf8_lossy(&l.msg);
+            for line in text.lines() {
+                if !line.trim().is_empty() {
+                    out.push(line.to_owned());
+                }
+            }
+        }
+    }
+    if out.len() > lines {
+        out.split_off(out.len() - lines)
+    } else {
+        out
+    }
+}
+
 pub async fn build_subtree(
     bk_addr: &str,
     registry: &str,
@@ -763,11 +810,29 @@ pub async fn build_subtree(
     // No session: measured, buildkit accepts a solve without one when the
     // build has no local sources and needs no registry auth, and a
     // dispatched subtree has neither.
-    let resp = c
-        .solve(solve_request(job, def, registry, ""))
-        .await
-        .map_err(|e| anyhow::anyhow!("solve: {} {}", e.code(), e.message()))?
-        .into_inner();
+    let req = solve_request(job, def, registry, "");
+    // Kept, so the status stream can be asked about this exact solve.
+    let solve_ref = req.r#ref.clone();
+    let resp = match c.solve(req).await {
+        Ok(r) => r.into_inner(),
+        Err(e) => {
+            // THE CONTAINER'S OWN WORDS. `solve` answers with a code and a
+            // sentence; the `cp: can't stat` that says why is on the status
+            // stream, and discarding it has cost three attempts on one
+            // `exit code: 1`.
+            let tail = tail_logs(bk_addr, &solve_ref, 20).await;
+            if !tail.is_empty() {
+                println!(
+                    "[solve] what the build printed, last {} line(s):",
+                    tail.len()
+                );
+                for l in &tail {
+                    println!("[solve]   {l}");
+                }
+            }
+            return Err(anyhow::anyhow!("solve: {} {}", e.code(), e.message()));
+        }
+    };
     // BY DIGEST, not by the tag we pushed to.
     //
     // A tag lives in ONE registry's mutable namespace. The requester is on
