@@ -96,6 +96,28 @@ fn default_session() -> String {
     std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "local".into())
 }
 
+/// Is the harvest's base image actually there to be pulled?
+///
+/// Checked before any solve, because the alternative is buildkit's version
+/// of the same news: `failed to load cache key: <ref>: not found`, which
+/// names the cache key it was computing and not the image it could not
+/// resolve. Two of the eleven faults in this path presented that way.
+///
+/// The registry's pull-through covers BLOBS, not manifest tags, so a public
+/// image has to be put there deliberately - `docker push` from the host, or
+/// `mirror_image` through a peer with a session. This says so rather than
+/// leaving it to be rediscovered.
+async fn base_is_reachable(base: &str) -> anyhow::Result<()> {
+    match crate::solve::image_blobs(base).await {
+        Some(b) if !b.is_empty() => Ok(()),
+        _ => anyhow::bail!(
+            "base image {base} does not resolve. The registry proxies blobs, not manifest \
+             tags, so a public image is not there unless it was put there - push it in \
+             (`docker push 127.0.0.1:<port>/library/...`) or name one the registry holds."
+        ),
+    }
+}
+
 /// One cache mount, out of a daemon and into the registry.
 async fn harvest_one(
     bk: &str,
@@ -291,6 +313,7 @@ async fn main() -> Result<()> {
             // Best effort per pair, like the step it replaces: a cache that
             // cannot be harvested leaves that mount cold, which is what it
             // was anyway.
+            base_is_reachable(&base).await?;
             let mut failed = 0usize;
             for (id, dest) in &pairs {
                 if let Err(e) = harvest_one(&bk, &registry, &base, id, dest).await {
@@ -333,6 +356,7 @@ async fn main() -> Result<()> {
             let (src, dst) = (format!("seedcheck-src-{n}"), format!("seedcheck-dst-{n}"));
             let marker = "rebuck2-seed-marker";
 
+            base_is_reachable(&base).await?;
             println!("[check] writing {marker} into cache {src}");
             solve::build_subtree(
                 &bk,
