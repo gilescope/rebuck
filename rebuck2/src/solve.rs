@@ -586,20 +586,54 @@ pub fn manifest_blobs(json: &str) -> Vec<crate::mesh::Dig> {
 ///
 /// Best effort by design: this feeds a PREFETCH, and a prefetch that cannot
 /// find out what to fetch leaves the lazy path untouched.
-pub async fn image_blobs(image_ref: &str) -> Option<Vec<crate::mesh::Dig>> {
+/// The registry URL that would return this image's manifest.
+///
+/// `Err` names what is missing. The caller used to fold every failure into
+/// one `None` and print "could not read the manifest", which appeared 412
+/// times in a single run without ever saying whether the reference was
+/// unparseable, the host unreachable, or the registry unhappy - three faults
+/// with three different fixes and one message.
+pub fn manifest_url(image_ref: &str) -> std::result::Result<String, String> {
     let r = image_ref
         .strip_prefix("docker-image://")
         .unwrap_or(image_ref);
-    let (host, rest) = r.split_once('/')?;
+    let Some((host, rest)) = r.split_once('/') else {
+        return Err(format!(
+            "{r}: no host - a manifest URL needs `host/repo@digest` or \
+             `host/repo:tag`, and a bare digest names content without saying \
+             where to ask for it"
+        ));
+    };
     let (repo, reference) = match rest.rsplit_once('@') {
         Some((repo, dig)) => (repo, dig.to_owned()),
-        None => {
-            let (repo, tag) = rest.rsplit_once(':')?;
-            (repo, tag.to_owned())
+        None => match rest.rsplit_once(':') {
+            Some((repo, tag)) => (repo, tag.to_owned()),
+            None => {
+                return Err(format!(
+                    "{r}: no tag and no digest - nothing after `{rest}` to \
+                     identify which manifest"
+                ))
+            }
+        },
+    };
+    Ok(format!("http://{host}/v2/{repo}/manifests/{reference}"))
+}
+
+/// The blobs an image is made of, or the reason we could not find out.
+///
+/// Reports rather than returns the reason, because every caller so far wants
+/// it printed and none can act on it. Silence here cost two runs: prefetch
+/// announced nothing at all in either, and the log said only that a manifest
+/// could not be read.
+pub async fn image_blobs(image_ref: &str) -> Option<Vec<crate::mesh::Dig>> {
+    let url = match manifest_url(image_ref) {
+        Ok(u) => u,
+        Err(why) => {
+            println!("[solve] no manifest URL for {why}");
+            return None;
         }
     };
-    let url = format!("http://{host}/v2/{repo}/manifests/{reference}");
-    let body = reqwest::Client::new()
+    let res = match reqwest::Client::new()
         .get(&url)
         .header(
             "Accept",
@@ -608,10 +642,32 @@ pub async fn image_blobs(image_ref: &str) -> Option<Vec<crate::mesh::Dig>> {
         )
         .send()
         .await
-        .ok()?
-        .text()
-        .await
-        .ok()?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            println!("[solve] {url}: {e}");
+            return None;
+        }
+    };
+    // A NON-2xx is not the same as an unreachable registry, and folding them
+    // together is what made 412 identical lines out of what may well be two
+    // different problems. The body is read either way - a registry's error
+    // body is often the only statement of what it objected to.
+    let status = res.status();
+    let body = match res.text().await {
+        Ok(b) => b,
+        Err(e) => {
+            println!("[solve] {url}: {status}, body unreadable: {e}");
+            return None;
+        }
+    };
+    if !status.is_success() {
+        println!(
+            "[solve] {url}: {status} {}",
+            body.chars().take(160).collect::<String>()
+        );
+        return None;
+    }
     Some(manifest_blobs(&body))
 }
 
@@ -976,6 +1032,37 @@ pub fn published_reference(
 
 #[cfg(test)]
 mod tests {
+    /// "Could not read the manifest" is four different faults.
+    ///
+    /// It printed 412 times in one run and 82 in another - prefetch, the
+    /// mechanism meant to fix cross-machine repetition, failing on every
+    /// single image - and the message names none of: an unparseable
+    /// reference, an unreachable host, a registry that answered with an
+    /// error, or a manifest with no layers. Each wants a different fix and
+    /// the log cannot tell them apart, so two runs of evidence say only
+    /// "something is wrong somewhere".
+    #[test]
+    fn a_manifest_url_says_why_it_could_not_be_built() {
+        let u = super::manifest_url;
+        assert_eq!(
+            u("docker-image://reg:15000/rebuck2/base@sha256:abc").unwrap(),
+            "http://reg:15000/v2/rebuck2/base/manifests/sha256:abc"
+        );
+        assert_eq!(
+            u("reg:15000/lib/busybox:1").unwrap(),
+            "http://reg:15000/v2/lib/busybox/manifests/1"
+        );
+        // A BARE digest is the shape that would fail silently: no host, no
+        // repo, nothing to build a URL from. It must name itself.
+        let e = u("sha256:abcdef").unwrap_err();
+        assert!(e.contains("sha256:abcdef"), "{e}");
+        assert!(e.contains("host"), "says what is missing: {e}");
+        // Host but no tag and no digest - equally unusable, equally silent
+        // before.
+        let e = u("reg:15000/rebuck2/base").unwrap_err();
+        assert!(e.contains("tag") || e.contains("digest"), "{e}");
+    }
+
     /// How our own layers are compressed, because unpack is the bottleneck.
     ///
     /// 87% of lead time in a measured run was in the seventeen leads that

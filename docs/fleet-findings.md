@@ -3834,3 +3834,36 @@ it. Every stats request failed and the code fell back to the previous
 sample, so the failure looked exactly like a clean flat line. The same
 address confusion is already documented three sections up in a different
 guise; it now has a `--stats` flag and a comment saying why.
+
+## Prefetch has never worked for subtree results
+
+```text
+412 [driver] prefetch: could not read the manifest for <img>
+```
+
+412 out of 412 in the ungated `+test-ast` run; 82 of 88 in the gated one.
+The six that worked were mirrored base images. Every subtree result failed,
+in every run, since prefetch was written.
+
+The cause is one line, and it is not a bug in prefetch. `published_reference`
+returns a **bare `sha256:...`** on purpose - a digest names content rather
+than a location, and that is precisely what lets a result travel between
+machines. `image_blobs` then tries `split_once('/')` to build
+`http://host/v2/repo/manifests/...`, finds no host, and returns `None`. One
+`None`, one message, no reason.
+
+So the mechanism aimed squarely at cross-machine repetition - the thing the
+93x re-serve ratio now points at - has been announcing nothing at all for
+its entire life, while reporting `PREFETCH=1` as enabled and printing a
+"prefetching, shared before it was placed" line just above each failure.
+
+The fix needs no URL. A manifest is a blob addressed by its own digest, and
+`FleetBlobs::by_hash` is already how the coordinator's registry reaches a
+blob some worker holds - the same path a lead's result takes. A bare digest
+now goes through it and the layers get announced.
+
+`image_blobs` also stopped folding four faults into one silence:
+unparseable reference, unreachable host, non-2xx from the registry, and a
+manifest with no layers each say so, with the URL and the status. `mech.rs`
+was built to catch a mechanism that is on and never applied; it cannot
+catch one that runs, fails, and says so in a message that names no cause.

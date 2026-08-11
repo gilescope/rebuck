@@ -1901,10 +1901,44 @@ impl Driver {
             // indistinguishable from a mechanism that ran and found nothing
             // to do. Several mechanisms here have been measured as "no
             // effect" while silently not running.
-            match crate::solve::image_blobs(&r).await {
+            // A BARE DIGEST has no host and no repo, so there is no URL to
+            // GET - and that is what every subtree result is.
+            // `published_reference` returns `sha256:...` deliberately, because
+            // a digest names content rather than a location and that is what
+            // lets a result travel between machines at all.
+            //
+            // So prefetch has NEVER worked for subtree results. It printed
+            // "could not read the manifest" 412 times in one run and 82 in
+            // another, which is every image it was ever handed by this path,
+            // while the six that succeeded were mirrored base images with a
+            // host in front of them.
+            //
+            // The driver does not need a URL. A manifest is a blob addressed
+            // by its own digest, and `FleetBlobs::by_hash` is exactly how the
+            // coordinator's registry already reaches a blob some worker holds.
+            let blobs = match crate::solve::manifest_url(&r) {
+                Ok(_) => crate::solve::image_blobs(&r).await,
+                Err(_) => {
+                    use crate::registry::FleetBlobs;
+                    match this.by_hash(r.trim_start_matches("sha256:")).await {
+                        Some(bytes) => match std::str::from_utf8(&bytes) {
+                            Ok(json) => Some(crate::solve::manifest_blobs(json)),
+                            Err(_) => {
+                                println!("[driver] prefetch: {r} is not a manifest");
+                                None
+                            }
+                        },
+                        None => {
+                            println!("[driver] prefetch: nobody in the fleet holds {r}");
+                            None
+                        }
+                    }
+                }
+            };
+            match blobs {
                 Some(d) if !d.is_empty() => this.prefetch_everywhere(d).await,
                 Some(_) => println!("[driver] prefetch: {r} names no blobs"),
-                None => println!("[driver] prefetch: could not read the manifest for {r}"),
+                None => {}
             }
         });
     }
