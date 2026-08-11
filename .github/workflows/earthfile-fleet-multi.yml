@@ -73,6 +73,7 @@ on:
       # so the control-leg discipline that governs the -ast experiments does
       # not apply: use the good config and find out what breaks.
       - giles-dispatch-ci-tests-balance-nobase
+      - giles-dispatch-ci-tests-balance-w12-nobase
       - giles-dispatch-ci-ast-minops-nobase
       - giles-dispatch-ci-ast-seed
       - giles-dispatch-ci-lint-graft
@@ -473,6 +474,12 @@ jobs:
     steps:
       - id: n
         env:
+          # `-w<N>` in the branch name, because workflow_dispatch inputs are
+          # unreachable for a workflow that lives off the default branch and
+          # six is not a law of nature. +test-no-qemu has fourteen
+          # independent branches; on six machines its ceiling is six however
+          # good the scheduler is, so testing "the workload sets the ceiling"
+          # needs the machine count to be a variable too.
           W: ${{ inputs.workers || '6' }}
           T: ${{ inputs.target || '' }}
           SEED: ${{ inputs.seed_caches || '' }}
@@ -482,6 +489,17 @@ jobs:
         run: |
           set -euo pipefail
           # A count or an explicit list - both are things a human types.
+          # ANYWHERE in the name, not only at the end. The first version
+          # anchored the digits to the end of the branch, so
+          # `-tests-balance-w12-nobase` silently fell through to six - a
+          # branch that says twelve and runs six is the worst possible
+          # outcome for a machine-count experiment.
+          case "$REF" in
+            *-w[0-9]*)
+              rest=${REF##*-w}
+              W=${rest%%[!0-9]*}
+              ;;
+          esac
           case "$W" in
             \[*) list="$W" ;;
             *[!0-9]*) echo "::error::workers must be a count or a JSON list, got '$W'"; exit 1 ;;
@@ -519,6 +537,13 @@ jobs:
           workload=$REF
           while :; do
             before=$workload
+            # `-w<N>` is a GLOB, not a fixed string: the count is part of
+            # the suffix. Two patterns because `%` removes the shortest
+            # match, so `-w12` needs the two-digit one and `-w8` the
+            # one-digit one, and trying only the short pattern on `-w12`
+            # leaves a stray `1` on the workload.
+            workload=${workload%-w[0-9]}
+            workload=${workload%-w[0-9][0-9]}
             for suffix in -seed -graft -arm -zstd -minops -imports -bcast -balance -nobase; do
               # QUOTED: unquoted, `$suffix` is taken as a glob pattern
               # rather than a literal, which shellcheck SC2295 catches and
