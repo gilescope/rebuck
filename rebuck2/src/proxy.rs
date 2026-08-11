@@ -1094,6 +1094,35 @@ pub fn ceiling(spans: &[Span]) -> f64 {
     1.0 / s
 }
 
+/// [`ceiling`] with a finite number of machines, which is the useful form.
+///
+/// `1/s` is Amdahl with infinitely many processors. A six-machine run
+/// reported 17.09x that way, which invites precisely the wrong conclusion -
+/// six machines cannot go nine times faster than six machines, so the
+/// deficit against 17x is arithmetic rather than a scheduler failing. The
+/// finite form is
+///
+/// ```text
+///                    1
+///     speedup = -------------
+///               s + (1 - s)/N
+/// ```
+///
+/// Both are printed. The infinite one says what the GRAPH allows and does
+/// not change when a machine is added; the finite one says what THIS fleet
+/// could have done, and is the one to put beside a wall clock.
+pub fn ceiling_with(infinite: f64, machines: usize) -> f64 {
+    if machines == 0 {
+        return 1.0;
+    }
+    let n = machines as f64;
+    if !infinite.is_finite() {
+        return n;
+    }
+    let s = (1.0 / infinite).clamp(0.0, 1.0);
+    1.0 / (s + (1.0 - s) / n)
+}
+
 /// How many solves were running at once, and how much of the wall clock that
 /// filled.
 ///
@@ -1573,8 +1602,9 @@ impl Wire {
              (1.00 = a queue)"
         );
         println!(
-            "[wire] amdahl ceiling : {ceiling:.2}x - the most ANY fleet could do to this \
-             graph, from the {:.0}% of wall clock with one solve in flight",
+            "[wire] amdahl ceiling : {ceiling:.2}x with infinite machines, from the {:.0}% of \
+             wall clock with one solve in flight - see `verdict` for the same figure at the \
+             machine count actually present, which is the one to put beside a clock",
             if ceiling > 0.0 { 100.0 / ceiling } else { 0.0 }
         );
         println!(
@@ -2205,12 +2235,21 @@ pub async fn serve(
         let costs = driver_for_report.cache_costs().await;
         let peak = driver_for_report.peak_inflight();
         let (uniq, total_ops, pairs) = driver_for_report.op_duplication().await;
+        // Counted HERE, before the `solo` guard below is taken. That guard
+        // is a std Mutex and is not Send, so awaiting anything while it is
+        // alive makes the whole SIGINT task non-Send - the same shape as the
+        // `if let` scrutinee that once held a lock across a dispatch.
+        //
+        // Plus peer 0, which is a machine even with HOME_SLOTS=0: it runs
+        // the gateway, the registry, and anything nobody else would take.
+        let machines = driver_for_report.worker_count().await + 1;
         // `peak_solves` is NOT `peak` a few lines up. That one counts
         // subtrees the driver had in flight; this counts client Solves
         // overlapping. They differ - a solve can be waiting on a subtree
         // somebody else is building - and conflating them would report the
         // fleet as busier or idler than it was.
         let (peak_solves, occupancy, ceiling) = wire.held().report();
+        let finite = ceiling_with(ceiling, machines);
         let solo = solo.held();
         let medians: std::collections::BTreeMap<usize, u64> = solo
             .iter()
@@ -2257,7 +2296,8 @@ pub async fn serve(
             println!(
                 "[wire] verdict        : target={} solves={} routed={} home={} peak_solves={peak_solves} \
                  inflight={peak} \
-                 occupancy={occupancy:.2} ceiling={ceiling:.2} dup={:.1} mounts_ms={} \
+                 occupancy={occupancy:.2} ceiling={ceiling:.2} ceiling_{machines}m={finite:.2} \
+                 dup={:.1} mounts_ms={} \
                  mount_leads={}",
                 std::env::var("REBUCK2_TARGET").unwrap_or_else(|_| "?".into()),
                 w.solves,
@@ -3684,6 +3724,30 @@ mod tests {
         assert!((c - 1.1).abs() < 0.01, "ceiling {c}, wanted 1.10");
 
         assert_eq!(super::ceiling(&[]), 1.0);
+    }
+
+    /// The ceiling that matters has a machine count in it.
+    ///
+    /// `1/s` is Amdahl with infinitely many processors, and a run reported
+    /// 17.09x for a six-machine fleet - a number that invites exactly the
+    /// wrong conclusion, since six machines cannot go nine times faster than
+    /// six machines. The finite form is
+    ///
+    ///     speedup = 1 / (s + (1 - s)/N)
+    #[test]
+    fn the_finite_ceiling_is_bounded_by_the_machines_present() {
+        let f = super::ceiling_with;
+        // 6% serial over six machines: not 17x.
+        let c = f(1.0 / 0.06, 6);
+        assert!((c - 4.62).abs() < 0.02, "{c}");
+        // One machine can never beat itself.
+        assert!((f(1.0 / 0.06, 1) - 1.0).abs() < 1e-9);
+        // Wholly serial stays 1 however many machines watch.
+        assert!((f(1.0, 64) - 1.0).abs() < 1e-9);
+        // Wholly parallel reaches the machine count and stops there.
+        assert!((f(f64::INFINITY, 6) - 6.0).abs() < 1e-9);
+        // And zero machines is not a division.
+        assert!((f(4.0, 0) - 1.0).abs() < 1e-9);
     }
 
     /// Sharedness must be asked of the graph that was OBSERVED.

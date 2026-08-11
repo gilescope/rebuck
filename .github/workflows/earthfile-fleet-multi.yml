@@ -712,6 +712,14 @@ jobs:
       # Only so the one-line verdict can name itself. Nothing dispatches on
       # it - a target name is an earthly concept and the proxy sees LLB.
       REBUCK2_TARGET: ${{ needs.plan.outputs.target }}
+      # ONE path for the binary in this job. It was written out twice and
+      # the copies disagreed: the proxy step had `./rebuck2-repo/...` and
+      # the harvest step `./rebuck2/...`, which is the WORKER job's layout.
+      # The harvest then reported `No such file or directory` for both cache
+      # ids and the run measured an unseeded fleet - correctly labelled as
+      # one, because the step warns rather than assuming success, which is
+      # the only reason it took a minute to find instead of a run.
+      RB: ./rebuck2-repo/rebuck2/target/release/rebuck2
     # 150, not 60. Sized for ONE group when that is what this built; the
     # whole `+test-no-qemu` is twelve of them and runs TWICE - baseline then
     # fleet. The first attempt was killed at 60 minutes, 51 of them into a
@@ -977,7 +985,7 @@ jobs:
           LAN=$(hostname -I | awk '{print $1}')
           echo "LAN=$LAN" >> "$GITHUB_ENV"
           REBUCK2_MIRROR=172.17.0.1:15000 \
-            ./rebuck2-repo/rebuck2/target/release/rebuck2 buildkit-proxy \
+            "$RB" buildkit-proxy \
               --listen 0.0.0.0:1234 \
               --upstream "http://$BK_ADDR" \
               --registry-bind 0.0.0.0:15000 \
@@ -1142,6 +1150,12 @@ jobs:
         run: |
           set -uo pipefail
           : > "$REBUCK2_CACHE_SEEDS_FILE"
+          # Named before the loop, so a wrong path is one line and not two
+          # warnings that look like the mechanism failing.
+          if [ ! -x "$RB" ]; then
+            echo "::error::no rebuck2 binary at $RB - nothing can be harvested"
+            exit 0
+          fi
           if ! docker inspect base-bk >/dev/null 2>&1; then
             echo "::warning::no base-bk to harvest from (fresh_fleet=0?) - the fleet stays cold"
             exit 0
@@ -1155,7 +1169,7 @@ jobs:
             # layer and a missing one harvests nothing; either leaves the
             # worker exactly as cold as it is today, which is the whole
             # safety argument for doing this at all.
-            out=$(./rebuck2/target/release/rebuck2 harvest-cache \
+            out=$("$RB" harvest-cache \
                     --bk "$LAN:28372" --registry "172.17.0.1:15000" \
                     --id "$id" --dest "$path" 2>&1) || {
               echo "::warning::harvest $id failed"; echo "$out" | tail -5; continue; }
