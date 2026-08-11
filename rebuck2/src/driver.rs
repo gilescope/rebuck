@@ -1973,7 +1973,17 @@ impl Driver {
         // the large layers are, 65 MiB apiece - reached neither, so prefetch
         // announced 2 blobs a time when the base chain is 26 blobs and 527
         // MiB. Third mechanism on this branch built and left unconnected.
-        if let Some(op) = self.job_terminal.lock().await.remove(&job) {
+        // The guard is DROPPED before the call, and that is the whole
+        // point: a temporary in an `if let` scrutinee lives for the entire
+        // body, so the previous form held `job_terminal` across an await
+        // that goes on to take `op_by_worker` and `workers` - while
+        // `place_subtree` needs `job_terminal` to dispatch at all.
+        //
+        // Symptom: routed fell from 94 to 7-8 the moment prefetch was
+        // switched on, across three runs, and a fleet that routes eight
+        // solves is not a fleet.
+        let terminal = { self.job_terminal.lock().await.remove(&job) };
+        if let Some(op) = terminal {
             self.prefetch_image_for(&image_ref, Some(&op)).await;
         }
         match st.requester {
