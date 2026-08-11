@@ -267,18 +267,70 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
         let store = store.clone();
         let ctrl = ctrl_send.clone();
         tokio::spawn(async move {
-            let mut last_n = usize::MAX;
+            // Seeded ONCE from disk, then maintained by insertion. A bloom is
+            // additive - inserting sets bits and never clears them - so it
+            // never needs rebuilding from a directory walk. That walk is why
+            // the tick was 30 seconds, and 30 seconds is longer than the
+            // window in which a freshly-fetched share is worth anything.
+            let mut held: Vec<String> = store.list_hashes();
+            let mut bloom = mesh::Bloom::with_capacity(held.len().max(1024));
+            for h in &held {
+                bloom.insert(h);
+            }
+            let mut sized_for = held.len().max(1024);
+            let mut dirty = true;
             loop {
-                let hashes = store.list_hashes();
-                if hashes.len() != last_n {
-                    last_n = hashes.len();
-                    let mut bloom = mesh::Bloom::with_capacity(hashes.len());
-                    for h in &hashes {
+                // Drain what the store has gained since the last pass.
+                {
+                    let (lock, _) = &*crate::store::GAINED;
+                    if let Ok(mut g) = lock.lock() {
+                        if g.resync {
+                            // The cap was hit and records were dropped, so
+                            // the in-memory filter can no longer be trusted
+                            // to be complete. One walk, then incremental
+                            // again - the old behaviour as a fallback rather
+                            // than as the design.
+                            g.resync = false;
+                            g.hashes.clear();
+                            drop(g);
+                            held = store.list_hashes();
+                            sized_for = held.len().max(1024);
+                            bloom = mesh::Bloom::with_capacity(sized_for);
+                            for h in &held {
+                                bloom.insert(h);
+                            }
+                            dirty = true;
+                        } else if !g.hashes.is_empty() {
+                            for h in g.hashes.drain(..) {
+                                bloom.insert(&h);
+                                held.push(h);
+                            }
+                            dirty = true;
+                        }
+                    }
+                }
+                // RESIZE when the filter is past what it was sized for, or
+                // its false-positive rate climbs and peers start being asked
+                // for blobs they do not have. Sizing is 12 bits an element
+                // rounded to a power of two, so this happens O(log N) times
+                // across a whole run, not per tick.
+                if held.len() > sized_for {
+                    sized_for = held.len() * 2;
+                    bloom = mesh::Bloom::with_capacity(sized_for);
+                    for h in &held {
                         bloom.insert(h);
                     }
-                    if mesh::send_frame(&mut *ctrl.lock().await, &W2D::Holdings { bloom })
-                        .await
-                        .is_err()
+                }
+                if dirty {
+                    dirty = false;
+                    if mesh::send_frame(
+                        &mut *ctrl.lock().await,
+                        &W2D::Holdings {
+                            bloom: bloom.clone(),
+                        },
+                    )
+                    .await
+                    .is_err()
                     {
                         return;
                     }
@@ -293,9 +345,15 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                 // was meant to replace. Strictly worse than not splitting.
                 //
                 // A share that nobody can see has not been shared.
+                // Woken by a blob landing; the timer is only a safety net
+                // now that nothing depends on it for latency.
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(30)) => {}
-                    _ = HOLDINGS_CHANGED.notified() => {}
+                    _ = crate::store::GAINED.1.notified() => {
+                        // Coalesce a burst: a hundred blobs arriving in a
+                        // second should be one gossip, not a hundred.
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
                 }
             }
         });
@@ -362,13 +420,8 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                         }
                     }
                     println!("[worker] prefetched {got}/{share} of my share ({n} announced)");
-                    // TELL THE FLEET NOW. The whole point of taking a share
-                    // is that the others can take theirs from here; waiting
-                    // for the next tick to say so is the difference between
-                    // a cascade and six machines each fetching everything.
-                    if got > 0 {
-                        HOLDINGS_CHANGED.notify_waiters();
-                    }
+                    // No explicit wake needed: the store fires on every
+                    // blob it gains, so a fetched share announces itself.
                 });
                 continue;
             }
@@ -567,14 +620,8 @@ async fn serve_get(
 /// Split out of the control loop so the decision chain is readable in one
 /// place: the checks run in the order `dispatch::consider` defines, and the
 /// build only happens after all of them pass.
-/// Woken when this worker gains blobs worth telling the fleet about.
-///
-/// Gossip is otherwise a 30s tick, which is longer than the window in which
-/// a prefetched share would be useful to anybody.
-static HOLDINGS_CHANGED: std::sync::LazyLock<tokio::sync::Notify> =
-    std::sync::LazyLock::new(tokio::sync::Notify::new);
-
-/// Which peer is responsible for pulling this blob from the driver first.
+// No explicit wake needed: the store fires on every
+// blob it gains, so a fetched share announces itself./// Which peer is responsible for pulling this blob from the driver first.
 ///
 /// The seed is one machine wide today: the first worker to want the base
 /// finds nothing on any peer and pulls all of it from the coordinator - 75

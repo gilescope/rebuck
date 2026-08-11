@@ -396,6 +396,40 @@ pub async fn recv_raw(r: &mut RecvStream, size: u64) -> Result<Vec<u8>> {
 mod tests {
 
     #[test]
+    fn a_bloom_is_additive_so_it_never_needs_rebuilding() {
+        use super::Bloom;
+
+        // The property the incremental gossip loop rests on: inserting sets
+        // bits and never clears them, so a filter maintained by insertion is
+        // identical to one rebuilt from the whole set. If that were false,
+        // dropping the 256-directory walk would silently lose holdings and
+        // peers would stop being asked for blobs they actually have.
+        let hashes: Vec<String> = (0..500).map(|n| format!("{n:064x}")).collect();
+
+        let mut built_once = Bloom::with_capacity(1024);
+        for h in &hashes {
+            built_once.insert(h);
+        }
+
+        let mut incremental = Bloom::with_capacity(1024);
+        for h in &hashes[..200] {
+            incremental.insert(h);
+        }
+        // ... time passes, more blobs land ...
+        for h in &hashes[200..] {
+            incremental.insert(h);
+        }
+
+        assert_eq!(
+            built_once.bits, incremental.bits,
+            "insertion order and batching must not change the filter"
+        );
+        for h in &hashes {
+            assert!(incremental.contains(h), "lost {h}");
+        }
+    }
+
+    #[test]
     fn prefetch_is_the_last_variant_and_stays_there() {
         use super::D2W;
 

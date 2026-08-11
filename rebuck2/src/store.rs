@@ -13,6 +13,44 @@ use crate::mesh::Dig;
 /// sha256 of the empty string — REAPI clients assume it exists without upload.
 pub const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+/// Hashes this process's CAS has gained, for whoever is gossiping them.
+///
+/// A bloom filter is ADDITIVE - inserting sets bits and never clears them -
+/// so a holdings filter never needs rebuilding from disk. Insert each new
+/// hash as it lands, O(k) apiece, and the 256-directory walk disappears
+/// entirely. That is what makes prompt gossip affordable: the walk is why
+/// the tick was 30 seconds, and 30 seconds is longer than the window in
+/// which a freshly-fetched share is worth anything to anyone.
+///
+/// Bounded, and the bound has a purpose. If nobody drains this - a driver
+/// process gossips nothing - it must not grow without limit, so past the cap
+/// it stops recording and asks for a resync instead. A consumer that sees
+/// `resync` walks the tree once and starts again, which is the old behaviour
+/// as a fallback rather than as the design.
+#[derive(Debug, Default)]
+pub struct Gained {
+    pub hashes: Vec<String>,
+    pub resync: bool,
+}
+
+pub static GAINED: std::sync::LazyLock<(std::sync::Mutex<Gained>, tokio::sync::Notify)> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Record a blob this process now holds, and wake anyone gossiping.
+pub fn note_gained(hash: &str) {
+    const CAP: usize = 50_000;
+    {
+        let Ok(mut g) = GAINED.0.lock() else { return };
+        if g.hashes.len() >= CAP {
+            g.hashes.clear();
+            g.resync = true;
+        } else {
+            g.hashes.push(hash.to_owned());
+        }
+    }
+    GAINED.1.notify_waiters();
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let d = Sha256::digest(bytes);
@@ -254,6 +292,9 @@ impl Store {
                 use std::os::unix::fs::PermissionsExt;
                 tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)).await?;
             }
+            // Held from here, whoever won the race - so gossip should say
+            // so now rather than at the next tick.
+            note_gained(&hash);
             if let Err(e) = tokio::fs::rename(&tmp, &dest).await {
                 // A concurrent identical put may have won the rename; content
                 // is identical by construction, so losing is fine.
@@ -463,6 +504,7 @@ impl Store {
                 tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)).await?;
             }
             tokio::fs::rename(&tmp, &dest).await?;
+            note_gained(&hash);
             self.stored_bytes
                 .fetch_add(total, std::sync::atomic::Ordering::Relaxed);
         }
