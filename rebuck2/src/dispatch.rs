@@ -1822,6 +1822,38 @@ pub fn offer_order(v: &Verdict, cands: &[Candidate], allow: Allow) -> Vec<u64> {
 /// is still not asked. Within what is left, warmth outranks emptiness and
 /// emptiness breaks ties, so this refines the old order rather than
 /// replacing it.
+/// Warmth, less what is already waiting on that machine.
+///
+/// The comparator this replaces put warmth FIRST and free capacity second,
+/// so warmth dominated lexicographically: a warm worker with one free slot
+/// beat a cold worker with sixteen, and every lead it took made it warmer.
+/// Across three runs with six workers available, placements went
+/// 223/125/63/3, 46/37/10 and 153/142/81/3 - two or three machines never
+/// took a single lead while one took more than half.
+///
+/// One queued lead cancels one warm item, using the same coarse 64 that
+/// `warmth` counts in. That is not a calibration and could not be: what a
+/// queued lead costs depends on the lead in front of it. It is the smallest
+/// statement that expresses the trade at all - a warm machine with work
+/// waiting is not obviously better than a cold machine with none - and
+/// principle 13 says prefer the coarse number you can defend.
+///
+/// Signed, because the answer is genuinely negative: a machine three deep is
+/// worse than an idle one however warm it is.
+pub fn offer_score(warmth: u32, queued: usize) -> i64 {
+    const QUEUED: i64 = 64;
+    i64::from(warmth) - (queued as i64) * QUEUED
+}
+
+/// Trade warmth against queue depth when ordering offers.
+///
+/// OFF by default. It changes where every subtree goes, and the run that
+/// would first show it also carries the prefetch fix; one variable at a
+/// time is the rule that has produced every answer here.
+pub fn balance_warmth() -> bool {
+    std::env::var("REBUCK2_BALANCE").as_deref() == Ok("1")
+}
+
 pub fn offer_order_warm(
     v: &Verdict,
     cands: &[Candidate],
@@ -1844,9 +1876,18 @@ pub fn offer_order_warm(
     // so two drivers deciding from the same state offer in the same order
     // rather than crossing over.
     let before: Vec<u64> = able.iter().map(|c| c.id).collect();
+    let balanced = balance_warmth();
     able.sort_by_key(|c| {
         (
-            std::cmp::Reverse(warm(c.id)),
+            // `load.driver` is what this worker is already holding from the
+            // driver - inflight jobs plus subtree leads - which is the queue
+            // a new lead would join. Off, the score is warmth alone and the
+            // ordering is byte-for-byte what it was.
+            std::cmp::Reverse(if balanced {
+                offer_score(warm(c.id), c.load.driver)
+            } else {
+                i64::from(warm(c.id))
+            }),
             std::cmp::Reverse(c.load.free()),
             c.id,
         )
@@ -1855,6 +1896,13 @@ pub fn offer_order_warm(
     // affinity that never reorders anything is indistinguishable from one
     // that is switched off, and that distinction has cost three mechanisms.
     if before != able.iter().map(|c| c.id).collect::<Vec<u64>>() {
+        if balanced {
+            // Counted separately: the question is not whether affinity
+            // reordered anything but whether trading against the queue
+            // reordered it DIFFERENTLY, and a run where every machine is
+            // idle answers the same either way.
+            crate::mech::applied("balance");
+        }
         crate::mech::applied("affinity");
     }
     able.into_iter().map(|c| c.id).collect()
@@ -2798,6 +2846,39 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// Warmth has to be TRADED against queue depth, not ranked ahead of it.
+    ///
+    /// `offer_order_warm` sorts by `(Reverse(warm), Reverse(free), id)`, so
+    /// warmth dominates lexicographically: a warm worker with one free slot
+    /// beats a cold worker with sixteen, and each lead it takes makes it
+    /// warmer. Measured consequence, three runs, six workers available in
+    /// each: 223/125/63/3, then 46/37/10, then 153/142/81/3. Two or three
+    /// machines never took a single lead.
+    ///
+    /// One queued lead cancels one warm item. Coarse on purpose - principle
+    /// 13 - and it says the thing worth saying: a warm machine with work
+    /// waiting is not obviously better than a cold machine with none.
+    #[test]
+    fn a_queue_cancels_warmth_one_for_one() {
+        let s = super::offer_score;
+        // Nothing queued: warmth decides, exactly as before.
+        assert!(s(64, 0) > s(0, 0));
+        assert!(s(128, 0) > s(64, 0));
+
+        // One warm item, one lead already waiting: no better than cold and
+        // idle. The tie then falls to free capacity, which is the next key.
+        assert_eq!(s(64, 1), s(0, 0));
+        // Two waiting and it is WORSE - the point of the whole change.
+        assert!(s(64, 2) < s(0, 0));
+        // Two warm items outlast one queued lead, which is why this is a
+        // trade and not a switch.
+        assert!(s(128, 1) > s(0, 0));
+
+        // A cold machine with a queue is worse than a cold machine without,
+        // so the comparator still spreads work among equals.
+        assert!(s(0, 3) < s(0, 1));
+    }
+
     /// A build that fills the whole lead is not an unknown build.
     ///
     /// The driver derives the start as `total - build_ms`, and `build_ms` is
