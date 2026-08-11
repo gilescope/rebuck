@@ -910,3 +910,24 @@ jobs:
       - name: logs
         if: always()
         run: tail -150 proxy.log || true
+
+      # KEEP them. Every diagnosis so far has depended on having guessed the
+      # right grep before the run: the h2 collapse, the nested-build funnel
+      # and the indented `*failed*` markers were each invisible until a later
+      # run happened to print the line that showed them. A tail of 150 lines
+      # of proxy.log is not enough to answer a question nobody had yet.
+      - name: keep the logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fleet-logs-${{ github.run_attempt }}
+          path: |
+            proxy.log
+            /tmp/fleet.log
+            /tmp/baseline.log
+            /tmp/fleet.failed
+            /tmp/baseline.failed
+            /tmp/fleet.targets
+            /tmp/baseline.targets
+          if-no-files-found: warn
+          retention-days: 7
