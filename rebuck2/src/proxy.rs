@@ -552,7 +552,25 @@ impl control::control_server::Control for Proxy {
     ) -> Result<Response<Self::SessionStream>, Status> {
         use std::sync::atomic::Ordering;
         let (meta, ext, stream) = request.into_parts();
+        // WHICH session, and how long it lived. Four of these fail per run
+        // with an h2 protocol error even now each has its own connection, so
+        // multiplexing is not the cause - and the two readings left are very
+        // different. Either the daemon is dropping live sessions, or a
+        // nested earthly finished and its ordinary teardown is being logged
+        // as a failure and RELAYED to the client as one.
+        //
+        // The session id separates them: an id that never carried a solve is
+        // a nested build going away, and one that did is a live session
+        // being cut.
+        let sid = meta
+            .get("x-docker-expose-session-uuid")
+            .or_else(|| meta.get("buildkit-controlapi-buildid"))
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("?")
+            .to_owned();
+        let started = std::time::Instant::now();
         let up = self.wire.clone();
+        let sid_in = sid.clone();
         let inbound = stream.filter_map(move |m| {
             match &m {
                 Ok(msg) => up
@@ -572,7 +590,7 @@ impl control::control_server::Control for Proxy {
                 // line ate the evidence.
                 Err(e) => {
                     println!(
-                        "[proxy] session stream from client failed: {} {}",
+                        "[proxy] session {sid_in} from client failed: {} {}",
                         e.code(),
                         e.message()
                     );
@@ -628,7 +646,8 @@ impl control::control_server::Control for Proxy {
                 // it names nothing on this side.
                 Err(e) => {
                     println!(
-                        "[proxy] session stream from daemon failed: {} {}",
+                        "[proxy] session {sid} from daemon failed after {}ms: {} {}",
+                        started.elapsed().as_millis(),
                         e.code(),
                         e.message()
                     );
