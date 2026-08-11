@@ -1021,10 +1021,24 @@ pub fn harvest_graph(base: &str, cache_id: &str, dest: &str) -> pb::Definition {
 /// rewriting the graph to make it portable; this is one more rewrite on the
 /// same spine.
 ///
-/// Only the ids in `seeds` are touched, and only mounts that have no input
-/// already. Seeding every mount would make a worker pull an image for a
-/// cache nobody measured, and the ranking of which are worth it is exactly
-/// what [`crate::driver::Driver::cache_costs`] exists to produce.
+/// Only the ids in `seeds` are touched. Seeding every mount would make a
+/// worker pull an image for a cache nobody measured, and the ranking of
+/// which are worth it is what [`crate::driver::Driver::cache_costs`] exists
+/// to produce.
+///
+/// A mount that ALREADY has an input is seeded by replacing it. That is not
+/// a special case: every earthly cache mount has one, and the earlier
+/// `input < 0` filter meant this function could never apply to a real graph
+/// at all - a run reported four seeds resolved and rewrote nothing. The
+/// input is what selects which cache directory the mount is
+/// (`getRefCacheDir` keys on the id plus the input's ref), so pointing it at
+/// the seed both chooses a directory and supplies its contents.
+///
+/// The old input's `selector` is cleared with it. Earthly's is
+/// `SourcePath("/cache")`, a path inside the state IT mounted; the seed
+/// image's root is the cache contents, so keeping the selector would pick a
+/// directory the seed does not have and the mount would come up empty -
+/// which looks exactly like not seeding.
 pub fn seed_cache_mounts(def: &pb::Definition, seeds: &BTreeMap<String, String>) -> pb::Definition {
     if seeds.is_empty() {
         return def.clone();
