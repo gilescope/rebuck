@@ -1169,6 +1169,44 @@ pub fn graft_built(def: &pb::Definition, built: &dyn Fn(&str) -> Option<String>)
     })
 }
 
+/// What the graph calls the op at `index`, if it calls it anything.
+///
+/// `llb.customname` is buildkit's own human label - the thing earthly prints
+/// as `+base | --> FROM alpine` - and it is the only name an LLB graph
+/// carries. Without it a lead is logged as the digest it produced, so the
+/// job that owned 40% of a wall clock could not be identified at all.
+///
+/// `None` rather than a placeholder: the caller falls back to the digest,
+/// which is unhelpful but true.
+pub fn describe(def: &pb::Definition, index: usize) -> Option<String> {
+    let bytes = def.def.get(index)?;
+    let digest = format!("sha256:{}", crate::store::sha256_hex(bytes));
+    def.metadata
+        .get(&digest)?
+        .description
+        .get("llb.customname")
+        .filter(|n| !n.is_empty())
+        .cloned()
+}
+
+/// What a whole subtree is called: the name of the op its terminal points at.
+///
+/// The terminal itself is never named - it is a pointer, not work.
+pub fn describe_root(def: &pb::Definition) -> Option<String> {
+    let last = def.def.last()?;
+    let target = pb::Op::decode(last.as_slice())
+        .ok()?
+        .inputs
+        .first()?
+        .digest
+        .clone();
+    let at = def
+        .def
+        .iter()
+        .position(|b| format!("sha256:{}", crate::store::sha256_hex(b)) == target)?;
+    describe(def, at)
+}
+
 /// Drop everything the terminal cannot reach.
 ///
 /// Grafting orphans by construction: replacing a subtree root with the image
@@ -1837,6 +1875,42 @@ mod tests {
             def: encoded,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_subtree_can_say_what_it_is() {
+        // Leads are logged by the digest of what they produced, which names
+        // nothing: `built at sha256:8793cb6b... in 209141ms` is 40% of a
+        // wall clock and no clue which target owns it. buildkit carries
+        // `llb.customname` in op metadata - it is what earthly prints as
+        // `+base | --> FROM ...` - so the graph can say.
+        let mut d = chain(vec![
+            (src("docker-image://docker.io/library/alpine:3.20"), vec![]),
+            (plain(), vec![0]),
+        ]);
+        let root = format!("sha256:{}", crate::store::sha256_hex(&d.def[1]));
+        d.metadata.insert(
+            root,
+            pb::OpMetadata {
+                description: [("llb.customname".to_owned(), "+base RUN apk add".to_owned())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(describe(&d, 1).as_deref(), Some("+base RUN apk add"));
+
+        // An op with no description says so rather than inventing one - the
+        // caller falls back to the digest, which is at least honest.
+        assert_eq!(describe(&d, 0), None);
+        // And an index that is not there is not a panic.
+        assert_eq!(describe(&d, 99), None);
+
+        // A whole subtree is named by the op its terminal points at, never
+        // by the terminal, which is a pointer rather than work.
+        let cut = subgraph(&d, 1).expect("a cut at the RUN");
+        assert_eq!(describe_root(&cut).as_deref(), Some("+base RUN apk add"));
+        assert_eq!(describe_root(&pb::Definition::default()), None);
     }
 
     #[test]

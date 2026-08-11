@@ -721,6 +721,19 @@ jobs:
           # workflow was grepping only the [wire] summary out of proxy.log,
           # so the per-job timings the driver already prints never left the
           # runner.
+          echo "=== the leads that own the critical path"
+          # One lead took 209s of a 525s wall - 40% of the wall clock in a
+          # single job, which no number of machines can divide. Which job it
+          # is decides whether that is inherent (a genuinely long target) or
+          # tax (a cold pull of something another machine already had), and
+          # those want opposite fixes.
+          # `[^ ]` not `\S`: BSD sed has no `\S`, and the substitution then
+          # silently does not apply - the line comes through unsorted and
+          # looks like the data, not like a broken pipeline.
+          grep -oE '\[driver\] subtree job [0-9]+ built at [^ ]+ in [0-9]+ms \[.*\]' proxy.log \
+            | sed -E 's/.*job ([0-9]+) built at [^ ]+ in ([0-9]+)ms \[(.*)\]/\2ms  job \1  \3/' \
+            | sort -rn | head -8 || true
+
           echo "=== what a lead cost, and in what"
           # Duration and BYTES side by side. A lead that moved 400MB and one
           # that computed for 90s both show as "24s average" and want

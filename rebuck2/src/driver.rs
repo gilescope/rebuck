@@ -366,6 +366,14 @@ pub struct Driver {
     /// it should approach the number of WORKERS if every worker is rebuilding
     /// the same ancestry.
     op_by_worker: tokio::sync::Mutex<std::collections::HashSet<(String, u64)>>,
+    /// What each job is, so the line that reports its DURATION can name it.
+    ///
+    /// A lead is otherwise logged as the digest it produced, and the job
+    /// that owned 40% of a wall clock could not be identified from the log
+    /// at all - which is the difference between "one target is genuinely
+    /// long" and "one cold pull is the tax", two conclusions that want
+    /// opposite fixes.
+    job_names: tokio::sync::Mutex<std::collections::BTreeMap<u64, String>>,
     /// Cross-machine single-flight. One per driver: it is the fleet's single
     /// coordinator, so there is no consensus problem to solve, only a
     /// liveness one.
@@ -451,6 +459,7 @@ impl Driver {
             dispatched_ops: Default::default(),
             built: Default::default(),
             op_by_worker: Default::default(),
+            job_names: Default::default(),
             store,
             cfg,
             jobs: Mutex::new(HashMap::new()),
@@ -759,7 +768,16 @@ impl Driver {
                                 None => (0, Default::default()),
                             }
                         };
-                        println!("[driver] subtree job {job} built at {image_ref} in {ms}ms");
+                        let what = self
+                            .job_names
+                            .lock()
+                            .await
+                            .get(&job)
+                            .cloned()
+                            .unwrap_or_else(|| image_ref.clone());
+                        println!(
+                            "[driver] subtree job {job} built at {image_ref} in {ms}ms [{what}]"
+                        );
                         // Attribute the SECONDS to the cache ids the graph
                         // named. A subtree with no cache mount contributes
                         // to nothing here, which is the point: this table
@@ -1571,6 +1589,15 @@ impl Driver {
         // took a subtree is only visible here now that the gateway offers
         // instead of choosing, and `grep -o -- '-> worker [0-9]*' | uniq -c`
         // is how spread is read in CI.
+        {
+            use prost::Message;
+            if let Some(name) = bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice())
+                .ok()
+                .and_then(|d| crate::dispatch::describe_root(&d))
+            {
+                self.job_names.lock().await.insert(job, name);
+            }
+        }
         println!("[driver] subtree job {job} -> worker {first}");
         // Which ops THIS worker will now have to have. A pair it already
         // holds is free - buildkit caches it - so only new pairs are work.
