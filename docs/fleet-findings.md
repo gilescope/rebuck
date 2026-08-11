@@ -4393,3 +4393,35 @@ place for it.
 Two runs, two mechanisms, 1773s to 1050s. The first repaired something that
 had never worked; the second stopped a working mechanism from working too
 hard.
+
+### The coordinator does seven seconds of work in a 1,050-second build
+
+The home-vertices instrument reported for the first time in the `-balance`
+run:
+
+```text
+[wire] home vertices : 211 ran in 7084ms, 0 cache hit(s)
+[wire] service ms    : home 0 (0) away 1049178 (1)
+```
+
+**Seven seconds.** 211 vertices ran on the coordinator's own daemon across a
+leg that took 1,050, and none of them was a cache hit - so that is seven
+seconds of real work, not seven seconds of lucky lookups.
+
+Two things retire on this.
+
+**The gateway is not a bottleneck.** It has been a standing suspicion -
+every solve funnels through one proxy, every result is pulled back through
+one registry - and the machine doing that funnelling spends 0.7% of the
+build computing. Whatever the remaining 38.9x is, it is not the coordinator
+running out of hands.
+
+**`service ms` is finally legible**, and it says what the NOT MEASURED
+branch predicted: `away 1049178 (1)`. One `Control.Solve`, holding the
+entire build, lasting the entire leg. That is why the home/away pair could
+never fill - there is exactly one outer solve and it is the whole thing, so
+the ratio it was built to compute has one sample and no counterpart.
+
+The pair stays, now that it has a use it did not have: `away` is a
+serviceable check that the leg time and the client's wait agree, which is
+one more thing that cannot silently drift.
