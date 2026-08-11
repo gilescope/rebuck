@@ -3175,3 +3175,49 @@ The prediction, so the run has something to disagree with:
 And the honest bound, unchanged: this is a cold-start measurement. Seeding
 is the warm case simulated, so a result here is evidence about what a
 permanent fleet would already have, not about what a hosted runner does.
+
+## Attempt nine: the transform fires, the reconstruction does not
+
+Against the prediction written before the run:
+
+| predicted                            | outcome                                           |
+| ------------------------------------ | ------------------------------------------------- |
+| `seed_mounts` appears at all         | **`seed_mounts=9`** - confirmed, first time ever  |
+| `go-mod`/`go-build` harvest real MiB | **0.0 MiB** - refuted                             |
+| seeded leads drop from p50 ~24s      | p50 34s, and meaningless while nothing is shipped |
+
+So fault 2 is fixed and proven: the transform now applies to real earthly
+graphs, nine times in this run, where the `input < 0` filter had meant it
+could never apply at all.
+
+Fault 1 is not fixed. The harvest reconstructs earthly's cache-mount input -
+scratch with `/cache` created, mode 0644 - and still reads an empty
+directory, which means the reconstructed op does not hash to the same ref.
+`getRefCacheDir` keys on `ref.ID()`, so *near enough* is not a thing that
+exists here: any field that differs gives a different digest, a different
+ref, a different directory.
+
+Candidates for the difference, none checked yet: earthly sets a `platform`
+on its ops and the reconstruction sets none; `constraints` likewise; the
+`FileAction`'s unused `secondaryInput`/`output` conventions in Go's llb
+builder may not be what was assumed.
+
+**And that is the wrong thing to chase.** Reproducing another program's op
+bytes field by field is a guess that has to stay right across every earthly
+release, and it fails silently - an empty directory, not an error.
+
+The proxy already HAS the bytes. It sees every graph earthly sends, cache
+mounts and all, so the input op can be taken verbatim instead of rebuilt.
+That is exact by construction and cannot drift. The awkwardness is timing:
+the harvest runs between the legs, and the proxy only sees graphs during the
+fleet leg.
+
+Which points at a better shape anyway. Harvest at the END of a run, from the
+graphs actually observed, and let the bank carry the seed refs and their
+blobs to the next run - the coordinator's store is already restored per
+target. That is the warm-CI case rather than a simulation of it, and it is
+what a permanent fleet does naturally.
+
+Two other numbers from the same run, both the best recorded: op duplication
+**1.2x** and amplification **3.4x**, down from 1.6x and 3.9x. Neither is
+attributable to seeding, which shipped nothing.
