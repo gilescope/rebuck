@@ -29,7 +29,18 @@ name: fleet
 # make the property observable, not to widen the grep - see docs/how-this-lies.md.
 
 on:
+  # A DEDICATED branch, matching the convention earthfile-fleet.yml already
+  # states: "nothing fires on a normal push to giles-dispatch, so committing
+  # stays cheap". This one fired on every push to every branch, holding a
+  # runner for up to 45 minutes each time and queueing behind the
+  # experiments it was competing with.
+  #
+  # It is also RED, and has been for all 99 runs in recorded history - not a
+  # regression, and not something to silence: `fleet check` reports "the
+  # driver dispatched nothing", so its harness needs its own look. Scoping
+  # the trigger stops the waste without pretending the test passes.
   push:
+    branches: [giles-dispatch-ci]
   pull_request:
   workflow_dispatch:
 
