@@ -188,6 +188,61 @@ which is a third thing, distinct from both "valid" and "noise". Deciding a
 past measurement is void is itself a claim, and wants the same standard of
 evidence as the measurement did.
 
+## 14. A zero that means "switched off"
+
+`[wire] grafted : 0 subtree(s) started from a built ancestor` printed in
+every run, including every run where `REBUCK2_GRAFT` was unset - which was
+all but one of them.
+
+**Instance:** I read that zero as "grafting never fires", wrote it into the
+workflow as a standing comment, and used it to rank grafting below other
+work. The mechanism had simply never been switched on. `seeds=0/0` had the
+same defect: a run with no seeds configured and a run whose seeds all failed
+to resolve printed the identical pair.
+
+**Countermeasure:** `OFF (REBUCK2_GRAFT unset) - not a zero`, and
+`seeds=off`. A reported number must distinguish "measured, none" from "not
+measured", and naming the variable in the output is what makes that
+impossible to misread.
+
+## 15. A fallback that turns "I could not look" into "nothing changed"
+
+**Instance:** `check-reserve` printed `0 KiB` for all six solves including
+the first, which reads as "the base is never fetched". Every stats request
+had failed - it was polling `host.docker.internal`, which is how the DAEMON
+reaches the host and not a name the host resolves - and the code fell back
+to the previous sample. Total instrument failure was indistinguishable from
+the clean flat line it was supposed to prove.
+
+**Countermeasure:** a `--stats` address over loopback, and the general rule:
+a fallback to the last good value must be counted, or silence becomes
+evidence. The status tap counts its dropped samples for the same reason.
+
+## 16. An instrument on the critical path of what it measures
+
+**Instance:** the vertex tap took `wire` - the mutex the placement path uses -
+once per frame of earthly's progress stream, from inside a stream poll on an
+async worker thread. Blocking there while another task holds the guard
+across an await is a deadlock, not a slow path, and that exact hazard had
+already been tripped three times in that file.
+
+**Countermeasure:** `try_lock` and count the misses; and the tap reports its
+own cost, which is how the 50-minute run was cleared without a second run -
+`3004 frame(s), 1ms total`.
+
+## 17. A guard with a symmetric hole
+
+**Instance:** `mech.rs` asserts every REPORTED mechanism has a counter. It
+cannot assert the converse, and three switches that changed behaviour -
+`peer_cache_mounts`, set in every CI run and responsible for seven
+dispatches in eight; `fleet_cache`; `warm` - were counted nowhere and named
+in no report. Two more, `serve_secrets` and `forward_agent`, decide what may
+leave the machine at all.
+
+**Countermeasure:** the mirror test. Every `REBUCK2_*` in `src/` must be
+counted under its lowercased name or exempted in a list that carries a
+reason. It found five the moment it ran.
+
 ## The common thread
 
 Twelve of these thirteen produced a GREEN result. Not one announced itself.
