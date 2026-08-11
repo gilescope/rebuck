@@ -409,7 +409,32 @@ pub fn cache_ids(def: &pb::Definition) -> BTreeSet<String> {
 /// verdict costs time, and refusing to retry a machine fault costs the
 /// build.
 pub fn is_build_verdict(why: &str) -> bool {
-    why.contains("did not complete successfully: exit code:")
+    let Some(tail) = why
+        .rsplit("did not complete successfully: exit code:")
+        .next()
+    else {
+        return false;
+    };
+    if tail.len() == why.len() {
+        return false;
+    }
+    let Some(code) = tail
+        .split_whitespace()
+        .next()
+        .and_then(|c| c.trim_end_matches(['"', ',', '.']).parse::<i32>().ok())
+    else {
+        return false;
+    };
+    // A SIGNAL is not a verdict. 128+N means something killed the process,
+    // and on a build runner that something is nearly always the OOM killer:
+    // 137 is SIGKILL, 143 SIGTERM. A machine with more memory may well
+    // succeed, so those stay retryable - which is the whole point of the
+    // predicate, and it shipped inverted for an hour with 137 asserted as a
+    // verdict. That would have turned "this worker ran out of memory" into
+    // "your build fails".
+    //
+    // 128 exactly is a real exit status, not a signal death.
+    !(129..=192).contains(&code)
 }
 
 /// Take a warm cache mount OUT of a daemon, as a layer.
@@ -2006,7 +2031,22 @@ mod tests {
             "build failed: solve: Unknown error process \"/bin/sh -c golangci-lint run\" \
              did not complete successfully: exit code: 1"
         ));
-        assert!(v("did not complete successfully: exit code: 137"));
+        assert!(v("did not complete successfully: exit code: 2"));
+        assert!(v("did not complete successfully: exit code: 127"));
+
+        // But NOT a signal. 128+N is "something killed the process", and on
+        // a build runner the something is nearly always the OOM killer -
+        // 137 is SIGKILL, 143 is SIGTERM. A machine with more memory may
+        // well succeed, so those stay retryable. This was shipped the other
+        // way round an hour ago with 137 asserted as a verdict, which would
+        // have turned "this worker ran out of memory" into "your build
+        // fails" - the exact confusion the whole predicate exists to
+        // prevent, inverted.
+        assert!(!v("did not complete successfully: exit code: 137"));
+        assert!(!v("did not complete successfully: exit code: 143"));
+        assert!(!v("did not complete successfully: exit code: 129"));
+        // 128 itself is not a signal death, it is a real exit status.
+        assert!(v("did not complete successfully: exit code: 128"));
 
         // Everything a DIFFERENT machine might survive stays retryable, and
         // the bias is deliberate: retrying a verdict costs time, declining
