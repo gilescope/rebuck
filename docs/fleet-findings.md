@@ -2728,3 +2728,35 @@ best explanation on offer for a lint costing the baseline ~15s and a peer
 So the failure this predicts, if seeding does not pay: the whole thing is
 dominated by shipping and unpacking `go-mod`, and the answer is to seed the
 compute caches and let the module cache download itself.
+
+## `+lint-all` is a low-variance target, and that was worth finding out
+
+Two runs of the same commit, six machines each:
+
+| run | baseline | fleet |
+| --- | -------- | ----- |
+| a   | 88s      | 252s  |
+| b   | 86s      | 249s  |
+
+2.3% apart on the baseline, 1.2% on the fleet. The 30% figure this document
+has been quoting is from `+test-no-qemu`, and it does not transfer: a target
+whose whole build is ninety seconds of CPU on a fixed graph is a far
+steadier instrument than one that pulls 617 MiB and runs nested earthly
+fourteen times.
+
+That partly retracts the argument for the within-run arm comparison. It was
+justified here as "a 10% effect between two runs is unreadable", which is
+true of group2 and false of `+lint-all`, where 5% is readable. The
+within-run split is still the better instrument - it removes the whole
+question rather than bounding it, and it separates per-id value that no
+across-run comparison can - but it is not the only one available, and the
+cheap experiment is now cheap enough to just run twice.
+
+Practical consequence: **use `+lint-all` for anything that needs a number,
+and group2 only for things that only group2 exhibits.** Fifteen minutes and
+±2% beats forty minutes and ±30% for every question either can answer.
+
+Also confirmed in the same pair: the guard markers work.
+`read_retry=0 (never needed)` where the previous run said
+`read_retry=ON BUT NEVER APPLIED`, and `verdict_stops_retry=4` both times -
+the same four Go modules, the same four failing lints.
