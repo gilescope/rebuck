@@ -58,6 +58,10 @@ confident version first - which has happened to me, in this file, twice.
 | A 20-op dispatch floor is harmful | ~5x slower overall while every per-lead number improved |
 | Building is roughly a quarter of lead time | 4,407s of `took Nms` against 14,812s of `lead_ms` |
 | A cap inside a cap turns slow into failed | worker `timeout 3000` under a 150-minute job |
+| Fixing prefetch took 30% off the fleet leg | 1773s -> 1240s, same target, same 412 solves |
+| Choosing a worker costs nothing | `placing 0s (0%)` - no offer was ever refused |
+| **Queueing is the largest cost in the system** | `waiting 6583s (65%)` against `building 3517s (35%)` |
+| The instruments are not the problem | the status tap: 1ms across 3004 frames |
 
 **Open.** Believed for a reason, not measured.
 
@@ -65,8 +69,8 @@ confident version first - which has happened to me, in this file, twice.
 | -------- | -------------- |
 | How much of the fleet's traffic crosses a wire | `SERVED_BYTES` mixes loopback with peer serving; `SERVED_LOCAL_BYTES` exists and has never reported |
 | Whether the fleet repeats itself, and by how much | the coordinator reports 1.1x; the per-worker figure has never printed |
-| Where the 10,400 seconds of non-building lead time goes | `lead phases` exists and has never reported |
-| Whether instruments changed the result | the 50-minute leg; `status tap` exists and has never reported |
+| Why 65% of lead time is queueing when machines sit idle | measured; `-balance` is in flight against it |
+| What made the reference run take 50 minutes | not the tap, which costs 1ms. Still unexplained |
 | What a 14-way target does | `+test-no-qemu` has never run |
 
 **Retracted.** Written here confidently and wrong. Left in place with the
