@@ -14,7 +14,7 @@ end as it happened. The header claimed the opposite for about thirty entries.
 baseline and a fleet leg in the same run - and `rebuck2/scripts/seed-check.sh`
 for anything that only needs one daemon.
 
-**If you read four things**, read these:
+**If you read five things**, read these:
 
 | entry                                                        | why                                              |
 | ------------------------------------------------------------ | ------------------------------------------------ |
@@ -22,6 +22,7 @@ for anything that only needs one daemon.
 | *Count the WORK before blaming the scheduler* (principle 21) | the fleet does ~9x the work; that is the problem |
 | *Every number here is a cold-start number*                   | what a hosted runner can and cannot measure      |
 | *`+all-buildkitd`: parity in time, and it says why*          | the one result that points somewhere             |
+| *How cache-mount seeding works, end to end*                  | the mechanism, without the nine-run chronology   |
 
 It lived in `src/proxy.rs` as a module comment until it reached 1342 lines --
 a third of the file, and a chronological log rather than documentation. The
