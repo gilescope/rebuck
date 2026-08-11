@@ -41,7 +41,10 @@ on:
   # the trigger stops the waste without pretending the test passes.
   push:
     branches: [giles-dispatch-ci]
-  pull_request:
+  # NOT on pull_request. Scoping the push trigger alone changed nothing:
+  # this branch has an open draft PR (#10), so every push still fired the
+  # job through the PR trigger - a 45-minute red job, on every commit,
+  # queueing in front of the experiments.
   workflow_dispatch:
 
 permissions:
