@@ -1238,12 +1238,58 @@ pub fn graft_built(def: &pb::Definition, built: &dyn Fn(&str) -> Option<String>)
 pub fn describe(def: &pb::Definition, index: usize) -> Option<String> {
     let bytes = def.def.get(index)?;
     let digest = format!("sha256:{}", crate::store::sha256_hex(bytes));
-    def.metadata
+    let raw = def
+        .metadata
         .get(&digest)?
         .description
         .get("llb.customname")
-        .filter(|n| !n.is_empty())
-        .cloned()
+        .filter(|n| !n.is_empty())?;
+    Some(readable(raw))
+}
+
+/// Turn earthly's vertex name into something a human can read.
+///
+/// earthly writes `[<base64 VertexMeta JSON>] <human tail>`, so the target
+/// name - the one thing worth knowing about a 250-second lead - is inside
+/// the base64, and the readable half comes AFTER the bracket. Reading
+/// between the brackets yields a wall of base64 and discards the useful
+/// part, which is exactly what the first version of the CI panel printed.
+///
+/// Anything that does not parse is returned unchanged: a name we cannot
+/// decode still beats no name.
+fn readable(raw: &str) -> String {
+    use base64::Engine;
+
+    let Some((b64, tail)) = raw
+        .strip_prefix('[')
+        .and_then(|r| r.split_once("] "))
+        .filter(|(b64, _)| !b64.is_empty())
+    else {
+        return raw.to_owned();
+    };
+    let Ok(json) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+        return raw.to_owned();
+    };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&json) else {
+        return raw.to_owned();
+    };
+    // `tnm` is VertexMeta.TargetName; `sl` its source location. Either may
+    // be absent - a vertex earthly generates itself has no target.
+    let target = v.get("tnm").and_then(|t| t.as_str()).unwrap_or_default();
+    let at = match (
+        v.pointer("/sl/file").and_then(|f| f.as_str()),
+        v.pointer("/sl/startLine").and_then(|l| l.as_u64()),
+    ) {
+        (Some(f), Some(l)) => format!("{f}:{l}"),
+        (Some(f), None) => f.to_owned(),
+        _ => String::new(),
+    };
+    [target, &at, tail]
+        .iter()
+        .filter(|p| !p.is_empty())
+        .copied()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// What a whole subtree is called: the name of the op its terminal points at.
@@ -2026,10 +2072,49 @@ mod tests {
         );
         assert_eq!(describe(&d, 1).as_deref(), Some("+base RUN apk add"));
 
-        // An op with no description says so rather than inventing one - the
-        // caller falls back to the digest, which is at least honest.
-        assert_eq!(describe(&d, 0), None);
-        // And an index that is not there is not a panic.
+        // earthly does not write a plain string. It writes
+        // `[<base64 VertexMeta JSON>] <human tail>` - the target name lives
+        // only inside the base64, and the readable half is AFTER the
+        // bracket, so taking what is between the brackets yields a wall of
+        // base64 and drops the useful part. Which is what the first version
+        // of the CI panel printed.
+        let meta = r#"{"tnm":"./tests+ga-no-qemu-group7","sl":{"file":"tests/Earthfile","startLine":1323}}"#;
+        let encoded = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD.encode(meta)
+        };
+        let earthly_name = format!("[{encoded}] RUN --privileged /bin/sh");
+        d.metadata.insert(
+            format!("sha256:{}", crate::store::sha256_hex(&d.def[0])),
+            pb::OpMetadata {
+                description: [("llb.customname".to_owned(), earthly_name)]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            describe(&d, 0).as_deref(),
+            Some("./tests+ga-no-qemu-group7 tests/Earthfile:1323 RUN --privileged /bin/sh"),
+        );
+
+        // Undecodable brackets are left alone rather than dropped: a name we
+        // cannot parse is still better than no name.
+        d.metadata.insert(
+            format!("sha256:{}", crate::store::sha256_hex(&d.def[0])),
+            pb::OpMetadata {
+                description: [(
+                    "llb.customname".to_owned(),
+                    "[not-base64!] FROM x".to_owned(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(describe(&d, 0).as_deref(), Some("[not-base64!] FROM x"));
+
+        // An index that is not there is not a panic.
         assert_eq!(describe(&d, 99), None);
 
         // A whole subtree is named by the op its terminal points at, never
