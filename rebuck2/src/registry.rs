@@ -1268,7 +1268,12 @@ pub fn router_with_upstream<S: RegistryStore>(
         .layer(axum::middleware::from_fn(
             |req: axum::extract::Request, next: axum::middleware::Next| async move {
                 let path = req.uri().path().to_owned();
+                let t = std::time::Instant::now();
                 let res = next.run(req).await;
+                SERVED_MS.fetch_add(
+                    t.elapsed().as_millis() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 if let Some(n) = res
                     .headers()
                     .get(axum::http::header::CONTENT_LENGTH)
@@ -1320,6 +1325,19 @@ pub async fn serve<S: RegistryStore>(addr: SocketAddr, store: Arc<S>) -> Result<
 /// A worker reads its inputs from a registry where home reads its own content
 /// store, so this is the size of the difference.
 pub static SERVED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds this registry spent serving those bytes.
+///
+/// Splits a number that was doing two jobs. A lead's cost tracks what it
+/// fetched, at a measured 7.2 MB/s - but that rate conflates GETTING the
+/// bytes, which is this registry going to the mesh or to disk, with
+/// UNPACKING them, which is buildkit's gzip and overlayfs writes. The two
+/// want opposite remedies: a faster mesh against a cheaper codec, and
+/// nothing so far says which.
+///
+/// This side of the line is measurable here. `served_bytes / served_ms` is
+/// the fetch rate; whatever is left of the lead is unpack.
+pub static SERVED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Blobs over a megabyte, by digest. A total says how much moved; this says
 /// whether it moved as a few large layers or many small ones, which is the
@@ -1438,6 +1456,50 @@ pub async fn serve_with_upstream<S: RegistryStore>(
 
 #[cfg(test)]
 mod tests {
+    /// Serving time, so the 7.2 MB/s can be split.
+    ///
+    /// A lead's cost tracks the bytes it fetched, at 7.2 MB/s - but that
+    /// number conflates getting the bytes (network, mesh, peers) with
+    /// unpacking them (gzip, overlayfs). The two want opposite fixes: a
+    /// faster mesh against a cheaper codec. This registry is on one side of
+    /// that line, so timing what IT spends says which.
+    #[tokio::test]
+    async fn serving_time_is_counted_alongside_the_bytes() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let dir = tempfile::tempdir().expect("tmp");
+        let store =
+            std::sync::Arc::new(crate::store::Store::new(dir.path().to_path_buf()).unwrap());
+        let payload = vec![7u8; 300_000];
+        let hash = store.blob_put(&payload).await.expect("put");
+        let app = super::router(store);
+
+        let before_ms = super::SERVED_MS.load(Relaxed);
+        let before_b = super::SERVED_BYTES.load(Relaxed);
+        let res = tower::ServiceExt::oneshot(
+            app,
+            axum::http::Request::get(format!("/v2/x/blobs/sha256:{hash}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("serve");
+        assert_eq!(res.status(), 200);
+
+        assert!(
+            super::SERVED_BYTES.load(Relaxed) >= before_b + payload.len() as u64,
+            "the bytes are still counted"
+        );
+        // Monotonic, and that is the whole assertion. A wall-clock figure
+        // cannot be asserted to a value, but a counter that never moves is
+        // the failure this middleware has already had once - two runs
+        // reported 0 KiB across 160 blob GETs because the increment sat
+        // outside the router.
+        assert!(
+            super::SERVED_MS.load(Relaxed) >= before_ms,
+            "serving time never goes backwards"
+        );
+    }
+
     use super::*;
     use axum::body::Body;
     use axum::http::Request;

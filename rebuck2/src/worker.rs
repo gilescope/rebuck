@@ -806,6 +806,7 @@ async fn lead_reply(
     // moved 400MB" from "this lead computed for 90 seconds", and those want
     // opposite fixes.
     let bytes_before = crate::registry::SERVED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    let serve_ms_before = crate::registry::SERVED_MS.load(std::sync::atomic::Ordering::Relaxed);
     let t = std::time::Instant::now();
     // Point any nested earthly at THIS machine's daemon before handing the
     // graph over. earthly forwards its own BUILDKIT_HOST into every RUN, and
@@ -831,8 +832,16 @@ async fn lead_reply(
     let out = crate::solve::build_subtree(bk, reg, job, def).await;
     let moved =
         crate::registry::SERVED_BYTES.load(std::sync::atomic::Ordering::Relaxed) - bytes_before;
+    // SERVING ms beside the bytes, because the two together split a number
+    // that was doing two jobs. A lead costs what it fetches, at 7.2 MB/s -
+    // and that rate is GETTING the bytes plus UNPACKING them. This registry
+    // is on one side of the line: what it spent is fetch, and the rest of
+    // the lead is unpack. A faster mesh and a cheaper codec fix different
+    // halves and nothing so far says which half is bigger.
+    let served_ms =
+        crate::registry::SERVED_MS.load(std::sync::atomic::Ordering::Relaxed) - serve_ms_before;
     println!(
-        "[worker] job {job} took {}ms ({} ops, {} KiB fetched)",
+        "[worker] job {job} took {}ms ({} ops, {} KiB fetched in {served_ms}ms)",
         t.elapsed().as_millis(),
         verdict.ops,
         moved / 1024
