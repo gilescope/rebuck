@@ -4425,3 +4425,28 @@ the ratio it was built to compute has one sample and no counterpart.
 The pair stays, now that it has a use it did not have: `away` is a
 serviceable check that the leg time and the client's wait agree, which is
 one more thing that cannot silently drift.
+
+### `-bcast`'s risk, stated before its run
+
+One lane. `prefetch_permits` defaults to 1, and the worker holds that
+permit for its whole share rather than per blob - deliberately, so six
+announcements cannot interleave into six concurrent pulls.
+
+That was sized for a share. Broadcast makes every worker take every blob, so
+the same single lane carries six times the bytes it was tuned for, and the
+`-balance` run announced 421 times with up to 13 blobs each.
+
+Three readings, written down first:
+
+- **`building` falls.** The bytes arrive before the lead does, which is what
+  pre-positioning is for.
+- **Nothing moves.** The lane is saturated, so the prefetch finishes after
+  the lead that needed it and the build pulls the blob itself anyway - a
+  mechanism that runs, costs bandwidth, and changes nothing.
+- **`building` rises.** Worse than nothing: the lane is competing with the
+  demand fetches on the same worker for the same network.
+
+If it is the second or third, the next move is `REBUCK2_PREFETCH_LANES`
+rather than abandoning the idea - the flag exists, defaults to 1, and has
+never been set. That is a cheaper follow-up than it looks, and worth knowing
+before reading a flat result as a verdict on broadcasting.
