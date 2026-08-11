@@ -230,11 +230,30 @@ impl Proxy {
         // waits, which is exactly when a keepalive decides a connection is
         // dead.
         //
-        // 0 disables it, which is what every run before the split used.
+        // OFF by default, and the daemon's own source says why. From
+        // grpc-go's http2_server.go, vendored into the buildkitd we talk to:
+        //
+        //     maxPingStrikes     = 2
+        //     defaultPingTimeout = 2 * time.Hour
+        //
+        // With no active streams and PermitWithoutStream false, EVERY ping
+        // inside two hours is a strike, and three strikes sends GOAWAY with
+        // ENHANCE_YOUR_CALM / "too_many_pings" and closes the connection.
+        // A 20s keepalive therefore kills an idle connection after exactly
+        // three pings - 60 seconds - which is the boundary the failures
+        // landed on. With active streams the bar is EnforcementPolicy
+        // MinTime, 5 minutes by default, so any keepalive faster than that
+        // is fatal either way.
+        //
+        // tonic then reports the closed connection as `transport error`,
+        // which is its own Kind::Transport string and not the daemon's - two
+        // days were spent reading it as an answer from buildkitd.
+        //
+        // Anything non-zero here must exceed 5 minutes to be safe.
         let ka: u64 = std::env::var("REBUCK2_KEEPALIVE_S")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(20);
+            .unwrap_or(0);
         let endpoint = move |u: String| -> anyhow::Result<tonic::transport::Endpoint> {
             let e = tonic::transport::Endpoint::new(u)?;
             Ok(if ka == 0 {
