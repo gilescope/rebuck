@@ -1938,3 +1938,29 @@ The same numbers say what pre-positioning cannot fix. 617 MiB has to be
 decompressed and unpacked on every machine that uses it however it arrives,
 and that cost is per-machine by construction - see principle 18's limit.
 Splitting the seed shortens the wire, and only the wire.
+
+## Lazy pulling is the obvious alternative, and it is wrong for a build
+
+The inverse of pre-positioning is not fetching at all until a byte is read:
+a FUSE or EROFS mount presented immediately, with HTTP range requests
+behind it. That is stargz / eStargz / SOCI / Nydus, and buildkit supports it
+natively (`--oci-worker-snapshotter=stargz`), so a `RUN` can begin executing
+before its image has arrived.
+
+The number that makes it compelling is that a container reaches ready state
+having touched about **6.4% of its image bytes** (SOCI, USENIX ATC 2023).
+Moving 6% instead of 100% is not an optimisation, it is a different problem.
+
+It does not transfer to this workload. A BUILD touches the toolchain: the
+compiler, the linker and the header tree between them read 60-90% of that
+layer, and the breakeven where lazy pull becomes SLOWER than bulk transfer
+is around 80%. Paying FUSE round-trip latency per read, to avoid moving
+bytes you are going to read anyway, is a loss - and the `apk add` in
+`+earthbuild-integration-test-base` is exactly the shape that reads most of
+what it was given.
+
+So the family is right: move the bytes in bulk, early, to the machines that
+will want them. What is worth stealing from that ecosystem is narrower -
+containerd's `content.Store` write API lets a third party push blobs
+directly into a worker's local store, which is a real push channel rather
+than an advisory hint that the worker then has to pull through a registry.
