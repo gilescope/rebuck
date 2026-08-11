@@ -2188,10 +2188,10 @@ because a fleet that routes 8 solves is not a fleet.
 **Retracted.** A later run with `prefetch=0` also routed 8, which kills the
 correlation. Across eight runs:
 
-| configuration    | routed        |
-| ---------------- | ------------- |
+| configuration      | routed         |
+| ------------------ | -------------- |
 | warm=1, four runs | 21, 29, 54, 94 |
-| no warm, four runs | 7, 7, 8, 8   |
+| no warm, four runs | 7, 7, 8, 8 |
 
 and even that is probably not a mechanism: the warm runs survived 267-441s
 while the others died at 209-223s, so they simply had longer to route.
