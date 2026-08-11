@@ -4806,3 +4806,41 @@ if !KNOWN_MOUNTS.contains(&m.mount_type) {
 An allow-list caught what the argument for not needing one said would never
 arrive. That is the whole case for allow-lists over reasoning, and it is
 worth more than the finding it produced.
+
+### What the host-bind ceiling costs, in numbers
+
+Seventeen solves that cannot leave the machine held **670 seconds** of
+building, against 1,450 seconds that did leave. So on `+test-no-qemu` as it
+stands, 32% of the work is serial by construction - not by dependency, but
+because `WITH DOCKER` binds a host.
+
+| machines | best possible speedup |
+| -------- | --------------------- |
+| 6 | **2.32x** |
+| 12 | 2.68x |
+| 24 | 2.90x |
+| infinite | **3.2x** |
+
+That is the answer to "how much of this can be distributed", and it is
+worth more than any scheduling result: **six machines cannot beat 2.32x on
+this target however perfect the placement, and doubling to twelve buys
+0.36x.**
+
+It also retires the `-w12` experiment for this target before it costs
+forty-five minutes. Twelve machines was going to test whether the ceiling
+is the workload's - and the ceiling is the workload's, calculable from one
+run, at 2.68x against the 2.32x six already permits. There is no scheduling
+work worth doing for that 0.36x while a third of the build cannot move at
+all.
+
+Coarse on purpose: `home` is buildkit vertex time and `away` is the sum of
+worker-side lead durations, which are not the same clock. The conclusion
+survives being wrong by a factor of two in either direction - at 20% serial
+it is 5x, at 45% it is 2.2x, and the shape of the answer does not change.
+
+The way to raise this ceiling is not a better scheduler. It is to make
+`WITH DOCKER` dispatchable, which means a worker's dind reaching the images
+the coordinator loaded - and that is the mesh problem this project already
+solves for base images, applied to a registry earthly stands up per build.
+Whether that is worth doing is a real question. Pretending the scheduler
+can reach it is not.
