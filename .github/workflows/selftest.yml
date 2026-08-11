@@ -83,7 +83,24 @@ jobs:
           set -euo pipefail
           # Same pinned image as the fleet workflow: a smoke test against a
           # different buildkit is a smoke test of a different thing.
+          # THE DAEMON HAS TO BE TOLD, and this is the other half of a
+          # distinction the fleet workflow already documents: publishing is
+          # made insecure per-solve, so a push to a plain-HTTP registry
+          # works with no config at all - but PULLING is governed by daemon
+          # config alone. The harvest pulls its base, so it needs the file,
+          # and without it buildkit reports
+          #
+          #   http: server gave HTTP response to HTTPS client
+          #
+          # having silently tried https:// first.
+          mkdir -p bkcfg
+          # printf, not a heredoc: the terminator would have to sit at column
+          # zero to end one, and an indented `TOML` simply does not - the
+          # heredoc would swallow the rest of the step.
+          printf '[registry."172.17.0.1:15000"]\n  http = true\n  insecure = true\n' \
+            > bkcfg/buildkitd.toml
           docker run -d --name smoke-bk --privileged -p 28372:8372 \
+            -v "$PWD/bkcfg:/etc/buildkit:ro" \
             -e BUILDKIT_TCP_TRANSPORT_ENABLED=true -e BUILDKIT_TLS_ENABLED=false \
             earthbuild/buildkitd:v0.8.17 >/dev/null
           # PULL-THROUGH ON. A sessionless solve cannot reach Docker Hub -

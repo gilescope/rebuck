@@ -1112,7 +1112,21 @@ jobs:
             # differ by buildkit version as well as by warmth.
             BK_IMAGE=${BK_IMAGE:-earthbuild/buildkitd:v0.8.17}
             docker rm -f base-bk >/dev/null 2>&1 || true
+            # The registry stanza, for the HARVEST rather than for the
+            # baseline - which needs nothing from our registry and would run
+            # fine without it. Publishing is insecure per-solve, so the push
+            # works unconfigured; PULLING is governed by daemon config
+            # alone, and the harvest pulls its base image from us. Without
+            # the file buildkit tries https:// and reports `server gave HTTP
+            # response to HTTPS client`.
+            mkdir -p "$RUNNER_TEMP/basebk-cfg"
+            # printf, not a heredoc: the terminator would have to sit at column
+            # zero to end one, and an indented `TOML` simply does not - the
+            # heredoc would swallow the rest of the step.
+            printf '[registry."172.17.0.1:15000"]\n  http = true\n  insecure = true\n' \
+              > "$RUNNER_TEMP/basebk-cfg/buildkitd.toml"
             docker run -d --name base-bk --privileged -p 28372:8372 \
+              -v "$RUNNER_TEMP/basebk-cfg:/etc/buildkit:ro" \
               -e BUILDKIT_TCP_TRANSPORT_ENABLED=true -e BUILDKIT_TLS_ENABLED=false \
               "$BK_IMAGE" >/dev/null
             for _ in $(seq 1 90); do
