@@ -745,6 +745,8 @@ fn gating() -> bool {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Span {
     pub total: u64,
+    /// This exact graph had been solved before.
+    pub resend: bool,
     /// Rewriting the graph: publishing the context, mirroring base images.
     pub portable: u64,
     /// The peer building it and pushing the result.
@@ -981,7 +983,20 @@ impl Wire {
         }
     }
 
-    fn observe(&mut self, def: &bollard_buildkit_proto::pb::Definition) {
+    /// Solves whose graph had already been sent, byte for byte.
+    fn resends(&self) -> usize {
+        let mut uniq = self.graph_ids.clone();
+        uniq.sort();
+        uniq.dedup();
+        self.graph_ids.len().saturating_sub(uniq.len())
+    }
+
+    /// Record a solve, and say whether this exact graph has been seen before.
+    ///
+    /// The verdict is returned rather than looked up later because arrival
+    /// order and completion order are different orders: `graph_ids` grows on
+    /// arrival, `spans` on completion, and eight solves run at once.
+    fn observe(&mut self, def: &bollard_buildkit_proto::pb::Definition) -> bool {
         use prost::Message;
         self.solves += 1;
         self.ops += def.def.len() as u64;
@@ -992,8 +1007,9 @@ impl Wire {
             .map(|b| crate::store::sha256_hex(b))
             .collect();
         ids.sort();
-        self.graph_ids
-            .push(crate::store::sha256_hex(ids.join("").as_bytes()));
+        let graph = crate::store::sha256_hex(ids.join("").as_bytes());
+        let seen_before = self.graph_ids.contains(&graph);
+        self.graph_ids.push(graph);
         let mut already = 0usize;
         for bytes in &def.def {
             let digest = crate::store::sha256_hex(bytes);
@@ -1020,6 +1036,7 @@ impl Wire {
             }
         }
         self.overlap_per_solve.push((already, def.def.len()));
+        seen_before
     }
 
     /// The characterisation, as one block. Printed on shutdown because the
@@ -1053,13 +1070,33 @@ impl Wire {
         // API; two graphs sharing a prefix is work a fleet could share. The
         // summary percentage cannot tell them apart, and reading one as the
         // other is how a measurement becomes a wrong conclusion.
-        let mut uniq = self.graph_ids.clone();
-        uniq.sort();
-        uniq.dedup();
-        let resends = self.graph_ids.len().saturating_sub(uniq.len());
+        let resends = self.resends();
+        // What the repeats COST, not just how many there are. A resend that
+        // buildkit answers from its own cache in 500ms is an artefact of how
+        // earthly drives the API and nothing to fix; a resend that pays full
+        // price is work a memo would delete outright - no fleet involved.
+        // Counting them without timing them cannot tell those apart, and the
+        // two conclusions are opposite.
+        let (r_n, r_ms): (usize, u64) = self
+            .spans
+            .iter()
+            .filter(|s| s.resend)
+            .fold((0, 0), |(n, ms), s| (n + 1, ms + s.total));
+        let (f_n, f_ms): (usize, u64) = self
+            .spans
+            .iter()
+            .filter(|s| !s.resend)
+            .fold((0, 0), |(n, ms), s| (n + 1, ms + s.total));
+        if r_n > 0 {
+            println!(
+                "[wire] resend cost    : {r_n} resends {}ms mean, {f_n} first-sightings {}ms mean",
+                r_ms / r_n as u64,
+                f_ms / f_n.max(1) as u64,
+            );
+        }
         println!(
             "[wire] distinct graphs: {} of {} solves ({resends} identical RESENDS)",
-            uniq.len(),
+            self.graph_ids.len() - resends,
             self.graph_ids.len(),
         );
         println!(
@@ -1419,7 +1456,8 @@ impl Proxy {
 }
 
 /// What the gateway's Solve offers a dispatcher. THIS is the graph.
-fn report_gateway(wire: &std::sync::Mutex<Wire>, req: &gw::SolveRequest) {
+/// Returns whether this exact graph has been solved before.
+fn report_gateway(wire: &std::sync::Mutex<Wire>, req: &gw::SolveRequest) -> bool {
     let Some(def) = &req.definition else {
         // Say WHY nothing can be dispatched, not merely that nothing was.
         // "no definition" is true and useless; a user who points `docker
@@ -1428,7 +1466,7 @@ fn report_gateway(wire: &std::sync::Mutex<Wire>, req: &gw::SolveRequest) {
         let mut w = wire.held();
         if req.frontend.is_empty() {
             *w.rejected.entry("no definition".to_owned()).or_default() += 1;
-            return;
+            return false;
         }
         let key = format!("frontend runs in the daemon: {}", req.frontend);
         let first = !w.rejected.contains_key(&key);
@@ -1447,12 +1485,12 @@ fn report_gateway(wire: &std::sync::Mutex<Wire>, req: &gw::SolveRequest) {
                 req.frontend
             );
         }
-        return;
+        return false;
     };
     let a = crate::dispatch::analyse(def, MIN_CUT_OPS);
     let free: Vec<&crate::dispatch::Cut> = a.free_cuts().collect();
     let mut w = wire.held();
-    w.observe(def);
+    let resend = w.observe(def);
     println!(
         "[proxy] gateway solve #{}: {} ops, {} cuts >= {MIN_CUT_OPS}, {} free-frontier",
         w.solves,
@@ -1460,6 +1498,7 @@ fn report_gateway(wire: &std::sync::Mutex<Wire>, req: &gw::SolveRequest) {
         a.cuts.len(),
         free.len(),
     );
+    resend
 }
 
 /// Serve the Control service on `addr`, forwarding to `upstream`.
@@ -1686,7 +1725,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
     ) -> Result<Response<gw::SolveResponse>, Status> {
         let (meta, ext, req) = request.into_parts();
         trace(&self.wire, "solve");
-        report_gateway(&self.wire, &req);
+        let resend = report_gateway(&self.wire, &req);
         // Where the time goes. The tax was invisible until peer 0 rejoined
         // the round robin (10s -> 11s); "attack the round-trip" is a guess
         // until it is split into publish / peer build / answer, because two
@@ -2296,6 +2335,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         let answer = t_answer.elapsed().as_millis() as u64;
         self.wire.held().spans.push(Span {
             total: t_solve.elapsed().as_millis() as u64,
+            resend,
             portable: t_portable,
             adopt: t_adopt,
             answer,
@@ -2482,6 +2522,45 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
 
 #[cfg(test)]
 mod tests {
+    /// A resend is recognised on arrival, which is the only place it can be.
+    ///
+    /// 28 of 91 solves in a six-runner run were byte-identical graphs sent
+    /// again. Whether that is worth memoising depends on what they COST, and
+    /// the cost cannot be paired with the count after the fact: `graph_ids`
+    /// is appended on arrival and `spans` on completion, so with eight solves
+    /// in flight the two vectors are not index-aligned. The verdict has to
+    /// ride with the solve.
+    #[test]
+    fn a_repeated_graph_is_known_to_be_repeated_when_it_arrives() {
+        use bollard_buildkit_proto::pb;
+        use prost::Message;
+
+        let def = |id: &str| pb::Definition {
+            def: vec![
+                pb::Op {
+                    op: Some(pb::op::Op::Source(pb::SourceOp {
+                        identifier: id.into(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+                pb::Op::default().encode_to_vec(),
+            ],
+            ..Default::default()
+        };
+
+        let mut w = super::Wire::default();
+        assert!(!w.observe(&def("a")), "first sighting is not a resend");
+        assert!(!w.observe(&def("b")), "a different graph is not a resend");
+        assert!(w.observe(&def("a")), "the same graph again is");
+        assert!(w.observe(&def("a")), "and again");
+
+        // Which must agree with the count the report already prints, or one
+        // of the two numbers is wrong and nobody can tell which.
+        assert_eq!(w.resends(), 2);
+    }
+
     /// The gateway answers gRPC at all.
     ///
     /// One second, no docker, and it would have caught the bug that cost a
@@ -2653,6 +2732,7 @@ mod tests {
             portable: 300,
             adopt: 9_000,
             answer: 700,
+            resend: false,
         };
         assert_eq!(dispatched.tax(), 1_000);
         // A solve that stayed home pays no tax, however long it took.
@@ -2660,6 +2740,7 @@ mod tests {
             total: 10_000,
             portable: 0,
             adopt: 0,
+            resend: false,
             answer: 9_990,
         };
         assert_eq!(home.tax(), 9_990);
