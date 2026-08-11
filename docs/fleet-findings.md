@@ -3900,3 +3900,43 @@ content where it will be used. That is the right shape for avoiding a herd
 on the coordinator and the wrong shape for content every worker needs. It
 is deliberately not changed now - one variable, and this one has been dead
 long enough that its live behaviour is unknown.
+
+## Affinity never looked at the expensive thing
+
+Chained on one daemon - each solve building on the previous solve's result,
+which is the fleet's actual shape:
+
+```text
+[reserve] solve 0:   344ms  registry served   1870 KiB in 2 request(s)
+[reserve] solve 1:   838ms  registry served      0 KiB in 0 request(s)
+[reserve] solve 5:   569ms  registry served      0 KiB in 0 request(s)
+```
+
+**Zero, even though the base changed every time** - because the daemon built
+that base and still has it. That is the entire difference between one
+machine and six: in a fleet the parent was built somewhere else, so the
+whole parent image crosses. 25.6 GiB served against 277 MiB distinct is that
+difference, counted.
+
+And the placement decision has never looked at it. `warmth(ops, caches)`
+scored two things:
+
+- ops the candidate has already built - but a **cut** subtree names its
+  parent as `docker-image://host/repo@sha256:...` instead of carrying its
+  ops, so op overlap is structurally blind to the parent
+- cache mounts it holds - real, and measured at ~24s, but not this
+
+So affinity was sorting on the small term while the large one went
+unexamined. `mech` reported `affinity=10` against 82 placements in the gated
+run: it reordered the queue ten times, and never once because a machine
+already held the image about to be pulled onto it.
+
+`warmth` takes a third term. The blooms already answer it - they exist, they
+are gossiped, and `FleetBlobs::by_hash` already trusts them for exactly this
+question. A bloom lies only in the safe direction, so a false positive
+misplaces one subtree and a false negative cannot happen.
+
+Weight: the same 64 as a cache mount. A warm mount saves ~24s of `go mod
+download`; a parent already local saves a 188 MiB transfer, which at this
+fleet's ~7 MB/s is the same order. Two constants would imply a precision
+that comes from nowhere.

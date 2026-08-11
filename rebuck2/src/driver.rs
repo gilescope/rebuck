@@ -1691,8 +1691,23 @@ impl Driver {
                 .as_ref()
                 .map(crate::dispatch::cache_ids)
                 .unwrap_or_default();
+            // The parent images this subtree imports, and who is known to
+            // hold them. The BLOOMS answer this - they already exist, they
+            // are already gossiped, and `FleetBlobs::by_hash` already trusts
+            // them for exactly this question. A bloom lies only in the safe
+            // direction, so a false positive here misplaces one subtree and a
+            // false negative is impossible.
+            let imports = def
+                .as_ref()
+                .map(crate::dispatch::imported_images)
+                .unwrap_or_default();
+            let endpoints: std::collections::BTreeMap<u64, String> = {
+                let ws = self.workers.lock().await;
+                ws.iter().map(|w| (w.id, w.endpoint.clone())).collect()
+            };
             let pairs = self.op_by_worker.lock().await;
             let mounts = self.cache_by_worker.lock().await;
+            let blooms = self.blooms.lock().await;
             candidates
                 .iter()
                 .map(|c| {
@@ -1704,7 +1719,19 @@ impl Driver {
                         .iter()
                         .filter(|id| mounts.contains(&((*id).clone(), c.id)))
                         .count();
-                    (c.id, crate::dispatch::warmth(n as u32, m as u32))
+                    // By ENDPOINT, because that is how blooms are keyed;
+                    // candidates carry worker ids. A candidate whose
+                    // endpoint we cannot find scores zero imports, which is
+                    // the safe direction - it loses a tie it might have won,
+                    // rather than winning one it should not.
+                    let i = match endpoints.get(&c.id) {
+                        Some(e) => blooms
+                            .get(e)
+                            .map(|b| imports.iter().filter(|h| b.contains(h)).count())
+                            .unwrap_or(0),
+                        None => 0,
+                    };
+                    (c.id, crate::dispatch::warmth(n as u32, m as u32, i as u32))
                 })
                 .collect()
         } else {

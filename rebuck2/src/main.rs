@@ -478,8 +478,19 @@ async fn main() -> Result<()> {
                     ))
                 }
             };
+            // `--chain`: each solve builds on the PREVIOUS solve's result,
+            // which is the fleet's actual shape - a lead's base is its
+            // parent subtree, not a shared image. Without it this rig
+            // measures the easy case and calls it the answer: the same base
+            // every time is exactly the situation a content store handles
+            // well, and the fleet is never in it.
+            let chain = args.flag("--chain");
             let mut last = served().await.unwrap_or((0, 0));
-            println!("[reserve] base {base}, {n} solves on one daemon");
+            let mut base = base;
+            println!(
+                "[reserve] base {base}, {n} solves on one daemon{}",
+                if chain { ", chained" } else { "" }
+            );
             for i in 0..n {
                 let t = std::time::Instant::now();
                 // A DIFFERENT command each time, or buildkit answers from its
@@ -490,9 +501,15 @@ async fn main() -> Result<()> {
                     "/c",
                     &format!("echo {i} > /dev/null"),
                 );
-                solve::build_subtree(&bk, &registry, i as u64, g)
+                let published = solve::build_subtree(&bk, &registry, i as u64, g)
                     .await
                     .map_err(|e| anyhow::anyhow!("solve {i}: {e:#}"))?;
+                if chain {
+                    // The same prefixing every consumer of a bare digest has
+                    // to do - see `pullable`, which exists because each
+                    // caller had grown its own copy of this line.
+                    base = solve::pullable(&registry, &published);
+                }
                 let now = served().await.unwrap_or(last);
                 println!(
                     "[reserve] solve {i}: {:>5}ms  registry served {:>6} KiB in {} request(s)",

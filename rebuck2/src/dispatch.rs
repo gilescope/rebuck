@@ -542,6 +542,38 @@ pub fn cache_mount_shapes(def: &pb::Definition) -> BTreeSet<(String, bool)> {
     out
 }
 
+/// The content-addressed images this graph imports, as bare hashes.
+///
+/// A cut subtree names its parent as `docker-image://host/repo@sha256:...`
+/// rather than carrying its ops, so op overlap cannot see it - and the
+/// parent is the expensive thing. `scripts/reserve-check.sh` shows a daemon
+/// serving 1870 KiB for the first solve and nothing for five more, chained
+/// or not, because it built the parents itself. In a fleet the parent was
+/// built elsewhere and the whole image crosses.
+///
+/// Bare hashes, no `sha256:` prefix, because that is what a bloom filter and
+/// `FleetBlobs::by_hash` are keyed by.
+///
+/// TAGS are skipped. `busybox:1` is a perfectly good import and a useless
+/// affinity signal: there is no digest to ask a bloom about, and guessing
+/// would put work on a machine for a reason nobody can check.
+pub fn imported_images(def: &pb::Definition) -> BTreeSet<String> {
+    use prost::Message;
+    def.def
+        .iter()
+        .filter_map(|b| pb::Op::decode(b.as_slice()).ok())
+        .filter_map(|op| match op.op {
+            Some(pb::op::Op::Source(s)) => Some(s.identifier),
+            _ => None,
+        })
+        .filter_map(|id| {
+            let r = id.strip_prefix("docker-image://")?;
+            let (_, dig) = r.rsplit_once("@sha256:")?;
+            Some(dig.to_owned())
+        })
+        .collect()
+}
+
 pub fn cache_ids(def: &pb::Definition) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for bytes in &def.def {
@@ -1687,9 +1719,22 @@ pub fn parse_cache_seeds(raw: Option<&str>) -> BTreeMap<String, String> {
 /// overlap breaks the ties between peers holding the same mounts. A finer
 /// number would need per-id costs the driver only learns at the END of a
 /// run, which is a generation too late to place anything.
-pub fn warmth(ops: u32, caches: u32) -> u32 {
-    const MOUNT: u32 = 64;
-    ops.saturating_add(caches.saturating_mul(MOUNT))
+///
+/// `imports` is the third and was missing entirely. A cut subtree names its
+/// parent by digest instead of carrying its ops, so op overlap is blind to
+/// it - and the parent is the expensive thing. On one daemon a chained solve
+/// serves ZERO bytes because it built its own parent; in a fleet that parent
+/// was built elsewhere and the whole image crosses. That difference is the
+/// 25.6 GiB served against 277 MiB of distinct content, and until now
+/// nothing in the placement decision looked at it.
+pub fn warmth(ops: u32, caches: u32, imports: u32) -> u32 {
+    // One weight for both big things. A warm mount saves ~24s of `go mod
+    // download`; a parent image already local saves the whole transfer, 188
+    // MiB in the worst case measured, which is the same order at the ~7 MB/s
+    // this fleet moves. Two constants would imply a precision that comes
+    // from nowhere.
+    const BIG: u32 = 64;
+    ops.saturating_add(caches.saturating_add(imports).saturating_mul(BIG))
 }
 
 // Affinity-free form. The driver always passes a warmth function now, so
@@ -2692,6 +2737,75 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// An image already on the machine outranks an op already built there.
+    ///
+    /// Both avoid work; they are not the same size. Re-running an op costs
+    /// what that op cost. Fetching a parent image costs the whole image -
+    /// 188 MiB in the worst measured case - and a lead whose parent is local
+    /// served literally zero bytes in the local rig. So an import held is
+    /// worth the same order as a warm cache mount, and both must beat any
+    /// op overlap a single subtree can plausibly contain.
+    #[test]
+    fn a_held_import_outranks_op_overlap() {
+        let w = super::warmth;
+        // Same shape as the cache-mount rule beside it: 64 is "more ops than
+        // a subtree here has", not a calibration.
+        assert!(w(60, 0, 0) < w(0, 0, 1), "one held image beats sixty ops");
+        assert!(
+            w(60, 0, 0) < w(0, 1, 0),
+            "unchanged: a mount beats sixty ops"
+        );
+        // A mount and an import are the same order, so op overlap still
+        // breaks the tie between two peers holding the same big things.
+        assert_eq!(w(0, 1, 0), w(0, 0, 1));
+        assert!(w(3, 0, 1) > w(1, 0, 1));
+        assert_eq!(w(0, 0, 0), 0, "nothing held is no reason to prefer anyone");
+    }
+
+    /// The images a graph imports, which is what its placement should follow.
+    ///
+    /// `scripts/reserve-check.sh` on one daemon: solve 0 pulls 1870 KiB,
+    /// solves 1 through 5 pull nothing - and that holds even when each solve
+    /// builds on the previous one's result, because the daemon built that
+    /// result and still has it. In a fleet the parent was built somewhere
+    /// else, so the whole image crosses. That is the 25.6 GiB against 277 MiB
+    /// distinct, and affinity does not look at it: `warmth` counts ops the
+    /// candidate has built and cache mounts it holds, and a cut subtree
+    /// imports its parent by digest rather than carrying its ops.
+    #[test]
+    fn the_images_a_graph_imports_are_findable() {
+        use bollard_buildkit_proto::pb;
+        use prost::Message;
+        let src = |id: &str| {
+            pb::Op {
+                op: Some(pb::op::Op::Source(pb::SourceOp {
+                    identifier: id.to_owned(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }
+            .encode_to_vec()
+        };
+        let def = pb::Definition {
+            def: vec![
+                src("docker-image://reg:15000/rebuck2/subtree@sha256:aaa"),
+                src("docker-image://reg:15000/rebuck2/base@sha256:bbb"),
+                // A tag, not a digest: nothing to look up in a bloom, so it
+                // is not an affinity signal and must not be reported as one.
+                src("docker-image://docker.io/library/busybox:1"),
+                src("local://context"),
+                pb::Op::default().encode_to_vec(),
+            ],
+            ..Default::default()
+        };
+        let got = super::imported_images(&def);
+        assert_eq!(
+            got,
+            ["aaa".to_owned(), "bbb".to_owned()].into_iter().collect(),
+            "bare hashes, ready to ask a bloom about"
+        );
+    }
+
     /// A graph too small to be worth the bytes it drags across.
     ///
     /// `+test-ast` dispatched 412 solves to run a 204-second build and took
@@ -3645,14 +3759,14 @@ mod tests {
     #[test]
     fn cache_warmth_outranks_op_warmth() {
         // Ten shared ops loses to one shared cache mount.
-        assert!(super::warmth(10, 0) < super::warmth(0, 1));
+        assert!(super::warmth(10, 0, 0) < super::warmth(0, 1, 0));
         // And to be sure it is not merely ordered: it still loses at fifty.
-        assert!(super::warmth(50, 0) < super::warmth(0, 1));
+        assert!(super::warmth(50, 0, 0) < super::warmth(0, 1, 0));
         // Op warmth still breaks ties between peers with the same mounts.
-        assert!(super::warmth(3, 1) > super::warmth(2, 1));
+        assert!(super::warmth(3, 1, 0) > super::warmth(2, 1, 0));
         // Two mounts beat one, whatever the ops say.
-        assert!(super::warmth(0, 2) > super::warmth(60, 1));
-        assert_eq!(super::warmth(0, 0), 0);
+        assert!(super::warmth(0, 2, 0) > super::warmth(60, 1, 0));
+        assert_eq!(super::warmth(0, 0, 0), 0);
     }
 
     use super::*;
