@@ -515,6 +515,30 @@ async fn serve_get(
 /// Split out of the control loop so the decision chain is readable in one
 /// place: the checks run in the order `dispatch::consider` defines, and the
 /// build only happens after all of them pass.
+/// How a nested build should reach the daemon on THIS machine, if it should.
+///
+/// `None` leaves the graph alone, which means a nested earthly keeps dialling
+/// whatever the coordinator forwarded. Off by default like every other
+/// mechanism here: it changes the cache key of any RUN that carries the
+/// variable, so a forwarded RUN stops merging across machines - a real cost
+/// that has to be measured against the funnel it removes rather than assumed
+/// smaller.
+///
+/// Not loopback. earthly's `IsLocal` treats 127.0.0.1 as "a buildkit I
+/// manage" and tries to start its own container from an image that is not
+/// published, so the nested build dies on `manifest unknown` before it
+/// solves anything.
+fn nested_host(enabled: bool, override_addr: Option<&str>, mine: Option<&str>) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let addr = override_addr.or(mine)?;
+    let addr = addr.strip_prefix("tcp://").unwrap_or(addr);
+    let host = addr.split(':').next().unwrap_or(addr);
+    (!host.is_empty() && host != "127.0.0.1" && host != "localhost" && host != "::1")
+        .then(|| format!("tcp://{addr}"))
+}
+
 async fn lead_reply(
     cfg: &WorkerCfg,
     slots: &Arc<Semaphore>,
@@ -607,6 +631,24 @@ async fn lead_reply(
     // opposite fixes.
     let bytes_before = crate::registry::SERVED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
     let t = std::time::Instant::now();
+    // Point any nested earthly at THIS machine's daemon before handing the
+    // graph over. earthly forwards its own BUILDKIT_HOST into every RUN, and
+    // in a fleet that address is the coordinator's - so a nested build here
+    // would dial back across the network and re-enter through one gateway.
+    //
+    // Only the worker can do this. The converter runs before placement and
+    // cannot know which machine will execute the op, and earthly's own
+    // machine-independent constant (tcp://buildkitsandbox:8372) resolves for
+    // most execs but not for `--privileged --entrypoint` ones, where the
+    // nested earthly dies on `could not connect to buildkit: timeout 1m0s`.
+    let def = match nested_host(
+        std::env::var("REBUCK2_LOCAL_NESTED").as_deref() == Ok("1"),
+        std::env::var("REBUCK2_NESTED_HOST").ok().as_deref(),
+        cfg.buildkit_addr.as_deref(),
+    ) {
+        Some(addr) => crate::dispatch::retarget_buildkit_host(&def, &addr),
+        None => def,
+    };
     let out = crate::solve::build_subtree(bk, reg, job, def).await;
     let moved =
         crate::registry::SERVED_BYTES.load(std::sync::atomic::Ordering::Relaxed) - bytes_before;
@@ -1239,6 +1281,49 @@ async fn sync_shard(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_nested_host_is_never_loopback_and_never_a_surprise() {
+        use super::nested_host;
+
+        // OFF unless asked for. Retargeting changes the cache key of any RUN
+        // carrying the variable, so a forwarded RUN stops merging across
+        // machines - a real cost that must not arrive by accident.
+        assert_eq!(nested_host(false, None, Some("tcp://10.0.0.9:8372")), None);
+
+        // The worker's own daemon, normalised to one spelling.
+        assert_eq!(
+            nested_host(true, None, Some("tcp://10.0.0.9:8372")).as_deref(),
+            Some("tcp://10.0.0.9:8372")
+        );
+        assert_eq!(
+            nested_host(true, None, Some("10.0.0.9:8372")).as_deref(),
+            Some("tcp://10.0.0.9:8372")
+        );
+
+        // NEVER loopback. earthly's IsLocal treats 127.0.0.1 as "a buildkit I
+        // manage" and starts its own container from an image that is not
+        // published, so the nested build dies on `manifest unknown` before it
+        // solves anything. That cost a baseline run to rediscover once.
+        for local in ["tcp://127.0.0.1:8372", "localhost:8372", "tcp://::1:8372"] {
+            assert_eq!(nested_host(true, None, Some(local)), None, "{local}");
+        }
+
+        // An explicit override wins - a worker's daemon address is how the
+        // WORKER reaches it, which is not always how an exec can.
+        assert_eq!(
+            nested_host(
+                true,
+                Some("tcp://172.17.0.1:8372"),
+                Some("tcp://127.0.0.1:8372")
+            )
+            .as_deref(),
+            Some("tcp://172.17.0.1:8372")
+        );
+        // Nothing configured is nothing done.
+        assert_eq!(nested_host(true, None, None), None);
+    }
+
     use super::*;
     use bazel_remote_apis::build::bazel::remote::execution::v2 as re;
 

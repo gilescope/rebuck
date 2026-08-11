@@ -41,6 +41,10 @@ on:
       home_slots:
         description: "slots peer 0 keeps for itself - 0 forces dispatch"
         default: "0"
+      local_nested:
+        description: a nested earthly uses the daemon on the machine running it (1/0)
+        type: string
+        default: '0'
       sandbox_host:
         description: nested earthly dials the LOCAL daemon via buildkitsandbox (1/0)
         type: string
@@ -141,6 +145,12 @@ env:
   REBUCK2_H2_RESETS: ${{ inputs.h2_resets || '' }}
   REBUCK2_CONSOLIDATE: ${{ inputs.consolidate || '1' }}
   REBUCK2_SANDBOX_HOST: ${{ inputs.sandbox_host || '0' }}
+  # The funnel fix that does NOT rely on a name resolving inside an exec.
+  # buildkitsandbox works for most execs and not for `--privileged
+  # --entrypoint` ones, where the nested earthly dies on `could not connect
+  # to buildkit`. The worker substitutes its own routable address instead,
+  # which is the one place the answer is known.
+  REBUCK2_LOCAL_NESTED: ${{ inputs.local_nested || '0' }}
   # Pinned by digest like everything else here: a collector that changes
   # under us changes the data.
   OTEL_IMAGE: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.145.0
