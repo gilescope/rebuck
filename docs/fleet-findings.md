@@ -1883,3 +1883,33 @@ real win, and it is the only shape of win available:
   bytes off the coordinator at six times the seed bandwidth.
 
 Both attack the 192-second chain. Nothing else on the table does.
+
+## Where this stands, and what each knob is for
+
+Every mechanism is off by default and each is one environment variable, so
+any of them can be A/B'd in a single run. What they attack, and what is
+known about each:
+
+| knob | attacks | status |
+| ------------------------ | ------------------------ | ---------------------- |
+| `REBUCK2_AFFINITY` | duplicate materialisation | 2.2x -> 1.2-1.4x built |
+| `REBUCK2_MIN_SIBLINGS` | dispatching serial work | untested |
+| `REBUCK2_WARM` | the 192s base chain | never yet ran |
+| `REBUCK2_LOCAL_NESTED` | the nested-build funnel | untested |
+| `REBUCK2_SANDBOX_HOST` | the same funnel | works, breaks one test |
+| `REBUCK2_GRAFT` | rebuilding known ancestry | costs 107s |
+| `REBUCK2_FLEET_CACHE` | rebuilding known ancestry | costs 334s |
+
+Only two of those have a measured benefit, and only affinity is unambiguous.
+
+The honest summary after all of it: the whole of `+test-no-qemu` runs
+through six machines and agrees with one machine on the answer, which is
+what "distributed buildkit" had to mean first. It is not faster, and the
+traces say why in a way no placement policy can address - 71% of the
+workload is a serial chain of three targets, and the parallel remainder
+costs the same either way.
+
+The two knobs that could still change that both attack the chain rather
+than the placement: warming it onto the workers in the window they already
+spend idle, and splitting the seed so six machines fetch a sixth each
+instead of one machine fetching all of it.
