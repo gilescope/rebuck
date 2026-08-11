@@ -1710,8 +1710,17 @@ impl Driver {
         let this = self.clone();
         let r = image_ref.to_owned();
         tokio::spawn(async move {
-            let digests = crate::solve::image_blobs(&r).await.unwrap_or_default();
-            this.prefetch_everywhere(digests).await;
+            // SAY SO when there is nothing to announce. An unreachable
+            // registry, a manifest list, a repo path this does not parse -
+            // each returns an empty list, and an empty list is
+            // indistinguishable from a mechanism that ran and found nothing
+            // to do. Several mechanisms here have been measured as "no
+            // effect" while silently not running.
+            match crate::solve::image_blobs(&r).await {
+                Some(d) if !d.is_empty() => this.prefetch_everywhere(d).await,
+                Some(_) => println!("[driver] prefetch: {r} names no blobs"),
+                None => println!("[driver] prefetch: could not read the manifest for {r}"),
+            }
         });
     }
 
