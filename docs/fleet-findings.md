@@ -5175,3 +5175,49 @@ proxy sees the definition the coordinator's daemon loads, so 337 is the one
 that applies - but a fork that rewrote ops before digesting would show up as
 partial matching, which is what the `Xms of Yms matched` figure exists to
 make visible.
+
+## `refused time`: 1%. The `WITH DOCKER` cut buys nothing
+
+```text
+[wire] refused time : 13s before the first exclusion, 2223s from it on
+                      (1% dispatchable if cut, 2236772ms of 750337ms home
+                      time matched) - ops are not time
+[wire] trapped ops  : 35 refused solve(s), 863 ops, 62 past the last
+                      exclusion (7%)
+```
+
+Thirteen seconds against 2,223. **One percent.** The prefix of a
+`WITH DOCKER` graph holds essentially none of its time, and the two figures
+together say why: 93% of the ops precede the last exclusion, 7% follow it,
+and the first exclusion arrives after 13 seconds of work. So the host binds
+bracket the expensive part rather than sitting at one end of it.
+
+Cutting at the first exclusion dispatches 1% of the time. Cutting at the
+last dispatches 7% of the ops. Neither is worth a mechanism, and the
+`WITH DOCKER` ceiling of **2.32x on six machines stands as the final
+answer** for this target.
+
+That closes the last open question. Everything remaining on `+test-no-qemu`
+is bounded by work that binds a host, and no scheduler reaches past it.
+
+### And the sanity figure caught my own instrument
+
+`2236772ms of 750337ms home time matched` - **matched exceeds the total, by
+three times.**
+
+Shared ops. A digest appearing in five refused graphs has its time added
+five times, once per graph, because I sum per-graph without deduplicating
+across them. The absolute totals are inflated; the RATIO is not, because
+both sides inflate together.
+
+So the 1% stands and the seconds do not. That distinction only exists
+because the guard prints both numbers instead of gating on them silently -
+the property argued for two commits ago, on the grounds that a guard can be
+wrong about its verdict but must not be wrong about its evidence. It was
+built expecting a mapping FAILURE and caught a double-count instead.
+
+The fix is a `BTreeSet` of digests across all refused graphs before summing,
+and it is not worth making: the answer is 1%, deduplication moves both
+numerator and denominator, and nothing downstream depends on the absolute
+seconds. Recorded rather than fixed, so the next reader does not take
+`2236772ms` for a measurement.
