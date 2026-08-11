@@ -100,6 +100,15 @@ type Published = std::sync::Arc<
     >,
 >;
 
+/// Status frames that passed through the vertex tap, and the microseconds it
+/// spent on them.
+///
+/// Reported so a run can say what its own instruments cost. Atomics rather
+/// than the `wire` mutex, because a counter that contends with the thing it
+/// is timing measures mostly itself.
+static TAP_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TAP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Note every vertex a status frame carries, keyed by digest.
 ///
 /// Buildkit re-sends a vertex as it progresses: once with `completed` unset,
@@ -683,6 +692,15 @@ impl control::control_server::Control for Proxy {
         let wire = self.wire.clone();
         let tapped = s.into_inner().map(move |item| {
             if let Ok(resp) = &item {
+                // The tap MEASURES ITSELF, in atomics, off any lock.
+                //
+                // The reference run for these instruments took 40 minutes
+                // against 29.5 for the same target without them, and there
+                // was no way to tell an expensive tap from a slow pool short
+                // of running it twice. An instrument that cannot say what it
+                // cost makes every number beside it unfalsifiable.
+                let t0 = std::time::Instant::now();
+                TAP_FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // NOTHING TO SAY, NOTHING TO LOCK. Most frames on this stream
                 // are log lines and byte counters with no vertex at all, and
                 // `wire` is the same mutex the placement path takes - taking
@@ -694,6 +712,10 @@ impl control::control_server::Control for Proxy {
                         note_vertices(&mut w.home_vertices, &resp.vertexes);
                     }
                 }
+                TAP_US.fetch_add(
+                    t0.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
             item
         });
@@ -2478,6 +2500,14 @@ pub async fn serve(
                 building_ms: b,
             };
             let t = total.total_ms().max(1);
+            let (frames, us) = (
+                TAP_FRAMES.load(std::sync::atomic::Ordering::Relaxed),
+                TAP_US.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            println!(
+                "[wire] status tap     : {frames} frame(s), {}ms total - what THIS instrument cost",
+                us / 1000
+            );
             println!(
                 "[wire] lead phases    : placing {}s ({:.0}%) waiting {}s ({:.0}%) building {}s ({:.0}%) \
                  - waiting is a worker BUSY, not a fleet failing",
