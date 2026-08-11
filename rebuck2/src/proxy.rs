@@ -681,8 +681,18 @@ impl control::control_server::Control for Proxy {
                 // is still worth naming here, because the client's report of
                 // it names nothing on this side.
                 Err(e) => {
+                    // ENDED, most likely, not failed. The lifetimes settled
+                    // this: three sessions ended within 150ms of each other
+                    // at 22.6s, on separate connections, which is three
+                    // nested earthlys that started together and exited
+                    // together - not a connection fault. The fourth ran
+                    // 439s, the length of the whole build.
+                    //
+                    // Called a failure for two days, it sent five fixes at
+                    // the wrong component. A stream ending when its client
+                    // goes away is the normal case and the log should say so.
                     println!(
-                        "[proxy] session {sid} from daemon failed after {}ms: {} {}",
+                        "[proxy] session {sid} ended after {}ms: {} {}",
                         started.elapsed().as_millis(),
                         e.code(),
                         e.message()

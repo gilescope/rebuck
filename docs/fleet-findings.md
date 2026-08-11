@@ -2052,3 +2052,44 @@ So the two mechanisms are not additive and may be opposed:
 
 If that table is right, `warm=1` wants `MIN_SIBLINGS=0`, and the two should
 never be measured together without saying which is expected to dominate.
+
+## The honest comparison: still 2x, and the confound was not the cause
+
+With the baseline moved to its own daemon, so the fleet's coordinator starts
+as cold as the machine it is measured against:
+
+| measure | baseline | fleet, 6 machines |
+| --------------- | ------------ | ---------------------------- |
+| daemon | fresh, 28372 | cold coordinator + 6 workers |
+| wall | 214s | 441s |
+| targets touched | 49 | 53 |
+| failed targets | 1 | 1 |
+
+Both legs completed, both failed the same one target, and for the first time
+they attempted comparable work. The fleet is 2.06x slower.
+
+So the warm-coordinator confound was real and was NOT the explanation. That
+matters more than it sounds: it was the best remaining candidate for a
+harness artefact hiding a genuine win, and removing it changed the ratio
+from 1.8x to 2.06x - the wrong direction for that hypothesis. What is left
+is the workload, and the workload is 71% serial.
+
+### And the session errors were never errors
+
+Four sessions "failed" per run, and the fix for it went through five
+components. The lifetimes end the question:
+
+```text
+session 60j9x98... after 22598ms
+session xp4n2dt... after 22728ms
+session ffdofjc... after 22746ms
+session syrwnny... after 439474ms
+```
+
+Three inside 150ms of each other, on SEPARATE connections, which is not a
+connection fault: it is three nested earthlys that started together and
+exited together. The fourth is the outer session, ending when the build did.
+
+A stream ending because its client went away is the normal case. Logging it
+as a failure sent five fixes at the wrong component over two days, and the
+line now says "ended".
