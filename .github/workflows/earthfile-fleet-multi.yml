@@ -1399,7 +1399,17 @@ jobs:
           # against a 1.4x ceiling is a graph with no seam; the same 1.8x
           # against a 5x ceiling is a dispatcher with a problem, and until
           # these two lines existed the two were indistinguishable.
-          grep -E '^\[wire\] (concurrency|amdahl ceiling|verdict)' proxy.log || true
+          grep -E '^\[wire\] (concurrency|amdahl ceiling|verdict|mount arms)' proxy.log || true
+          # WORK AMPLIFICATION, which is the number that reframes all of
+          # these. The fleet's lead time against the whole baseline wall: if
+          # it is 9, the fleet did nine times the work and no scheduler
+          # divides that across seven machines into a win. Parallelism is
+          # then not the thing to fix.
+          lead_ms=$(grep -oE 'lead_ms=[0-9]+' proxy.log | tail -1 | cut -d= -f2)
+          if [ -n "${lead_ms:-}" ] && [ "${BASELINE_SECS:-0}" -gt 0 ]; then
+            awk -v l="$lead_ms" -v b="$BASELINE_SECS" \
+              'BEGIN{printf "amplification : %.1fx - %.0fs of lead work against a %ss baseline\n", l/1000/b, l/1000, b}'
+          fi
           # A WARNING, deliberately not an error. Peak 1 across N machines is
           # usually the graph and occasionally us, and a gate that cannot
           # tell the difference would go red on a correct run of a serial

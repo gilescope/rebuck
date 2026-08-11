@@ -2302,6 +2302,7 @@ pub async fn serve(
         }
         let (lead_total_ms, lead_total_n) = driver_for_report.cache_lead_total();
         let (seeded_ms, seeded_n, cold_ms, cold_n) = driver_for_report.seeded_split().await;
+        let (all_lead_ms, all_leads) = driver_for_report.lead_total();
         {
             let w = wire.held();
             // ONE LINE with the numbers a run is compared on, because the ledger
@@ -2316,7 +2317,8 @@ pub async fn serve(
                 "[wire] verdict        : target={} solves={} routed={} home={} peak_solves={peak_solves} \
                  inflight={peak} \
                  occupancy={occupancy:.2} ceiling={ceiling:.2} ceiling_{machines}m={finite:.2} \
-                 dup={:.1} seeds={}/{} mounts_ms={} \
+                 dup={:.1} seeds={}/{} leads={all_leads} lead_ms={all_lead_ms} \
+                 mounts_ms={} \
                  mount_leads={}",
                 std::env::var("REBUCK2_TARGET").unwrap_or_else(|_| "?".into()),
                 w.solves,

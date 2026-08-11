@@ -381,6 +381,19 @@ pub struct Driver {
     /// cannot be true and was very nearly quoted.
     cache_lead_ms: std::sync::atomic::AtomicU64,
     cache_leads: std::sync::atomic::AtomicU64,
+    /// EVERY lead's duration, summed, and how many.
+    ///
+    /// The number that reframes this project's results. group2: 143 solves,
+    /// occupancy 3.53, 598s of wall - so about 2100 machine-seconds of lead
+    /// work against a baseline that finished the same target in 233. The
+    /// fleet does roughly NINE TIMES the work, and no scheduler divides 9x
+    /// across 7 machines into a win.
+    ///
+    /// So the thing to attack is amplification, not parallelism. Reported
+    /// rather than derived, because deriving it needs occupancy and a wall
+    /// clock and gets rounded twice on the way.
+    all_lead_ms: std::sync::atomic::AtomicU64,
+    all_leads: std::sync::atomic::AtomicU64,
     /// The most subtrees ever in flight at once.
     ///
     /// The question that outranks every transfer optimisation: can this
@@ -534,6 +547,8 @@ impl Driver {
             cache_cost: Default::default(),
             seeded_leads: Default::default(),
             cold_leads: Default::default(),
+            all_lead_ms: Default::default(),
+            all_leads: Default::default(),
             cache_lead_ms: Default::default(),
             cache_leads: Default::default(),
             peak_inflight: Default::default(),
@@ -868,6 +883,8 @@ impl Driver {
                         // ranks what seeding a warm cache would actually
                         // buy, and cannot be derived from the Earthfile.
                         {
+                            self.all_lead_ms.fetch_add(ms, Ordering::Relaxed);
+                            self.all_leads.fetch_add(1, Ordering::Relaxed);
                             if !caches.is_empty() {
                                 self.cache_lead_ms.fetch_add(ms, Ordering::Relaxed);
                                 self.cache_leads.fetch_add(1, Ordering::Relaxed);
@@ -2130,6 +2147,14 @@ impl Driver {
         let mut a = self.seeded_leads.lock().await.clone();
         let mut b = self.cold_leads.lock().await.clone();
         (median(&mut a), a.len(), median(&mut b), b.len())
+    }
+
+    /// Every lead's milliseconds, summed, and the count.
+    pub fn lead_total(&self) -> (u64, u64) {
+        (
+            self.all_lead_ms.load(Ordering::Relaxed),
+            self.all_leads.load(Ordering::Relaxed),
+        )
     }
 
     /// Lead time spent in leads that named ANY cache mount, and how many.
