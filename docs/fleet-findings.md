@@ -2093,3 +2093,33 @@ exited together. The fourth is the outer session, ending when the build did.
 A stream ending because its client went away is the normal case. Logging it
 as a failure sent five fixes at the wrong component over two days, and the
 line now says "ended".
+
+## Warming cannot work, because portability changes the cache keys
+
+The warm-up succeeds - all six workers, `warm exit=0`, the whole base chain
+built locally - and the fleet is no faster. The per-lead bytes say why:
+
+```text
+job 22 took 37626ms (92 ops, 362249 KiB fetched)
+job  3 took  3659ms  (4 ops,  45573 KiB fetched)
+```
+
+A warm worker fetched 354 MiB. If its cache were usable those layers would
+already be present, so the cache is being missed entirely.
+
+The reason is structural rather than a bug. A dispatched graph is made
+PORTABLE first: `local://` sources become published context images, base
+images become mirrored refs. That rewrite changes the op bytes, so it
+changes their digests, so it changes every cache key beneath them. A worker
+warmed by running earthly directly has a cache keyed on the UNREWRITTEN
+graph, and the two can never meet.
+
+This is not fixable by warming harder. Any warm-up that runs an ordinary
+build produces ordinary cache keys, and the fleet only ever asks for
+rewritten ones.
+
+What follows is that pre-positioning has to move the exact blobs the
+rewritten graph names - which is what `REBUCK2_PREFETCH` does, and is now
+the only member of this family left untested. It does not need cache keys to
+match: it puts the bytes where the pull will look, and the pull is
+`docker-image://mirror/x@sha256:...` by digest.
