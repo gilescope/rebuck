@@ -3221,10 +3221,17 @@ mod tests {
         }
 
         assert_eq!(d.consumers_of("leaf").await, 1, "a leaf has one consumer");
-        assert_eq!(d.consumers_of("shared").await, 3, "distinct workers, not pairings");
+        assert_eq!(
+            d.consumers_of("shared").await,
+            3,
+            "distinct workers, not pairings"
+        );
 
         // The rule, stated as the code applies it.
-        assert!(d.consumers_of("leaf").await < 2, "leaf: do not pre-position");
+        assert!(
+            d.consumers_of("leaf").await < 2,
+            "leaf: do not pre-position"
+        );
         assert!(d.consumers_of("shared").await >= 2, "shared: pre-position");
     }
     use super::*;
