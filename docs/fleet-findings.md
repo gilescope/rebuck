@@ -3867,3 +3867,36 @@ unparseable reference, unreachable host, non-2xx from the registry, and a
 manifest with no layers each say so, with the URL and the status. `mech.rs`
 was built to catch a mechanism that is on and never applied; it cannot
 catch one that runs, fails, and says so in a message that names no cause.
+
+### What the fixed prefetch should look like, stated before the run
+
+Every worker line in both `+test-ast` runs:
+
+```text
+126 [worker] prefetched 0/0 of my share (2 announced)
+ 62 [worker] prefetched 1/1 of my share (2 announced)
+ 36 [worker] prefetched 0/0 of my share (6 announced)
+```
+
+Two, four or six blobs announced - base-image manifests, the only ones whose
+refs carried a host. **Eighty-four blobs prefetched in total**, across every
+worker of both runs, against 17 distinct artifacts over a megabyte and 25.6
+GiB served. Prefetch has been moving nothing, and the counter said
+`prefetch=6` rather than `ON BUT NEVER APPLIED`, because it did fire - six
+times, on the wrong six images.
+
+So the signature to look for, written down first:
+
+- announcements should carry **tens** of blobs, not two - a subtree result's
+  manifest lists its whole layer chain
+- `prefetched N/N` with N > 0 on most workers, not `0/0`
+- and the number that decides it: **MiB served should fall**, because a
+  worker that already holds a layer does not ask a peer for it
+
+If announcements grow and served bytes do not fall, the answer is in
+`my_share`: it splits the announced blobs across workers so that SOME peer
+holds each one, which spreads the source rather than pre-positioning the
+content where it will be used. That is the right shape for avoiding a herd
+on the coordinator and the wrong shape for content every worker needs. It
+is deliberately not changed now - one variable, and this one has been dead
+long enough that its live behaviour is unknown.
