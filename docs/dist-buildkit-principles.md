@@ -855,3 +855,42 @@ Two corollaries worth having:
   0.0 MiB - the lint fails on the first module, so the cache that would have
   paid never fills. The cheap target could not answer the question, and
   nothing about the mechanism was wrong.
+
+## 25. A lead costs what it fetches, so measure the work against the bytes
+
+Ask of every solve, before dispatching it: is there more work here than
+there are bytes to move? If not, keep it home. Idle machines are not a
+reason to send it - they are a reason to send something else.
+
+`+test-ast` is the case. 412 solves, every one routed, none kept home; 204
+seconds baseline against 1773 in the fleet; 24.7 GiB moved. The median lead
+ran 2.6 seconds and fetched 26 MiB, to run a `jq` and a `diff`. Fifty-four
+leads carried twenty ops or fewer, cost 232 seconds between them, and
+dragged 1.2 GiB.
+
+**73x.** Not 73% slower - 73 times the work, to produce the same artifacts.
+
+Occupancy read 8.41 against a graph ceiling of 3.50, and both numbers are
+right. The ceiling is what the graph permits; being above it means the
+fleet was busier than its own critical path, which is only possible if
+distribution added work rather than dividing it. When those two disagree in
+that direction, the overhead IS the finding - do not go looking for the
+scheduling bug.
+
+The proxy cannot know a graph's runtime, and does not need to. Op count is
+a crude proxy, known before dispatch, needing no history - principle 13.
+The asymmetry is what licenses the crudeness: being wrong costs one solve
+built at home; being absent cost 73x.
+
+Distinguish this from a cap on WORKERS, which I wrote, tested, and removed
+in the same hour because it rested on reading 162 machine-seconds as wall
+clock. That retraction stands. This is a different question asked of a
+different object: not how many machines should participate, but whether
+this particular graph is worth a machine at all. Also not `min_siblings`,
+which asks whether anything else is in flight - that governs whether
+dispatch can OVERLAP, and it would not have stopped one of the 412.
+
+The general form, for any system that moves work to where the capacity is:
+the unit of dispatch has a floor price, and it is set by the context the
+work needs, not by the work. Below that floor, the fastest scheduler in the
+world loses to doing nothing.
