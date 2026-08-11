@@ -2215,11 +2215,18 @@ mod tests {
 
         // Metadata describes ops that exist.
         for k in after.metadata.keys() {
-            assert!(by_digest.contains(k), "{what}: metadata for a pruned op {k}");
+            assert!(
+                by_digest.contains(k),
+                "{what}: metadata for a pruned op {k}"
+            );
         }
 
         // Anything carried over unchanged is carried over BYTE for byte.
-        let kept: Vec<&Vec<u8>> = after.def.iter().filter(|b| before.def.contains(b)).collect();
+        let kept: Vec<&Vec<u8>> = after
+            .def
+            .iter()
+            .filter(|b| before.def.contains(b))
+            .collect();
         for b in kept {
             assert!(
                 before.def.contains(b),
@@ -2244,7 +2251,10 @@ mod tests {
         let d = chain(vec![
             (src("docker-image://docker.io/library/alpine:3.20"), vec![]),
             (src("git://github.com/example/repo.git#main"), vec![]),
-            (exec(vec!["EARTHLY_BUILDKIT_HOST=tcp://10.0.0.1:1234"]), vec![0, 1]),
+            (
+                exec(vec!["EARTHLY_BUILDKIT_HOST=tcp://10.0.0.1:1234"]),
+                vec![0, 1],
+            ),
             (plain(), vec![2]),
             (pb::Op::default(), vec![3]),
         ]);
@@ -2253,7 +2263,11 @@ mod tests {
         // Each rewrite in turn, and then the compositions that actually run
         // in the proxy - the terminal-as-vertex bug only appeared when
         // grafting and cutting were both on.
-        assert_well_formed(&d, &retarget_buildkit_host(&d, "tcp://10.0.0.9:8372"), "retarget");
+        assert_well_formed(
+            &d,
+            &retarget_buildkit_host(&d, "tcp://10.0.0.9:8372"),
+            "retarget",
+        );
         assert_well_formed(&d, &rewrite_git_sources(&d, &|_| None), "git (no-op)");
         assert_well_formed(
             &d,
@@ -2280,7 +2294,11 @@ mod tests {
             d.def,
             "already pointing there: no change"
         );
-        assert_eq!(graft_built(&d, &|_| None).def, d.def, "nothing built: no change");
+        assert_eq!(
+            graft_built(&d, &|_| None).def,
+            d.def,
+            "nothing built: no change"
+        );
     }
 
     #[test]
@@ -2311,7 +2329,13 @@ mod tests {
         };
         let d = chain(vec![
             (src("docker-image://alpine:3.20"), vec![]),
-            (exec(vec!["PATH=/bin", "EARTHLY_BUILDKIT_HOST=tcp://10.0.0.1:1234"]), vec![0]),
+            (
+                exec(vec![
+                    "PATH=/bin",
+                    "EARTHLY_BUILDKIT_HOST=tcp://10.0.0.1:1234",
+                ]),
+                vec![0],
+            ),
             (exec(vec!["PATH=/bin"]), vec![1]),
             (pb::Op::default(), vec![2]),
         ]);

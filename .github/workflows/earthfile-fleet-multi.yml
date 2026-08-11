@@ -993,6 +993,22 @@ jobs:
       # and the indented `*failed*` markers were each invisible until a later
       # run happened to print the line that showed them. A tail of 150 lines
       # of proxy.log is not enough to answer a question nobody had yet.
+      - name: flush the collector
+        if: always()
+        run: |
+          set -uo pipefail
+          # The file exporter buffers. Stopping the container flushes it, and
+          # an artifact of a half-written jsonl is worse than none: it looks
+          # like the run produced few spans.
+          docker stop -t 20 otelcol >/dev/null 2>&1 || true
+          f="$RUNNER_TEMP/otel/traces.jsonl"
+          if [ -s "$f" ]; then
+            echo "traces: $(wc -l < "$f" | tr -d ' ') batches, $(du -h "$f" | cut -f1)"
+          else
+            echo "::warning::no traces were collected - earthly may not have exported"
+            docker logs otelcol 2>&1 | tail -10 || true
+          fi
+
       - name: keep the logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -1000,6 +1016,7 @@ jobs:
           name: fleet-logs-${{ github.run_attempt }}
           path: |
             proxy.log
+            ${{ runner.temp }}/otel/traces.jsonl
             /tmp/fleet.log
             /tmp/baseline.log
             /tmp/fleet.failed
