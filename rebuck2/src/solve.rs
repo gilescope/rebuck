@@ -899,6 +899,46 @@ pub fn cache_ids_held(mounts: &[(String, i64)]) -> Vec<String> {
         .collect()
 }
 
+/// Per-vertex timings for one solve, keyed the way the coordinator keys
+/// them.
+///
+/// The discriminator for the 12.5x: the fleet spends 4,521s building against
+/// a 212s whole-build baseline, duplication explains 1.7x of it, and nothing
+/// says whether the rest is the same ops costing more on a worker or ops the
+/// baseline never ran at all.
+///
+/// A vertex digest is `sha256:<hex of the marshalled op bytes>`
+/// (`vertex.go:337`), so identical bytes give an identical key on either
+/// machine and the two halves join on it. Same `note_vertices` the proxy
+/// uses, against the worker's own daemon instead of the client's stream.
+///
+/// Best effort throughout: a worker that cannot read its own status stream
+/// still builds, and this is a measurement rather than a dependency.
+pub async fn vertex_times(
+    addr: &str,
+    solve_ref: &str,
+) -> std::collections::BTreeMap<String, (u64, bool)> {
+    let mut seen = Default::default();
+    let Ok(mut c) = connect(addr).await else {
+        return seen;
+    };
+    let Ok(stream) = c
+        .status(control::StatusRequest {
+            r#ref: solve_ref.to_owned(),
+        })
+        .await
+    else {
+        return seen;
+    };
+    let mut stream = stream.into_inner();
+    // The stream stays open for the life of the solve; this runs after it,
+    // so what arrives is the replay and then the end.
+    while let Ok(Some(resp)) = stream.message().await {
+        crate::proxy::note_vertices(&mut seen, &resp.vertexes);
+    }
+    seen
+}
+
 /// What a failed solve actually printed, from `Control.Status`.
 ///
 /// A `Solve` answers with a code and a sentence. The container's own output
@@ -999,7 +1039,44 @@ pub async fn build_subtree(
     //
     // Naming the builder's own registry here is what confined the fleet to
     // one host: it produced a reference nobody else could resolve.
+    // PER-VERTEX timings, collected here because `solve_ref` is generated
+    // inside `solve_request` and never escapes. The fleet spends 4,521s
+    // building against a 212s whole-build baseline; duplication explains
+    // 1.7x and nothing says whether the rest is the same ops costing more
+    // on a worker or ops the baseline never ran. The digest joins the two
+    // halves and this is the half that was missing.
+    {
+        let mut w = WORKER_VERTICES.lock().await;
+        for (d, v) in vertex_times(bk_addr, &solve_ref).await {
+            w.entry(d).or_insert(v);
+        }
+    }
     published_reference(&resp.exporter_response, registry, job)
+}
+
+/// Every vertex this worker's daemon ran, by digest. See `vertex_times`.
+pub static WORKER_VERTICES: tokio::sync::Mutex<std::collections::BTreeMap<String, (u64, bool)>> =
+    tokio::sync::Mutex::const_new(std::collections::BTreeMap::new());
+
+/// What this worker spent building, per vertex, for the digest join.
+pub async fn worker_vertex_summary() {
+    let w = WORKER_VERTICES.lock().await;
+    if w.is_empty() {
+        return;
+    }
+    let ran = w.values().filter(|(_, c)| !c).count();
+    let ms: u64 = w.values().filter(|(_, c)| !c).map(|(m, _)| m).sum();
+    println!(
+        "[worker] vertices     : {ran} ran in {ms}ms, {} cache hit(s) - join these \
+         digests against the coordinator's baseline to price the fleet's build cost",
+        w.values().filter(|(_, c)| *c).count()
+    );
+    // The ten most expensive, so a join can start without the whole map.
+    let mut v: Vec<(&String, &(u64, bool))> = w.iter().filter(|(_, (_, c))| !c).collect();
+    v.sort_by_key(|(_, (m, _))| std::cmp::Reverse(*m));
+    for (d, (m, _)) in v.into_iter().take(10) {
+        println!("[worker]   {m:>8}ms  {d}");
+    }
 }
 
 /// What the builder may CLAIM to have published, given what the exporter said.

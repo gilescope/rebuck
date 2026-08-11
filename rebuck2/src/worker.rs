@@ -384,6 +384,7 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                     // is why SERVED_LOCAL_BYTES has never once reported the
                     // local-versus-remote split it was built for.
                     fetch_summary();
+                    crate::solve::worker_vertex_summary().await;
                     println!("[worker] driver closed control stream — done");
                     return Ok(());
                 }
@@ -462,6 +463,7 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
             }
             D2W::Exit => {
                 fetch_summary();
+                crate::solve::worker_vertex_summary().await;
                 println!("[worker] driver said exit — done");
                 return Ok(());
             }

@@ -1100,7 +1100,8 @@ jobs:
           # nothing forever - the same shape of dead mechanism this session
           # has now found five times.
           echo "=== repetition, and which side of the wire"
-          grep -E '^\[worker\] ([0-9]+ blobs over|of that,|served [0-9]+ MiB)' \
+          # `vertices` too: the per-digest half of the 12.5x join.
+          grep -E '^\[worker\] (vertices|[0-9]+ blobs over|of that,|served [0-9]+ MiB)' \
             "worker-${WORKER_N}.log" || echo "  (worker printed no serve summary)"
 
   coordinator:
