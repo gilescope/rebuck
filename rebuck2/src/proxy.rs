@@ -1072,6 +1072,16 @@ pub struct Wire {
     /// at a million distinct ops the odds are about three in a hundred
     /// million.
     seen_ops: std::collections::BTreeSet<u64>,
+    /// How many distinct solves each op has appeared in.
+    ///
+    /// The signal pre-positioning actually wants. `op_by_worker` counts
+    /// which machines have BEEN SENT an op - a measurement of the past, and
+    /// one that affinity deliberately drives towards one, so gating a
+    /// prefetch on it means the better affinity works the less is ever
+    /// pre-positioned. This counts the graphs the CLIENT has sent, which is
+    /// known before anything is dispatched: an op in two solves will be
+    /// wanted twice however it is placed.
+    op_solves: std::collections::BTreeMap<u64, u32>,
     pub repeated_ops: u64,
     /// Digest of each Solve's whole op set, in order.
     ///
@@ -1261,6 +1271,16 @@ impl Wire {
     /// The verdict is returned rather than looked up later because arrival
     /// order and completion order are different orders: `graph_ids` grows on
     /// arrival, `spans` on completion, and eight solves run at once.
+    /// Will more than one graph want this op? Asked of the SOLVES seen so
+    /// far, so it is a prediction rather than a record of placements.
+    fn shared_graph(&self, def: &bollard_buildkit_proto::pb::Definition) -> bool {
+        def.def.iter().any(|b| {
+            let d = crate::store::sha256_hex(b);
+            let short = u64::from_str_radix(&d[..16], 16).unwrap_or_default();
+            self.op_solves.get(&short).is_some_and(|n| *n > 1)
+        })
+    }
+
     fn observe(&mut self, def: &bollard_buildkit_proto::pb::Definition) -> bool {
         use prost::Message;
         self.solves += 1;
@@ -1279,6 +1299,7 @@ impl Wire {
         for bytes in &def.def {
             let digest = crate::store::sha256_hex(bytes);
             let short = u64::from_str_radix(&digest[..16], 16).unwrap_or_default();
+            *self.op_solves.entry(short).or_default() += 1;
             if !self.seen_ops.insert(short) {
                 // The same op in two Solves. High overlap means routing
                 // whole Solves duplicates work that dispatch would share.
@@ -2608,9 +2629,15 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                                                 // graph as before. A failed
                                                 // optimisation must not fail a
                                                 // build.
+                                                // A PREFIX is shared by
+                                                // definition - it was cut
+                                                // because several graphs
+                                                // carry it - so say so
+                                                // rather than waiting for
+                                                // placements to prove it.
                                                 let r = self
                                                     .driver
-                                                    .lead_subtree(bytes, Vec::new())
+                                                    .lead_subtree_shared(bytes, Vec::new(), true)
                                                     .await
                                                     .ok();
                                                 // A PREFIX exists precisely
@@ -2678,9 +2705,16 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         } else {
                             None
                         };
+                        // Does more than one graph want any of this? Asked
+                        // of the solves seen so far, which is a prediction:
+                        // an op in two solves will be wanted twice however
+                        // it is placed. Counting placements instead lets
+                        // affinity - whose job is one machine per op -
+                        // suppress the pre-positioning that would help.
+                        let shared_graph = self.wire.held().shared_graph(&portable);
                         let led = self
                             .driver
-                            .lead_subtree(portable.encode_to_vec(), Vec::new())
+                            .lead_subtree_shared(portable.encode_to_vec(), Vec::new(), shared_graph)
                             .await;
                         t_adopt = t.elapsed().as_millis() as u64;
                         match led {

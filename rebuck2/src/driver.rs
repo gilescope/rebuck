@@ -372,6 +372,10 @@ pub struct Driver {
     /// never reached.
     job_terminal: tokio::sync::Mutex<std::collections::BTreeMap<u64, String>>,
 
+    /// Ops the CALLER said more than one graph wants. See
+    /// [`Driver::lead_subtree_shared`].
+    shared_ops: tokio::sync::Mutex<std::collections::BTreeSet<String>>,
+
     /// What each job is, so the line that reports its DURATION can name it.
     ///
     /// A lead is otherwise logged as the digest it produced, and the job
@@ -474,6 +478,7 @@ impl Driver {
             op_by_worker: Default::default(),
             job_names: Default::default(),
             job_terminal: Default::default(),
+            shared_ops: Default::default(),
             store,
             cfg,
             jobs: Mutex::new(HashMap::new()),
@@ -1947,6 +1952,47 @@ impl Driver {
     ///
     /// `None` means nobody took it, which is not an error: it is the answer
     /// that says build it here.
+    /// As [`Driver::lead_subtree`], told whether more than one graph wants
+    /// this subtree.
+    ///
+    /// The caller knows and the driver cannot: sharing is a property of the
+    /// solves the CLIENT has sent, and the driver only sees what has already
+    /// been placed. Gating a prefetch on placements means affinity - whose
+    /// job is to make each op land on one machine - suppresses the very
+    /// pre-positioning that would help.
+    pub async fn lead_subtree_shared(
+        self: &Arc<Self>,
+        subtree: Vec<u8>,
+        frontier: Vec<Dig>,
+        shared: bool,
+    ) -> Result<String, String> {
+        // Keyed by the op this subtree PRODUCES, not by a job id: the id is
+        // assigned inside place_subtree and reading it back afterwards is a
+        // race. subtree_built already extracts the same op.
+        if shared {
+            use prost::Message;
+            if let Some(op) = bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice())
+                .ok()
+                .and_then(|d| {
+                    let last = d.def.last()?;
+                    bollard_buildkit_proto::pb::Op::decode(last.as_slice())
+                        .ok()?
+                        .inputs
+                        .first()
+                        .map(|i| i.digest.clone())
+                })
+            {
+                self.shared_ops.lock().await.insert(op);
+            }
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.place_subtree(Requester::Gateway(tx), subtree, frontier)
+            .await;
+        rx.await.unwrap_or_else(|_| Err("driver went away".into()))
+    }
+
+    /// Dispatch a subtree without a sharing hint - assume not shared.
+    #[allow(dead_code)] // the shared-aware form is what the proxy calls
     pub async fn lead_subtree(
         self: &Arc<Self>,
         subtree: Vec<u8>,
@@ -1984,7 +2030,13 @@ impl Driver {
         // solves is not a fleet.
         let terminal = { self.job_terminal.lock().await.remove(&job) };
         if let Some(op) = terminal {
-            self.prefetch_image_for(&image_ref, Some(&op)).await;
+            // Unconditional when the caller predicted sharing; otherwise
+            // fall back to counting placements, which affinity suppresses.
+            if self.shared_ops.lock().await.contains(&op) {
+                self.prefetch_image_for(&image_ref, None).await;
+            } else {
+                self.prefetch_image_for(&image_ref, Some(&op)).await;
+            }
         }
         match st.requester {
             Requester::Worker(id) => self.tell(id, D2W::Placed { job, image_ref }).await,
