@@ -58,6 +58,7 @@ on:
       # the Earthfile survives the fleet - which is the one `+all` is for.
       - giles-dispatch-ci-all-nobase
       - giles-dispatch-ci-ast-imports
+      - giles-dispatch-ci-ast-bcast
       - giles-dispatch-ci-tests-nobase
       - giles-dispatch-ci-ast-minops-nobase
       - giles-dispatch-ci-ast-seed
@@ -453,6 +454,7 @@ jobs:
       compression: ${{ steps.n.outputs.compression }}
       minops: ${{ steps.n.outputs.minops }}
       imports: ${{ steps.n.outputs.imports }}
+      bcast: ${{ steps.n.outputs.bcast }}
       nobase: ${{ steps.n.outputs.nobase }}
     steps:
       - id: n
@@ -503,7 +505,7 @@ jobs:
           workload=$REF
           while :; do
             before=$workload
-            for suffix in -seed -graft -arm -zstd -minops -imports -nobase; do
+            for suffix in -seed -graft -arm -zstd -minops -imports -bcast -nobase; do
               # QUOTED: unquoted, `$suffix` is taken as a glob pattern
               # rather than a literal, which shellcheck SC2295 catches and
               # which would misbehave the moment a suffix contained a `?`
@@ -603,6 +605,16 @@ jobs:
           case "$REF" in *-imports*) imports=1 ;; *) imports=0 ;; esac
           echo "affinity imports: $imports"
           echo "imports=$imports" >> "$GITHUB_OUTPUT"
+
+          # `-bcast`: a prefetch announcement goes to EVERY worker instead of
+          # being split one-blob-one-worker. The driver only announces
+          # content with two or more consumers, so splitting it
+          # pre-positions the bytes for one machine and leaves every other
+          # one to fetch them lazily, on the critical path - the same total
+          # transfer with most of it back where prefetch exists to remove it.
+          case "$REF" in *-bcast*) bcast=1 ;; *) bcast=0 ;; esac
+          echo "prefetch broadcast: $bcast"
+          echo "bcast=$bcast" >> "$GITHUB_OUTPUT"
 
           # `-nobase`: skip the baseline leg. For comparing a MECHANISM
           # against itself, where the control is another fleet leg and the
@@ -958,6 +970,7 @@ jobs:
       REBUCK2_COMPRESSION: ${{ needs.plan.outputs.compression }}
       REBUCK2_MIN_OPS: ${{ needs.plan.outputs.minops }}
       REBUCK2_AFFINITY_IMPORTS: ${{ needs.plan.outputs.imports }}
+      REBUCK2_PREFETCH_ALL: ${{ needs.plan.outputs.bcast }}
       REBUCK2_SKIP_BASELINE: ${{ needs.plan.outputs.nobase }}
       # ONE path for the binary in this job. It was written out twice and
       # the copies disagreed: the proxy step had `./rebuck2-repo/...` and

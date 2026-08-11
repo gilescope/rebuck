@@ -1632,6 +1632,7 @@ impl Wire {
                 ("min_siblings", min_siblings() > 0),
                 ("min_ops", crate::dispatch::min_ops() > 0),
                 ("?affinity_imports", crate::dispatch::imports_affinity(),),
+                ("?prefetch_broadcast", crate::worker::prefetch_broadcast()),
                 (
                     "prefetch",
                     std::env::var("REBUCK2_PREFETCH").as_deref() == Ok("1")

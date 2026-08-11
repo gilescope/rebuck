@@ -677,6 +677,40 @@ fn prefetch_gate() -> &'static Semaphore {
     })
 }
 
+/// Which of these blobs is this worker's to fetch.
+///
+/// `broadcast` is the question the announcement should already have
+/// answered. The driver only announces content with two or more consumers,
+/// and splitting THAT one-way means it is pre-positioned for one machine and
+/// still arrives lazily, on the critical path, for the rest - the same total
+/// transfer with most of it back where prefetch exists to remove it.
+///
+/// Splitting is still right for the herd it was written against, and
+/// `seeder_for` spreads the SOURCE per blob either way, so a broadcast pulls
+/// each blob from a different peer rather than stampeding one.
+///
+/// Alone, both answers are everything. A prefetch that quietly does nothing
+/// when there is nobody to split with fails at the moment it matters most.
+pub fn share_of(hashes: &[String], ids: &[String], me: &str, broadcast: bool) -> Vec<String> {
+    if broadcast || ids.len() <= 1 {
+        return hashes.to_vec();
+    }
+    hashes
+        .iter()
+        .filter(|h| seeder_for(h, ids).as_deref() == Some(me))
+        .cloned()
+        .collect()
+}
+
+/// Whether an announcement goes to every worker or is split between them.
+///
+/// OFF by default: it changes what the fleet transfers, and the run that
+/// would first show it also carries the prefetch fix that made announcements
+/// non-empty at all. One variable.
+pub fn prefetch_broadcast() -> bool {
+    std::env::var("REBUCK2_PREFETCH_ALL").as_deref() == Ok("1")
+}
+
 fn seeder_for(hash: &str, peers: &[String]) -> Option<String> {
     if peers.is_empty() {
         return None;
@@ -1072,12 +1106,23 @@ impl RemoteBlobs {
         // there is nobody to split with, and fetching nothing would make the
         // prefetch silently do nothing at exactly the moment it is most
         // needed.
-        if ids.len() <= 1 {
-            return digests;
+        // One policy, in `share_of`, so the broadcast case is testable
+        // without a fleet - and so "alone means everything" is stated once
+        // rather than in each branch.
+        let want: std::collections::BTreeSet<String> = share_of(
+            &digests.iter().map(|d| d.hash.clone()).collect::<Vec<_>>(),
+            &ids,
+            &self.my_id,
+            prefetch_broadcast(),
+        )
+        .into_iter()
+        .collect();
+        if prefetch_broadcast() && ids.len() > 1 {
+            crate::mech::applied("prefetch_broadcast");
         }
         digests
             .into_iter()
-            .filter(|d| seeder_for(&d.hash, &ids).as_deref() == Some(self.my_id.as_str()))
+            .filter(|d| want.contains(&d.hash))
             .collect()
     }
 
@@ -1589,6 +1634,58 @@ async fn sync_shard(
 
 #[cfg(test)]
 mod tests {
+    /// Splitting an announcement defeats what the announcement is for.
+    ///
+    /// `my_share` gives each blob to exactly ONE worker, chosen by
+    /// `seeder_for`. For content the driver has already established has two
+    /// or more consumers, that means the bytes are pre-positioned on one
+    /// machine and still arrive lazily, on the critical path, for every
+    /// other machine that wants them. Same total transfer, most of it moved
+    /// back to where prefetch exists to remove it - principle 18 says
+    /// pre-position layers against work that has not started, and a
+    /// one-in-six share does that for one machine in six.
+    ///
+    /// The split's stated purpose is avoiding a herd on the coordinator, and
+    /// `seeder_for` already spreads the SOURCE per blob - so a broadcast can
+    /// pull each blob from a different peer without any herd at all.
+    #[test]
+    fn a_broadcast_reaches_every_worker_and_a_share_reaches_one() {
+        let ids: Vec<String> = ["a", "b", "c"].iter().map(|s| (*s).to_owned()).collect();
+        let hashes: Vec<String> = (0..30u64)
+            .map(|i| format!("{:064x}", i.wrapping_mul(2_654_435_761)))
+            .collect();
+
+        // Shared: every worker takes every blob.
+        for me in &ids {
+            let got = super::share_of(&hashes, &ids, me, true);
+            assert_eq!(got.len(), hashes.len(), "{me} takes all of it");
+        }
+
+        // Split: the shares partition - no gaps, no duplicates. That is the
+        // property worth keeping, and the reason the driver's peer list is
+        // used rather than each worker's own gossip.
+        let mut seen: Vec<String> = Vec::new();
+        for me in &ids {
+            seen.extend(super::share_of(&hashes, &ids, me, false));
+        }
+        seen.sort();
+        let mut want = hashes.clone();
+        want.sort();
+        assert_eq!(seen, want, "every blob claimed exactly once");
+
+        // Alone, both policies are the same and neither may return nothing:
+        // a prefetch that silently does nothing when there is nobody to
+        // split with fails at the moment it is most needed.
+        let solo = vec!["a".to_owned()];
+        assert_eq!(
+            super::share_of(&hashes, &solo, "a", false).len(),
+            hashes.len()
+        );
+        assert_eq!(
+            super::share_of(&hashes, &solo, "a", true).len(),
+            hashes.len()
+        );
+    }
 
     /// How many prefetches a worker runs at once, and why it is one.
     #[test]
