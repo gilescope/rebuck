@@ -899,6 +899,56 @@ pub fn cache_ids_held(mounts: &[(String, i64)]) -> Vec<String> {
         .collect()
 }
 
+/// Every vertex a daemon has records of, by digest, replayed from history.
+///
+/// The baseline leg talks straight to its own daemon - `EARTHLY_BUILDKIT_HOST`
+/// points at `BASE_PORT`, not the proxy - which is correct, since a baseline
+/// through the proxy would be measuring the proxy. It also meant nothing
+/// could see the baseline's vertices, and the join that prices the 12.5x
+/// needs exactly those.
+///
+/// It is not blocked after all. `Solver::Status` serves from the build
+/// HISTORY rather than only from a live job
+/// (`solver/llbsolver/solver.go:439`), and `BuildHistoryRecord` carries the
+/// ref that `Status` wants. So a build can be read AFTER it finishes,
+/// without instrumenting it while it runs, and the baseline stays exactly
+/// what it was.
+///
+/// `early_exit` so the history stream ends rather than following the daemon
+/// for new builds. Best effort throughout: this is a measurement, and a
+/// daemon that will not answer leaves the baseline unmeasured rather than
+/// failing a run.
+pub async fn history_vertex_times(addr: &str) -> std::collections::BTreeMap<String, (u64, bool)> {
+    let mut seen = Default::default();
+    let Ok(mut c) = connect(addr).await else {
+        return seen;
+    };
+    let Ok(hist) = c
+        .listen_build_history(control::BuildHistoryRequest {
+            early_exit: true,
+            ..Default::default()
+        })
+        .await
+    else {
+        return seen;
+    };
+    let mut refs: Vec<String> = Vec::new();
+    let mut hist = hist.into_inner();
+    while let Ok(Some(ev)) = hist.message().await {
+        if let Some(r) = ev.record.as_ref().map(|r| r.r#ref.clone()) {
+            if !r.is_empty() {
+                refs.push(r);
+            }
+        }
+    }
+    for r in refs {
+        for (d, v) in vertex_times(addr, &r).await {
+            seen.entry(d).or_insert(v);
+        }
+    }
+    seen
+}
+
 /// Per-vertex timings for one solve, keyed the way the coordinator keys
 /// them.
 ///

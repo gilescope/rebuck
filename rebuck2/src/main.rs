@@ -428,6 +428,48 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        "watch-vertices" => {
+            // `rebuck2 watch-vertices --bk <addr>`
+            //
+            // Every vertex a daemon has a record of, by digest and
+            // milliseconds. Run against the BASELINE daemon after its leg,
+            // and the output joins against the workers' own `vertices` lines
+            // on the digest - which is `sha256:<hex of the marshalled op
+            // bytes>` on either machine (`vertex.go:337`).
+            //
+            // That join is the only thing that prices the 12.5x: the fleet
+            // spends 4,521s building against a 212s whole-build baseline,
+            // duplication explains 1.7x, and nothing yet says whether the
+            // rest is the same ops costing more on a worker or ops the
+            // baseline never ran.
+            //
+            // Reads history rather than watching live, so the baseline keeps
+            // talking straight to its daemon and stays the clean
+            // single-machine number every comparison here rests on.
+            let bk = args.opt("--bk").unwrap_or_else(|| "127.0.0.1:8372".into());
+            let v = solve::history_vertex_times(&bk).await;
+            if v.is_empty() {
+                println!("[vertices] none - no build history at {bk}");
+                return Ok(());
+            }
+            let ran = v.values().filter(|(_, c)| !c).count();
+            let ms: u64 = v.values().filter(|(_, c)| !c).map(|(m, _)| m).sum();
+            println!(
+                "[vertices] {ran} ran in {ms}ms, {} cache hit(s), {} digest(s)",
+                v.values().filter(|(_, c)| *c).count(),
+                v.len()
+            );
+            // EVERY digest, not a top-N. This output exists to be joined,
+            // and a join against a truncated side silently drops the rows
+            // that differ most.
+            for (d, (m, cached)) in &v {
+                println!(
+                    "[vertex] {d} {m} {}",
+                    if *cached { "cached" } else { "ran" }
+                );
+            }
+            Ok(())
+        }
         "check-reserve" => {
             // `rebuck2 check-reserve --bk <addr> --registry <host:port>
             //  [--base <image>] [--n 5]`

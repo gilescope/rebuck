@@ -1612,6 +1612,24 @@ jobs:
       #
       # Harvested from base-bk and not own-bk: with FRESH_FLEET=1 the
       # baseline ran on base-bk, so that is the daemon whose mounts are warm.
+      # The baseline's own vertices, by digest, read from its daemon's build
+      # HISTORY after the leg. Joins against the workers' `vertices` lines on
+      # the same key, and that join is the only thing that prices the 12.5x -
+      # the fleet spends twenty-one times the whole baseline just building,
+      # duplication explains 1.7x, and nothing says what the rest is.
+      #
+      # AFTER the baseline and reading history, so the baseline keeps talking
+      # straight to its daemon and stays the clean single-machine number
+      # every comparison in the findings rests on.
+      - name: what the baseline's own daemon spent, per vertex
+        if: env.REBUCK2_SKIP_BASELINE != '1'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          "$RB" watch-vertices --bk "${LAN}:${BASE_PORT}" > baseline-vertices.txt 2>&1 || true
+          head -1 baseline-vertices.txt || true
+          echo "baseline vertex rows: $(grep -c '^\[vertex\]' baseline-vertices.txt || echo 0)"
+
       - name: harvest the baseline's cache mounts
         if: env.REBUCK2_SEED_CACHES == '1'
         run: |
@@ -2046,6 +2064,7 @@ jobs:
           name: fleet-logs-${{ github.run_attempt }}
           path: |
             proxy.log
+            baseline-vertices.txt
             ${{ runner.temp }}/otel/traces.jsonl
             /tmp/fleet.log
             /tmp/baseline.log
