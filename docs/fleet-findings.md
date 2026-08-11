@@ -5496,3 +5496,38 @@ safe to run until the media-type failure is understood.
 Recorded as a correctness failure rather than a performance one, because
 that is what it is: the parity gate is the only reason this is not written
 up as the best result of the day.
+
+### The 12.5x join is blocked: the baseline does not go through the proxy
+
+```yaml
+EARTHLY_BUILDKIT_HOST="tcp://${LAN}:${BASE_PORT}" earthly $EARTHLY_FLAGS "$TARGET"
+```
+
+`BASE_PORT`, not the proxy's. The baseline leg talks **directly to a
+buildkit daemon**, which is correct - a baseline that went through the proxy
+would be measuring the proxy - and it means the coordinator's status tap
+never sees a single baseline vertex.
+
+So `home_vertices` holds only what the FLEET leg built at home. The worker
+half of the join, built an hour ago and working, has nothing to join
+against: I have per-digest times from workers and per-digest times from the
+coordinator's refused solves, and both are the same leg.
+
+Three ways forward, none free:
+
+- **Tap the baseline daemon separately.** Clean, and needs the build's solve
+  ref, which `Control.Status` requires and the baseline never surfaces
+  because nothing is proxying it.
+- **Run the baseline through the proxy with dispatch off.** Then the tap
+  sees everything - and the baseline stops being a clean single-machine
+  number, which is the one measurement in this whole rig that has stayed
+  stable across nine hours and eight runs.
+- **Compare worker vertices against the coordinator's HOME vertices from the
+  same leg.** Free, and compares different populations: home vertices are
+  the refused ops, which are refused precisely because they are unlike the
+  dispatched ones.
+
+Recorded as blocked rather than worked around. The worker half is committed
+and costs nothing; the 12.5x stays the largest open number in this document,
+and the honest statement is that measuring it needs a baseline-side
+instrument nobody has built.
