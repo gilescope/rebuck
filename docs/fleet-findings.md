@@ -3790,3 +3790,47 @@ time either: **there is no home-side equivalent of the driver's lead
 timings.** That absence is why this run could not be diagnosed from its own
 output, and it is now the next thing to build - the line says NOT MEASURED
 rather than zeros in the meantime.
+
+## A daemon does not re-fetch a base it already holds
+
+`scripts/reserve-check.sh` - one buildkitd, one registry, six trivial solves
+on the same base, about a minute:
+
+```text
+[reserve] solve 0:   342ms  registry served   1870 KiB in 2 request(s)
+[reserve] solve 1:   223ms  registry served      0 KiB in 0 request(s)
+[reserve] solve 2:   226ms  registry served      0 KiB in 0 request(s)
+[reserve] solve 3:   243ms  registry served      0 KiB in 0 request(s)
+[reserve] solve 4:   240ms  registry served      0 KiB in 0 request(s)
+[reserve] solve 5:   234ms  registry served      0 KiB in 0 request(s)
+```
+
+Fetched once, re-used five times. So of the two explanations for 277 MiB
+distinct against 25,658 MiB served, **one is eliminated**: it is not a
+daemon re-materialising a base per solve. There is no per-solve
+re-materialisation to fix.
+
+What remains is repetition **across machines** - six daemons each needing
+the same artifacts, and every lead's parent result travelling to whichever
+worker took the child. That is consistent with worker 2 serving one 26,726
+KiB blob seventy-six times: it was the machine that HELD the popular
+artifact and handed it out, not a machine fetching it over and over.
+
+Consistent, not proven. `SERVED_LOCAL_BYTES` decides it, and the run
+carrying it is in flight. If most of a worker's serving is remote, the cost
+is transport and the levers are placement, affinity and prefetch. If it is
+local, this rig missed something and the local result is the one to
+re-examine.
+
+Note what the rig cost against what it settles: a minute, against half an
+hour per CI run, for a question two CI runs had already failed to answer.
+Principle 23, earning its keep for the second time.
+
+**And it nearly answered wrongly.** The first run printed `0 KiB` for every
+solve including the first, which reads as "the base is never fetched at
+all". The stats were being polled at `$HOSTADDR`, which is how the DAEMON
+reaches the host - `host.docker.internal` - and the host does not resolve
+it. Every stats request failed and the code fell back to the previous
+sample, so the failure looked exactly like a clean flat line. The same
+address confusion is already documented three sections up in a different
+guise; it now has a `--stats` flag and a comment saying why.

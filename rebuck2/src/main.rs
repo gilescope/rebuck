@@ -428,6 +428,86 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        "check-reserve" => {
+            // `rebuck2 check-reserve --bk <addr> --registry <host:port>
+            //  [--base <image>] [--n 5]`
+            //
+            // Does a daemon that already holds a base image fetch it again
+            // for the next solve?
+            //
+            // A fleet run reported 277 MiB of distinct content over a
+            // megabyte and 25,658 MiB served - a factor of 93 - and the
+            // reading that survived every retraction is that the volume is
+            // repetition. This asks the question directly, on one machine, in
+            // about a minute: solve N trivial graphs on the same base and
+            // watch what the registry serves for each.
+            //
+            // If serve 2 costs what serve 1 did, the daemon is
+            // re-materialising a base it has. If it costs nothing, the
+            // repetition is between MACHINES and the answer is placement, not
+            // caching. Those want completely different fixes and no run so
+            // far distinguishes them.
+            //
+            // No unit test: it needs a live daemon and a registry, same as
+            // `check-seeding` beside it. The rig IS the test.
+            let bk = args.opt("--bk").unwrap_or_else(|| "127.0.0.1:8372".into());
+            let registry = args
+                .opt("--registry")
+                .ok_or_else(|| anyhow::anyhow!("check-reserve: --registry <host:port>"))?;
+            let base = args
+                .opt("--base")
+                .unwrap_or_else(|| format!("{registry}/library/busybox:1"));
+            let n: usize = args.opt("--n").and_then(|v| v.parse().ok()).unwrap_or(5);
+            // NOT `registry`. That address is how the DAEMON reaches this
+            // host - `host.docker.internal` under Docker Desktop - and the
+            // host itself may not resolve it. The first run of this read
+            // zeroes for every solve and looked like "the base is never
+            // fetched", when in fact every stats request had failed.
+            let stats = format!(
+                "http://{}/_rebuck/stats",
+                args.opt("--stats").unwrap_or_else(|| registry.clone())
+            );
+            let served = || {
+                let stats = stats.clone();
+                async move {
+                    let v: serde_json::Value =
+                        reqwest::get(&stats).await.ok()?.json().await.ok()?;
+                    Some((
+                        v.get("serve_bytes")?.as_u64()?,
+                        v.get("serves")?.as_u64().unwrap_or(0),
+                    ))
+                }
+            };
+            let mut last = served().await.unwrap_or((0, 0));
+            println!("[reserve] base {base}, {n} solves on one daemon");
+            for i in 0..n {
+                let t = std::time::Instant::now();
+                // A DIFFERENT command each time, or buildkit answers from its
+                // own result cache and the probe measures nothing at all.
+                let g = dispatch::cache_probe_graph(
+                    &base,
+                    &format!("reserve-{}-{i}", std::process::id()),
+                    "/c",
+                    &format!("echo {i} > /dev/null"),
+                );
+                solve::build_subtree(&bk, &registry, i as u64, g)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("solve {i}: {e:#}"))?;
+                let now = served().await.unwrap_or(last);
+                println!(
+                    "[reserve] solve {i}: {:>5}ms  registry served {:>6} KiB in {} request(s)",
+                    t.elapsed().as_millis(),
+                    now.0.saturating_sub(last.0) / 1024,
+                    now.1.saturating_sub(last.1),
+                );
+                last = now;
+            }
+            println!(
+                "[reserve] a flat profile means the base is re-fetched every solve; \
+                 a first-solve spike then near-zero means the repetition is BETWEEN machines"
+            );
+            Ok(())
+        }
         "check-seeding" => {
             // `rebuck2 check-seeding --bk <addr> --registry <host:port>
             //  [--base <image>]`
