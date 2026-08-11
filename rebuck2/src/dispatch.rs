@@ -390,6 +390,28 @@ pub fn cache_ids(def: &pb::Definition) -> BTreeSet<String> {
     out
 }
 
+/// Did the BUILD fail, as opposed to the peer failing to build it?
+///
+/// The distinction the fleet was missing. `subtree_declined` re-offers to
+/// the next peer whatever the reason, which is right for "no slots", "wrong
+/// platform" or a daemon that died, and catastrophic for a build that simply
+/// fails: every machine runs it, every machine fails, and the client waits
+/// for all of them.
+///
+/// Measured on `+lint-all`: 92s on one machine, 628s on six, with four
+/// solves of ~470s apiece and a `not routed` table naming the same
+/// `golangci-lint ... exit code: 1` four times. The single-machine build
+/// pays a deterministic failure once; the fleet paid it per peer.
+///
+/// Matched on buildkit's own framing - the container RAN and the process
+/// exited non-zero - and nothing else. Every machine-shaped failure stays
+/// retryable, because the two mistakes are not the same size: retrying a
+/// verdict costs time, and refusing to retry a machine fault costs the
+/// build.
+pub fn is_build_verdict(why: &str) -> bool {
+    why.contains("did not complete successfully: exit code:")
+}
+
 /// Take a warm cache mount OUT of a daemon, as a layer.
 ///
 /// The other half of [`seed_cache_mounts`]. Seeding needs an image whose
@@ -1967,6 +1989,48 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// A build that FAILED is not a peer that could not.
+    ///
+    /// `+lint-all`: baseline 92s, fleet 628s, and four solves of ~470s each
+    /// in a run whose whole single-machine build is a minute and a half. The
+    /// `not routed` table named it - the same `golangci-lint ... exit code:
+    /// 1` four times over. A deterministic failure was offered to peer after
+    /// peer, each ran the whole lint, each failed identically.
+    #[test]
+    fn a_failed_build_is_a_verdict_and_a_dead_peer_is_not() {
+        let v = super::is_build_verdict;
+
+        // buildkit's own wording when the container ran and the command
+        // exited non-zero. No other machine can do better with this graph.
+        assert!(v(
+            "build failed: solve: Unknown error process \"/bin/sh -c golangci-lint run\" \
+             did not complete successfully: exit code: 1"
+        ));
+        assert!(v("did not complete successfully: exit code: 137"));
+
+        // Everything a DIFFERENT machine might survive stays retryable, and
+        // the bias is deliberate: retrying a verdict costs time, declining
+        // to retry a machine fault costs the build.
+        assert!(!v("build failed and daemon died: solve: transport error"));
+        assert!(!v("build failed: solve: Unknown error no active sessions"));
+        assert!(!v("build failed: solve: Unknown error no such job t7p8h37"));
+        assert!(!v("no slots"));
+        assert!(!v("wrong platform: wanted linux/arm64"));
+        assert!(!v(""));
+
+        // A build whose own OUTPUT quotes the phrase is still a verdict -
+        // which is correct here and is the opposite of the `worth_retrying`
+        // case, where a test printing "transport error" must not trigger a
+        // rebuild. The difference: there the phrase could be anywhere in a
+        // relayed message, here buildkit itself frames it with the exit
+        // code, and a graph that made a process exit non-zero will do it
+        // again wherever it runs.
+        assert!(v(
+            "build failed: solve: process \"sh -c echo hi\" did not complete \
+             successfully: exit code: 2"
+        ));
+    }
+
     /// The graph that takes a warm mount OUT of a daemon.
     ///
     /// Both halves are checked against buildkit's own

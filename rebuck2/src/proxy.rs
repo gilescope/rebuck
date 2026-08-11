@@ -1484,6 +1484,8 @@ impl Wire {
                 // free when it is not needed. The counter is here so a run
                 // that survived one says so.
                 ("read_retry", true),
+                // Also always on. A verdict is not a policy.
+                ("verdict_stops_retry", true),
                 ("min_siblings", min_siblings() > 0),
                 (
                     "prefetch",

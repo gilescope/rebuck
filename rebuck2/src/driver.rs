@@ -1851,6 +1851,30 @@ impl Driver {
         // oneshot cannot be, and taking it early would strand a caller that
         // is still holding a client's Solve open. It is only removed on the
         // branch that gives up.
+        // A VERDICT stops here. The peer ran the container and the process
+        // exited non-zero, so the next peer will run the same container and
+        // get the same answer - and on `+lint-all` that cost 628s against a
+        // 92s baseline, four peers deep into a lint that fails on purpose.
+        //
+        // Straight to `unplaced`, which means the requester builds it at
+        // home and produces the authentic error from its own daemon. One
+        // extra run of a failing build, which is what a single machine pays
+        // anyway. Returning the PEER's error instead would be faster and is
+        // not obviously safe: the peer's platform and mirror are not the
+        // client's, and principle 5 says a mechanism may make a build faster
+        // and must never make one wrong.
+        if crate::dispatch::is_build_verdict(why) {
+            crate::mech::applied("verdict_stops_retry");
+            println!(
+                "[driver] subtree job {job} FAILED on worker {who} - not re-offering, \
+                 the build itself did not succeed"
+            );
+            let Some(st) = self.subtrees.lock().await.remove(&job) else {
+                return;
+            };
+            self.unplaced(st.requester, job, why).await;
+            return;
+        }
         let (next, subtree, frontier) = {
             let mut map = self.subtrees.lock().await;
             let Some(st) = map.get_mut(&job) else { return };
