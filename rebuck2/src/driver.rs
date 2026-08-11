@@ -3686,6 +3686,15 @@ async fn serve_blob_stream(
     Ok(())
 }
 
+/// How long one peer gets to answer for one blob.
+///
+/// Short on purpose. The caller is usually a registry request that buildkit
+/// is blocked on, and buildkit's own patience is finite - so the choice is
+/// between a fast 404 that it retries or routes around, and a hang that ends
+/// the build. Six unanswering peers at this budget still comes in under any
+/// client timeout worth the name.
+const PEER_BLOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// The fleet, as the COORDINATOR's registry sees it.
 ///
 /// The mirror of the worker's impl, and the half that makes a result
@@ -3714,9 +3723,19 @@ impl crate::registry::FleetBlobs for Driver {
                 no.into_iter().map(|(e, _)| e.clone()).collect(),
             )
         };
+        // BOUNDED per peer. A dead runner does not refuse, it hangs, and
+        // this loop is what a manifest HEAD waits on: buildkit asked for a
+        // subtree manifest, six workers had just been killed by their own
+        // 50-minute cap, and the walk sat on each corpse in turn until
+        // buildkit gave up with `timeout awaiting response headers` and
+        // failed the build. A miss must 404 quickly; it is a perfectly
+        // ordinary answer and buildkit knows what to do with it.
         for who in claimants.iter().chain(others.iter()) {
-            if let Ok(bytes) = self.fetch_by_hash_from(who, hash).await {
-                return Some(bytes);
+            match tokio::time::timeout(PEER_BLOB_TIMEOUT, self.fetch_by_hash_from(who, hash)).await
+            {
+                Ok(Ok(bytes)) => return Some(bytes),
+                Ok(Err(_)) => {}
+                Err(_) => println!("[driver] {who} did not answer for {hash} in time"),
             }
         }
         None

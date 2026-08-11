@@ -876,6 +876,119 @@ impl<T> Held<T> for std::sync::Mutex<T> {
 }
 
 #[cfg(test)]
+mod held_across_await {
+    /// A `held()` guard must not still be alive at an `.await`.
+    ///
+    /// `Held` hands back a `std::sync::MutexGuard`, which is not `Send` and
+    /// blocks rather than yields. Holding one across an await point does two
+    /// bad things: the future stops being `Send` (a compile error, so that
+    /// half looks after itself), and any OTHER task that reaches the same
+    /// mutex from inside a poll blocks an executor thread on a guard whose
+    /// owner is suspended. That is a deadlock, and it is not a compile error.
+    ///
+    /// Tripped four times in this repo, most recently by a status-stream tap
+    /// that took `wire` once per progress frame. Vigilance has now failed
+    /// often enough to be replaced by a check.
+    ///
+    /// Deliberately a SOURCE test and deliberately crude: it counts braces
+    /// from the binding to the end of its block and looks for `.await`. It
+    /// cannot see through macros or closures, so it is a floor and not a
+    /// proof - `drop(x)` before the await is how you tell it you meant it,
+    /// which is also how you tell the next reader.
+    /// The scan itself, over text, so it can be shown to FAIL.
+    ///
+    /// The first version of this was "verified" by injecting an await into
+    /// proxy.rs and watching the check stay quiet - which proved nothing,
+    /// because the injection did not compile and the test never ran. A
+    /// checker whose failure path has never executed is the thing this
+    /// session keeps finding.
+    pub fn guards_alive_at_await(text: &str) -> Vec<usize> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut bad = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            if !t.starts_with("let ") || !t.contains(".held()") {
+                continue;
+            }
+            let name = t
+                .trim_start_matches("let ")
+                .trim_start_matches("mut ")
+                .split([' ', ':', '='])
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            let mut depth = 0i32;
+            for (j, l) in lines.iter().enumerate().skip(i) {
+                if j > i {
+                    if l.contains(&format!("drop({name})")) {
+                        break;
+                    }
+                    if l.contains(".await") {
+                        bad.push(j + 1);
+                        break;
+                    }
+                }
+                depth += l.matches('{').count() as i32;
+                depth -= l.matches('}').count() as i32;
+                if j > i && depth <= 0 {
+                    break;
+                }
+            }
+        }
+        bad
+    }
+
+    #[test]
+    fn the_scan_finds_a_guard_held_across_an_await() {
+        let bad = guards_alive_at_await(
+            "async fn f() {\n    let mut w = self.wire.held();\n    other().await;\n    w.n += 1;\n}\n",
+        );
+        assert_eq!(bad, vec![3], "a guard alive at an await is the whole point");
+
+        // Dropped first: fine, and `drop(w)` is how you say you meant it.
+        let ok = guards_alive_at_await(
+            "async fn f() {\n    let mut w = self.wire.held();\n    w.n += 1;\n    drop(w);\n    other().await;\n}\n",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+
+        // Scoped block that ends before the await: also fine, and the
+        // commonest shape in this codebase.
+        let ok = guards_alive_at_await(
+            "async fn f() {\n    {\n        let mut w = self.wire.held();\n        w.n += 1;\n    }\n    other().await;\n}\n",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn no_std_guard_is_alive_at_an_await() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut bad: Vec<String> = Vec::new();
+        for f in std::fs::read_dir(&dir).expect("src") {
+            let f = f.expect("entry").path();
+            if f.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).expect("read");
+            let name = f
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            for line in guards_alive_at_await(&text) {
+                bad.push(format!(
+                    "{name}: a held() guard is still alive at line {line}"
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "std MutexGuard alive across an await - drop it first:\n  {}",
+            bad.join("\n  ")
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     /// Case-collision / leftover tolerance: materializing onto an existing
     /// dest replaces it (last-wins - the semantics tar gave case-colliding

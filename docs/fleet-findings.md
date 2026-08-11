@@ -4008,3 +4008,53 @@ target is the first chance to test that claim.
 
 So the coverage ladder is `+test-no-qemu` first and `+all` second, which is
 the reverse of the order I had been assuming. `-tests` selects it.
+
+## The reference run died, and taught more than it would have measured
+
+`-ast`, instruments only, no mechanism changed. It ran the fleet leg for 50
+minutes against 29.5 for the same target before the instruments, then failed
+with exit 124.
+
+The chain, in order:
+
+1. The leg ran long. Cause still open - see below.
+2. It crossed `timeout 3000` on the WORKER command: fifty minutes.
+3. All six workers were killed at once.
+4. The coordinator's registry went on being asked for subtree manifests
+   that only those workers held, and `FleetBlobs::by_hash` walked each dead
+   peer in turn with no deadline.
+5. buildkit gave up: `Head ".../v2/rebuck2/subtree/manifests/sha256:...":
+   net/http: timeout awaiting response headers`, and failed the build.
+
+Two defects, both independent of whatever made the leg slow.
+
+**A cap inside a cap turns "slower than expected" into "failed".** The job
+allows 150 minutes and the worker allowed 50. That is the worst possible
+reading of a performance experiment: it destroys the measurement and
+misattributes the cause in the same stroke. Now 8100s, under the job's cap
+rather than a third of it.
+
+**A miss must 404 quickly.** A dead runner does not refuse, it hangs, and
+the peer walk is what a manifest HEAD waits on. Five seconds per peer now;
+six unanswering peers still comes in under any client timeout worth the
+name, and 404 is an answer buildkit knows what to do with.
+
+### And a number I got wrong
+
+```text
+[registry] 26 blobs over 1MiB: 514 MiB distinct, 545 MiB served (1.1x re-served)
+```
+
+**1.1x, not 93x.** The per-digest count I added for exactly this question
+says the coordinator's registry barely repeats itself.
+
+The 93x came from dividing the fleet's total served bytes by the
+COORDINATOR's distinct bytes - two different registries, and no more valid
+than the earlier loopback claim. The re-serve ratio that matters is
+per-worker, and the workers' own summary line did not appear in this run's
+logs because they were killed before printing it.
+
+So the repetition claim is retracted a second time and remains open. What is
+NOT open: `scripts/reserve-check.sh` shows a single daemon serving a base
+once and never again, chained or not - so whatever the fleet is repeating,
+it is not one machine re-materialising its own work.

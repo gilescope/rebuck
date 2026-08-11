@@ -871,7 +871,17 @@ jobs:
           # Its OWN registry, reachable only from this machine - which is the
           # point. Its daemon pulls from localhost; a miss is answered by
           # whichever runner holds the layer, over the mesh.
-          timeout 3000 ./rebuck2/target/release/rebuck2 worker \
+          # 8100s = 135 minutes, against the job's 150. It was 3000 - fifty
+          # minutes - and a run that took longer did not degrade, it DIED:
+          # every worker was killed at 50:00, the coordinator went on asking
+          # dead peers for subtree manifests, and buildkit failed the build
+          # with `timeout awaiting response headers` on a HEAD to a registry
+          # that could no longer answer.
+          #
+          # A cap inside a cap turns "slower than expected" into "failed",
+          # which is the worst possible reading of a performance experiment:
+          # it destroys the measurement AND misattributes the cause.
+          timeout 8100 ./rebuck2/target/release/rebuck2 worker \
             --session "earthfile-${GITHUB_RUN_ID}" \
             --store "$HOME/.cache/rebuck2/worker" \
             --buildkit-addr "http://${BK_ADDR}" \
