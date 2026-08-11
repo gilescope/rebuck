@@ -67,6 +67,12 @@ on:
       # to fix. Tested alone it could only regress; tested on top of
       # -balance it is a fair question.
       - giles-dispatch-ci-ast-balance-imports
+      # -bcast where WAITING binds. On +test-no-qemu it cut waiting 45% and
+      # moved the clock by nothing, because that leg is set by host-bind
+      # serial work. +test-ast has no host binds and was 45% waiting after
+      # -balance, so this is the target where removing queue time can
+      # actually show.
+      - giles-dispatch-ci-ast-balance-bcast
       - giles-dispatch-ci-tests-nobase
       # The coverage run, with whatever placement is known best at the time.
       # A coverage run's deliverable is the failed-target list, not a clock,
