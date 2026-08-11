@@ -596,6 +596,19 @@ pub fn cache_probe_graph(base: &str, cache_id: &str, dest: &str, cmd: &str) -> p
         op: Some(pb::op::Op::Exec(pb::ExecOp {
             meta: Some(pb::Meta {
                 args: vec!["/bin/sh".into(), "-c".into(), cmd.to_owned()],
+                // PATH, because hand-built LLB has no image config behind
+                // it. A frontend merges the image's own Env into Meta;
+                // constructing the op directly does not, so `cp` and `test`
+                // are not on any path and `/bin/sh -c` reports
+                // `did not complete successfully: exit code: 1` naming the
+                // whole command and none of the reason.
+                //
+                // The same shape as the image-identifier fault: `llb.Image`
+                // and `llb.Exec` do a normalisation step for you, and a
+                // hand-written op inherits none of it.
+                env: vec![
+                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
+                ],
                 cwd: "/".into(),
                 ..Default::default()
             }),
@@ -695,10 +708,28 @@ pub fn harvest_graph(base: &str, cache_id: &str, dest: &str) -> pb::Definition {
                 // an EMPTY cache harvests an empty layer instead of failing
                 // the build. A missing seed is a cold worker, which is
                 // today's behaviour; a failed solve is a broken one.
+                //
+                // stderr is NOT swallowed. It was, and the first real
+                // failure then read `exit code: 1` with the whole command
+                // quoted and not one word of why - which is a minute of
+                // guessing per attempt, and there have been eleven.
                 args: vec![
                     "/bin/sh".into(),
                     "-c".into(),
-                    format!("cp -a {dest}/. {OUT}/ 2>/dev/null || true"),
+                    format!("cp -a {dest}/. {OUT}/ || true"),
+                ],
+                // PATH, because hand-built LLB has no image config behind
+                // it. A frontend merges the image's own Env into Meta;
+                // constructing the op directly does not, so `cp` and `test`
+                // are not on any path and `/bin/sh -c` reports
+                // `did not complete successfully: exit code: 1` naming the
+                // whole command and none of the reason.
+                //
+                // The same shape as the image-identifier fault: `llb.Image`
+                // and `llb.Exec` do a normalisation step for you, and a
+                // hand-written op inherits none of it.
+                env: vec![
+                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
                 ],
                 cwd: "/".into(),
                 ..Default::default()
@@ -2273,6 +2304,11 @@ mod tests {
             .args
             .join(" ")
             .contains("touch /c/marker"));
+        let env = &e.meta.as_ref().unwrap().env;
+        assert!(
+            env.iter().any(|v| v.starts_with("PATH=")),
+            "a probe runs `test` and `touch`, which are on no path without one: {env:?}"
+        );
 
         // THE ROOTFS IS THE OUTPUT, and it has to be something.
         //
