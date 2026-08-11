@@ -2165,7 +2165,7 @@ rewrite a graph to point at an image that must already exist. Grafting was
 the obvious suspect and has been eliminated: `REBUCK2_GRAFT: 0`, `grafted:
 0`, NotFound unchanged. `cut_prefix` is the other, and is on by default.
 
-### routed collapses when prefetch is on
+### routed collapses when prefetch is on -- WRONG, retracted below
 
 | run | prefetch | routed |
 | ----------- | -------- | ------ |
@@ -2184,3 +2184,23 @@ and then `op_by_worker` on the completion path, and `place_subtree` takes
 Worth recording separately from the h2 question, because it is a
 regression introduced by a mechanism rather than a pre-existing fault, and
 because a fleet that routes 8 solves is not a fleet.
+
+**Retracted.** A later run with `prefetch=0` also routed 8, which kills the
+correlation. Across eight runs:
+
+| configuration    | routed        |
+| ---------------- | ------------- |
+| warm=1, four runs | 21, 29, 54, 94 |
+| no warm, four runs | 7, 7, 8, 8   |
+
+and even that is probably not a mechanism: the warm runs survived 267-441s
+while the others died at 209-223s, so they simply had longer to route.
+`routed` tracks how long the leg lived. Four data points and a plausible
+story were enough to convince me of a regression that is not there - the
+same error as the `+base` aggregate, which was also real, correctly
+computed, and pointing the wrong way.
+
+The lock held across an await was a genuine bug and the fix stands: a guard
+taken in an `if let` scrutinee lives for the body, and this one was held
+while taking two further locks. It is a latent deadlock. It is not the
+explanation for anything measured.
