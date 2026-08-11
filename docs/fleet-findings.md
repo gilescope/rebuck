@@ -5653,6 +5653,20 @@ are the other call path: `prefetch_image_for(&image_ref, None)`, where
 images and cut prefixes. That path bypasses the gate entirely, and it is the
 only reason prefetch does anything at all.
 
+**Measured, not inferred.** Across four runs with logs:
+
+| run | count-path fired | refused | shared-path |
+| ---- | ---------------- | ------- | ----------- |
+| art3 | **0** | 8 | 153 |
+| art5 | **0** | 6 | 135 |
+| pf | **0** | 0 | 2 |
+| bal | **0** | 0 | 2 |
+
+**Zero acceptances, fourteen refusals, 292 prefetches that bypassed it
+entirely.** The gate has never once said yes. Its only observable effect is
+refusing fourteen prefetches that might have been worth making, and
+`prefetching <img>: N consumers` has never appeared in any log.
+
 So the counting path has been dead weight since it was written, and its
 comment says the opposite:
 
