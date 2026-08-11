@@ -30,6 +30,18 @@ grep -rah "prefetch: \|prefetched .* of my share\|no manifest URL for" "$dir" \
 echo; echo "── affinity and mechanisms ─────────────────"
 grep -rah "wire\] mechanisms\|op duplication\|mount arms" "$dir" | strip | sort -u
 
+echo; echo "── placement spread ────────────────────────"
+# The metric -balance exists to move. Three runs with six workers available
+# placed 223/125/63/3, 46/37/10 and 153/142/81/3 - two or three machines
+# never took a lead, and 65% of lead time was leads queued behind others on
+# the machine affinity kept choosing.
+grep -rah -- "-> worker" "$dir" | strip | grep -vE "grep|echo" | sort -u \
+  | awk '{n++; c[n]=$1; t+=$1}
+         END {if(!n){print "  none"; exit}
+              printf "  %d worker(s) took work, %d placements:", n, t
+              for(i=1;i<=n;i++) printf " %d", c[i]; print ""
+              if (n < 6) printf "  %d of 6 took NOTHING\n", 6-n}'
+
 echo; echo "── leads ───────────────────────────────────"
 # macOS awk has no 3-argument match(), so the fields are cut with sed first
 # rather than parsed in awk - the portable half of a two-line script beats a
