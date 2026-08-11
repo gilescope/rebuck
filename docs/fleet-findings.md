@@ -3416,3 +3416,53 @@ And the general lesson for the instrument: the local rig gave a number that
 was right for the rig and wrong for the fleet by a factor of forty. It could
 not have known - loopback is loopback. The fleet number was available all
 along in a log line that has been printing since long before any of this.
+
+## The fleet spent 1.9x the whole build just materialising layers
+
+Same run, arithmetic on the same log lines.
+
+|                                |                                     |
+| ------------------------------ | ----------------------------------- |
+| fetched across the fleet       | **1164 MiB**                        |
+| per worker, six of them        | 194 MiB                             |
+| at the measured 7.2 MB/s       | 27s each, **162s across the fleet** |
+| total lead time                | 207s                                |
+| the whole single-machine build | **87s**                             |
+
+**Materialising layers cost 1.9 times the entire baseline**, and it accounts
+for 162 of the 207 seconds of lead work. Duplication is 1.2x, so this is not
+the same op arriving twice - it is six machines each needing the base chain
+once, which is the irreducible shape of a cold fleet.
+
+That gives a much better model than "amplification", and a decision rule
+falls straight out of it:
+
+```text
+    a worker pays        base_bytes / unpack_rate      to join the work
+    a worker is worth it when the work it takes exceeds that
+```
+
+For `+lint-all`: a worker pays ~27s to materialise what it needs, and the
+whole build is 87s of single-machine work. Six workers therefore spend 162s
+buying access to 87s of work. **No scheduler can win that**, and every
+occupancy and ceiling figure in this document is describing how well the
+fleet divided a job it should not have taken on so many machines.
+
+Three ways out, in increasing order of how much they change:
+
+- **Fewer workers.** Two workers pay 54s to divide 87s. Still not a win here
+  but far closer, and the fleet currently uses every machine it has
+  regardless of whether the work justifies one. This is the cheapest thing
+  to try and nothing tests it.
+- **Warm workers.** The 194 MiB is paid once per machine per RUN because a
+  hosted runner is destroyed afterwards. A permanent fleet pays it once,
+  ever - which is the cold-start bound already recorded, quantified.
+- **Faster unpack.** zstd instead of gzip, now selectable. 7.2 MB/s is
+  decompression on two cores, and zstd is several times quicker at similar
+  size.
+
+The first is the interesting one, because it is a scheduling decision this
+project already has all the inputs for: base size is known before dispatch,
+the unpack rate is measurable, and the work available is the solve count.
+Using six machines because six exist is the one choice here that nothing has
+ever justified.
