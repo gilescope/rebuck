@@ -1604,6 +1604,30 @@ impl Driver {
         };
         let verdict = crate::dispatch::inspect(&def);
 
+        // The SECOND dispatch site, and it needs the same floor as the
+        // first. A worker handing a five-op branch to a peer makes that peer
+        // materialise a base image to run it, exactly as the proxy did 412
+        // times on `+test-ast` for 24.7 GiB and 73x. Principle 25.
+        //
+        // Refusing here is not a failure: the requester builds it itself,
+        // which is the outcome the rule wants. For a verbatim client graph
+        // this is a no-op - the proxy already applied the same floor to the
+        // same bytes - so what it actually gates is subdivision.
+        if crate::dispatch::too_small_to_send(def.def.len(), crate::dispatch::min_ops()) {
+            crate::mech::applied("min_ops");
+            self.unplaced(
+                requester,
+                job,
+                LeadRefusal::Unplaced(format!(
+                    "{} ops is below the {}-op floor: smaller than the bytes it would drag",
+                    def.def.len(),
+                    crate::dispatch::min_ops()
+                )),
+            )
+            .await;
+            return;
+        }
+
         // Subtree leads a worker is already holding. `inflight` counts REAPI
         // jobs ONLY, so without this every worker prices as idle however many
         // subtrees it is sitting on - measured: four leads, all to worker 1,
