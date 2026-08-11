@@ -2432,6 +2432,43 @@ pub async fn serve(
     let wire = proxy.wire.clone();
     let solo = proxy.solo_ms.clone();
     let driver_for_report = proxy.driver.clone();
+
+    // A HEARTBEAT, because the full report only prints on SIGINT and a run
+    // that is killed prints nothing at all. The last reference run spent
+    // fifty minutes in its fleet leg, was killed by a timeout, and left no
+    // statement of what it had been doing for any of them - the diagnosis
+    // had to be reconstructed from worker logs afterwards.
+    //
+    // Every 60s and only when something MOVED, so a quiet fleet stays quiet
+    // in the log and a stuck one is visible by the line that stops changing.
+    {
+        let wire = wire.clone();
+        let driver = driver_for_report.clone();
+        tokio::spawn(async move {
+            let mut last = (0u64, 0u64, 0u64);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                // try_lock, never block: this is a diagnostic and the mutex
+                // it wants is on the placement path.
+                let Ok(w) = wire.try_lock() else { continue };
+                let now = (w.solves, w.placed.get(&1).copied().unwrap_or(0), w.home);
+                drop(w);
+                let (leads_ms, leads) = driver.lead_total();
+                if now == last {
+                    continue;
+                }
+                last = now;
+                println!(
+                    "[wire] .. {} solves, {} routed, {} home, {leads} lead(s) done, \
+                     {}s of lead time",
+                    now.0,
+                    now.1,
+                    now.2,
+                    leads_ms / 1000
+                );
+            }
+        });
+    }
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         // BEFORE the std::Mutex guards below: this awaits, and a std guard
