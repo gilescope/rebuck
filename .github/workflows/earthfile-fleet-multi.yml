@@ -664,6 +664,7 @@ jobs:
         env:
           OTLP_FORWARD: ${{ secrets.OTLP_FORWARD }}
           OTLP_TOKEN: ${{ secrets.OTLP_TOKEN }}
+          OTLP_CA: ${{ secrets.OTLP_CA }}
         run: |
           set -euo pipefail
           d="$RUNNER_TEMP/otel"; mkdir -p "$d"; chmod 777 "$d"
@@ -677,14 +678,25 @@ jobs:
             printf '      http: { endpoint: 0.0.0.0:4318 }\n'
             printf 'exporters:\n  file:\n    path: /out/traces.jsonl\n'
             if [ -n "${OTLP_FORWARD:-}" ]; then
-              # insecure_skip_verify, NOT insecure. `insecure: true` means
-              # PLAINTEXT, so it would dial a TLS listener without TLS and
-              # every export would fail - the collector is TLS with a
-              # self-signed cert, which needs verification skipped, not
-              # encryption dropped.
+              # `insecure: true` would mean PLAINTEXT, not skip-verify - it
+              # would dial a TLS listener without TLS and drop every batch.
+              #
+              # And NOT insecure_skip_verify either, which was the first
+              # version of this and is worse than it looks: this exporter
+              # carries a bearer token, and skipping verification means
+              # anyone who can intercept the connection presents their own
+              # certificate, takes the token, and reads the traces. The
+              # collector's certificate is self-signed, which is not the same
+              # as unverifiable - pin it and the check is real.
               printf '  otlp/forward:\n    endpoint: %s\n' "$OTLP_FORWARD"
-              printf '    tls: { insecure_skip_verify: true }\n'
-              # And the token, or the far end 401s every batch.
+              if [ -n "${OTLP_CA:-}" ]; then
+                printf '%s\n' "$OTLP_CA" > "$d/ca.crt"
+                printf '    tls: { ca_file: /etc/otel/ca.crt }\n'
+              else
+                echo "::error::OTLP_FORWARD is set but OTLP_CA is not - refusing to send a token to an unverified endpoint"
+                exit 1
+              fi
+              # The token, or the far end 401s every batch.
               if [ -n "${OTLP_TOKEN:-}" ]; then
                 printf '    headers: { Authorization: "Bearer %s" }\n' "$OTLP_TOKEN"
               fi
