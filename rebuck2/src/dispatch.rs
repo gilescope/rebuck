@@ -879,7 +879,36 @@ pub fn affinity() -> bool {
 /// through a build would give two identical subtrees different graphs.
 pub fn cache_seeds() -> &'static BTreeMap<String, String> {
     static S: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
-    S.get_or_init(|| parse_cache_seeds(std::env::var("REBUCK2_CACHE_SEEDS").ok().as_deref()))
+    S.get_or_init(|| {
+        // A FILE as well as a variable, and that is not a convenience. The
+        // seeds are harvested from the daemon that just did the work, which
+        // is after this process starts - a variable set then would never
+        // reach it. This is read lazily, on the first dispatch, so a file
+        // written between startup and the fleet leg is seen.
+        let inline = std::env::var("REBUCK2_CACHE_SEEDS").ok();
+        let from_file = std::env::var("REBUCK2_CACHE_SEEDS_FILE")
+            .ok()
+            .filter(|p| !p.is_empty())
+            .and_then(|p| match std::fs::read_to_string(&p) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    // NAMED and not silent: a seeds file the harvest failed
+                    // to write looks exactly like seeding not paying off.
+                    println!("[dispatch] REBUCK2_CACHE_SEEDS_FILE {p}: {e}");
+                    None
+                }
+            });
+        let mut m = parse_cache_seeds(inline.as_deref());
+        // Newlines count as separators too, because a file written one pair
+        // per line is what a shell loop produces.
+        m.extend(parse_cache_seeds(
+            from_file.map(|t| t.replace('\n', ",")).as_deref(),
+        ));
+        if !m.is_empty() {
+            println!("[dispatch] cache seeds: {m:?}");
+        }
+        m
+    })
 }
 
 /// `id=ref` pairs, comma separated. Anything unparseable is dropped LOUDLY.
@@ -1998,6 +2027,12 @@ mod tests {
         let m = super::parse_cache_seeds(Some("go-mod=reg/a,broken,=x,y="));
         assert_eq!(m.len(), 1);
         assert!(super::parse_cache_seeds(None).is_empty());
+        // One pair per line is what a shell loop writes, and it must parse
+        // the same as the comma form - the file is the path that actually
+        // gets used, since the harvest happens after this process starts.
+        let text = "go-mod=reg/a@sha256:1\nnpm=reg/b@sha256:2\n";
+        let m = super::parse_cache_seeds(Some(&text.replace('\n', ",")));
+        assert_eq!(m.len(), 2, "newlines separate pairs: {m:?}");
     }
 
     /// A cold cache mount can be handed a starting point.

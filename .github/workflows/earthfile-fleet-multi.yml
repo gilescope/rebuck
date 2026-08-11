@@ -37,7 +37,7 @@ on:
   # The test side is 71% serial and caps at 1.4x by Amdahl however well the
   # fleet works; this side is the shape a build farm is actually for.
   push:
-    branches: [giles-dispatch-ci, giles-dispatch-ci-binaries]
+    branches: [giles-dispatch-ci, giles-dispatch-ci-binaries, giles-dispatch-ci-seed]
   workflow_dispatch:
     inputs:
       peer_cache_mounts:
@@ -58,6 +58,14 @@ on:
         description: the baseline gets its own daemon, so the fleet's coordinator starts cold (1/0)
         type: string
         default: '1'
+      seed_caches:
+        description: harvest the baseline's cache mounts and start the fleet's from them (1/0)
+        type: string
+        default: '0'
+      seed_ids:
+        description: which cache mounts to harvest, as `id:path` pairs
+        type: string
+        default: 'go-mod:/go/pkg/mod,go-build:/root/.cache/go-build'
       prefetch:
         description: announce a finished layer to the fleet before it is asked for (1/0)
         type: string
@@ -240,6 +248,23 @@ env:
   # base chain of 26. Gated on solve counts it should announce that chain.
   # Off again, with the number, if it does not pay.
   REBUCK2_PREFETCH: ${{ inputs.prefetch || '1' }}
+  # Both measured workloads lose the same way: a lifted cache mount starts
+  # COLD on whoever gets the work, so six machines each pay for a fill that
+  # one machine pays for once. buildkit can start a cache dir as a
+  # copy-on-write ref over `Mount.input`; this is the switch that uses it.
+  #
+  # READ THE CAVEAT in the harvest step before quoting any number from a run
+  # with this on. It compares a seeded fleet against an unseeded fleet, not
+  # against the baseline.
+  #
+  # Resolved in `plan` and set on the coordinator job, because it is chosen
+  # by branch and a workflow-level `env:` cannot see `needs`. One place
+  # states it, which is the rule the graft episode bought.
+  REBUCK2_SEED_IDS: ${{ inputs.seed_ids || 'go-mod:/go/pkg/mod,go-build:/root/.cache/go-build' }}
+  # A FILE, not a variable. The seeds are harvested after the proxy is
+  # already running, so a variable set at that point would never reach it;
+  # `cache_seeds()` reads this lazily on the first dispatch.
+  REBUCK2_CACHE_SEEDS_FILE: /tmp/cache-seeds.txt
   REBUCK2_FRESH_FLEET: ${{ inputs.fresh_fleet || '1' }}
   REBUCK2_CONNS: ${{ inputs.conns || '' }}
   REBUCK2_KEEPALIVE_S: ${{ inputs.keepalive_s || '' }}
@@ -345,11 +370,13 @@ jobs:
       list: ${{ steps.n.outputs.list }}
       count: ${{ steps.n.outputs.count }}
       target: ${{ steps.n.outputs.target }}
+      seed: ${{ steps.n.outputs.seed }}
     steps:
       - id: n
         env:
           W: ${{ inputs.workers || '6' }}
           T: ${{ inputs.target || '' }}
+          SEED: ${{ inputs.seed_caches || '' }}
           REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -378,6 +405,15 @@ jobs:
           esac
           echo "target: $target"
           echo "target=$target" >> "$GITHUB_OUTPUT"
+          # A third CI branch, same trick as `-binaries`: workflow_dispatch
+          # is not reachable for a workflow that lives off the default
+          # branch, so an experiment is selected by where it is pushed.
+          case "${SEED:-}" in
+            "") case "$REF" in *-seed) seed=1 ;; *) seed=0 ;; esac ;;
+            *)  seed="$SEED" ;;
+          esac
+          echo "seed caches: $seed"
+          echo "seed=$seed" >> "$GITHUB_OUTPUT"
 
   # One job per worker. They join the coordinator's mesh, lend their buildkitd
   # to it, and exit when it disconnects.
@@ -661,6 +697,7 @@ jobs:
       OTEL_TRACES_EXPORTER: otlp
       OTEL_EXPORTER_OTLP_PROTOCOL: grpc
       OTEL_EXPORTER_OTLP_ENDPOINT: http://127.0.0.1:4317
+      REBUCK2_SEED_CACHES: ${{ needs.plan.outputs.seed }}
     # 150, not 60. Sized for ONE group when that is what this built; the
     # whole `+test-no-qemu` is twelve of them and runs TWICE - baseline then
     # fleet. The first attempt was killed at 60 minutes, 51 of them into a
@@ -1066,6 +1103,56 @@ jobs:
           rm -rf "/tmp/baseline-build"
           if [ -d build ]; then mv build "/tmp/baseline-build"; fi
 
+
+      # WHAT THIS DOES AND DOES NOT MEASURE, because the number will be
+      # quoted and the rig is not symmetric.
+      #
+      # It harvests the cache mounts the BASELINE just filled and hands them
+      # to the fleet. That makes the fleet leg strictly better off than the
+      # baseline was, so `one machine Xs / 6 machines Ys` from a seeded run
+      # is NOT a fair fleet-versus-one-machine comparison and must not be
+      # read as one. The question it answers is narrower and is the one
+      # currently open: does starting a cold worker's mount from an image
+      # remove the ~24s-per-lead fill, yes or no. Compare a seeded fleet
+      # against an UNSEEDED fleet.
+      #
+      # The fair version - both legs seeded from a build that preceded both -
+      # is the second experiment, and it is the realistic one: in CI the
+      # seed comes from yesterday's build, and then a single machine has no
+      # special advantage from warming itself as it goes.
+      #
+      # Harvested from base-bk and not own-bk: with FRESH_FLEET=1 the
+      # baseline ran on base-bk, so that is the daemon whose mounts are warm.
+      - name: harvest the baseline's cache mounts
+        if: env.REBUCK2_SEED_CACHES == '1'
+        run: |
+          set -uo pipefail
+          : > "$REBUCK2_CACHE_SEEDS_FILE"
+          if ! docker inspect base-bk >/dev/null 2>&1; then
+            echo "::warning::no base-bk to harvest from (fresh_fleet=0?) - the fleet stays cold"
+            exit 0
+          fi
+          IFS=',' read -ra pairs <<< "$REBUCK2_SEED_IDS"
+          for pair in "${pairs[@]}"; do
+            id=${pair%%:*}; path=${pair#*:}
+            [ -n "$id" ] && [ -n "$path" ] && [ "$id" != "$path" ] || {
+              echo "::warning::seed_ids: ignoring '$pair', wanted id:path"; continue; }
+            # Best effort, one at a time. An empty cache harvests an empty
+            # layer and a missing one harvests nothing; either leaves the
+            # worker exactly as cold as it is today, which is the whole
+            # safety argument for doing this at all.
+            out=$(./rebuck2/target/release/rebuck2 harvest-cache \
+                    --bk "$LAN:28372" --registry "172.17.0.1:15000" \
+                    --id "$id" --dest "$path" 2>&1) || {
+              echo "::warning::harvest $id failed"; echo "$out" | tail -5; continue; }
+            echo "$out" | tail -2
+            echo "$out" | grep -oE '^REBUCK2_CACHE_SEEDS=.*' | sed 's/^REBUCK2_CACHE_SEEDS=//' \
+              >> "$REBUCK2_CACHE_SEEDS_FILE"
+          done
+          echo "=== seeds the fleet will start from"
+          cat "$REBUCK2_CACHE_SEEDS_FILE" || true
+          [ -s "$REBUCK2_CACHE_SEEDS_FILE" ] || \
+            echo "::warning::nothing harvested - this run measures an unseeded fleet"
 
       - name: the Earthfile, through the fleet
         working-directory: earthbuild
