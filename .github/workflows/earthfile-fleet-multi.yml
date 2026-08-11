@@ -456,7 +456,15 @@ jobs:
           # joining would make the coordinator's barrier wait for it, which
           # moves the cost onto the critical path instead of removing it.
           if [ "${REBUCK2_WARM:-0}" = "1" ]; then
-            ( cd earthbuild && EARTHLY_BUILDKIT_HOST="tcp://${BK_ADDR}" \
+            # NOT BK_ADDR, which is 127.0.0.1. earthly's IsLocal treats
+            # loopback as "a buildkit I manage" and tries to start its own
+            # container from an image that is not published - the first
+            # warm-up died doing exactly that, printing docker run arguments
+            # instead of building anything. Same trap the nested-host code
+            # documents, walked into two hours after writing the comment.
+            WARM_HOST=$(hostname -I 2>/dev/null | awk '{print $1}')
+            [ -n "$WARM_HOST" ] || WARM_HOST=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
+            ( cd earthbuild && EARTHLY_BUILDKIT_HOST="tcp://${WARM_HOST}:18372" \
                 EARTHLY_TLS_ENABLED=false EARTH_TLS_ENABLED=false \
                 EARTHLY_VERSION_FLAG_OVERRIDES="$(tr -d '\n' < .earthly_version_flag_overrides)" \
                 timeout 900 earthly --ci "$REBUCK2_WARM_TARGET" \
