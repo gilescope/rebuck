@@ -2282,13 +2282,13 @@ runs, which is larger than any effect being looked for.
 
 The standing goal is larger and larger parts of it, so here is the ledger.
 
-| target                   | shape                                  | status                                   |
-| ------------------------ | -------------------------------------- | ---------------------------------------- |
-| `+test-no-qemu-group1`   | one group, nested earthly, WITH DOCKER | parity, locally                          |
-| `+test-no-qemu-group2`   | the same, one group                    | parity, in CI, six machines              |
-| `+test-no-qemu-group10`  | the same, one group                    | where graft and cut-prefix were measured |
-| `+test-no-qemu` (all 14) | 14 groups on one 192s base chain       | completes, parity, 508s vs 285s          |
-| `+all-binaries`          | 5 cross-compiles off one `+code` stem  | first run in flight                      |
+| target                   | shape                                  | status                                          |
+| ------------------------ | -------------------------------------- | ----------------------------------------------- |
+| `+test-no-qemu-group1`   | one group, nested earthly, WITH DOCKER | parity, locally                                 |
+| `+test-no-qemu-group2`   | the same, one group                    | parity, in CI, six machines                     |
+| `+test-no-qemu-group10`  | the same, one group                    | where graft and cut-prefix were measured        |
+| `+test-no-qemu` (all 14) | 14 groups on one 192s base chain       | completes, parity, 508s vs 285s                 |
+| `+all-binaries`          | 5 cross-compiles off one `+code` stem  | **green both legs**, 262s vs 712s, 2.3x ceiling |
 
 Everything above the last line is the same shape wearing different numbers:
 a long serial base chain, then nested earthly builds that each want a 600
@@ -2406,3 +2406,55 @@ and takes minutes about it. The default moved accordingly.
 
 Still off, because affinity is the variable under test and two at once is
 neither.
+
+## `+all-binaries`: the ceiling doubles, and the fleet still loses
+
+First run of the structurally different target. Six machines.
+
+|                    | baseline | fleet                                   |
+| ------------------ | -------- | --------------------------------------- |
+| wall               | 262s     | 712s                                    |
+| failed targets     | 0        | **0 - the same, so parity**             |
+| solves             |          | 33, all 33 routed, 0 home               |
+| peak in flight     |          | 6                                       |
+| occupancy          |          | 2.29                                    |
+| **Amdahl ceiling** |          | **2.30x**                               |
+| leads              |          | 34; p50 **47.6s**, max 224s             |
+| op duplication     |          | 612 sent / 101 distinct, **3.4x built** |
+
+Two things are confirmed and one is now unavoidable.
+
+**Confirmed: the workload is what principle 19 said it would be.** A 2.30x
+ceiling against 1.4x for the test groups, occupancy 2.29 out of a possible
+2.30 - the fleet is extracting essentially all the parallelism this graph
+contains. Peak 6, so every machine had work. Nothing about dispatch is
+failing here.
+
+**Confirmed: it builds correctly.** Zero failed targets either way. That is
+the first target in this ledger that is green on both legs rather than
+equally red, and it is a stronger parity statement than any group has made.
+
+**Unavoidable: the baseline's advantage is one shared warm cache mount.**
+p50 lead 47.6s against a 262s baseline that produced all five binaries. One
+machine cross-compiling five platforms downloads the module graph ONCE into
+one `/go/pkg/mod` and reuses one `go-build` cache; six machines each pay for
+their own, and 3.4x built duplication says most ops were materialised on
+three of them. Two structurally different workloads now fail the same way.
+
+And it puts affinity in an awkward position. Affinity for cache mounts
+prefers the worker that already has the warm one - which for five
+independent leaves means piling all five onto one machine, i.e.
+reconstructing the baseline. Concentrating is right when only one mount is
+warm; it is a workaround for the mount not being available anywhere else.
+
+So the mount has to become something a cold worker can be GIVEN. That is not
+a metaphor: buildkit's `getRefCacheDirNoCache` creates a cache dir as a
+copy-on-write ref over `Mount.input` when the dir does not exist, so an LLB
+cache mount can carry a starting image. The Earthfile never has to know
+(principle 15) because we are the ones rewriting the graph.
+
+Footnote on the byte-parity check, which reported nothing: `+all-binaries`
+reaches the per-platform targets through `COPY`, and earthly only writes
+`SAVE ARTIFACT ... AS LOCAL` for targets named on the command line. So there
+were genuinely no local files to hash, on either leg, and the check
+correctly said nothing rather than passing vacuously.

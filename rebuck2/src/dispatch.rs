@@ -1651,6 +1651,125 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// A cold cache mount can be handed a starting point.
+    ///
+    /// buildkit builds a cache dir as a copy-on-write ref over the mount's
+    /// INPUT when the dir does not exist yet - `getRefCacheDirNoCache` calls
+    /// `cm.New(ctx, ref, ...)` with exactly that ref. So an input turns "this
+    /// worker has never seen go-mod" into "this worker starts from a filled
+    /// one", without the Earthfile knowing (principle 15).
+    #[test]
+    fn a_cold_cache_mount_can_be_seeded_from_an_image() {
+        use bollard_buildkit_proto::pb;
+        use prost::Message;
+
+        let base = pb::Op {
+            op: Some(pb::op::Op::Source(pb::SourceOp {
+                identifier: "docker-image://golang:1".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let base_d = format!("sha256:{}", crate::store::sha256_hex(&base.encode_to_vec()));
+        let mount = |id: &str, dest: &str| pb::Mount {
+            input: -1,
+            dest: dest.into(),
+            output: -1,
+            mount_type: pb::MountType::Cache as i32,
+            cache_opt: Some(pb::CacheOpt {
+                id: id.into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let exec = pb::Op {
+            inputs: vec![pb::Input {
+                digest: base_d.clone(),
+                index: 0,
+            }],
+            op: Some(pb::op::Op::Exec(pb::ExecOp {
+                mounts: vec![
+                    pb::Mount {
+                        input: 0,
+                        dest: "/".into(),
+                        output: 0,
+                        ..Default::default()
+                    },
+                    mount("go-mod", "/go/pkg/mod"),
+                    mount("npm", "/root/.npm"),
+                ],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let def = pb::Definition {
+            def: vec![base.encode_to_vec(), exec.encode_to_vec()],
+            ..Default::default()
+        };
+
+        let mut seeds = std::collections::BTreeMap::new();
+        seeds.insert("go-mod".to_owned(), "reg/seed@sha256:aa".to_owned());
+        let out = super::seed_cache_mounts(&def, &seeds);
+
+        // One op added, and it is the seed source.
+        assert_eq!(out.def.len(), 3, "the seed image is a new source op");
+        let seed_src = out
+            .def
+            .iter()
+            .filter_map(|b| pb::Op::decode(b.as_slice()).ok())
+            .find_map(|o| match o.op {
+                Some(pb::op::Op::Source(s)) if s.identifier.contains("seed") => Some(s.identifier),
+                _ => None,
+            });
+        assert_eq!(
+            seed_src.as_deref(),
+            Some("docker-image://reg/seed@sha256:aa")
+        );
+
+        let e = out
+            .def
+            .iter()
+            .filter_map(|b| pb::Op::decode(b.as_slice()).ok())
+            .find_map(|o| match o.op {
+                Some(pb::op::Op::Exec(e)) => Some((o.inputs, e)),
+                _ => None,
+            })
+            .expect("the exec survived");
+        let (inputs, e) = e;
+        let go = &e.mounts[1];
+        assert!(go.input >= 0, "go-mod now starts from something");
+        assert_eq!(
+            inputs[go.input as usize].digest,
+            format!(
+                "sha256:{}",
+                crate::store::sha256_hex(
+                    &pb::Op {
+                        op: Some(pb::op::Op::Source(pb::SourceOp {
+                            identifier: "docker-image://reg/seed@sha256:aa".into(),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    }
+                    .encode_to_vec()
+                )
+            ),
+            "and that something is the seed"
+        );
+        // The UNSEEDED mount is untouched: seeding every mount would make a
+        // worker pull images for caches nobody measured.
+        assert_eq!(e.mounts[2].input, -1, "npm was not asked for");
+        // And the rootfs mount still points at the base, not at the seed -
+        // appending an input must not renumber the existing ones.
+        assert_eq!(e.mounts[0].input, 0);
+        assert_eq!(inputs[0].digest, base_d);
+
+        // Nothing to seed is the identity, byte for byte. A transform that
+        // rewrites a graph it had no reason to touch changes every digest
+        // below it for nothing.
+        let same = super::seed_cache_mounts(&def, &Default::default());
+        assert_eq!(same.def, def.def);
+    }
+
     /// A warm cache MOUNT outranks a warm op, and by how much.
     ///
     /// The two are not the same size. Reusing an op saves whatever that op
