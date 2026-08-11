@@ -1121,7 +1121,11 @@ controller reads "home is the straggler" and sends more work away, which
 raises the away mean in turn. The first run looked like a win over the
 hand-tuned 15s; the second was worse than doing nothing.
 
-So it ships OFF, behind `REBUCK2_ADAPT=1`, with the measurement kept: the
+So it shipped OFF behind `REBUCK2_ADAPT=1` - and the flag is **gone from
+the code**: no `.rs` file mentions it, though `docs/running-a-fleet.md`
+listed it for operators until today. Whether it was removed deliberately or
+lost in a refactor, the effect was a documented switch that did nothing, and
+the reasoning below is what survives. The measurement is kept: the
 law is worth having and this loop around it is not. A stable version has
 to break the feedback - compare against a quantity the controller does not
 move, or damp and converge rather than jump to the ratio each time.

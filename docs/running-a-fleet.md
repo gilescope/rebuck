@@ -190,11 +190,21 @@ privilege is a trust decision, and no session service makes a peer's
 | `REBUCK2_MIRROR` | registry address **as the workers' daemons see it** |
 | `REBUCK2_HOME_SLOTS` | local concurrency before work is sent away (default: cores) |
 | `REBUCK2_PEER_CACHE_MOUNTS` | see above |
-| `REBUCK2_ADAPT=1` | derive weights from service times. **Unstable** - it chases itself, see the findings doc |
-| `REBUCK2_GATE=1` | skip subtrees smaller than their transfer. Does not fire in practice |
+| `REBUCK2_GATE=1` | skip subtrees smaller than their transfer. Does not fire in practice, and now known why: `placing` measures 0% |
+| `REBUCK2_MIN_OPS=N` | refuse to dispatch a graph under N ops. **Measured harmful** - about 5x slower, because op count measures size and the fleet's problem is criticality |
+| `REBUCK2_BALANCE=1` | trade warmth against queue depth instead of ranking warmth first. **Measured good** - 1240s to 1050s and no idle machine |
+| `REBUCK2_AFFINITY_IMPORTS=1` | also score a candidate on parent images it holds. Under measurement |
+| `REBUCK2_PREFETCH_ALL=1` | announce prefetched blobs to every worker rather than splitting them one-blob-one-worker. Unmeasured; note `REBUCK2_PREFETCH_LANES` defaults to 1 |
+| `REBUCK2_LOCAL_NESTED=1` | point a nested `earthly` at the daemon on its own machine. Aimed at the five ~245s nested leads that own `+test-no-qemu`'s critical path; hazardous under `--privileged --entrypoint` |
 
-The last two are opt-in experiments that did not work, kept with their
-measurements rather than deleted, so nobody re-derives them.
+`REBUCK2_ADAPT` used to be listed here and **does not exist in the code** -
+no `.rs` file mentions it. An operator setting it would have got silence and
+no effect, which is the same defect this project keeps finding in its own
+mechanisms, arriving from the documentation side instead.
+
+`REBUCK2_GATE` and `REBUCK2_MIN_OPS` are opt-in experiments that did not
+work, kept with their measurements rather than deleted, so nobody
+re-derives them.
 
 ## The mirror grows and nothing prunes it
 
