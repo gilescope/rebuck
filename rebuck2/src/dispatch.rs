@@ -390,6 +390,131 @@ pub fn cache_ids(def: &pb::Definition) -> BTreeSet<String> {
     out
 }
 
+/// Give named cache mounts a starting point, so a cold worker is not cold.
+///
+/// This is the answer to the largest measured cost in the project. Lifting a
+/// cache mount is what makes a subtree dispatchable - otherwise it is
+/// grounded to the machine holding the mount - but lifting the hazard does
+/// not lift the cost: the worker builds against its OWN mount, which is
+/// empty, so `go mod download` runs again. Measured at ~24s a lead across 64
+/// leads on one target, and it is why a six-machine `+all-binaries` loses to
+/// a one-machine baseline that fills one `/go/pkg/mod` and reuses it five
+/// times.
+///
+/// buildkit already supports the fix and nothing has been using it.
+/// `getRefCacheDirNoCache` creates a cache dir as a copy-on-write ref over
+/// the mount's INPUT when no dir exists yet - `cm.New(ctx, ref, ...)` in
+/// `solver/llbsolver/mounts/mount.go`. So a cache mount with an input starts
+/// filled. `vertex.go` names the same property in a comment: "value shows in
+/// mount is on top of a ref".
+///
+/// The Earthfile never learns about this (principle 15). We are already
+/// rewriting the graph to make it portable; this is one more rewrite on the
+/// same spine.
+///
+/// Only the ids in `seeds` are touched, and only mounts that have no input
+/// already. Seeding every mount would make a worker pull an image for a
+/// cache nobody measured, and the ranking of which are worth it is exactly
+/// what [`crate::driver::Driver::cache_costs`] exists to produce.
+pub fn seed_cache_mounts(def: &pb::Definition, seeds: &BTreeMap<String, String>) -> pb::Definition {
+    if seeds.is_empty() {
+        return def.clone();
+    }
+    let digest = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
+    let source_for = |image: &str| -> (Vec<u8>, String) {
+        let bytes = pb::Op {
+            op: Some(pb::op::Op::Source(pb::SourceOp {
+                identifier: if image.contains("://") {
+                    image.to_owned()
+                } else {
+                    format!("docker-image://{image}")
+                },
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let d = digest(&bytes);
+        (bytes, d)
+    };
+
+    // The source ops go FIRST and in one pass. LLB is topological and a
+    // source has no inputs, so the front is always legal; appending them
+    // instead would put an op after the terminal, which `loadLLB` reads as a
+    // second terminal and rejects with `no support for <nil>`. That failure
+    // mode has already cost this project a day.
+    let mut added: Vec<Vec<u8>> = Vec::new();
+    let mut seed_digest: BTreeMap<String, String> = BTreeMap::new();
+    let mut present: BTreeSet<String> = def.def.iter().map(|b| digest(b)).collect();
+    for image in seeds.values().collect::<BTreeSet<_>>() {
+        let (bytes, d) = source_for(image);
+        if present.insert(d.clone()) {
+            added.push(bytes);
+        }
+        seed_digest.insert(image.clone(), d);
+    }
+
+    let used = std::cell::Cell::new(false);
+    let edited = rewrite_ops(def, &|op| {
+        let Some(pb::op::Op::Exec(e)) = op.op.as_mut() else {
+            return false;
+        };
+        // Collected first: `op.inputs` and `op.op` cannot both be borrowed
+        // mutably, and the index of a new input depends on how many were
+        // appended before it.
+        let wants: Vec<(usize, String)> = e
+            .mounts
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.input < 0)
+            .filter_map(|(i, m)| {
+                let id = &m.cache_opt.as_ref()?.id;
+                seeds
+                    .get(id)
+                    .and_then(|img| seed_digest.get(img))
+                    .map(|d| (i, d.clone()))
+            })
+            .collect();
+        if wants.is_empty() {
+            return false;
+        }
+        for (mount, d) in wants {
+            // Reuse an input edge if this op already has one pointing at the
+            // seed, rather than adding a duplicate per mount.
+            let at = match op.inputs.iter().position(|i| i.digest == d) {
+                Some(at) => at,
+                None => {
+                    op.inputs.push(pb::Input {
+                        digest: d,
+                        index: 0,
+                    });
+                    op.inputs.len() - 1
+                }
+            };
+            // APPENDED, never inserted: every existing `Mount.input` is an
+            // index into this vector and renumbering them would silently
+            // remount the rootfs somewhere else.
+            let Some(pb::op::Op::Exec(e)) = op.op.as_mut() else {
+                continue;
+            };
+            e.mounts[mount].input = at as i64;
+            used.set(true);
+        }
+        true
+    });
+    if !used.get() {
+        return def.clone();
+    }
+    crate::mech::applied("seed_mounts");
+    let mut out = edited;
+    // Prepended, and the metadata comes along or buildkit treats the vertex
+    // as having no options at all.
+    let mut def_out = added;
+    def_out.append(&mut out.def);
+    out.def = def_out;
+    out
+}
+
 /// Everything a graph carries that a SESSIONLESS solve cannot satisfy,
 /// spelled out for a human.
 ///
@@ -629,6 +754,42 @@ pub fn worth_offering(
 /// that is an argument, and arguments have lost to measurements every time.
 pub fn affinity() -> bool {
     std::env::var("REBUCK2_AFFINITY").as_deref() == Ok("1")
+}
+
+/// Images to start named cache mounts from, as `id=ref,id=ref`.
+///
+/// Supplied rather than discovered, for now. Harvesting a warm mount off the
+/// coordinator is a separate job with its own failure modes; this makes the
+/// rewrite measurable without it, and an operator who already has a filled
+/// `/go/pkg/mod` published can point at it today.
+///
+/// Read once, like every other policy here: a seed map that changed halfway
+/// through a build would give two identical subtrees different graphs.
+pub fn cache_seeds() -> &'static BTreeMap<String, String> {
+    static S: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
+    S.get_or_init(|| parse_cache_seeds(std::env::var("REBUCK2_CACHE_SEEDS").ok().as_deref()))
+}
+
+/// `id=ref` pairs, comma separated. Anything unparseable is dropped LOUDLY.
+///
+/// Silence here would be the third instance of a mechanism measured while
+/// switched off: a typo in one pair would leave the others working and the
+/// run would look like seeding simply did not pay.
+pub fn parse_cache_seeds(raw: Option<&str>) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for part in raw.unwrap_or_default().split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.split_once('=') {
+            Some((id, r)) if !id.trim().is_empty() && !r.trim().is_empty() => {
+                out.insert(id.trim().to_owned(), r.trim().to_owned());
+            }
+            _ => println!("[dispatch] REBUCK2_CACHE_SEEDS: ignoring {part:?}, wanted id=ref"),
+        }
+    }
+    out
 }
 
 /// Who to offer this subtree to, best first. Empty means build it yourself.
@@ -1651,6 +1812,20 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cache_seed_pairs_are_read_or_reported() {
+        let m = super::parse_cache_seeds(Some("go-mod=reg/a@sha256:1, npm=reg/b@sha256:2"));
+        assert_eq!(m.get("go-mod").map(String::as_str), Some("reg/a@sha256:1"));
+        assert_eq!(m.get("npm").map(String::as_str), Some("reg/b@sha256:2"));
+        assert_eq!(m.len(), 2, "whitespace is not a third pair");
+        // A half-written pair takes only itself out. It also prints, which is
+        // the part that matters: silently dropping one would leave the run
+        // looking like seeding did not pay.
+        let m = super::parse_cache_seeds(Some("go-mod=reg/a,broken,=x,y="));
+        assert_eq!(m.len(), 1);
+        assert!(super::parse_cache_seeds(None).is_empty());
+    }
+
     /// A cold cache mount can be handed a starting point.
     ///
     /// buildkit builds a cache dir as a copy-on-write ref over the mount's

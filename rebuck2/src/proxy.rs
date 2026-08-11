@@ -1446,6 +1446,7 @@ impl Wire {
             "[wire] mechanisms   : {}",
             crate::mech::summary(&[
                 ("affinity", crate::dispatch::affinity()),
+                ("seed_mounts", !crate::dispatch::cache_seeds().is_empty()),
                 ("min_siblings", min_siblings() > 0),
                 (
                     "prefetch",
@@ -1832,9 +1833,15 @@ impl Proxy {
             .await;
         }
         let git_ns = format!("git:{}", target.unwrap_or("default"));
-        crate::dispatch::rewrite_git_sources(&out, &|r| {
+        let out = crate::dispatch::rewrite_git_sources(&out, &|r| {
             self.resolved(&(git_ns.clone(), r.to_owned()))
-        })
+        });
+        // LAST, and after everything that rewrites sources. A seed is itself
+        // a `docker-image://` source pointing at a registry a worker can
+        // already reach, so it neither needs mirroring nor should be
+        // mirrored - putting it earlier would send it round the base-image
+        // path and copy a cache image through peer 0 for no reason.
+        crate::dispatch::seed_cache_mounts(&out, crate::dispatch::cache_seeds())
     }
 
     /// Materialise every `local://` source this graph names.
