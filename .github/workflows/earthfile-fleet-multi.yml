@@ -1454,7 +1454,14 @@ jobs:
             /tmp/own-bk.log | head -5 || echo "no panic line"
           # And the twenty lines after the FIRST one, which is where the
           # offending call is named.
-          first=$(grep -anE "^(panic|fatal error):" /tmp/own-bk.log | head -1 | cut -d: -f1)
+          # `|| true`, and it is not decoration. GitHub runs a step with
+          # `bash -e` whatever the script's own `set` line says, so an
+          # assignment from a grep that matches NOTHING exits the step - and
+          # matching nothing is the good news here. This diagnostic turned a
+          # green at-parity +all-buildkitd run into a red job: 1161s against
+          # 1188s, zero failed targets either way, reported as a failure by
+          # the step that checks whether anything went wrong.
+          first=$(grep -anE "^(panic|fatal error):" /tmp/own-bk.log | head -1 | cut -d: -f1) || true
           if [ -n "${first:-}" ]; then
             echo "--- from the panic:"
             sed -n "${first},$((first + 20))p" /tmp/own-bk.log

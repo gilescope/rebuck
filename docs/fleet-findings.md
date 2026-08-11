@@ -2282,15 +2282,15 @@ runs, which is larger than any effect being looked for.
 
 The standing goal is larger and larger parts of it, so here is the ledger.
 
-| target                   | shape                                  | status                                             |
-| ------------------------ | -------------------------------------- | -------------------------------------------------- |
-| `+test-no-qemu-group1`   | one group, nested earthly, WITH DOCKER | parity, locally                                    |
-| `+test-no-qemu-group2`   | the same, one group                    | parity, in CI, six machines                        |
-| `+test-no-qemu-group10`  | the same, one group                    | where graft and cut-prefix were measured           |
-| `+test-no-qemu` (all 14) | 14 groups on one 192s base chain       | completes, parity, 508s vs 285s                    |
-| `+all-binaries`          | 5 cross-compiles off one `+code` stem  | **green both legs**, 262s vs 712s, 2.3x ceiling    |
-| `+lint-all`              | 3 independent lint targets, no docker  | parity, 88s vs 252s after the retry fix (was 628s) |
-| `+all-buildkitd`         | multi-arch buildkitd, needs qemu       | baseline leg alone ran past 55 min - see below     |
+| target                   | shape                                  | status                                                    |
+| ------------------------ | -------------------------------------- | --------------------------------------------------------- |
+| `+test-no-qemu-group1`   | one group, nested earthly, WITH DOCKER | parity, locally                                           |
+| `+test-no-qemu-group2`   | the same, one group                    | parity, in CI, six machines                               |
+| `+test-no-qemu-group10`  | the same, one group                    | where graft and cut-prefix were measured                  |
+| `+test-no-qemu` (all 14) | 14 groups on one 192s base chain       | completes, parity, 508s vs 285s                           |
+| `+all-binaries`          | 5 cross-compiles off one `+code` stem  | **green both legs**, 262s vs 712s, 2.3x ceiling           |
+| `+lint-all`              | 3 independent lint targets, no docker  | parity, 88s vs 252s after the retry fix (was 628s)        |
+| `+all-buildkitd`         | multi-arch buildkitd, needs qemu       | **parity**, 1161s vs 1188s - arm64 half is undispatchable |
 
 Everything above the last line is the same shape wearing different numbers:
 a long serial base chain, then nested earthly builds that each want a 600
@@ -2905,3 +2905,51 @@ identical timings at 0 and 200 MiB, because the script did not forward
 "the flag did nothing", and it is the same shape as every ON BUT NEVER
 APPLIED bug in this project. A measurement that cannot distinguish those two
 is not a measurement.
+
+## `+all-buildkitd`: parity in time, and it says why
+
+The largest target attempted, and the closest result recorded.
+
+|                   | baseline  | fleet                           |
+| ----------------- | --------- | ------------------------------- |
+| wall              | **1161s** | **1188s** (+2.3%)               |
+| failed targets    | 0         | 0 - parity                      |
+| solves            |           | 28 seen, 14 routed, **14 home** |
+| occupancy         |           | 0.57                            |
+| **amplification** |           | **0.5x**                        |
+| op duplication    |           | 1.7x built                      |
+
+Amplification below 1.0 for the first time: 545s of lead work against a
+1161s baseline. Occupancy 0.57 says the same thing from the other side - for
+most of the wall clock there was no dispatched solve running at all.
+
+`not routed` explains both numbers in one line:
+
+```text
+fleet: no peer can take it (wanted Pinned("linux/arm64");
+  had 1:linux/amd64 1/4, 2:linux/amd64 0/4, 3:linux/amd64 0/4, ...)
+```
+
+`+all-buildkitd` builds `linux/amd64` and `linux/arm64`. Every worker is
+amd64, so the arm64 half is pinned to a platform nobody has, stays home, and
+runs under qemu on peer 0 exactly as the baseline runs it. Fourteen solves
+routed, fourteen kept.
+
+So the fleet distributed the cheap half, left the expensive half where it
+was, and finished 27 seconds behind. That is a fair description of a draw,
+and it is the first target where distribution costs almost nothing - because
+the part that dominates never entered the fleet.
+
+**Which points somewhere useful.** The arm64 build is essentially the whole
+critical path and it is slow *because it is emulated*. A fleet with one
+arm64 worker would not merely divide that work, it would run it natively -
+qemu against native is not a 2x difference. Platform-diverse workers are the
+obvious next experiment for this target, and nothing else measured here
+would benefit from them at all.
+
+Footnote, and an unflattering one: this run was reported RED. The
+`is the daemon still alive` step greps for a panic line, and GitHub runs
+steps under `bash -e` whatever the script's own `set` says, so an assignment
+from a grep matching nothing exits the step. Matching nothing is the good
+news. A diagnostic added to make failures legible turned the best result in
+the ledger into a failure.
