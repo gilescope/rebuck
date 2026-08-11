@@ -3555,3 +3555,27 @@ keep doing.
 
 And the discipline the audit exists to enforce: a mechanism that is off and
 unmeasured is not a feature, it is a hypothesis with code attached.
+
+## The mixed-architecture run, cancelled rather than reported
+
+`+all-buildkitd` with two `ubuntu-24.04-arm` workers. The arm64 runners
+scheduled fine and the label works, which is the one thing it did establish.
+
+It was cancelled at 100 minutes with its **baseline leg** still running. The
+same leg, same target, same amd64 coordinator, took 1161s when it ran alone.
+
+Cancelled rather than left to finish, and the reason is the finding two
+sections up: it was sharing the pool with two other fleet runs, its baseline
+was already five times the reference, and a wall clock from it could not
+have been compared with anything. Letting it run would have cost another
+hour of seven runners while distorting every other measurement taken beside
+it - and produced a number nobody could use.
+
+The question it exists to ask is still open and still the best one available:
+`+all-buildkitd`'s arm64 half is pinned to a platform no worker had, so it
+stayed home and ran under qemu exactly as the baseline ran it. A native
+arm64 worker does not divide that work, it stops emulating it. Nothing else
+measured here would gain from a platform-diverse fleet.
+
+It needs a quiet pool and one run at a time, which is now the standing rule
+rather than a preference.
