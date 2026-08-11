@@ -1223,6 +1223,10 @@ pub struct Wire {
     /// `(cache id, has an input)` as the client wrote them. See
     /// [`crate::dispatch::cache_mount_shapes`].
     cache_shapes: std::collections::BTreeSet<(String, bool)>,
+    /// The exact input op behind each cache mount, from the client's own
+    /// graphs. See [`crate::dispatch::cache_mount_inputs`] - reconstructing
+    /// these was measured wrong, and wrong silently.
+    pub cache_inputs: std::collections::BTreeMap<String, (Vec<u8>, String)>,
     /// Digest of each Solve's whole op set, in order.
     ///
     /// Repetition means two very different things and the summary number
@@ -1430,6 +1434,12 @@ impl Wire {
         if self.cache_shapes.is_empty() {
             self.cache_shapes = crate::dispatch::cache_mount_shapes(def);
         }
+        // Accumulated across solves, not taken from the first: different
+        // targets mount different ids, and a run only ever sees each one in
+        // the graphs that use it.
+        for (id, v) in crate::dispatch::cache_mount_inputs(def) {
+            self.cache_inputs.entry(id).or_insert(v);
+        }
         self.solves += 1;
         self.ops += def.def.len() as u64;
         self.per_solve.push(def.def.len());
@@ -1529,6 +1539,44 @@ impl Wire {
             self.registry_sources, self.local_sources, self.other_sources
         );
         println!("[wire] platforms      : {:?}", self.platforms);
+        // WRITTEN OUT, so a later harvest can present the same input and
+        // therefore read the same cache directory. Reconstructing it was
+        // measured wrong: `getRefCacheDir` keys on the input's ref, so a
+        // digest that differs by a platform field reads an empty directory
+        // and reports a cold cache.
+        //
+        // The timing is the open part. The proxy sees graphs during the
+        // fleet leg, and the harvest currently runs before it - so this file
+        // is for the NEXT run, carried by the bank, which is the warm-CI
+        // case rather than a simulation of it.
+        if let Some(path) = std::env::var("REBUCK2_CACHE_INPUTS_FILE")
+            .ok()
+            .map(|p| crate::dispatch::expand_home(&p))
+        {
+            if !self.cache_inputs.is_empty() {
+                let body: Vec<String> = self
+                    .cache_inputs
+                    .iter()
+                    .map(|(id, (op, sel))| {
+                        use base64::Engine;
+                        format!(
+                            "{id}\t{sel}\t{}",
+                            base64::engine::general_purpose::STANDARD.encode(op)
+                        )
+                    })
+                    .collect();
+                if let Some(dir) = std::path::Path::new(&path).parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                match std::fs::write(&path, body.join("\n")) {
+                    Ok(()) => println!(
+                        "[wire] cache inputs  : {} written to {path}",
+                        self.cache_inputs.len()
+                    ),
+                    Err(e) => println!("[wire] cache inputs  : could not write {path}: {e}"),
+                }
+            }
+        }
         if !self.cache_shapes.is_empty() {
             println!(
                 "[wire] cache mounts   : {:?} (id, has-input) - an input means a DIFFERENT \

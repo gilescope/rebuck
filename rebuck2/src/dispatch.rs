@@ -396,6 +396,72 @@ fn hazards(op: &pb::Op) -> Vec<Exclusion> {
 /// Naming them is the first step to deciding which are worth seeding: the
 /// answer is not "all of them", and it cannot be guessed from the Earthfile
 /// because frequency in the source says nothing about time spent.
+/// `~/x` as a real path.
+///
+/// A workflow's `env:` value has `${{ }}` expressions evaluated and nothing
+/// else, so `~/.cache/...` arrives at the process as a literal tilde and
+/// every write lands in a directory called `~` or fails. The shell would
+/// have expanded it; a process handed that environment will not.
+///
+/// `~user` is left alone - that is a shell convention for somebody else's
+/// home and not ours to guess at.
+pub fn expand_home(path: &str) -> String {
+    match path.strip_prefix('~') {
+        Some("") => std::env::var("HOME").unwrap_or_else(|_| path.to_owned()),
+        Some(rest) if rest.starts_with('/') => match std::env::var("HOME") {
+            Ok(h) => format!("{h}{rest}"),
+            Err(_) => path.to_owned(),
+        },
+        _ => path.to_owned(),
+    }
+}
+
+/// The exact input op behind each cache mount, keyed by cache id.
+///
+/// Returns `(op bytes, selector)`. The bytes are lifted from the graph
+/// verbatim, and that is the whole point: `getRefCacheDir` keys a cache
+/// directory on `id` plus the input's `ref.ID()`, so reading the directory
+/// earthly writes means presenting an input that hashes identically.
+///
+/// Reconstruction was tried and failed silently. Building
+/// `Scratch().File(Mkdir("/cache", 0644))` by hand from a reading of
+/// `runmount.go` produced an op that did not match - a platform on the op,
+/// a constraint, or a differing convention for a FileAction's unused fields
+/// is enough - and the harvest read an empty directory it created itself.
+/// No error, no warning, just 0.0 MiB and a run's delay.
+///
+/// A mount with no input contributes nothing: there is no ref in its key, so
+/// there is nothing to reproduce.
+pub fn cache_mount_inputs(def: &pb::Definition) -> BTreeMap<String, (Vec<u8>, String)> {
+    let by_digest: BTreeMap<String, &Vec<u8>> = def
+        .def
+        .iter()
+        .map(|b| (format!("sha256:{}", crate::store::sha256_hex(b)), b))
+        .collect();
+    let mut out = BTreeMap::new();
+    for bytes in &def.def {
+        let Ok(op) = pb::Op::decode(bytes.as_slice()) else {
+            continue;
+        };
+        let Some(pb::op::Op::Exec(e)) = &op.op else {
+            continue;
+        };
+        for m in &e.mounts {
+            let (Some(c), true) = (&m.cache_opt, m.input >= 0) else {
+                continue;
+            };
+            let Some(input) = op.inputs.get(m.input as usize) else {
+                continue;
+            };
+            if let Some(src) = by_digest.get(&input.digest) {
+                out.entry(c.id.clone())
+                    .or_insert_with(|| ((*src).clone(), m.selector.clone()));
+            }
+        }
+    }
+    out
+}
+
 /// Cache mounts as the CLIENT wrote them: id, and whether it has an input.
 ///
 /// The input decides which directory the mount is, not just what it starts
@@ -837,6 +903,21 @@ pub fn cache_probe_graph(base: &str, cache_id: &str, dest: &str, cmd: &str) -> p
 /// it, and the fleet's mirror is the only registry every peer is known to
 /// reach.
 pub fn harvest_graph(base: &str, cache_id: &str, dest: &str) -> pb::Definition {
+    harvest_graph_with(base, cache_id, dest, None)
+}
+
+/// [`harvest_graph`], given the cache mount's input taken from a real graph.
+///
+/// `input` is `(op bytes, selector)` from [`cache_mount_inputs`]. Passing
+/// `None` reconstructs earthly's shape, which is a guess that has been
+/// measured wrong: it produces a different digest, a different ref, and a
+/// different - empty - cache directory, with no error anywhere.
+pub fn harvest_graph_with(
+    base: &str,
+    cache_id: &str,
+    dest: &str,
+    input: Option<(Vec<u8>, String)>,
+) -> pb::Definition {
     let src = pb::Op {
         op: Some(pb::op::Op::Source(pb::SourceOp {
             identifier: image_identifier(base),
@@ -869,7 +950,10 @@ pub fn harvest_graph(base: &str, cache_id: &str, dest: &str) -> pb::Definition {
     // Reconstructed rather than approximated: identical LLB gives an
     // identical digest gives the same ref gives the same key. 0o644 is
     // earthly's default mode for a cache mount, from the same function.
-    let mkdir_bytes = earthly_cache_context();
+    // Taken from a real graph when we have one, reconstructed only as a
+    // fallback - see `cache_mount_inputs` for why the fallback is a guess.
+    let (mkdir_bytes, selector) =
+        input.unwrap_or_else(|| (earthly_cache_context(), "/cache".to_owned()));
     let mkdir_digest = format!("sha256:{}", crate::store::sha256_hex(&mkdir_bytes));
 
     // `/.seed` and not `/out`: the harvest runs against whatever base the
@@ -952,7 +1036,7 @@ pub fn harvest_graph(base: &str, cache_id: &str, dest: &str) -> pb::Definition {
                     // Input 1: the mkdir built above, which is what makes
                     // this key match earthly's. See that comment for why.
                     input: 1,
-                    selector: "/cache".into(),
+                    selector: selector.clone(),
                     dest: dest.to_owned(),
                     output: -1,
                     readonly: true,
@@ -2509,6 +2593,145 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_leading_tilde_is_expanded_because_a_workflow_env_does_not() {
+        // GitHub evaluates `${{ }}` in an `env:` value and nothing else, so
+        // `~/.cache/x` reaches the process as a literal tilde and every
+        // write to it fails on a directory called `~`. The shell would have
+        // expanded it; a process started with that env does not.
+        std::env::set_var("HOME", "/home/runner");
+        assert_eq!(super::expand_home("~/.cache/x"), "/home/runner/.cache/x");
+        assert_eq!(super::expand_home("~"), "/home/runner");
+        // Not a prefix match on the character: `~foo` is a username in
+        // shell and is not ours to interpret.
+        assert_eq!(super::expand_home("~foo/x"), "~foo/x");
+        assert_eq!(super::expand_home("/tmp/x"), "/tmp/x");
+        assert_eq!(super::expand_home("relative/x"), "relative/x");
+    }
+
+    /// The input op is TAKEN from a real graph, not rebuilt from a reading
+    /// of one.
+    ///
+    /// Reconstructing earthly's `Scratch().File(Mkdir("/cache"))` produced
+    /// an op that did not hash to earthly's ref, so the harvest read an
+    /// empty directory - `getRefCacheDir` keys on `ref.ID()` and near enough
+    /// does not exist. Any of a platform, a constraint or a differing
+    /// convention for the FileAction's unused fields is a different digest,
+    /// and the failure is silent.
+    ///
+    /// The proxy sees the bytes. Taking them verbatim cannot drift.
+    #[test]
+    fn a_cache_mounts_input_is_lifted_out_of_a_real_graph() {
+        use bollard_buildkit_proto::pb;
+        use prost::Message;
+
+        // Something a reconstruction would get wrong: a platform on the op.
+        let ctx = pb::Op {
+            platform: Some(pb::Platform {
+                os: "linux".into(),
+                architecture: "amd64".into(),
+                ..Default::default()
+            }),
+            op: Some(pb::op::Op::File(pb::FileOp {
+                actions: vec![pb::FileAction {
+                    input: -1,
+                    secondary_input: -1,
+                    output: 0,
+                    action: Some(pb::file_action::Action::Mkdir(pb::FileActionMkDir {
+                        path: "/cache".into(),
+                        mode: 0o644,
+                        ..Default::default()
+                    })),
+                }],
+            })),
+            ..Default::default()
+        };
+        let ctx_bytes = ctx.encode_to_vec();
+        let ctx_digest = format!("sha256:{}", crate::store::sha256_hex(&ctx_bytes));
+        let base = pb::Op {
+            op: Some(pb::op::Op::Source(pb::SourceOp {
+                identifier: "docker-image://golang:1".into(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let exec = pb::Op {
+            inputs: vec![
+                pb::Input {
+                    digest: format!("sha256:{}", crate::store::sha256_hex(&base.encode_to_vec())),
+                    index: 0,
+                },
+                pb::Input {
+                    digest: ctx_digest.clone(),
+                    index: 0,
+                },
+            ],
+            op: Some(pb::op::Op::Exec(pb::ExecOp {
+                mounts: vec![
+                    pb::Mount {
+                        input: 0,
+                        dest: "/".into(),
+                        output: 0,
+                        ..Default::default()
+                    },
+                    pb::Mount {
+                        input: 1,
+                        selector: "/cache".into(),
+                        dest: "/go/pkg/mod".into(),
+                        output: -1,
+                        mount_type: pb::MountType::Cache as i32,
+                        cache_opt: Some(pb::CacheOpt {
+                            id: "go-mod".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let def = pb::Definition {
+            def: vec![
+                base.encode_to_vec(),
+                ctx_bytes.clone(),
+                exec.encode_to_vec(),
+            ],
+            ..Default::default()
+        };
+
+        let found = super::cache_mount_inputs(&def);
+        assert_eq!(
+            found.get("go-mod").map(|(b, sel)| (b.clone(), sel.clone())),
+            Some((ctx_bytes, "/cache".to_owned())),
+            "the exact bytes, and the selector that goes with them"
+        );
+
+        // A mount with NO input contributes nothing rather than an empty
+        // guess: seeding one of those needs no input to copy.
+        let plain = pb::Definition {
+            def: vec![pb::Op {
+                op: Some(pb::op::Op::Exec(pb::ExecOp {
+                    mounts: vec![pb::Mount {
+                        input: -1,
+                        dest: "/c".into(),
+                        mount_type: pb::MountType::Cache as i32,
+                        cache_opt: Some(pb::CacheOpt {
+                            id: "bare".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }
+            .encode_to_vec()],
+            ..Default::default()
+        };
+        assert!(super::cache_mount_inputs(&plain).is_empty());
+    }
+
     /// An id the Earthfile never named still has to be found.
     ///
     /// A mount written without `id=` is not keyed on its destination:

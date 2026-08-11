@@ -306,6 +306,16 @@ env:
   # already running, so a variable set at that point would never reach it;
   # `cache_seeds()` reads this lazily on the first dispatch.
   REBUCK2_CACHE_SEEDS_FILE: /tmp/cache-seeds.txt
+  # THE BYTES, not a reconstruction of them. Earthly's cache mounts carry an
+  # input and `getRefCacheDir` keys the directory on that input's ref, so a
+  # harvest has to present the same op - and rebuilding it from a reading of
+  # runmount.go produced a different digest and an empty harvest, silently.
+  #
+  # Under the BANKED store, so it survives to the next run. The proxy only
+  # sees graphs during the fleet leg, which is after the harvest, so the
+  # inputs a run observes are for the run after it - which is the warm-CI
+  # case rather than a simulation of one.
+  REBUCK2_CACHE_INPUTS_FILE: ~/.cache/rebuck2/coord/cache-inputs.tsv
   REBUCK2_FRESH_FLEET: ${{ inputs.fresh_fleet || '1' }}
   REBUCK2_CONNS: ${{ inputs.conns || '' }}
   REBUCK2_KEEPALIVE_S: ${{ inputs.keepalive_s || '' }}

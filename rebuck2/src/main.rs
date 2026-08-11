@@ -141,8 +141,9 @@ async fn harvest_one(
     base: &str,
     id: &str,
     dest: &str,
+    input: Option<(Vec<u8>, String)>,
 ) -> anyhow::Result<()> {
-    let def = dispatch::harvest_graph(base, id, dest);
+    let def = dispatch::harvest_graph_with(base, id, dest, input);
     // Job 0: this is not a subtree and shares no numbering with one.
     let digest = solve::build_subtree(bk, registry, 0, def).await?;
     // PULLABLE, not the bare digest `build_subtree` answers with. A digest
@@ -371,6 +372,39 @@ async fn main() -> Result<()> {
             // `/root/.cache/golangci_lint` names nothing and the harvest
             // would read an empty directory it created itself.
             let ids_held = solve::cache_ids_held(&held);
+            // THE REAL INPUTS, if a previous run left them. Reconstructing
+            // earthly's cache-mount input was measured wrong - the digest
+            // differs, so the key differs, so the harvest reads an empty
+            // directory and reports a cold cache. These are the bytes the
+            // proxy saw earthly send.
+            let inputs = std::env::var("REBUCK2_CACHE_INPUTS_FILE")
+                .ok()
+                .map(|p| dispatch::expand_home(&p))
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .map(|t| {
+                    use base64::Engine;
+                    t.lines()
+                        .filter_map(|l| {
+                            let mut f = l.splitn(3, '\t');
+                            let id = f.next()?.to_owned();
+                            let sel = f.next()?.to_owned();
+                            let op = base64::engine::general_purpose::STANDARD
+                                .decode(f.next()?)
+                                .ok()?;
+                            Some((id, (op, sel)))
+                        })
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                })
+                .unwrap_or_default();
+            if inputs.is_empty() {
+                println!(
+                    "[harvest] no observed cache-mount inputs - falling back to a \
+                     RECONSTRUCTION of earthly's, which has been measured wrong and \
+                     fails silently as an empty harvest"
+                );
+            } else {
+                println!("[harvest] {} observed cache-mount input(s)", inputs.len());
+            }
             let mut failed = 0usize;
             for (id, dest) in &pairs {
                 let id = match dispatch::resolve_cache_id(id, &ids_held) {
@@ -386,7 +420,8 @@ async fn main() -> Result<()> {
                     }
                 };
                 let id = &id;
-                if let Err(e) = harvest_one(&bk, &registry, &base, id, dest).await {
+                let input = inputs.get(id).cloned();
+                if let Err(e) = harvest_one(&bk, &registry, &base, id, dest, input).await {
                     println!("[harvest] {id} at {dest} failed: {e:#}");
                     failed += 1;
                 }
