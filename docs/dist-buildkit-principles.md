@@ -585,3 +585,48 @@ building at all: pre-positioning shortens TRANSFER, not unpack. Every
 machine still decompresses its own copy. It pays when the wire is on the
 critical path and the window is genuinely idle - which here it is, for 284
 seconds at a stretch.
+
+## 19. The workload sets the ceiling, so measure it before building a scheduler
+
+Every mechanism in this document -- affinity, cutting the prefix, seeding in
+pieces, pre-positioning -- moves work around more cleverly. None of them can
+move work that has nowhere to go.
+
+`+test-no-qemu` is 14 groups, and it looks embarrassingly parallel. It is
+not. From the traces:
+
+| phase                                          | baseline | fleet |
+| ---------------------------------------------- | -------- | ----- |
+| base chain (`+earthly-docker` -> `+test-base`) | 192s     | 192s  |
+| the 14 groups, which is the parallel part      | 79s      | 81s   |
+
+71% of the work is one chain, and a chain does not care how many machines
+are watching it. Amdahl puts the ceiling at **1.4x with infinitely many
+machines**, and the parallel phase already measures the same to within
+noise. Every run spent tuning dispatch against that target was measuring the
+serial fraction and attributing it to the fleet.
+
+The number to compute first, before any of the machinery:
+
+                        1
+        speedup_max = -------    s = serial fraction of the critical path
+                        s
+
+Two things follow, and the second is the useful one.
+
+**Report the ceiling next to the result.** "508s against a 285s baseline" is
+unreadable; "1.8x off a 1.4x ceiling" says the scheduler is not the problem.
+A distributed builder that does not know its own ceiling will keep
+optimising past it and calling the residue a bug.
+
+**Then go and find a workload with a lower one.** `+all-binaries` is five
+cross-compiles off a single `+code` stem -- no nested earthly, no 600 MiB
+images, and different GOOS/GOARCH share almost nothing in the go-build
+cache, so one machine does five near-cold compiles in a row. Same repo, same
+Earthfile, a serial fraction several times smaller.
+
+This is not choosing an easy benchmark. It is the same distinction as
+principle 11: the seam is a property of the graph, not of the dispatcher,
+and a graph with no seam has nothing to offer however good the dispatcher
+is. Finding out which of the two you are looking at is a ten-minute trace,
+and it is the cheapest work available.
