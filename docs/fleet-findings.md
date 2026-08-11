@@ -5221,3 +5221,33 @@ and it is not worth making: the answer is 1%, deduplication moves both
 numerator and denominator, and nothing downstream depends on the absolute
 seconds. Recorded rather than fixed, so the next reader does not take
 `2236772ms` for a measurement.
+
+### A red run whose coordinator was fine: one worker exits non-zero
+
+The `refused time` run reports `completed/failure`, and the failure is not
+in the measurement. `worker (5)`'s *serve until the coordinator goes* step
+exited non-zero at 12m48s - well inside its 8100s cap - with no panic, no
+error line, and driver-vitals still printing at the end. The other five
+workers exited cleanly, the coordinator's steps all passed, and every number
+above came out of that run.
+
+Signature, so a future red run is not misread as a real failure:
+
+- coordinator job green, one or two worker jobs red
+- the worker's last lines are ordinary - vitals, a completed job, a prefetch
+- exit well under the timeout, so it is not the cap
+- intermittent: the identical configuration ran all-green twenty minutes
+  earlier
+
+Most likely the abrupt-driver-death family already in
+`~/git/gilescope/rebuck-nits.md`: the driver's teardown is a SIGTERM with no
+QUIC close, so a worker mid-operation gets a broken connection rather than a
+clean end, and whether that surfaces as `Ok(())` or an error depends on what
+it was doing at the time. The 30-second teardown measured earlier is the
+happy path of the same race.
+
+Not chasing it now. It costs nothing but a red tick, the results are intact,
+and the fix belongs with the worker's exit handling rather than in the
+middle of a measurement sequence. Recorded because "the run went red" is
+about to stop meaning "the experiment failed", and that is worth knowing
+before the next one.
