@@ -3112,6 +3112,28 @@ gives an identical digest gives the same ref, so the same key. That is a
 FileOp built by hand, which is more work than a SourceOp and is the only
 honest way to read the directory earthly writes.
 
+**Confirmed independently by the daemon's own accounting**, one run later.
+`buildctl du -v` against `base-bk`, before the harvest:
+
+```text
+cached mount /root/.cache/go-build   ... with id "go-build"
+cached mount /go/pkg/mod             ... with id "go-mod"
+cached mount /root/.cache/golangci_lint ... with id
+  "/run/cache/b369714dd3084d9bf3adc7911b40056e0f36f2d79516e5474021e7d61bddc541/root/.cache/golangci_lint"
+Total:  1.71GB
+```
+
+1.71 GB, on the right daemon, under the exact ids the harvest asked for -
+and the harvest still read nothing. Same id, different key, therefore the
+input. The source said it and the daemon agrees.
+
+The third line carries a second bug for free. A mount with no `id=` in the
+Earthfile is NOT keyed on its destination: earthly computes
+`/run/cache/<per-target hash>/<target>`, so the seed list's
+`/root/.cache/golangci_lint:/root/.cache/golangci_lint` names an id that
+does not exist. Guessed from the dest; should have been read off a run, and
+now can be.
+
 Worth noting what this cost and what it did not. Eight CI attempts reached
 "the harvest runs and finds nothing"; the answer took two minutes of reading
 `runmount.go`, and it was available from the first attempt. The local rig
