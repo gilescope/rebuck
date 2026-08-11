@@ -735,10 +735,23 @@ pub fn harvest_graph(base: &str, cache_id: &str, dest: &str) -> pb::Definition {
                 ..Default::default()
             }),
             mounts: vec![
+                // OUTPUT 1, and it has to be something. From buildkit's
+                // `PrepareMounts`: a BIND mount with an output becomes
+                // `makeMutable`, while the root-mount branch below it only
+                // makes one when `m.Readonly` is set - so `readonly: false`
+                // with no output leaves the root as the IMMUTABLE ref,
+                // which is the opposite of what the comment above that
+                // branch says a root needs. The exec then fails as `exit
+                // code: 1` without running a line, and three attempts went
+                // on a `cp` that turned out to be innocent - proven by
+                // running the same `cp` in the same image by hand, where it
+                // exits 0 even with no PATH at all.
+                //
+                // Index 1 so index 0 stays the seed: the terminal selects 0.
                 pb::Mount {
                     input: 0,
                     dest: "/".into(),
-                    output: -1,
+                    output: 1,
                     ..Default::default()
                 },
                 pb::Mount {
@@ -2561,6 +2574,29 @@ mod tests {
             .expect("something has to be the result");
         assert_eq!(out.input, -1, "scratch: buildkit makes it mutable for us");
         assert_eq!(out.mount_type, pb::MountType::Bind as i32);
+        assert_eq!(
+            out.dest, "/.seed",
+            "and index 0 is the seed, not the rootfs"
+        );
+
+        // THE ROOTFS NEEDS AN OUTPUT TOO, or it is mounted immutable and
+        // nothing in the container can start.
+        //
+        // From buildkit's `PrepareMounts`: a BIND mount with an output
+        // becomes `makeMutable`, and the root-mount branch below only makes
+        // one when `m.Readonly` is set - so `readonly: false` with no output
+        // leaves the root as the immutable ref, which is the opposite of
+        // what the comment above that branch says it needs. The exec then
+        // fails as `exit code: 1` before running a line, which is how three
+        // attempts went on a `cp` that turned out to be innocent.
+        //
+        // Index 1, so index 0 stays the seed - the terminal selects 0.
+        let root = e
+            .mounts
+            .iter()
+            .find(|m| m.dest == "/")
+            .expect("a rootfs is mounted");
+        assert_eq!(root.output, 1, "mutable, and not the exported result");
 
         // The copy has to name both ends, or this harvests an empty layer
         // and every seeded worker starts exactly as cold as before while the
