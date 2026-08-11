@@ -45,6 +45,31 @@ BASE_PORT=${BASE_PORT:-29371}
 FLAGS=${FLAGS:---ci -P}
 OVERRIDES=$(tr -d '\n' < "$EB/.earthly_version_flag_overrides")
 
+# Traces, if somewhere is listening for them.
+#
+# earthly emits OTLP spans through the standard autoexport, and they carry
+# per-target timing directly - the thing this script otherwise infers from a
+# wall clock and a failed-target set. The collector on the x86 box keeps them
+# across runs, which a CI artifact cannot.
+#
+# OFF unless OTLP_ENDPOINT is set, and that is not tidiness: pointed at a
+# collector that is not there, earthly retries every export and logs
+# `traces export: exporter export timeout` until it gives up, which slows the
+# very thing being measured.
+if [ -n "${OTLP_ENDPOINT:-}" ]; then
+  export OTEL_TRACES_EXPORTER=otlp
+  export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+  export OTEL_EXPORTER_OTLP_ENDPOINT="$OTLP_ENDPOINT"
+  # Self-signed on the box: encrypt the token and the span contents without
+  # pretending to authenticate the server.
+  export OTEL_EXPORTER_OTLP_INSECURE_SKIP_VERIFY=true
+  [ -z "${OTLP_TOKEN:-}" ] || export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer ${OTLP_TOKEN}"
+  # Which leg a span belongs to, or the two are indistinguishable in the
+  # collector and the comparison this script exists for cannot be made.
+  export OTEL_SERVICE_NAME="earthly"
+  echo "== traces -> $OTLP_ENDPOINT"
+fi
+
 # NOT loopback, for either half. earthly's `IsLocal` counts 127.0.0.1 as "a
 # buildkit I manage" and tries to (re)start its own container from the image
 # compiled into the binary - which for a source build is
@@ -74,6 +99,7 @@ failed_set() {
 }
 
 echo "== baseline: $TARGET with no fleet at all"
+export OTEL_RESOURCE_ATTRIBUTES="rebuck2.leg=baseline,rebuck2.target=$TARGET"
 docker rm -f "$BASE_BK" >/dev/null 2>&1 || true
 BK_IMAGE=${BK_IMAGE:-earthbuild/buildkitd:v0.8.17}
 docker run -d --name "$BASE_BK" --privileged -p "$BASE_PORT:8372" \
@@ -102,6 +128,7 @@ failed_set "$RUN/baseline.log" > "$RUN/baseline.failed"
 docker rm -f "$BASE_BK" >/dev/null 2>&1 || true
 
 echo "== the same target, through the fleet"
+export OTEL_RESOURCE_ATTRIBUTES="rebuck2.leg=fleet,rebuck2.target=$TARGET"
 start=$SECONDS
 RUN="$RUN/fleet" BIN="$BIN" EARTHLY_BIN="$EARTHLY_BIN" \
   EARTHLY_TRUST_CONFIG=1 EARTHLY_ARGS="$FLAGS" \
