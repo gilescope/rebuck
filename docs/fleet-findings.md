@@ -4232,3 +4232,27 @@ compression or the op floor could ever have reached.
 reference leg was not the tap, and the suspicion that had me rewriting it
 twice was wrong - which is exactly what that self-measurement was added to
 settle, and it settled it without a second run costing forty minutes.
+
+### What `waiting` is, exactly - and why more slots is not the fix
+
+Checked rather than assumed, because "the remainder" is where a
+misattribution would hide.
+
+`build_ms` is started at `worker.rs:845`, and the only awaits before it are
+a local `daemon_platforms` gRPC call and - the important one -
+`slots.acquire().await`. So the worker's own slot semaphore is **outside**
+the build timer, and everything spent queueing for a slot lands in the
+driver's `waiting` bucket.
+
+`waiting 6583s (65%)` therefore means precisely "queued for a slot on a
+worker", not "some unattributed remainder". The bucket boundary is a
+semaphore, not a guess.
+
+That also rules out the obvious alternative fix. Slots default to
+`available_parallelism()`, so six hosted runners advertise roughly 24
+between them, and peak in flight was **11**. The fleet was never short of
+slots in aggregate - it was short of slots *on the one machine affinity kept
+choosing*, while two machines held four each and did nothing.
+
+More slots would not have helped. Spreading the work is the fix, which is
+what `-balance` does.
