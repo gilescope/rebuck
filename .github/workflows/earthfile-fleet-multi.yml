@@ -41,6 +41,14 @@ on:
       home_slots:
         description: "slots peer 0 keeps for itself - 0 forces dispatch"
         default: "0"
+      warm:
+        description: workers build the base chain while the baseline runs (1/0)
+        type: string
+        default: '0'
+      warm_target:
+        description: what to warm with
+        type: string
+        default: ./t/integration-base+test-base
       local_nested:
         description: a nested earthly uses the daemon on the machine running it (1/0)
         type: string
@@ -151,6 +159,8 @@ env:
   # to buildkit`. The worker substitutes its own routable address instead,
   # which is the one place the answer is known.
   REBUCK2_LOCAL_NESTED: ${{ inputs.local_nested || '0' }}
+  REBUCK2_WARM: ${{ inputs.warm || '0' }}
+  REBUCK2_WARM_TARGET: ${{ inputs.warm_target || './t/integration-base+test-base' }}
   # Pinned by digest like everything else here: a collector that changes
   # under us changes the data.
   OTEL_IMAGE: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.145.0
@@ -436,6 +446,27 @@ jobs:
           WORKER_N: ${{ matrix.n }}
         run: |
           set -euo pipefail
+          # WARM, in the window this machine would otherwise spend idle.
+          #
+          # A worker joins, then waits out the coordinator's entire baseline
+          # leg - some 275s - before the fleet leg gives it anything to do.
+          # It then pays to materialise the base chain from cold, and the
+          # traces price that precisely: `+base` costs 3.0s on the machine
+          # that already has it and 20.5s on one that does not, and
+          # `+earthly-docker` underneath it averages 207s.
+          #
+          # In the BACKGROUND, so joining is not delayed. Warming before
+          # joining would make the coordinator's barrier wait for it, which
+          # moves the cost onto the critical path instead of removing it.
+          if [ "${REBUCK2_WARM:-0}" = "1" ]; then
+            ( cd earthbuild && EARTHLY_BUILDKIT_HOST="tcp://${BK_ADDR}" \
+                EARTHLY_TLS_ENABLED=false EARTH_TLS_ENABLED=false \
+                EARTHLY_VERSION_FLAG_OVERRIDES="$(tr -d '\n' < .earthly_version_flag_overrides)" \
+                timeout 900 earthly --ci "$REBUCK2_WARM_TARGET" \
+                > "$GITHUB_WORKSPACE/warm-${WORKER_N}.log" 2>&1
+              echo "warm exit=$?" >> "$GITHUB_WORKSPACE/warm-${WORKER_N}.log" ) &
+            echo "warming $REBUCK2_WARM_TARGET in the background"
+          fi
           # Its OWN registry, reachable only from this machine - which is the
           # point. Its daemon pulls from localhost; a miss is answered by
           # whichever runner holds the layer, over the mesh.
@@ -445,6 +476,25 @@ jobs:
             --buildkit-addr "http://${BK_ADDR}" \
             --registry-bind 0.0.0.0:15000 \
             --registry-addr 172.17.0.1:15000 | tee "worker-${WORKER_N}.log"
+
+      - name: did warming finish in time
+        if: always()
+        env:
+          WORKER_N: ${{ matrix.n }}
+        run: |
+          set -uo pipefail
+          f="warm-${WORKER_N}.log"
+          [ -f "$f" ] || { echo "not warmed"; exit 0; }
+          # A warm-up still running when the fleet leg starts is not a
+          # warm-up, it is contention - it competes for the same four cores
+          # with the work it was meant to accelerate. The exit line only
+          # appears once it finished.
+          if grep -q '^warm exit=' "$f"; then
+            echo "warm finished: $(grep '^warm exit=' "$f")"
+          else
+            echo "::warning::warming did not finish - it competed with the build it meant to help"
+          fi
+          tail -3 "$f"
 
       - name: where did this worker's blobs come from
         if: always()
