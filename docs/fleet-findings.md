@@ -4570,3 +4570,37 @@ Three specific things to check, each of which can fail on its own.
 
 If 525s does not move, the fixes are `+test-ast` artefacts and this document
 has been measuring one target's quirks all day.
+
+### The wide target's critical path is five nested builds
+
+From the earlier `+test-no-qemu` analysis, re-read while planning the
+re-run:
+
+> The five leads that own a full `+test-no-qemu` critical path are all
+> nested builds at 231-258s each - each longer than the entire 221s
+> single-machine build, and clustered the way a queue clusters.
+
+That is the 209-second lead in the newer numbers, and it is not a slow test.
+It is a nested `earthly` inside a `RUN`, dialling **back to the
+coordinator's gateway** across the network and re-entering through one
+funnel - because earthly forwards its own `BUILDKIT_HOST` into every exec,
+and in a fleet that address is the coordinator's.
+
+`REBUCK2_LOCAL_NESTED` exists for exactly this: `retarget_buildkit_host`
+points a nested build at the daemon on the machine actually running it. It
+is **`0` in every CI run**.
+
+So the biggest single cost on the widest target has a purpose-built fix that
+has never been switched on in a fleet run. Five leads at ~245s each against
+a 525s leg is most of the leg.
+
+It is not going into the coverage run. The deliverable there is the
+failed-target list, the switch is unmeasured, and it carries a documented
+hazard: nested builds under `--privileged --entrypoint` die on
+`could not connect to buildkit: timeout 1m0s` when retargeted. Turning it
+on for a run whose job is to find out what breaks would make every failure
+ambiguous.
+
+It goes next, on `+test-no-qemu`, alone. Ahead of `-bcast`: `-bcast` shaves
+a term that is 55% spread over 400 leads, and this one addresses five leads
+holding perhaps 40% of the critical path on the target that matters.
