@@ -611,6 +611,13 @@ jobs:
           grep -ao "^[^ ]* \*failed\*" /tmp/baseline.log | sed 's/ \*failed\*//' \
             | sort -u > /tmp/baseline.failed || true
           echo "BASELINE_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
+          # HOW MUCH did this leg get through before it stopped? Both legs
+          # abort on the same failed target, and "186s versus 525s" is only a
+          # comparison if they attempted the same work first - a leg that
+          # dies early looks fast. earthly prefixes each line with the target
+          # it belongs to, so the distinct prefixes are the targets touched.
+          grep -aoE "^[^ |]+\+[^ |]+ \|" /tmp/baseline.log | sed 's/ |$//' | sort -u > /tmp/baseline.targets || true
+          echo "baseline touched $(wc -l < /tmp/baseline.targets | tr -d ' ') target(s)"
           echo "baseline: $((SECONDS - start))s, $(wc -l < /tmp/baseline.failed | tr -d ' ') failed"
           # A build that DIED is not a build that passed. Judged on the EXIT
           # CODE, not the success banner: a fleet log carries the nested
@@ -640,6 +647,13 @@ jobs:
             earthly $EARTHLY_FLAGS "$TARGET" > /tmp/fleet.log 2>&1 && rc=0 || rc=$?
           tail -60 /tmp/fleet.log
           grep -ao "^[^ ]* \*failed\*" /tmp/fleet.log | sed 's/ \*failed\*//' | sort -u > /tmp/fleet.failed || true
+          # HOW MUCH did this leg get through before it stopped? Both legs
+          # abort on the same failed target, and "186s versus 525s" is only a
+          # comparison if they attempted the same work first - a leg that
+          # dies early looks fast. earthly prefixes each line with the target
+          # it belongs to, so the distinct prefixes are the targets touched.
+          grep -aoE "^[^ |]+\+[^ |]+ \|" /tmp/fleet.log | sed 's/ |$//' | sort -u > /tmp/fleet.targets || true
+          echo "fleet touched $(wc -l < /tmp/fleet.targets | tr -d ' ') target(s)"
           echo "fleet failed targets: $(wc -l < /tmp/fleet.failed | tr -d ' ')"
           # A build that DIED is not a build that passed. Judged on the EXIT
           # CODE, not the success banner: a fleet log carries the nested
@@ -668,6 +682,14 @@ jobs:
           if [ -n "${BASELINE_DIED:-}${FLEET_DIED:-}" ]; then
             echo "::error::a leg died, so there is nothing to compare"
             exit 1
+          fi
+          # Comparable only if both legs attempted the same work.
+          bt=$(wc -l < /tmp/baseline.targets | tr -d ' ')
+          ft=$(wc -l < /tmp/fleet.targets | tr -d ' ')
+          echo "targets touched: baseline $bt, fleet $ft"
+          if [ "$bt" -ne "$ft" ]; then
+            echo "::warning::the legs attempted different work ($bt vs $ft targets) - the wall clocks are not comparable"
+            diff -u /tmp/baseline.targets /tmp/fleet.targets || true
           fi
           if diff -u /tmp/baseline.failed /tmp/fleet.failed; then
             echo "PARITY: the same $(wc -l < /tmp/baseline.failed | tr -d ' ') target(s) failed either way"
