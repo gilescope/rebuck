@@ -47,6 +47,7 @@ on:
       - giles-dispatch-ci-lint-seed
       - giles-dispatch-ci-binaries-seed
       - giles-dispatch-ci-lint-graft
+      - giles-dispatch-ci-buildkitd-arm
   workflow_dispatch:
     inputs:
       peer_cache_mounts:
@@ -140,6 +141,10 @@ on:
       fleet_cache:
         description: "off | read | readwrite. ALL THREE measured slower - see docs"
         default: "off"
+      arm_workers:
+        description: how many workers run on arm64, so a pinned arm64 solve has somewhere to go
+        type: string
+        default: ''
       graft:
         description: "import an already-built ancestor instead of rebuilding it"
         # OFF, and the env expression below cannot enforce that on its own:
@@ -410,6 +415,7 @@ jobs:
       target: ${{ steps.n.outputs.target }}
       seed: ${{ steps.n.outputs.seed }}
       graft: ${{ steps.n.outputs.graft }}
+      fleet: ${{ steps.n.outputs.fleet }}
     steps:
       - id: n
         env:
@@ -417,6 +423,7 @@ jobs:
           T: ${{ inputs.target || '' }}
           SEED: ${{ inputs.seed_caches || '' }}
           GRAFT: ${{ inputs.graft || '' }}
+          ARM: ${{ inputs.arm_workers || '' }}
           REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -448,6 +455,7 @@ jobs:
           # would go stale the first time a target was added.
           workload=${REF%-seed}
           workload=${workload%-graft}
+          workload=${workload%-arm}
           case "${T:-}" in
             "") case "$workload" in
                   *-binaries) target=+all-binaries ;;
@@ -488,6 +496,37 @@ jobs:
           echo "graft: $graft"
           echo "graft=$graft" >> "$GITHUB_OUTPUT"
 
+          # WHICH ARCHITECTURE each worker runs on.
+          #
+          # +all-buildkitd reached parity - 1161s against 1188s - and its
+          # `not routed` said why: `wanted Pinned("linux/arm64"); had
+          # 1:linux/amd64, 2:linux/amd64, ...`. Every worker is amd64, so
+          # the arm64 half stayed home and ran under qemu on peer 0 exactly
+          # as the baseline ran it. The fleet distributed the cheap half.
+          #
+          # An arm64 worker does not merely divide that work, it stops
+          # EMULATING it, and qemu against native is not a 2x difference.
+          # This is the only target measured that would gain from a
+          # platform-diverse fleet, and the only one whose gain is not
+          # bounded by Amdahl.
+          #
+          # A list of OBJECTS, so the label rides with the number. Two
+          # parallel lists would let the count and the architectures drift,
+          # and a matrix that disagrees with the coordinator's barrier is
+          # the `workers: 6` bug that once expanded to zero jobs.
+          arm=${ARM:-0}
+          case "$REF" in *-arm) [ "$arm" = 0 ] && arm=2 ;; esac
+          pairs=""
+          i=0
+          for n in $(echo "$list" | tr -cd '0-9,' | tr ',' ' '); do
+            i=$((i + 1))
+            if [ "$i" -le "$arm" ]; then os=ubuntu-24.04-arm; else os=ubuntu-latest; fi
+            pairs="$pairs{\"n\":$n,\"os\":\"$os\"},"
+          done
+          fleet="[${pairs%,}]"
+          echo "fleet: $fleet"
+          echo "fleet=$fleet" >> "$GITHUB_OUTPUT"
+
   # One job per worker. They join the coordinator's mesh, lend their buildkitd
   # to it, and exit when it disconnects.
   worker:
@@ -499,8 +538,9 @@ jobs:
       # workers=5 against a fixed [1,2,3] and the coordinator waits out its
       # timeout for two runners nobody launched.
       matrix:
-        n: ${{ fromJSON(needs.plan.outputs.list) }}
-    runs-on: ubuntu-latest
+        w: ${{ fromJSON(needs.plan.outputs.fleet) }}
+    # The label rides WITH the number, out of `plan`.
+    runs-on: ${{ matrix.w.os }}
     # 150, not 60. Sized for ONE group when that is what this built; the
     # whole `+test-no-qemu` is twelve of them and runs TWICE - baseline then
     # fleet. The first attempt was killed at 60 minutes, 51 of them into a
@@ -655,7 +695,7 @@ jobs:
 
       - name: serve until the coordinator goes
         env:
-          WORKER_N: ${{ matrix.n }}
+          WORKER_N: ${{ matrix.w.n }}
         run: |
           set -euo pipefail
           # WARM, in the window this machine would otherwise spend idle.
@@ -711,7 +751,7 @@ jobs:
       - name: did warming finish in time
         if: always()
         env:
-          WORKER_N: ${{ matrix.n }}
+          WORKER_N: ${{ matrix.w.n }}
         run: |
           set -uo pipefail
           f="$GITHUB_WORKSPACE/warm-${WORKER_N}.log"
@@ -742,17 +782,17 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: worker-${{ matrix.n }}-logs-${{ github.run_attempt }}
+          name: worker-${{ matrix.w.n }}-logs-${{ github.run_attempt }}
           path: |
-            warm-${{ matrix.n }}.log
-            worker-${{ matrix.n }}.log
+            warm-${{ matrix.w.n }}.log
+            worker-${{ matrix.w.n }}.log
           if-no-files-found: warn
           retention-days: 7
 
       - name: where did this worker's blobs come from
         if: always()
         env:
-          WORKER_N: ${{ matrix.n }}
+          WORKER_N: ${{ matrix.w.n }}
         run: |
           # local / peer / driver. `peer` non-zero is the evidence that layers
           # moved runner to runner instead of through the coordinator.

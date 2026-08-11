@@ -2531,16 +2531,17 @@ confirmed on duplication and unproven on time.
 branch - the API resolves a workflow by its presence there - so an
 experiment is chosen by where it is pushed.
 
-| branch                         | target                 | what it asks                                  |
-| ------------------------------ | ---------------------- | --------------------------------------------- |
-| `giles-dispatch-ci`            | `+test-no-qemu-group2` | the default rig; 1.4x ceiling                 |
-| `giles-dispatch-ci-binaries`   | `+all-binaries`        | five independent compiles; 2.3x ceiling       |
-| `giles-dispatch-ci-lint`       | `+lint-all`            | three cheap independent targets, no docker    |
-| `giles-dispatch-ci-buildkitd`  | `+all-buildkitd`       | multi-arch buildkitd; the qemu path           |
-| `giles-dispatch-ci-all`        | `+all`                 | binaries plus two multi-arch images           |
-| `giles-dispatch-ci-seed`       | the DEFAULT target     | seeded mounts, so it is comparable with `-ci` |
-| `giles-dispatch-ci-lint-seed`  | `+lint-all`, seeded    | the same, fifteen minutes instead of forty    |
-| `giles-dispatch-ci-lint-graft` | `+lint-all`, grafting  | can a WARM bank make grafting pay?            |
+| branch                            | target                              | what it asks                                  |
+| --------------------------------- | ----------------------------------- | --------------------------------------------- |
+| `giles-dispatch-ci`               | `+test-no-qemu-group2`              | the default rig; 1.4x ceiling                 |
+| `giles-dispatch-ci-binaries`      | `+all-binaries`                     | five independent compiles; 2.3x ceiling       |
+| `giles-dispatch-ci-lint`          | `+lint-all`                         | three cheap independent targets, no docker    |
+| `giles-dispatch-ci-buildkitd`     | `+all-buildkitd`                    | multi-arch buildkitd; the qemu path           |
+| `giles-dispatch-ci-all`           | `+all`                              | binaries plus two multi-arch images           |
+| `giles-dispatch-ci-seed`          | the DEFAULT target                  | seeded mounts, so it is comparable with `-ci` |
+| `giles-dispatch-ci-lint-seed`     | `+lint-all`, seeded                 | the same, fifteen minutes instead of forty    |
+| `giles-dispatch-ci-lint-graft`    | `+lint-all`, grafting               | can a WARM bank make grafting pay?            |
+| `giles-dispatch-ci-buildkitd-arm` | `+all-buildkitd`, two arm64 workers | can the emulated half run natively?           |
 
 `-seed` keeps the default target deliberately. It selects a mechanism rather
 than a workload, and a mechanism has to be measured against the same graph
