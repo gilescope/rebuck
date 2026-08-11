@@ -3356,3 +3356,63 @@ two that do fill are the two the prior said would not pay.
   bad, and it can now be tested rather than argued.
 - Fire the pair back to back with nothing else running, per the concurrency
   finding.
+
+## The per-lead cost is bytes, at about 7 MB/s
+
+From data already in the logs - `[worker] job N took Xms (Y ops, Z KiB
+fetched)` - across attempt eleven's 41 distinct leads.
+
+|                            |                                                    |
+| -------------------------- | -------------------------------------------------- |
+| leads under 15s            | 73 of 82; median **138ms**, median fetch **1 KiB** |
+| leads fetching over 1 MiB  | 17, and they hold **87%** of all lead time         |
+| median rate across those   | **7.2 MB/s**                                       |
+| total fetched by the fleet | **1164 MiB**                                       |
+
+The correlation is not subtle:
+
+```text
+      ms       KiB    MB/s
+    1317      7970     5.9
+    8686     86823     9.8
+   10527     94020     8.7
+   19151    139421     7.1
+   25905    266864    10.1
+```
+
+**A lead costs what it fetches.** A trivial one is 138ms - dispatch overhead
+is not the problem and never was, which retires a suspicion this document
+has carried for a while. The whole per-lead constant is layer
+materialisation, and 87% of all lead time is in the seventeen leads that
+move real bytes.
+
+7 MB/s is slow for a hosted runner on a gigabit link, so this is unpack and
+not the wire: gzip decompression plus overlayfs writes on two cores. That
+matches principle 18's caveat exactly - pre-positioning shortens transfer,
+and unpack is what is left.
+
+**This corrects principle 24's arithmetic, and not by a little.** The local
+rig measured seeding at ~3.5ms per MiB, on loopback with a fast disk. In the
+fleet it is **~140ms per MiB**, forty times worse. So:
+
+| seed                  | at 3.5ms/MiB | at 140ms/MiB |
+| --------------------- | ------------ | ------------ |
+| `go-mod`, 171.8 MiB   | 0.6s         | **24s**      |
+| `go-build`, 128.7 MiB | 0.5s         | **18s**      |
+| both, per worker      | 1.1s         | **42s**      |
+
+Forty-two seconds per worker to save a `go mod download` and some
+recompilation. That is why attempt eleven shipped 300 MiB and the clock did
+not move: the seed cost about what the cold caches cost, and the two
+cancelled.
+
+Which sharpens the rule rather than overturning it. Seeding still pays when
+the miss is expensive CPU - but the bar is 140ms per MiB shipped, not 3.5,
+and almost nothing clears that at 300 MiB. **Seed small caches with
+expensive misses.** `golangci_lint` on a target where it actually fills is
+the remaining candidate; `go-mod` is not close.
+
+And the general lesson for the instrument: the local rig gave a number that
+was right for the rig and wrong for the fleet by a factor of forty. It could
+not have known - loopback is loopback. The fleet number was available all
+along in a log line that has been printing since long before any of this.
