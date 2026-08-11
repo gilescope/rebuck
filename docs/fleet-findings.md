@@ -5565,3 +5565,31 @@ of the shipped configuration - which doubles as a third reference point for
 
 Worth writing down that this was available before the join was designed. The
 join is a better instrument and it is blocked; this one is worse and works.
+
+### Third hypothesis refuted, and a real cost broadcast does have
+
+The worker's `by_hash` reads its store or fetches from a peer, and nothing
+else - no in-memory buffer, no partial serve. A peer that turns out not to
+have the blob returns an error and the walk continues. So the third
+candidate for the `-bcast` media-type failure goes the way of the first two,
+and the cause remains unknown after three source reads.
+
+The read did surface a real property of broadcast, unrelated to the failure:
+
+```rust
+peers.iter().filter(|(id, b)| **id != self.my_id && b.contains(hash))
+```
+
+Candidates are chosen by **bloom membership**. Under the split, a blob lives
+on one worker and one bloom contains it, so the walk is short and usually
+right. Under broadcast every worker holds every blob, **every bloom contains
+everything**, and the candidate list becomes the whole fleet for every hash.
+
+That does not break anything - the local check comes first, so a worker that
+holds the blob never walks at all - but it means the peer-walk fallback goes
+from "ask the one machine that has it" to "ask everyone, in order". Any
+future fan-out mechanism inherits that, and the mitigation is the ordering
+already there for the driver: claimants first, then everyone else.
+
+Recorded because it is the kind of thing that shows up later as an
+unexplained slowdown in a mechanism nobody connected to bloom saturation.
