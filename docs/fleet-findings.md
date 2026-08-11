@@ -5815,3 +5815,45 @@ So the honest next step is not another mechanism. It is the baseline-side
 instrument that makes the 12.5x attributable, and it is blocked on one
 design decision: the baseline deliberately bypasses the proxy, which is
 correct and which is also why nothing can see inside it.
+
+## The 12.5x join is unblocked: status replays from build history
+
+The blocker was that `Control.Status` needs a solve ref, and the baseline
+never surfaces one because nothing proxies it. Reading buildkit rather than
+working around it:
+
+```go
+// solver/llbsolver/solver.go:439
+func (s *Solver) Status(ctx context.Context, id string, ...) error {
+    if err := s.history.Status(ctx, id, statusChan); err != nil {
+```
+
+**Status is served from the build HISTORY**, not only from a live job. A
+finished build's vertices can be replayed by ref, after the fact.
+
+And the ref is discoverable. `BuildHistoryRecord` carries it:
+
+```proto
+message BuildHistoryRecord {
+    string Ref = 1;
+    ...
+    google.protobuf.Timestamp CompletedAt = 7;
+```
+
+`ListenBuildHistory` streams those records, and the proxy already relays
+that call - so the plumbing exists on both sides.
+
+So the design is: after the baseline leg, a separate observer asks the
+baseline daemon for its build history, takes the most recent record's ref,
+and replays `Status(ref)` through the same `note_vertices` everything else
+uses. **The baseline is not touched at all** - it keeps talking directly to
+its daemon, keeps being a clean single-machine number, and gets read
+afterwards rather than instrumented during.
+
+That is the join, and it needs perhaps forty lines: a `watch-vertices`
+subcommand and one workflow step after the baseline.
+
+Worth noting what unblocked it. Three turns ago I wrote "needs a solve ref
+the baseline never surfaces" and listed three unpalatable options. All three
+were workarounds for a constraint that does not exist - and the fork has
+been checked out three directories away the whole time.
