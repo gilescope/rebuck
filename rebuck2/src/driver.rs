@@ -366,6 +366,12 @@ pub struct Driver {
     /// it should approach the number of WORKERS if every worker is rebuilding
     /// the same ancestry.
     op_by_worker: tokio::sync::Mutex<std::collections::HashSet<(String, u64)>>,
+    /// The terminal op of each dispatched subtree, so its result can be
+    /// tested for sharing when it completes. Without it `prefetch_image_for`
+    /// has no op to count consumers of, and the gate it was built for is
+    /// never reached.
+    job_terminal: tokio::sync::Mutex<std::collections::BTreeMap<u64, String>>,
+
     /// What each job is, so the line that reports its DURATION can name it.
     ///
     /// A lead is otherwise logged as the digest it produced, and the job
@@ -467,6 +473,7 @@ impl Driver {
             built: Default::default(),
             op_by_worker: Default::default(),
             job_names: Default::default(),
+            job_terminal: Default::default(),
             store,
             cfg,
             jobs: Mutex::new(HashMap::new()),
@@ -1622,11 +1629,23 @@ impl Driver {
         // is how spread is read in CI.
         {
             use prost::Message;
-            if let Some(name) = bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice())
-                .ok()
-                .and_then(|d| crate::dispatch::describe_root(&d))
-            {
-                self.job_names.lock().await.insert(job, name);
+            if let Ok(d) = bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice()) {
+                if let Some(name) = crate::dispatch::describe_root(&d) {
+                    self.job_names.lock().await.insert(job, name);
+                }
+                // The op this subtree PRODUCES - the one whose consumers
+                // decide whether its result is worth pre-positioning. The
+                // terminal is a pointer; the op it points at is the result.
+                if let Some(last) = d.def.last() {
+                    if let Ok(t) = bollard_buildkit_proto::pb::Op::decode(last.as_slice()) {
+                        if let Some(input) = t.inputs.first() {
+                            self.job_terminal
+                                .lock()
+                                .await
+                                .insert(job, input.digest.clone());
+                        }
+                    }
+                }
             }
         }
         println!("[driver] subtree job {job} -> worker {first}");
@@ -1947,6 +1966,15 @@ impl Driver {
         let Some(st) = self.subtrees.lock().await.remove(&job) else {
             return;
         };
+        // The firing site the consumer gate was built for, and was never
+        // wired to. Base images are announced from `make_portable` and a
+        // prefix cut from the cut path; a subtree RESULT - which is where
+        // the large layers are, 65 MiB apiece - reached neither, so prefetch
+        // announced 2 blobs a time when the base chain is 26 blobs and 527
+        // MiB. Third mechanism on this branch built and left unconnected.
+        if let Some(op) = self.job_terminal.lock().await.remove(&job) {
+            self.prefetch_image_for(&image_ref, Some(&op)).await;
+        }
         match st.requester {
             Requester::Worker(id) => self.tell(id, D2W::Placed { job, image_ref }).await,
             Requester::Gateway(tx) => {
