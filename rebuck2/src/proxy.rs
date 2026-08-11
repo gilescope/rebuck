@@ -1861,14 +1861,41 @@ impl Wire {
                 before += b;
                 after += a;
             }
-            let t = (before + after).max(1);
-            println!(
-                "[wire] refused time   : {}s before the first exclusion, {}s from it on \
-                 ({:.0}% dispatchable if cut) - ops are not time",
-                before / 1000,
-                after / 1000,
-                100.0 * before as f64 / t as f64
-            );
+            // DID THE MAPPING WORK? A vertex digest matching
+            // `sha256:<hex of op bytes>` is the assumption this rests on,
+            // and it is the same assumption grafting rests on - which has
+            // never fired in any run, so it has never been confirmed.
+            //
+            // If the digests do not match, every lookup misses and this
+            // prints `0s before, 0s from it on (0% dispatchable)`, which
+            // reads as a finding. It is not. Compared against the home
+            // vertex total, which is measured independently.
+            let matched = before + after;
+            let home_total: u64 = self
+                .home_vertices
+                .values()
+                .filter(|(_, cached)| !cached)
+                .map(|(ms, _)| ms)
+                .sum();
+            if matched * 20 < home_total {
+                println!(
+                    "[wire] refused time   : NOT MEASURED - only {matched}ms of {home_total}ms \
+                     of home vertex time matched an op digest, so the sha256-of-op-bytes \
+                     mapping does not hold and 0% would be an artefact"
+                );
+            } else {
+                let t = matched.max(1);
+                println!(
+                    "[wire] refused time   : {}s before the first exclusion, {}s from it on \
+                     ({:.0}% dispatchable if cut, {}ms of {}ms home time matched) \
+                     - ops are not time",
+                    before / 1000,
+                    after / 1000,
+                    100.0 * before as f64 / t as f64,
+                    matched,
+                    home_total
+                );
+            }
         }
         if !self.trapped_ops.is_empty() {
             let n = self.trapped_ops.len();
