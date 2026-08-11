@@ -2864,3 +2864,44 @@ several. A local rig - buildkitd in docker, our registry beside it - took
 the last two in four minutes, and one of those had already consumed three CI
 runs on its own. **Build the cheapest instrument first**; `scripts/seed-check.sh`
 is that instrument and it should have existed on day one.
+
+## Unpacking a seed is cheap, which was the doubt
+
+`scripts/seed-check.sh --fill-mb N`, locally, against a real daemon.
+Incompressible bytes, so the layer is honest about its size.
+
+| fill    | write once | harvest once | **seed+read, per worker** |
+| ------- | ---------- | ------------ | ------------------------- |
+| 0 MiB   | 360ms      | 371ms        | 248ms                     |
+| 200 MiB | 1557ms     | 9195ms       | **937ms**                 |
+
+About 3.5ms per MiB to seed, so a 600 MiB module cache would cost a worker
+roughly **two seconds** to start from. Against the ~24s per lead that a cold
+`go-mod` was measured to cost, that is not a close call.
+
+**This revises the prior written two hours ago**, which said `go-mod` was
+probably not worth shipping because principle 18's caveat - pre-positioning
+shortens transfer, not unpack - would eat the gain. The caveat is sound and
+the estimate behind it was wrong: unpack is the cheap half.
+
+What this does NOT measure, and the distinction matters: the transfer. Both
+ends are on one machine here, so the bytes move over loopback and the 937ms
+is essentially pure unpack. On a fleet the seed crosses the mesh, and
+whether that is cheap is what the seed spread and prefetch exist to decide.
+So the honest reading is:
+
+- **unpack per worker: measured, and cheap.** ~2s for a cache the size of
+  the one in question.
+- **transfer per worker: not measured here.** One copy leaves the
+  coordinator under the seed spread and the rest move peer to peer, which is
+  the design; whether it behaves is a fleet question.
+
+The harvest at 9.2s for 200 MiB is the one number that grows awkwardly, and
+it is also the one paid ONCE, on one machine, off the critical path.
+
+Also worth recording as method: the first pair of runs came back with
+identical timings at 0 and 200 MiB, because the script did not forward
+`--fill-mb` to the binary. That reads as "200 MiB is free" rather than as
+"the flag did nothing", and it is the same shape as every ON BUT NEVER
+APPLIED bug in this project. A measurement that cannot distinguish those two
+is not a measurement.

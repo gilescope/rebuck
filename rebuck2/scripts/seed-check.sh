@@ -10,7 +10,7 @@
 #
 # The lesson is priced: build the cheapest instrument first.
 #
-#   scripts/seed-check.sh
+#   scripts/seed-check.sh [--fill-mb N]
 #
 # Leaves the daemon running for a second pass; `docker rm -f seedcheck-bk`
 # when done.
@@ -72,8 +72,12 @@ echo "$man" | curl -sf -X PUT -H "Content-Type: $ct" --data-binary @- \
   "http://127.0.0.1:$PORT/v2/library/busybox/manifests/1" -o /dev/null \
   || { echo "could not seed the base image into the registry"; exit 1; }
 
+# "$@" forwarded, so `--fill-mb 200` reaches the binary. Without this the
+# script silently ignored it and two runs at different sizes came back with
+# identical timings, which reads as "200 MiB is free" rather than as "the
+# flag did nothing".
 "$BIN" check-seeding --bk "127.0.0.1:$BKPORT" --registry "$HOSTADDR:$PORT" \
-  --base "$HOSTADDR:$PORT/library/busybox:1"
+  --base "$HOSTADDR:$PORT/library/busybox:1" "$@"
 rc=$?
 echo "== check-seeding rc=$rc  (logs in $RUN)"
 exit $rc

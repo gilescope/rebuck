@@ -371,18 +371,43 @@ async fn main() -> Result<()> {
             let n = std::process::id();
             let (src, dst) = (format!("seedcheck-src-{n}"), format!("seedcheck-dst-{n}"));
             let marker = "rebuck2-seed-marker";
+            // `--fill-mb N` makes the round trip a MEASUREMENT as well as a
+            // check. Principle 18's last clause says pre-positioning
+            // shortens transfer and not unpack, and the open question is
+            // whether a cache big enough to matter is still one it pays to
+            // ship: `go-mod` runs to hundreds of megabytes and its miss path
+            // is a download from a fast proxy, while `go-build`'s miss path
+            // is CPU nothing can avoid.
+            let fill: u64 = args
+                .opt("--fill-mb")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let write_cmd = if fill > 0 {
+                // Incompressible, so the layer is honest about its size. A
+                // gigabyte of zeroes ships as almost nothing and would
+                // flatter the mechanism enormously.
+                format!(
+                    "touch /c/{marker} && dd if=/dev/urandom of=/c/bulk bs=1M count={fill} \
+                     2>/dev/null"
+                )
+            } else {
+                format!("touch /c/{marker}")
+            };
 
             base_is_reachable(&base, &registry).await;
-            println!("[check] writing {marker} into cache {src}");
+            let t = std::time::Instant::now();
+            println!("[check] writing {marker} into cache {src} ({fill} MiB of bulk)");
             solve::build_subtree(
                 &bk,
                 &registry,
                 0,
-                dispatch::cache_probe_graph(&base, &src, "/c", &format!("touch /c/{marker}")),
+                dispatch::cache_probe_graph(&base, &src, "/c", &write_cmd),
             )
             .await
             .map_err(|e| anyhow::anyhow!("could not write to a cache mount: {e:#}"))?;
+            let t_write = t.elapsed();
 
+            let t = std::time::Instant::now();
             println!("[check] harvesting {src}");
             let digest = solve::build_subtree(
                 &bk,
@@ -392,6 +417,7 @@ async fn main() -> Result<()> {
             )
             .await
             .map_err(|e| anyhow::anyhow!("could not harvest a cache mount: {e:#}"))?;
+            let t_harvest = t.elapsed();
             let reference = solve::pullable(&registry, &digest);
             println!("[check] harvested {src} -> {reference}");
 
@@ -409,9 +435,26 @@ async fn main() -> Result<()> {
             }
 
             println!("[check] reading {marker} back out of {dst}, seeded from {reference}");
+            let t = std::time::Instant::now();
             match solve::build_subtree(&bk, &registry, 0, seeded).await {
                 Ok(_) => {
+                    let t_seed = t.elapsed();
                     println!("[check] SEEDING WORKS: a cold {dst} started from {src}'s contents");
+                    // Three phases, and only the LAST is a cost a real build
+                    // pays per machine. Writing and harvesting happen once,
+                    // on one machine; seeding happens on every worker, and
+                    // it is the number principle 18's caveat is about.
+                    println!(
+                        "[check] timings: write {}ms, harvest {}ms, seed+read {}ms{}",
+                        t_write.as_millis(),
+                        t_harvest.as_millis(),
+                        t_seed.as_millis(),
+                        if fill > 0 {
+                            format!(" for {fill} MiB")
+                        } else {
+                            String::new()
+                        }
+                    );
                     Ok(())
                 }
                 // The probe's own `test -f` failing is the interesting
