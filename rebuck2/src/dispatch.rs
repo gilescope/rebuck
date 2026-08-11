@@ -624,6 +624,43 @@ pub fn image_identifier(name: &str) -> String {
     format!("docker-image://{full}")
 }
 
+/// The id a daemon actually holds, given the id an operator asked for.
+///
+/// A mount written without `id=` in the Earthfile is NOT keyed on its
+/// destination. Earthly computes `/run/cache/<per-target hash>/<target>`,
+/// so a seed list naming `/root/.cache/golangci_lint` names an id that
+/// exists nowhere - and the harvest then reads an empty directory it
+/// created itself, which looks exactly like a cold cache.
+///
+/// Exact match first, then a unique tail match. Ambiguity is refused rather
+/// than resolved: two targets can share a mount path, and harvesting one
+/// target's cache to seed every other is the one thing principle 20 forbids
+/// outright.
+///
+/// Named by the operator either way - this widens how a name is matched, not
+/// what may be seeded.
+pub fn resolve_cache_id(want: &str, held: &[String]) -> Option<String> {
+    if held.iter().any(|h| h == want) {
+        return Some(want.to_owned());
+    }
+    let tail = if want.starts_with('/') {
+        want.to_owned()
+    } else {
+        format!("/{want}")
+    };
+    let mut hits = held.iter().filter(|h| h.ends_with(&tail));
+    let first = hits.next()?;
+    if hits.next().is_some() {
+        println!(
+            "[dispatch] cache id {want:?} matches more than one id on this daemon - \
+             refusing to guess which"
+        );
+        return None;
+    }
+    println!("[dispatch] cache id {want:?} is {first:?} on this daemon");
+    Some(first.clone())
+}
+
 /// Earthly's cache-mount input: scratch with `/cache` created.
 ///
 /// One function because two copies of it would be two chances to differ,
@@ -2458,6 +2495,47 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// An id the Earthfile never named still has to be found.
+    ///
+    /// A mount written without `id=` is not keyed on its destination:
+    /// earthly computes `/run/cache/<per-target hash>/<target>`. So a seed
+    /// list saying `/root/.cache/golangci_lint` names an id that exists
+    /// nowhere, and the harvest reads an empty directory it created itself -
+    /// which is indistinguishable from the cache being cold.
+    #[test]
+    fn a_namespaced_cache_id_is_matched_by_its_tail() {
+        let held = [
+            "go-mod".to_owned(),
+            "go-build".to_owned(),
+            "/run/cache/b369714dd3084d9bf3adc7911b40056e0f36f2d79516e5474021e7d61bddc541\
+             /root/.cache/golangci_lint"
+                .to_owned(),
+        ];
+        let r = |want: &str| super::resolve_cache_id(want, &held);
+
+        // An exact id wins outright, with no searching.
+        assert_eq!(r("go-mod"), Some("go-mod".to_owned()));
+        // The namespaced one is found by its tail.
+        assert_eq!(r("/root/.cache/golangci_lint"), Some(held[2].clone()));
+        // Nothing that matches is nothing, NOT a guess. Harvesting the
+        // wrong id reads an empty dir and reports it as an empty cache.
+        assert_eq!(r("npm"), None);
+    }
+
+    /// Two candidates is not an answer.
+    #[test]
+    fn an_ambiguous_cache_id_is_refused() {
+        let held = [
+            "/run/cache/aaa/root/.cache/x".to_owned(),
+            "/run/cache/bbb/root/.cache/x".to_owned(),
+        ];
+        // Both end with the same tail - two targets with the same mount
+        // path. Picking either would harvest one target's cache and seed it
+        // into every other, which is the one thing principle 20 forbids
+        // outright: a cache that is not the one asked for.
+        assert_eq!(super::resolve_cache_id("/root/.cache/x", &held), None);
+    }
+
     /// The harvest has to mount the cache the way EARTHLY mounts it.
     #[test]
     fn the_harvest_mounts_the_cache_the_way_earthly_does() {

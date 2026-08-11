@@ -782,6 +782,28 @@ pub async fn cache_mounts(addr: &str) -> Vec<(String, i64)> {
     out
 }
 
+/// The cache ids a daemon holds, pulled out of the descriptions.
+///
+/// buildkit appends ` with id "<id>"` to a cache mount's description when
+/// the id differs from the destination, and omits it when they are the
+/// same. See `MountManager.getRefCacheDir`. So the id is either in quotes at
+/// the end or it IS the dest, and both cases have to be read.
+pub fn cache_ids_held(mounts: &[(String, i64)]) -> Vec<String> {
+    mounts
+        .iter()
+        .filter_map(|(desc, _)| {
+            match desc.rsplit_once(" with id \"") {
+                Some((_, tail)) => tail.strip_suffix('"').map(str::to_owned),
+                // `cached mount <dest> from ...` - the id is the dest.
+                None => desc
+                    .strip_prefix("cached mount ")
+                    .and_then(|r| r.split_once(" from "))
+                    .map(|(dest, _)| dest.to_owned()),
+            }
+        })
+        .collect()
+}
+
 /// What a failed solve actually printed, from `Control.Status`.
 ///
 /// A `Solve` answers with a code and a sentence. The container's own output
@@ -915,6 +937,23 @@ pub fn published_reference(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cache_ids_come_out_of_buildkits_own_descriptions() {
+        let held = vec![
+            (
+                "cached mount /go/pkg/mod from exec /bin/sh -c 'go mod download' \
+                 with id \"go-mod\""
+                    .to_owned(),
+                1_000i64,
+            ),
+            // No ` with id`, because buildkit omits it when the id IS the
+            // dest. Reading only the quoted form would silently drop these.
+            ("cached mount /root/.npm from exec npm ci".to_owned(), 5i64),
+        ];
+        let ids = super::cache_ids_held(&held);
+        assert_eq!(ids, vec!["go-mod".to_owned(), "/root/.npm".to_owned()]);
+    }
+
     /// An LLB source identifier is a URL, and three copies of this rule
     /// disagreed about that.
     #[test]

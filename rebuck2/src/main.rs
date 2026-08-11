@@ -365,8 +365,27 @@ async fn main() -> Result<()> {
                 // answers "was the cache filled by a build" and not "how
                 // much can be read out of it".
             }
+            // RESOLVE each asked-for id against what the daemon holds. A
+            // mount with no `id=` in the Earthfile is keyed
+            // `/run/cache/<per-target hash>/<target>`, so
+            // `/root/.cache/golangci_lint` names nothing and the harvest
+            // would read an empty directory it created itself.
+            let ids_held = solve::cache_ids_held(&held);
             let mut failed = 0usize;
             for (id, dest) in &pairs {
+                let id = match dispatch::resolve_cache_id(id, &ids_held) {
+                    Some(found) => found,
+                    None => {
+                        println!(
+                            "[harvest] no cache id {id:?} on this daemon - skipping. \
+                             Harvesting it would read an empty directory and report a \
+                             cold cache."
+                        );
+                        failed += 1;
+                        continue;
+                    }
+                };
+                let id = &id;
                 if let Err(e) = harvest_one(&bk, &registry, &base, id, dest).await {
                     println!("[harvest] {id} at {dest} failed: {e:#}");
                     failed += 1;
