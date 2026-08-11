@@ -918,3 +918,48 @@ find out what it is a number OF before you build on it.** The 24.7 GiB was
 a real counter, correctly incremented, measuring loopback. The 73x needed
 no explaining to be true - I explained it anyway, and the explanation was
 the part that was wrong.
+
+## 26. A mechanism and its absence must not print the same thing
+
+If "it ran and found nothing", "it is switched off", and "it could not run
+at all" produce the same output, the output is not evidence. Make them
+different at the point of printing, not in the reader's head.
+
+Five in one session, all reported as working or as a clean zero:
+
+| line | read as | actually |
+| ----------------------------- | -------------------- | ------------------------------ |
+| `prefetch: could not read the manifest` x412 | a flaky registry | every subtree ref is a bare digest, so there was never a URL |
+| `service ms : home 0 (0) away 0 (0)` | home and away cost the same | keyed off an outer solve that earthly never issues per placement |
+| `grafted : 0` | grafting never fires | `REBUCK2_GRAFT` was unset in every one of those runs |
+| `seeds=0/0` | seeding found nothing | no seeds were configured |
+| `[cas] 0 KiB` (twice, historically) | nobody serves a worker's inputs | the counter was in a layer no test drove |
+
+`mech.rs` was built for one of these five - the ON BUT NEVER APPLIED case -
+and catches only it. It cannot catch a mechanism that fires on the wrong
+input (prefetch fired six times, on six base images), one that is off (a
+zero is not a refusal), or one whose counter cannot fill (a lookup that
+always misses).
+
+Three rules that would have caught all five:
+
+- **Name the variable in the output.** `OFF (REBUCK2_GRAFT unset)` cannot be
+  misread as a measurement; `0` can, and was, into a workflow comment and a
+  ranking decision.
+- **Count what you could not do.** A dropped sample, a missed lock, a
+  refused lookup. Silence must be a number.
+- **Say why, not just that.** `could not read the manifest` survived two
+  full runs and 494 printings. `no host in sha256:... - a bare digest names
+  content without saying where to ask` names the bug in the message.
+
+And the reason this keeps happening, which is worth stating plainly: a
+mechanism that does nothing costs nothing and breaks nothing. Nothing pushes
+back. The only thing that can push back is the output, so the output has to
+be built to.
+
+The same discipline applies to what an instrument costs. A tap that takes a
+mutex on the critical path, or a fallback that returns the last good sample
+when a probe fails, does not just fail to inform - it produces a confident
+wrong answer. `check-reserve` reported a flat zero across six solves because
+every stats request had failed; the flat line looked exactly like the result
+it was supposed to prove.
