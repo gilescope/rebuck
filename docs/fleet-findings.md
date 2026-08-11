@@ -2204,3 +2204,46 @@ The lock held across an await was a genuine bug and the fix stands: a guard
 taken in an `if let` scrutinee lives for the body, and this one was held
 while taking two further locks. It is a latent deadlock. It is not the
 explanation for anything measured.
+
+## The h2 collapse: solved, and it was our own keepalive
+
+Confirmed by A/B on the full `+test-no-qemu`, one variable:
+
+| | keepalive 20s | keepalive off |
+| --- | --- | --- |
+| h2 protocol errors | every run | 0 |
+| `no such job` | 9 | 0 |
+| solves routed | 8 | 147 |
+| outcome | died | completed, 1 failed target, as the baseline |
+
+The mechanism, from grpc-go's `http2_server.go` as vendored into the
+buildkitd we talk to:
+
+```text
+maxPingStrikes     = 2
+defaultPingTimeout = 2 * time.Hour
+```
+
+With no active streams and `PermitWithoutStream` false, every ping inside
+two hours is a strike, and three strikes sends GOAWAY with
+ENHANCE_YOUR_CALM and `too_many_pings`, closing the connection. A 20-second
+keepalive kills an idle connection after exactly three pings - 60 seconds -
+which is the boundary every failure landed on. With active streams the bar
+is `EnforcementPolicy.MinTime`, five minutes by default, so anything faster
+is fatal either way.
+
+Two readings that were wrong for two days:
+
+- `transport error` is TONIC's string - `Kind::Transport` - not the
+  daemon's. Read as an answer from buildkitd, it produced five theories
+  about a server that was behaving exactly as documented.
+- the `no such job` NotFounds were consequences, not causes. Nine of them,
+  all for one job id, after that job's `Control.Solve` had already died.
+
+And the collapse in routing - 8 solves against the usual 40-130 - was the
+same fault, not the prefetch regression it was briefly recorded as. The
+build died before it could dispatch.
+
+The keepalive was added as a FIX for this symptom, in the commit that gave
+Session its own connection. It caused the failure it was meant to prevent,
+for a dozen runs.
