@@ -40,6 +40,50 @@ hundred `fleet.yml` runs, and the run log does not contain the step's output,
 so nobody has read a failure. Filed in `~/git/gilescope/rebuck-nits.md`. Treat
 the script as documentation of intent until that is fixed.
 
+## Current state of belief
+
+Added after retracting the same class of claim three times in one session.
+A document that records everything it ever believed needs a page saying what
+it believes NOW, or the retractions get re-derived by whoever reads the
+confident version first - which has happened to me, in this file, twice.
+
+**Established.** Measured, and nothing since contradicts it.
+
+| claim | evidence |
+| ----- | -------- |
+| The workload sets the ceiling, not the fleet | Amdahl ceilings of 3.1-6.0x on targets with 3-5 branches |
+| A daemon does not re-fetch what it built | `reserve-check.sh`: 1870 KiB on solve 0, zero for five more, chained or not |
+| Prefetch never worked for subtree results | 412 of 412 failures; a bare digest has no manifest URL |
+| Affinity never scored parent images | `warmth` counted ops and mounts; a cut subtree carries neither |
+| A 20-op dispatch floor is harmful | ~5x slower overall while every per-lead number improved |
+| Building is roughly a quarter of lead time | 4,407s of `took Nms` against 14,812s of `lead_ms` |
+| A cap inside a cap turns slow into failed | worker `timeout 3000` under a 150-minute job |
+
+**Open.** Believed for a reason, not measured.
+
+| question | why it is open |
+| -------- | -------------- |
+| How much of the fleet's traffic crosses a wire | `SERVED_BYTES` mixes loopback with peer serving; `SERVED_LOCAL_BYTES` exists and has never reported |
+| Whether the fleet repeats itself, and by how much | the coordinator reports 1.1x; the per-worker figure has never printed |
+| Where the 10,400 seconds of non-building lead time goes | `lead phases` exists and has never reported |
+| Whether instruments changed the result | the 50-minute leg; `status tap` exists and has never reported |
+| What a 14-way target does | `+test-no-qemu` has never run |
+
+**Retracted.** Written here confidently and wrong. Left in place with the
+correction attached, because a deleted mistake gets made again.
+
+| claim | what was wrong |
+| ----- | -------------- |
+| "A lead costs what it fetches" | bytes served correlate with lead duration at r = 0.06 |
+| "24.7 GiB moved across the fleet" | `SERVED_BYTES` is bytes served, not bytes fetched |
+| "...therefore it was loopback" | `upstream: None` says where a registry FETCHES, not who it SERVES |
+| "93x re-served" | fleet-wide served divided by one machine's distinct - two different registries |
+| `worth_spreading`, a worker-count cap | 162 machine-seconds read as wall clock |
+
+The pattern in every retraction is one shape: **a real counter, correctly
+incremented, answering a question I was not asking.** Before building on a
+number, establish what it is a number OF.
+
 ## Both lifts work across a real network
 
 Verified locally first, which proves the wiring and not the topology. With
