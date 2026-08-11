@@ -31,8 +31,13 @@ on:
   #
   # To run: `git push -f origin HEAD:giles-dispatch-ci`. Nothing fires on a
   # normal push to giles-dispatch, so committing stays cheap.
+  # Two branches, because the interesting question is no longer only about
+  # the test groups. `-binaries` builds +all-binaries: five cross-compiles
+  # off one shared stem, no nested earthly, no docker layers of any size.
+  # The test side is 71% serial and caps at 1.4x by Amdahl however well the
+  # fleet works; this side is the shape a build farm is actually for.
   push:
-    branches: [giles-dispatch-ci]
+    branches: [giles-dispatch-ci, giles-dispatch-ci-binaries]
   workflow_dispatch:
     inputs:
       peer_cache_mounts:
@@ -303,10 +308,13 @@ jobs:
     outputs:
       list: ${{ steps.n.outputs.list }}
       count: ${{ steps.n.outputs.count }}
+      target: ${{ steps.n.outputs.target }}
     steps:
       - id: n
         env:
           W: ${{ inputs.workers || '6' }}
+          T: ${{ inputs.target || '' }}
+          REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           # A count or an explicit list - both are things a human types.
@@ -320,6 +328,20 @@ jobs:
           echo "$count worker(s): $list"
           echo "list=$list" >> "$GITHUB_OUTPUT"
           echo "count=$count" >> "$GITHUB_OUTPUT"
+          # Resolved HERE and nowhere else. It was written out four times -
+          # a bank cache key, its restore prefix, and the two legs - and the
+          # bank key is the one that hurts when they disagree: a run would
+          # restore the test groups' bank, build something else, and save it
+          # back under the same name.
+          case "${T:-}" in
+            "") case "$REF" in
+                  *-binaries) target=+all-binaries ;;
+                  *)          target=+test-no-qemu-group2 ;;
+                esac ;;
+            *)  target="$T" ;;
+          esac
+          echo "target: $target"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
 
   # One job per worker. They join the coordinator's mesh, lend their buildkitd
   # to it, and exit when it disconnects.
@@ -713,9 +735,9 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/rebuck2/coord
-          key: rebuck2-bank-${{ inputs.target || '+test-no-qemu-group2' }}-${{ github.run_id }}
+          key: rebuck2-bank-${{ needs.plan.outputs.target }}-${{ github.run_id }}
           restore-keys: |
-            rebuck2-bank-${{ inputs.target || '+test-no-qemu-group2' }}-
+            rebuck2-bank-${{ needs.plan.outputs.target }}-
 
       - name: what the bank brought
         run: |
@@ -910,7 +932,7 @@ jobs:
       - name: baseline - the same target on one machine
         working-directory: earthbuild
         env:
-          TARGET: ${{ inputs.target || '+test-no-qemu-group2' }}
+          TARGET: ${{ needs.plan.outputs.target }}
         run: |
           set -euo pipefail
           start=$SECONDS
@@ -994,7 +1016,7 @@ jobs:
       - name: the Earthfile, through the fleet
         working-directory: earthbuild
         env:
-          TARGET: ${{ inputs.target || '+test-no-qemu-group2' }}
+          TARGET: ${{ needs.plan.outputs.target }}
         run: |
           set -euo pipefail
           start=$SECONDS
