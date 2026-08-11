@@ -1834,3 +1834,52 @@ real number, correctly computed, pointing at a fix that would have done
 nothing - and it took a per-leg tag to see it. Three instruments have now
 had to be corrected before they told the truth; this one was correct and
 still misleading until it was split.
+
+## Why the fleet loses: the workload is 71% serial
+
+The traces make the shape plain. Long spans, on a timeline, for one full
+`+test-no-qemu`:
+
+```text
+baseline 271s              fleet 363s
+  +earthly-docker    187s    +earthly-docker    227s   (+40s)
+  ...FROM it, apk      5s    ...FROM it, apk     55s   (+50s)
+  base chain ends    192s    base chain ends    282s
+  TESTS, parallel     79s    TESTS, parallel     81s   (+2s)
+```
+
+The parallel phase is the same in both: 79s against 81s. Every second of
+the fleet's deficit is in the serial base chain that precedes it.
+
+That chain is three deep and cannot be divided: `+earthly-docker` builds an
+image, `+earthbuild-integration-test-base` is `FROM` it plus an `apk add`,
+and `+test-base` is `FROM` that. Nothing else in the build can start until
+it finishes. 192 of the baseline's 271 seconds are spent there, so the
+workload is 71% SERIAL, and Amdahl caps any distribution of it at 1.4x with
+infinite machines.
+
+The fleet then makes the serial part 47% longer, and the split says why:
++40s inside `+earthly-docker` itself, and +50s in the step that consumes it,
+which is a `FROM` - materialising the parent image on the machine that
+builds the child.
+
+This retires the whole placement question. Nine mechanisms were measured
+against a critical path that no placement policy can shorten, because the
+path is one chain of three targets on one machine either way.
+
+### What would actually win
+
+If the base chain were already present on the workers, the fleet's own work
+is the 81-second parallel phase. Against a 271-second baseline that is a
+real win, and it is the only shape of win available:
+
+- warm the workers with the base chain in the window they currently spend
+  idle - they wait out the entire baseline leg doing nothing
+- or seed it faster. The cascade already exists and works: worker 1 finds
+  nothing on any peer and pulls 75 blobs from the coordinator, after which
+  worker 2 gets 26 of 36 from PEERS. What is missing is that the seed is
+  serial - one machine pulls the whole base while five wait for it. Six
+  workers each pulling a different sixth, then exchanging, is the same
+  bytes off the coordinator at six times the seed bandwidth.
+
+Both attack the 192-second chain. Nothing else on the table does.
