@@ -1012,3 +1012,42 @@ symptom is the ratchet coming back.
 
 The number to watch is the ratio of applications: a preference term firing
 five times per brake application is not being traded against anything.
+
+## 28. Optimise the term that BINDS, not the one that is biggest
+
+Three targeting rules in one day, each replacing the last, each wrong for a
+reason worth keeping.
+
+**"Run it on the cheap target."** `+test-ast` finishes in twenty minutes and
+nothing in it fails on purpose, so nine hours of measurement went there. Its
+bottleneck - queueing, 65% of lead time - turned out not to be the wide
+target's bottleneck at all, and the two fixes tuned against it were worth
+41% there and **zero** on the target the mandate was about.
+
+**"Run it where the bucket is biggest."** Better, and still wrong.
+`building` was 73% on `+test-no-qemu` against 55% on `+test-ast`, so
+`-bcast` went to the wide target. It cut `waiting` by 45% and moved the
+clock by **nothing**, because that leg is set by 771 seconds of serial work
+behind host binds. The bucket was bigger. The bucket was not the constraint.
+
+**"Run it where the term binds."** A mechanism can only pay if the thing it
+shortens is what the clock is waiting on. That is not the largest term, and
+it is not the term with the most headroom - it is whichever one, made
+smaller, makes the wall clock smaller.
+
+The test is cheap once the phases are split: **compare the leg against the
+serial fraction.** `+test-no-qemu` spends 771s of home vertex time in a
+517s leg, so its parallel work is already overlapped and shortening it is
+invisible. `+test-ast` spends 7s at home in a 1050s leg, so almost
+everything is parallel and almost anything that shortens it should show.
+
+Two mechanisms carry the same epitaph in `fleet-findings.md` - `-sandbox`
+cut the critical leads by a third, `-bcast` cut queueing by 45%, and neither
+moved a clock. Both work. Both were pointed at a target where the answer was
+already decided elsewhere.
+
+The failure is seductive because every intermediate number improves. Lead
+round trips halve, duplication falls, queueing drops - and the only number
+anybody cares about does not move. **An improvement that does not reach the
+binding term is indistinguishable from no improvement, and it costs a run
+either way.**
