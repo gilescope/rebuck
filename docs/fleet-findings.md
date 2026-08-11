@@ -1964,3 +1964,48 @@ will want them. What is worth stealing from that ecosystem is narrower -
 containerd's `content.Store` write API lets a third party push blobs
 directly into a worker's local store, which is a real push channel rather
 than an advisory hint that the worker then has to pull through a registry.
+
+## The h2 collapse was our own client connection
+
+Every full `+test-no-qemu` for two days ended the same way:
+
+```text
+Error: h2 protocol error: error reading a body from connection
+```
+
+reported by earthly, naming nothing. Five fixes were aimed at it before the
+cause was known, and all five were on the wrong side of the wire:
+
+| attempt | reasoning | outcome |
+| -------------------------------- | ------------------------------ | ------------------ |
+| `max_concurrent_streams(None)` | our server refuses a stream | error persisted |
+| `max_pending_accept_reset_streams` 20 -> 10k | mass cancellation trips a GOAWAY | one clean run, then it returned |
+| the same limit removed entirely | prove it either way | error persisted |
+| retry `Control.Solve` on Unavailable | the failing call is the solve | never fired, wrong code |
+| retry on `Unknown: transport error` | it is the solve after all | fired 4x, 3 cancelled |
+
+The answer came from instrumenting the SESSION relay, which had been
+swallowing its errors - `m.ok()` turning a stream error into a clean
+end-of-stream:
+
+```text
+[proxy] session stream from daemon failed: Unknown error
+h2 protocol error: error reading a body from connection
+```
+
+**From the daemon.** The connection that breaks is the one this proxy MAKES
+to peer 0's buildkitd, and the text reaching the user is that error relayed
+outward. Every fix had been applied to the server we run.
+
+The cause is structural rather than a limit: ONE h2 connection carried the
+whole Control surface - 163 gateway solves, `Control.Solve`, `Status`, and
+the long-lived `Session`. A connection-level event takes every stream on it,
+and `Session` is the one that cannot be retried: it carries filesync and
+credentials, so the build dies with it.
+
+Session now has its own connection.
+
+The lesson generalises past this bug. A relay that drops errors is not
+quiet, it is lying, and it took five attempts at the wrong component before
+anyone asked the relay what it had seen. Principle 17's third shape - an
+instrument that cannot be distinguished from its own silence.
