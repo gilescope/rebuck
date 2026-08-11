@@ -1897,10 +1897,19 @@ known about each:
 | `REBUCK2_WARM` | the 192s base chain | never yet ran |
 | `REBUCK2_LOCAL_NESTED` | the nested-build funnel | untested |
 | `REBUCK2_SANDBOX_HOST` | the same funnel | works, breaks one test |
-| `REBUCK2_GRAFT` | rebuilding known ancestry | costs 107s |
+| `REBUCK2_GRAFT` | rebuilding known ancestry | costs 107s, and was ON |
 | `REBUCK2_FLEET_CACHE` | rebuilding known ancestry | costs 334s |
 
 Only two of those have a measured benefit, and only affinity is unambiguous.
+
+**And "off by default" was not true of all of them.** `REBUCK2_GRAFT` reads
+`${{ inputs.graft || '0' }}`, which cannot be off while the `graft:` input
+declares its own default of `"1"`: the value is never empty, so the fallback
+never evaluates. Grafting therefore ran in every run after the commit that
+turned it off, at a measured cost of 107s, and several comparisons in this
+document were taken with it on. `scripts/check-workflow-defaults.sh` checks
+the two defaults agree, and found a second instance in the single-runner
+workflow the first time it ran.
 
 The honest summary after all of it: the whole of `+test-no-qemu` runs
 through six machines and agrees with one machine on the answer, which is
