@@ -3074,3 +3074,48 @@ disk rather than time.
 So: no machinery needed, and the `cache_by_worker` gate described above
 would have been solving a problem that does not exist. Reading the key
 construction was worth it anyway; assuming what it implied was not.
+
+## Why every harvest was empty: earthly's cache mounts carry an input
+
+Answered from earthly's own source rather than from another run.
+`earthfile2llb/runmount.go`, the `cache` case:
+
+```go
+mountOpts = append(mountOpts, llb.AsPersistentCacheDir(cacheID, sharingMode))
+state = c.cacheContext                       // pllb.Scratch()
+state = state.File(pllb.Mkdir("/cache", mountMode))
+mountOpts = append(mountOpts, llb.SourcePath("/cache"))
+return []llb.RunOption{pllb.AddMount(mountTarget, state, mountOpts...)}
+```
+
+The mount has a **state** as its input - scratch with `/cache` created - and
+a `SourcePath` selector. Put that beside `getRefCacheDir`:
+
+```go
+key := id
+if ref != nil { key += ":" + ref.ID() }
+```
+
+Earthly's `go-mod` lives at key `go-mod:<ref of that scratch+mkdir>`. The
+harvest mounts `go-mod` with **no** input, so its key is plain `go-mod` - a
+different directory, which nothing has ever written to. Four harvests
+returned 0.0 MiB because they were reading an empty directory that they
+themselves had just created.
+
+Everything about the harvest was working. The graph solved, the layer
+exported, the reference resolved, the seeded read succeeded - the local
+round trip proves all of it. It was pointed at the wrong dir.
+
+**The fix is to construct the same input**, not to guess at it: scratch, a
+`Mkdir("/cache")`, and `selector: "/cache"` on the mount. Identical LLB
+gives an identical digest gives the same ref, so the same key. That is a
+FileOp built by hand, which is more work than a SourceOp and is the only
+honest way to read the directory earthly writes.
+
+Worth noting what this cost and what it did not. Eight CI attempts reached
+"the harvest runs and finds nothing"; the answer took two minutes of reading
+`runmount.go`, and it was available from the first attempt. The local rig
+could never have found it - it reproduces MY writer, and my writer was
+consistent with my reader. Principle 23 says build the cheapest instrument
+first, and this is its limit: an instrument that reproduces your own
+assumptions confirms them.
