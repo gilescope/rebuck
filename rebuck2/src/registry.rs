@@ -1289,10 +1289,15 @@ pub fn router_with_upstream<S: RegistryStore>(
                     // shipped whole regardless.
                     if n > 1_000_000 {
                         if let Some(d) = path.rsplit('/').next() {
-                            BIG_BLOBS
-                                .lock()
-                                .expect("blob sizes")
-                                .insert(d.to_owned(), n);
+                            // COUNT the serves, do not overwrite them. The
+                            // previous `insert` reported a worker that served
+                            // one 26,726 KiB layer 76 times as a single 26 MiB
+                            // blob - which is how 24.7 GiB looked like volume
+                            // rather than repetition.
+                            let mut big = BIG_BLOBS.lock().expect("blob sizes");
+                            let e = big.entry(d.to_owned()).or_insert((n, 0));
+                            e.0 = n;
+                            e.1 += 1;
                         }
                     }
                 }
@@ -1339,11 +1344,15 @@ pub static SERVED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// the fetch rate; whatever is left of the lead is unpack.
 pub static SERVED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Blobs over a megabyte, by digest. A total says how much moved; this says
-/// whether it moved as a few large layers or many small ones, which is the
-/// difference between "split the seed" and "one layer dominates".
+/// Blobs over a megabyte: digest -> (size, times served).
+///
+/// A total says how much moved; the size says whether it moved as a few large
+/// layers or many small ones. The COUNT says whether it moved at all, or
+/// whether the same layer was handed to the same buildkitd over and over -
+/// which is what a 24.7 GiB total turned out to be, and what the earlier
+/// `insert`-only version could not have shown.
 pub static BIG_BLOBS: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
+    std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
 > = std::sync::LazyLock::new(Default::default);
 
 pub static TRAFFIC: std::sync::Mutex<Option<std::collections::BTreeMap<String, u64>>> =
@@ -1433,18 +1442,30 @@ pub async fn serve_with_upstream<S: RegistryStore>(
                 let kib = SERVED_BYTES.load(std::sync::atomic::Ordering::Relaxed) / 1024;
                 println!("[registry] served {total} requests, {kib} KiB: {m:?}");
                 let big = BIG_BLOBS.lock().expect("blob sizes");
-                let mut v: Vec<(&String, &u64)> = big.iter().collect();
-                v.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
-                let sum: u64 = v.iter().map(|(_, n)| **n).sum();
+                // By BYTES SERVED - size times count - not by size. The
+                // biggest single layer is rarely the biggest cost; a 26 MiB
+                // one served 76 times beats a 190 MiB one served once.
+                let mut v: Vec<(&String, &(u64, u64))> = big.iter().collect();
+                v.sort_by_key(|(_, (n, c))| std::cmp::Reverse(n * c));
+                let distinct: u64 = v.iter().map(|(_, (n, _))| *n).sum();
+                let served: u64 = v.iter().map(|(_, (n, c))| n * c).sum();
                 println!(
-                    "[registry] {} blobs over 1MiB, {} MiB of the total; largest:",
+                    "[registry] {} blobs over 1MiB: {} MiB distinct, {} MiB served \
+                     ({:.1}x re-served); largest by served:",
                     v.len(),
-                    sum / 1_048_576
+                    distinct / 1_048_576,
+                    served / 1_048_576,
+                    if distinct > 0 {
+                        served as f64 / distinct as f64
+                    } else {
+                        0.0
+                    }
                 );
-                for (d, n) in v.into_iter().take(8) {
+                for (d, (n, c)) in v.into_iter().take(8) {
                     println!(
-                        "[registry]   {:>7} MiB  {}",
+                        "[registry]   {:>7} MiB x{:<4} {}",
                         n / 1_048_576,
+                        c,
                         &d[..24.min(d.len())]
                     );
                 }
@@ -1456,6 +1477,41 @@ pub async fn serve_with_upstream<S: RegistryStore>(
 
 #[cfg(test)]
 mod tests {
+    /// A blob served twice is two facts, not one.
+    ///
+    /// `BIG_BLOBS` kept digest -> size and OVERWROTE on the second serve, so
+    /// a worker that served an identical 26,726 KiB layer 76 times reported
+    /// one 26 MiB blob. That map was the only per-digest evidence there was,
+    /// and it was hiding the one thing worth knowing about a 24.7 GiB total:
+    /// that almost all of it is the same few artifacts, re-materialised on a
+    /// machine that already had them.
+    #[tokio::test]
+    async fn a_blob_served_twice_is_counted_twice() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store =
+            std::sync::Arc::new(crate::store::Store::new(dir.path().to_path_buf()).unwrap());
+        let payload = vec![3u8; 1_500_000];
+        let hash = store.blob_put(&payload).await.expect("put");
+        let app = super::router(store);
+        for _ in 0..3 {
+            let res = tower::ServiceExt::oneshot(
+                app.clone(),
+                axum::http::Request::get(format!("/v2/x/blobs/sha256:{hash}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("serve");
+            assert_eq!(res.status(), 200);
+        }
+        let big = super::BIG_BLOBS.lock().expect("blob sizes");
+        let (size, times) = *big
+            .get(&format!("sha256:{hash}"))
+            .expect("a blob over 1MiB is recorded");
+        assert_eq!(size, payload.len() as u64);
+        assert_eq!(times, 3, "three serves of one digest, not one");
+    }
+
     /// Serving time, so the 7.2 MB/s can be split.
     ///
     /// A lead's cost tracks the bytes it fetched, at 7.2 MB/s - but that

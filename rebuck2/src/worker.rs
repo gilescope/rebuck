@@ -919,6 +919,40 @@ fn fetch_summary() {
             0.0
         }
     );
+    // DISTINCT against SERVED, which is the whole question a total cannot
+    // answer. The coordinator's registry reported 17 blobs over a megabyte
+    // and 277 MiB distinct while the fleet served 25,658 MiB - so the volume
+    // is not volume, it is the same seventeen artifacts handed out again and
+    // again. The workers never printed their own version of that line: the
+    // registry only reports it on ctrl-c, and a worker exits when the
+    // coordinator goes.
+    let big = crate::registry::BIG_BLOBS.lock().expect("blob sizes");
+    if big.is_empty() {
+        return;
+    }
+    let distinct: u64 = big.values().map(|(n, _)| *n).sum();
+    let served: u64 = big.values().map(|(n, c)| n * c).sum();
+    let mut v: Vec<(&String, &(u64, u64))> = big.iter().collect();
+    v.sort_by_key(|(_, (n, c))| std::cmp::Reverse(n * c));
+    println!(
+        "[worker] {} blobs over 1MiB: {} MiB distinct, {} MiB served ({:.0}x re-served)",
+        v.len(),
+        distinct / 1_048_576,
+        served / 1_048_576,
+        if distinct > 0 {
+            served as f64 / distinct as f64
+        } else {
+            0.0
+        }
+    );
+    for (d, (n, c)) in v.into_iter().take(5) {
+        println!(
+            "[worker]   {:>6} MiB x{:<4} {}",
+            n / 1_048_576,
+            c,
+            &d[..24.min(d.len())]
+        );
+    }
 }
 
 fn arch() -> &'static str {

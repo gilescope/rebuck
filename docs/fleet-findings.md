@@ -3689,3 +3689,36 @@ as this section claims.
 | 20 | 63 | 15% |
 | 40 | 221 | 53% |
 | 100 | 315 | 76% |
+
+### 277 MiB distinct, 24.7 GiB served
+
+The coordinator's registry printed this at shutdown and I had not read it:
+
+```text
+[registry] 17 blobs over 1MiB, 277 MiB of the total; largest:
+[registry]        65 MiB  sha256:b05ba1b396096c36a
+[registry]        37 MiB  sha256:4cea535e2a7b45e35
+[registry]        36 MiB  sha256:4c9ed40f1723d92dc
+[registry]        22 MiB  sha256:977a4b8e92e1b94c1
+```
+
+**Seventeen blobs. 277 MiB of distinct content in the whole build.** The
+fleet served 25,658 MiB. That is a factor of **93**.
+
+So the 24.7 GiB is not volume at all - it is repetition. The same seventeen
+artifacts, handed to the same buildkitd over and over, once per lead. Which
+is exactly the shape the per-lead medians showed (26,726 / 26,729 / 26,726
+KiB across three separate op-buckets) without my reading it that way.
+
+The map that would have said so kept `digest -> size` and **overwrote** on
+every serve, so seventy-six serves of one layer reported as one 26 MiB
+blob. It is now `digest -> (size, times)`, sorted by size x count rather
+than by size, because the biggest single layer is rarely the biggest cost.
+And `fetch_summary` prints it on the worker's own exit path: the registry
+only reported it on ctrl-c, which is why no worker ever did.
+
+The unit of the problem has moved. It is not "how much does the fleet
+move" - it moves almost nothing, twice. It is **"why does a machine that
+already holds a layer materialise it again for the next lead"**, which is a
+question about buildkitd's content store and the refs we hand it, and it is
+worth more than any transport work on the list.
