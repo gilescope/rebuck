@@ -1177,6 +1177,10 @@ pub fn graft_built(def: &pb::Definition, built: &dyn Fn(&str) -> Option<String>)
             };
             let nb = src.encode_to_vec();
             let after = digest(&nb);
+            // An op REPLACED by its built ancestor: the outcome grafting
+            // exists to produce. Counted because grafting spent a week
+            // switched on while its flag said otherwise.
+            crate::mech::applied("graft");
             if after != before {
                 remap.insert(before.clone(), after.clone());
                 if let Some(m) = metadata.remove(&before) {

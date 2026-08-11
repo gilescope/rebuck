@@ -789,7 +789,10 @@ async fn lead_reply(
         std::env::var("REBUCK2_NESTED_HOST").ok().as_deref(),
         cfg.buildkit_addr.as_deref(),
     ) {
-        Some(addr) => crate::dispatch::retarget_buildkit_host(&def, &addr),
+        Some(addr) => {
+            crate::mech::applied("local_nested");
+            crate::dispatch::retarget_buildkit_host(&def, &addr)
+        }
         None => def,
     };
     let out = crate::solve::build_subtree(bk, reg, job, def).await;

@@ -1261,6 +1261,18 @@ impl Wire {
                     "prefetch",
                     std::env::var("REBUCK2_PREFETCH").as_deref() == Ok("1")
                 ),
+                (
+                    "graft",
+                    std::env::var("REBUCK2_GRAFT").as_deref() == Ok("1")
+                ),
+                (
+                    "cut_prefix",
+                    std::env::var("REBUCK2_CUT_PREFIX").as_deref() == Ok("1")
+                ),
+                (
+                    "local_nested",
+                    std::env::var("REBUCK2_LOCAL_NESTED").as_deref() == Ok("1")
+                ),
             ])
         );
         println!("[wire] gateway solves : {}", self.solves);
