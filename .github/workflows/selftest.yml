@@ -11,6 +11,15 @@ on:
   pull_request:
   workflow_dispatch:
 
+# One run per branch. Six jobs fire on every push, and a busy branch queues
+# them behind each other until the account's 20-job cap is reached - which
+# today meant a fleet experiment waiting on selftests for commits that had
+# already been superseded twice. An older run of the same branch tells you
+# nothing a newer one does not.
+concurrency:
+  group: selftest-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
