@@ -1220,6 +1220,9 @@ pub struct Wire {
     /// wanted twice however it is placed.
     op_solves: std::collections::BTreeMap<u64, u32>,
     pub repeated_ops: u64,
+    /// `(cache id, has an input)` as the client wrote them. See
+    /// [`crate::dispatch::cache_mount_shapes`].
+    cache_shapes: std::collections::BTreeSet<(String, bool)>,
     /// Digest of each Solve's whole op set, in order.
     ///
     /// Repetition means two very different things and the summary number
@@ -1420,6 +1423,13 @@ impl Wire {
 
     fn observe(&mut self, def: &bollard_buildkit_proto::pb::Definition) -> bool {
         use prost::Message;
+        // WHAT SHAPE the client's cache mounts are, once, from the first
+        // graph that has any. An input makes a mount a different directory -
+        // `getRefCacheDir` keys on `id + ":" + ref.ID()` - so harvesting an
+        // id with no input can read somewhere the client never wrote.
+        if self.cache_shapes.is_empty() {
+            self.cache_shapes = crate::dispatch::cache_mount_shapes(def);
+        }
         self.solves += 1;
         self.ops += def.def.len() as u64;
         self.per_solve.push(def.def.len());
@@ -1519,6 +1529,13 @@ impl Wire {
             self.registry_sources, self.local_sources, self.other_sources
         );
         println!("[wire] platforms      : {:?}", self.platforms);
+        if !self.cache_shapes.is_empty() {
+            println!(
+                "[wire] cache mounts   : {:?} (id, has-input) - an input means a DIFFERENT \
+                 cache dir, so a harvest without one reads elsewhere",
+                self.cache_shapes
+            );
+        }
         println!(
             "[wire] repeated ops   : {} ({}% of all ops seen again in a later solve)",
             self.repeated_ops,

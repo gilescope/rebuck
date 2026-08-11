@@ -396,6 +396,42 @@ fn hazards(op: &pb::Op) -> Vec<Exclusion> {
 /// Naming them is the first step to deciding which are worth seeding: the
 /// answer is not "all of them", and it cannot be guessed from the Earthfile
 /// because frequency in the source says nothing about time spent.
+/// Cache mounts as the CLIENT wrote them: id, and whether it has an input.
+///
+/// The input decides which directory the mount is, not just what it starts
+/// from. `getRefCacheDir` builds its key as
+///
+/// ```text
+///     key := id
+///     if ref != nil { key += ":" + ref.ID() }
+/// ```
+///
+/// so a mount with an input is a DIFFERENT cache dir from the same id
+/// without one. Harvesting id `go-mod` with no input therefore reads a
+/// directory earthly may never have written to - which is the leading
+/// explanation for four harvests coming back at 0.0 MiB from a daemon that
+/// had just run a build using those exact ids.
+///
+/// Read off the graphs the client actually sent, because guessing what
+/// earthly emits is how the last three of these went.
+pub fn cache_mount_shapes(def: &pb::Definition) -> BTreeSet<(String, bool)> {
+    let mut out = BTreeSet::new();
+    for bytes in &def.def {
+        let Ok(op) = pb::Op::decode(bytes.as_slice()) else {
+            continue;
+        };
+        let Some(pb::op::Op::Exec(e)) = op.op else {
+            continue;
+        };
+        for m in &e.mounts {
+            if let Some(c) = &m.cache_opt {
+                out.insert((c.id.clone(), m.input >= 0));
+            }
+        }
+    }
+    out
+}
+
 pub fn cache_ids(def: &pb::Definition) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for bytes in &def.def {
