@@ -1775,3 +1775,30 @@ whenever earthly's target column is widened by a long target name, and the
 extraction was anchored at column 1 - so it found no failed targets, which
 is precisely the signature the died-check looks for. The verdict was an
 artefact of the instrument, not the run.
+
+### The local shared daemon works, and costs a test
+
+`sandbox_host=1` forwards `tcp://buildkitsandbox:8372` so a nested earthly
+uses the daemon on its OWN machine. Two full-target runs, and both had
+zero h2 protocol errors where every previous one collapsed. The second
+reported `PARITY: the same 1 target(s) failed either way` - the full
+`+test-no-qemu` completing and reporting honestly rather than dying.
+
+It is not a speed win and it is not free:
+
+| group10, 6 runners | baseline | fleet | routed | mean lead | duplication |
+| ------------------ | -------- | ----- | ------ | --------- | ----------- |
+| plain              | 216s     | 504s  | 44     | 18.6s     | 2.2x        |
+| affinity + sandbox | 208s     | 527s  | 30     | 32.6s     | 1.2x        |
+
+Fewer, longer leads: a nested build now runs entirely inside the worker's
+lead instead of re-entering the gateway, so the work is relocated rather
+than reduced. And `./tests+remote-test` fails through the fleet while
+passing on one machine - the first parity break the fleet has caused, and
+exactly the hazard the `if false` comment warned about.
+
+So it stays off by default. What it establishes is that the full-target
+collapse is caused by the funnel and not by anything unfixable, which
+makes the next question worth asking: whether retrying a relayed solve
+once on `Unavailable` survives the same mass cancellation without
+relocating any work, and so without breaking `remote-test`.
