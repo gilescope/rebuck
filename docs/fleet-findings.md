@@ -2598,3 +2598,50 @@ Worth stating plainly, because it changes how the other numbers read: this
 suite contains targets that fail on purpose, and every fleet measurement
 taken on `+test-no-qemu-*` includes at least one of them. Some part of every
 "the fleet was slower by N seconds" in this document is this bug.
+
+## What `+lint-all` would have cost without the retry storm
+
+From the same run's per-solve windows, so this is arithmetic on a
+measurement rather than a new measurement.
+
+Every solve that was not the failing lint had finished by **112.6s**:
+
+```text
+solve 11 : 105242..107094
+solve 12 : 105243..108437
+solve 13 : 105244..111914
+solve 14 : 105242..112645     <- the last honest one
+solve 15 : 105242..541322     <- the lint, retried around the fleet
+```
+
+Against a 92s baseline, that is **1.2x slower, not 6.8x**. Everything the
+fleet did with work that could succeed finished within a quarter of the
+baseline's own time of it.
+
+The failing target does not become free, and the fix does not make it free.
+A verdict now goes straight to `unplaced`, so the cost is one peer attempt
+plus one build at home - roughly 220s on this run's numbers - where the
+baseline pays one attempt. **The fleet pays a deterministic failure twice.**
+
+Whether that second attempt is necessary is a real question and not settled
+here. The home rebuild exists because the peer ran a REWRITTEN graph: local
+contexts became images, base images were repointed at our mirror, and this
+project has produced failures from exactly that (`no active sessions`,
+`security.insecure is not allowed`). Reporting the peer's error would then
+mean reporting a failure the client's own daemon would not produce - red
+where the truth is green, which is the one direction principle 5 forbids
+absolutely.
+
+A precise version exists and is worth building: if the dispatched graph was
+byte-identical to the client's and the peer's platform matches, the peer ran
+the same thing on the same architecture and its verdict is the client's.
+That check is cheap - `portable == def` is already known at the dispatch
+site.
+
+One correction to record, because it was shipped wrong for an hour: the
+first predicate matched **any** `exit code:`, including 137. That is
+SIGKILL, and on a build runner it is nearly always the OOM killer. Treating
+it as a verdict would turn "this worker ran out of memory" into "your build
+fails", which is the confusion the predicate exists to prevent, pointed at
+the one case where another machine genuinely could do better. 128+N is a
+signal and stays retryable.
