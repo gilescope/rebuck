@@ -1501,6 +1501,27 @@ fn report_gateway(wire: &std::sync::Mutex<Wire>, req: &gw::SolveRequest) -> bool
     resend
 }
 
+/// How many reset streams hyper tolerates before it gives up on a connection.
+///
+/// `None` = no limit, and that is an EXPERIMENT rather than a setting: it
+/// removes the RUSTSEC-2024-0003 / hyper#2877 backstops. It exists because
+/// raising the limit from hyper's default of 20 to 10_000 did not stop
+/// `h2 protocol error: error reading a body from connection`, and the
+/// proxy's own connection log stayed silent - which settles nothing, since
+/// hyper answers a tripped limit with a GOAWAY and a graceful close, so
+/// `serve_connection` returns Ok and never reports it.
+///
+/// An unparseable value keeps the default. A typo in a CI input must not
+/// quietly remove a DoS backstop.
+fn reset_limit(raw: Option<&str>) -> Option<usize> {
+    const DEFAULT: usize = 10_000;
+    match raw {
+        Some("none") => None,
+        Some(v) => Some(v.parse().unwrap_or(DEFAULT)),
+        None => Some(DEFAULT),
+    }
+}
+
 /// Serve the Control service on `addr`, forwarding to `upstream`.
 pub async fn serve(
     addr: std::net::SocketAddr,
@@ -1672,6 +1693,8 @@ pub async fn serve(
     // and written off as a flake, which it was not - it is load-dependent,
     // and consolidation is what supplied the load.
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let resets = reset_limit(std::env::var("REBUCK2_H2_RESETS").ok().as_deref());
+    println!("[proxy] h2 reset limit: {resets:?}");
     loop {
         let (stream, _peer) = listener.accept().await?;
         let router = router.clone();
@@ -1709,8 +1732,8 @@ pub async fn serve(
                 // hyper#2877 DoS backstops, and a gateway on a CI runner
                 // still wants one. 10k is far above any burst a build can
                 // produce and far below a resource problem.
-                .max_pending_accept_reset_streams(10_000)
-                .max_local_error_reset_streams(10_000)
+                .max_pending_accept_reset_streams(resets)
+                .max_local_error_reset_streams(resets)
                 // Keepalive, because a nested earthly can sit idle while its
                 // own build runs and a dropped control stream is a dead
                 // build.
@@ -2542,6 +2565,28 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
 
 #[cfg(test)]
 mod tests {
+    /// The h2 reset limit is a knob, so the question can be settled by an A/B.
+    #[test]
+    fn the_reset_limit_can_be_lifted_for_an_experiment() {
+        // `h2 protocol error: error reading a body from connection` survived
+        // raising this from 20 to 10_000, and the proxy's own connection log
+        // stayed silent - which proves nothing either way, because hyper
+        // answers a tripped reset limit with a GOAWAY and a GRACEFUL close,
+        // so `serve_connection` returns Ok and the error branch never runs.
+        //
+        // The only way to know whether it is us is to remove the limit and
+        // see. A knob rather than an edit, so the run is reproducible and
+        // the default stays safe.
+        assert_eq!(super::reset_limit(None), Some(10_000));
+        assert_eq!(super::reset_limit(Some("50")), Some(50));
+        assert_eq!(super::reset_limit(Some("none")), None, "the experiment");
+        // Anything unparseable keeps the DEFAULT rather than silently
+        // becoming unlimited: a typo in a CI input must not quietly remove a
+        // DoS backstop.
+        assert_eq!(super::reset_limit(Some("lots")), Some(10_000));
+        assert_eq!(super::reset_limit(Some("")), Some(10_000));
+    }
+
     /// A resend is recognised on arrival, which is the only place it can be.
     ///
     /// 28 of 91 solves in a six-runner run were byte-identical graphs sent
