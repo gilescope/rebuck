@@ -1617,6 +1617,14 @@ impl Wire {
         // environment and never reached is reported as such, because three
         // of them have now been measured as "does not help" while never
         // running at all.
+        // A preference that has outgrown its brake, named rather than left
+        // to be noticed. It took a 1050s-to-1475s regression and a hand
+        // comparison of two counters to spot it the first time.
+        if let Some(warning) =
+            crate::mech::outweighs(&crate::mech::report(), "affinity_imports", "balance")
+        {
+            println!("[wire] WARNING      : {warning}");
+        }
         println!(
             "[wire] mechanisms   : {}",
             crate::mech::summary(&[

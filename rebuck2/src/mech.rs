@@ -45,6 +45,36 @@ pub fn report() -> Vec<(&'static str, u64)> {
         .unwrap_or_default()
 }
 
+/// Is a preference firing far more often than its brake reorders anything?
+///
+/// A preference that feeds itself needs a counterweight, and the
+/// counterweight has to grow with the number of preferences - principle 27.
+/// Nothing warns you when it stops: each term is defensible, the sort still
+/// compiles, and the symptom is an idle machine in a fleet reporting high
+/// occupancy.
+///
+/// The ratio does warn you. `affinity_imports` fired 1,724 times against
+/// `balance`'s 361 reorders in the run where the leg went 1050s to 1475s -
+/// a preference applying five times per brake application is not being
+/// traded against anything, it is winning outright with extra steps.
+///
+/// Four is the threshold, and it is coarse on purpose - principle 13. It
+/// separates "sometimes decisive" from "in charge", and nothing finer could
+/// be justified from one measurement.
+pub fn outweighs(counts: &[(&str, u64)], preference: &str, brake: &str) -> Option<String> {
+    let get = |n: &str| counts.iter().find(|(k, _)| *k == n).map(|(_, v)| *v);
+    let (p, b) = (get(preference)?, get(brake)?);
+    if b == 0 || p < b.saturating_mul(4) {
+        return None;
+    }
+    Some(format!(
+        "{preference} applied {p}x against {brake}'s {b} - ratio {:.1}, so the \
+         preference is outweighing its brake rather than being traded against \
+         it (principle 27)",
+        p as f64 / b as f64
+    ))
+}
+
 /// A line naming every mechanism that is ON, and how often it mattered.
 ///
 /// `enabled` is what the environment asked for. A name that is enabled and
@@ -82,6 +112,25 @@ pub fn summary(enabled: &[(&'static str, bool)]) -> String {
 
 #[cfg(test)]
 mod summary_shape {
+    /// The ratio that would have caught the over-weighting on the day.
+    #[test]
+    fn a_preference_outweighing_its_brake_says_so() {
+        let real = [("affinity_imports", 1724u64), ("balance", 361u64)];
+        let m = super::outweighs(&real, "affinity_imports", "balance").expect("flagged");
+        assert!(m.contains("ratio 4.8"), "{m}");
+
+        // Traded, not dominant: no complaint.
+        assert!(super::outweighs(&[("p", 300), ("b", 200)], "p", "b").is_none());
+        // Exactly at the threshold is not over it - 4x is the line.
+        assert!(super::outweighs(&[("p", 800), ("b", 200)], "p", "b").is_some());
+        assert!(super::outweighs(&[("p", 799), ("b", 200)], "p", "b").is_none());
+        // A brake that never fired cannot be outweighed, only absent - and
+        // saying "ratio infinity" would be noise, not a finding.
+        assert!(super::outweighs(&[("p", 900), ("b", 0)], "p", "b").is_none());
+        // Either side missing entirely: nothing to compare.
+        assert!(super::outweighs(&[("p", 900)], "p", "b").is_none());
+    }
+
     /// Zero is not always a bug, and the report has to say which it is.
     ///
     /// `read_retry` and `verdict_stops_retry` are GUARDS - the good day is
