@@ -2277,3 +2277,41 @@ unconditional base-image path is the one that fires.
 Wall clock is not the discriminator here: 483s against a 219s baseline with
 prefetch, 508s against 285s without. The baselines differ by 30% between
 runs, which is larger than any effect being looked for.
+
+## How much of the Earthfile has actually been through this
+
+The standing goal is larger and larger parts of it, so here is the ledger.
+
+| target                   | shape                                  | status                                   |
+| ------------------------ | -------------------------------------- | ---------------------------------------- |
+| `+test-no-qemu-group1`   | one group, nested earthly, WITH DOCKER | parity, locally                          |
+| `+test-no-qemu-group2`   | the same, one group                    | parity, in CI, six machines              |
+| `+test-no-qemu-group10`  | the same, one group                    | where graft and cut-prefix were measured |
+| `+test-no-qemu` (all 14) | 14 groups on one 192s base chain       | completes, parity, 508s vs 285s          |
+| `+all-binaries`          | 5 cross-compiles off one `+code` stem  | first run in flight                      |
+
+Everything above the last line is the same shape wearing different numbers:
+a long serial base chain, then nested earthly builds that each want a 600
+MiB image. That shape caps at 1.4x (principle 19), and four entries of it is
+four measurements of Amdahl.
+
+`+all-binaries` is the first structurally different one in the repo:
+
+- five leaves, genuinely independent, each a Go compile of minutes
+- one shared stem (`+code`), which cut-prefix already handles - and it is
+  cut once, behind the same `OnceCell` the contexts use, so the four later
+  solves await the first rather than each rebuilding it
+- no nested earthly, so no `BUILDKIT_HOST` forwarding and no second daemon
+- the result of each leaf is `alpine` plus one binary, tens of MiB, against
+  the 617 MiB the test groups move
+- different `GOOS`/`GOARCH` share almost nothing in the go-build cache, so
+  the one-machine baseline pays for five near-cold compiles in a row rather
+  than one and four cheap ones
+
+Still untried, in rough order of how much they would add:
+
+| target      | why it is interesting                      | why not yet                         |
+| ----------- | ------------------------------------------ | ----------------------------------- |
+| `+all`      | `+all-binaries` plus two multi-arch images | wants `+all-binaries` to pass first |
+| `+lint-all` | three independent, cheap, no docker        | small, but a good smoke target      |
+| `+test`     | `+test-no-qemu` plus the qemu legs         | qemu on a runner is its own fight   |
