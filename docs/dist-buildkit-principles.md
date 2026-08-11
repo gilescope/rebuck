@@ -665,3 +665,53 @@ The corollary is that the mechanism has to be cheap to leave off. A missing
 seed is a cold mount, which is exactly today's behaviour, so every failure
 along the way -- no shell in the harvest base, an empty cache, a registry
 that will not take the layer -- degrades to "slower", never to "wrong".
+
+## 21. Count the WORK before blaming the scheduler
+
+A distributed builder has two ways to be slower than one machine, and they
+look identical from the outside.
+
+The first is bad placement: the work is divisible, and it was not divided.
+Every number in this project's reports was built to detect that -- peak in
+flight, occupancy, the Amdahl ceiling, op duplication -- and by all of them
+the scheduler is fine.
+
+The second is **amplification**: the fleet did more work. Not the same work
+badly arranged, more work. Measured on `+test-no-qemu-group2`:
+
+|                                  |            |
+| -------------------------------- | ---------- |
+| baseline wall                    | 233s       |
+| fleet wall                       | 598s       |
+| fleet occupancy                  | 3.53       |
+| **machine-seconds of lead work** | **~2100s** |
+| **against a baseline of**        | **233s**   |
+
+**Nine times the work.** Seven machines cannot divide 9x into a win however
+perfectly they are scheduled, and every scheduling number above is
+simultaneously true and beside the point.
+
+The arithmetic is one line -- total lead time over the baseline's whole wall
+clock -- and it was not in the report for months of measurements. Without
+it, "the fleet was slower by 365s" reads as an indictment of dispatch, and
+three separate mechanisms were built to make dispatch better while the thing
+to fix was elsewhere.
+
+Where amplification comes from, in the order they were found:
+
+- **Duplication.** The same op materialised on several machines. Visible as
+  `op duplication`, and the one everybody looks for. Affinity took it from
+  2.9x to 1.7x, which accounts for less of the 9x than it feels like it
+  should.
+- **Cold state.** A lifted cache mount starts empty on whoever gets the
+  work, so a `go build` the baseline did once is done again per machine.
+  Principle 20 is about repairing this, and it is bigger than duplication.
+- **Retried failure.** A build that fails deterministically was offered to
+  every peer in turn -- 6.8x on `+lint-all` until a verdict stopped meaning
+  "try somebody else".
+- **Transfer and unpack.** Every machine decompresses its own copy of
+  whatever it pulls. Pre-positioning shortens the first half only.
+
+So: report the amplification beside the wall clock, always. A fleet at 1.0x
+amplification and poor occupancy is a scheduling problem. A fleet at 9x is
+not, and no amount of work on the scheduler will make it one.
