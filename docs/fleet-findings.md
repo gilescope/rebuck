@@ -2030,12 +2030,12 @@ fleet leg cold while six workers are warm.
 
 So the two mechanisms are not additive and may be opposed:
 
-| configuration          | who builds the base chain | expected |
-| ---------------------- | ------------------------- | -------- |
-| cold, dispatch         | a worker, from nothing    | 192s + transfer |
-| cold, MIN_SIBLINGS     | the coordinator           | 192s, no transfer |
-| warm, dispatch         | a warm worker: cache hit  | ~0 |
-| warm, MIN_SIBLINGS     | the cold coordinator      | 192s |
+| configuration      | who builds the base chain | expected          |
+| ------------------ | ------------------------- | ----------------- |
+| cold, dispatch     | a worker, from nothing    | 192s + transfer   |
+| cold, MIN_SIBLINGS | the coordinator           | 192s, no transfer |
+| warm, dispatch     | a warm worker: cache hit  | ~0                |
+| warm, MIN_SIBLINGS | the cold coordinator      | 192s              |
 
 If that table is right, `warm=1` wants `MIN_SIBLINGS=0`, and the two should
 never be measured together without saying which is expected to dominate.
