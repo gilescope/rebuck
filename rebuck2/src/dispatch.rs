@@ -624,6 +624,41 @@ pub fn image_identifier(name: &str) -> String {
     format!("docker-image://{full}")
 }
 
+/// Earthly's cache-mount input: scratch with `/cache` created.
+///
+/// One function because two copies of it would be two chances to differ,
+/// and a difference here is invisible - it does not fail, it silently reads
+/// a different cache directory. From `earthfile2llb/runmount.go`:
+///
+/// ```go
+///     state = c.cacheContext                    // pllb.Scratch()
+///     state = state.File(pllb.Mkdir("/cache", mountMode))
+///     mountOpts = append(mountOpts, llb.SourcePath("/cache"))
+/// ```
+///
+/// The bytes matter, not the intent: `getRefCacheDir` keys on the input's
+/// ref, so identical LLB is the whole requirement.
+pub fn earthly_cache_context() -> Vec<u8> {
+    pb::Op {
+        op: Some(pb::op::Op::File(pb::FileOp {
+            actions: vec![pb::FileAction {
+                // -1: builds on nothing, which is Scratch.
+                input: -1,
+                secondary_input: -1,
+                output: 0,
+                action: Some(pb::file_action::Action::Mkdir(pb::FileActionMkDir {
+                    path: "/cache".into(),
+                    mode: 0o644,
+                    make_parents: false,
+                    ..Default::default()
+                })),
+            }],
+        })),
+        ..Default::default()
+    }
+    .encode_to_vec()
+}
+
 /// A one-command graph with a writable cache mount, for checking seeding.
 ///
 /// Both halves of a round trip are this shape. Write a marker into cache A,
@@ -638,6 +673,15 @@ pub fn image_identifier(name: &str) -> String {
 /// this one only has to succeed or fail, and an output mount nothing writes
 /// to would export an empty layer on every check.
 pub fn cache_probe_graph(base: &str, cache_id: &str, dest: &str, cmd: &str) -> pb::Definition {
+    // The probe writes the cache the way EARTHLY writes it, which is the
+    // difference between a rig that tests the mechanism and one that
+    // confirms its own assumptions.
+    //
+    // It did the latter for eight CI attempts: the probe mounted the cache
+    // with no input, the harvest read it with no input, the round trip
+    // passed, and neither half resembled the graphs earthly actually sends.
+    // The first thing the corrected harvest did was fail against this probe,
+    // which is the rig finally disagreeing with itself.
     let src = pb::Op {
         op: Some(pb::op::Op::Source(pb::SourceOp {
             identifier: image_identifier(base),
@@ -648,11 +692,22 @@ pub fn cache_probe_graph(base: &str, cache_id: &str, dest: &str, cmd: &str) -> p
     let src_bytes = src.encode_to_vec();
     let src_digest = format!("sha256:{}", crate::store::sha256_hex(&src_bytes));
 
+    // Earthly's cache-mount input, reconstructed. See `harvest_graph` for
+    // why the input decides WHICH directory the mount is.
+    let mkdir_bytes = earthly_cache_context();
+    let mkdir_digest = format!("sha256:{}", crate::store::sha256_hex(&mkdir_bytes));
+
     let exec = pb::Op {
-        inputs: vec![pb::Input {
-            digest: src_digest,
-            index: 0,
-        }],
+        inputs: vec![
+            pb::Input {
+                digest: src_digest,
+                index: 0,
+            },
+            pb::Input {
+                digest: mkdir_digest,
+                index: 0,
+            },
+        ],
         op: Some(pb::op::Op::Exec(pb::ExecOp {
             meta: Some(pb::Meta {
                 args: vec!["/bin/sh".into(), "-c".into(), cmd.to_owned()],
@@ -685,7 +740,8 @@ pub fn cache_probe_graph(base: &str, cache_id: &str, dest: &str, cmd: &str) -> p
                     ..Default::default()
                 },
                 pb::Mount {
-                    input: -1,
+                    input: 1,
+                    selector: "/cache".into(),
                     dest: dest.to_owned(),
                     // Never the cache: buildkit refuses to export one, which
                     // is why `harvest_graph` copies out of it instead.
@@ -708,6 +764,7 @@ pub fn cache_probe_graph(base: &str, cache_id: &str, dest: &str, cmd: &str) -> p
     pb::Definition {
         def: vec![
             src_bytes,
+            mkdir_bytes,
             exec_bytes,
             pb::Op {
                 inputs: vec![pb::Input {
@@ -753,15 +810,47 @@ pub fn harvest_graph(base: &str, cache_id: &str, dest: &str) -> pb::Definition {
     let src_bytes = src.encode_to_vec();
     let src_digest = format!("sha256:{}", crate::store::sha256_hex(&src_bytes));
 
+    // THE MOUNT'S INPUT, and it is the whole reason four harvests read
+    // nothing. From earthfile2llb/runmount.go:
+    //
+    //     state = c.cacheContext                    // pllb.Scratch()
+    //     state = state.File(pllb.Mkdir("/cache", mountMode))
+    //     mountOpts = append(mountOpts, llb.SourcePath("/cache"))
+    //     return []llb.RunOption{pllb.AddMount(mountTarget, state, ...)}
+    //
+    // and from buildkit's getRefCacheDir:
+    //
+    //     key := id
+    //     if ref != nil { key += ":" + ref.ID() }
+    //
+    // So earthly's `go-mod` sits at `go-mod:<ref of that scratch+mkdir>`,
+    // and a harvest mounting `go-mod` with no input reads plain `go-mod` -
+    // a directory it creates itself and nothing has ever written to. The
+    // daemon held 1.71 GB under these exact ids while the harvest reported
+    // 0.0 MiB.
+    //
+    // Reconstructed rather than approximated: identical LLB gives an
+    // identical digest gives the same ref gives the same key. 0o644 is
+    // earthly's default mode for a cache mount, from the same function.
+    let mkdir_bytes = earthly_cache_context();
+    let mkdir_digest = format!("sha256:{}", crate::store::sha256_hex(&mkdir_bytes));
+
     // `/.seed` and not `/out`: the harvest runs against whatever base the
     // operator named, and a path that already exists would be shadowed by
     // the mount and copied into itself.
     const OUT: &str = "/.seed";
     let exec = pb::Op {
-        inputs: vec![pb::Input {
-            digest: src_digest.clone(),
-            index: 0,
-        }],
+        inputs: vec![
+            pb::Input {
+                digest: src_digest.clone(),
+                index: 0,
+            },
+            // Input 1: the mkdir, which the cache mount points at.
+            pb::Input {
+                digest: mkdir_digest,
+                index: 0,
+            },
+        ],
         op: Some(pb::op::Op::Exec(pb::ExecOp {
             meta: Some(pb::Meta {
                 // `.` after the slash so dotfiles come too, and `|| true` so
@@ -823,7 +912,10 @@ pub fn harvest_graph(base: &str, cache_id: &str, dest: &str) -> pb::Definition {
                     ..Default::default()
                 },
                 pb::Mount {
-                    input: -1,
+                    // Input 1: the mkdir built above, which is what makes
+                    // this key match earthly's. See that comment for why.
+                    input: 1,
+                    selector: "/cache".into(),
                     dest: dest.to_owned(),
                     output: -1,
                     readonly: true,
@@ -852,6 +944,7 @@ pub fn harvest_graph(base: &str, cache_id: &str, dest: &str) -> pb::Definition {
     pb::Definition {
         def: vec![
             src_bytes,
+            mkdir_bytes,
             exec_bytes,
             // The terminal: no union, one input, and LAST. loadLLB deletes
             // exactly the last entry and hands anything else union-less to
@@ -955,11 +1048,20 @@ pub fn seed_cache_mounts(def: &pb::Definition, seeds: &BTreeMap<String, String>)
         // Collected first: `op.inputs` and `op.op` cannot both be borrowed
         // mutably, and the index of a new input depends on how many were
         // appended before it.
+        // NO `input < 0` FILTER. It was there, and it meant this transform
+        // could never touch a real graph: every earthly cache mount already
+        // carries an input - `AddMount(target, cacheContext.File(Mkdir(
+        // "/cache")), ...)` - so the filter excluded all of them. A run
+        // reported `seeds=4/4` resolved and rewrote nothing at all.
+        //
+        // Replacing the input is what seeding MEANS here. The input selects
+        // which cache directory the mount is (`getRefCacheDir` keys on id
+        // plus the input's ref), so pointing it at the seed both chooses a
+        // directory and supplies its initial contents.
         let wants: Vec<(usize, String)> = e
             .mounts
             .iter()
             .enumerate()
-            .filter(|(_, m)| m.input < 0)
             .filter_map(|(i, m)| {
                 let id = &m.cache_opt.as_ref()?.id;
                 seeds
@@ -991,6 +1093,14 @@ pub fn seed_cache_mounts(def: &pb::Definition, seeds: &BTreeMap<String, String>)
                 continue;
             };
             e.mounts[mount].input = at as i64;
+            // AND THE SELECTOR GOES WITH IT. Earthly's mount carries
+            // `SourcePath("/cache")`, a path inside the OLD input. The
+            // seed image's root IS the cache contents, so keeping `/cache`
+            // would select a directory the seed does not have and the mount
+            // would come up empty - which is the same symptom as not
+            // seeding at all, and this project has spent enough runs on
+            // that distinction.
+            e.mounts[mount].selector = String::new();
             used.set(true);
         }
         true
@@ -2348,6 +2458,76 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// The harvest has to mount the cache the way EARTHLY mounts it.
+    #[test]
+    fn the_harvest_mounts_the_cache_the_way_earthly_does() {
+        use bollard_buildkit_proto::pb;
+        use prost::Message;
+
+        let def = super::harvest_graph("busybox:1", "go-mod", "/go/pkg/mod");
+        let ops: Vec<pb::Op> = def
+            .def
+            .iter()
+            .map(|b| pb::Op::decode(b.as_slice()).unwrap())
+            .collect();
+
+        // A FileOp appeared: scratch with /cache created, which is what
+        // earthfile2llb hands to `AddMount` -
+        //   state = c.cacheContext            // pllb.Scratch()
+        //   state = state.File(pllb.Mkdir("/cache", mode))
+        //   mountOpts = append(mountOpts, llb.SourcePath("/cache"))
+        let mkdir = ops.iter().find_map(|o| match &o.op {
+            Some(pb::op::Op::File(f)) => Some(f),
+            _ => None,
+        });
+        let mkdir = mkdir.expect("the cache mount's input is a mkdir over scratch");
+        assert_eq!(mkdir.actions.len(), 1);
+        let Some(pb::file_action::Action::Mkdir(m)) = &mkdir.actions[0].action else {
+            panic!("the one action is a mkdir")
+        };
+        assert_eq!(m.path, "/cache");
+        // SCRATCH, not a base: input -1 on the action, so the FileOp builds
+        // on nothing. Earthly's `cacheContext` is `pllb.Scratch()`, and the
+        // ref this produces is what the cache key is built from - a
+        // different base gives a different ref gives a different directory.
+        assert_eq!(mkdir.actions[0].input, -1);
+
+        let exec = ops
+            .iter()
+            .find_map(|o| match &o.op {
+                Some(pb::op::Op::Exec(e)) => Some((o, e)),
+                _ => None,
+            })
+            .expect("the copy");
+        let (exec_op, e) = exec;
+        let cache = e
+            .mounts
+            .iter()
+            .find(|m| m.mount_type == pb::MountType::Cache as i32)
+            .expect("the cache is mounted");
+
+        // AND IT HAS THAT INPUT. Without one the key is plain `go-mod`,
+        // which is a directory nothing has ever written to - four harvests
+        // read 0.0 MiB out of exactly that.
+        assert!(cache.input >= 0, "the cache mount must carry an input");
+        let src = &exec_op.inputs[cache.input as usize];
+        let mkdir_digest = format!(
+            "sha256:{}",
+            crate::store::sha256_hex(
+                &def.def
+                    .iter()
+                    .find(|b| matches!(
+                        pb::Op::decode(b.as_slice()).map(|o| o.op),
+                        Ok(Some(pb::op::Op::File(_)))
+                    ))
+                    .unwrap()
+                    .clone()
+            )
+        );
+        assert_eq!(src.digest, mkdir_digest, "and the input is the mkdir");
+        assert_eq!(cache.selector, "/cache", "with earthly's SourcePath");
+    }
+
     /// A graph that pins a platform says which one, before anyone places it.
     #[test]
     fn a_pinned_graph_names_the_architecture_to_mirror_for() {
@@ -2378,12 +2558,19 @@ mod tests {
             .iter()
             .map(|b| pb::Op::decode(b.as_slice()).unwrap())
             .collect();
-        assert_eq!(ops.len(), 3, "source, exec, terminal");
-        assert!(ops[2].op.is_none(), "and the terminal is last");
+        // Source, mkdir, exec, terminal. The mkdir is earthly's cache-mount
+        // input, which the probe now reproduces so that it writes the same
+        // directory earthly writes.
+        assert_eq!(ops.len(), 4, "source, mkdir, exec, terminal");
+        assert!(ops.last().unwrap().op.is_none(), "and the terminal is last");
 
-        let Some(pb::op::Op::Exec(e)) = &ops[1].op else {
-            panic!("the middle op runs the command")
-        };
+        let e = ops
+            .iter()
+            .find_map(|o| match &o.op {
+                Some(pb::op::Op::Exec(e)) => Some(e),
+                _ => None,
+            })
+            .expect("the op that runs the command");
         let cache = e
             .mounts
             .iter()
@@ -2393,9 +2580,13 @@ mod tests {
         assert_eq!(cache.dest, "/c");
         // WRITABLE, unlike the harvest's. A probe that writes needs to.
         assert!(!cache.readonly);
-        // And it must be seedable: no input, so `seed_cache_mounts` has
-        // somewhere to attach one.
-        assert_eq!(cache.input, -1);
+        // AND IT HAS EARTHLY'S INPUT. This assertion said the opposite -
+        // "no input, so `seed_cache_mounts` has somewhere to attach one" -
+        // which was true of the transform as written and false of every
+        // graph earthly sends. Seeding replaces an input; it does not
+        // require an absent one.
+        assert_eq!(cache.input, 1, "the mkdir, as earthly mounts it");
+        assert_eq!(cache.selector, "/cache");
         assert!(e
             .meta
             .as_ref()
@@ -2625,7 +2816,9 @@ mod tests {
 
         // Source, exec, terminal - and the terminal is LAST, which is the
         // only place loadLLB will accept it.
-        assert_eq!(ops.len(), 3);
+        // Source, MKDIR, exec, terminal - four now. The mkdir is earthly's
+        // cache-mount input reconstructed; see `harvest_graph`.
+        assert_eq!(ops.len(), 4);
         let Some(pb::op::Op::Source(src)) = &ops[0].op else {
             panic!("the first op is the base image")
         };
@@ -2639,18 +2832,32 @@ mod tests {
             panic!()
         };
         assert_eq!(s2.identifier, "docker-image://ghcr.io/x/y:v2");
-        assert!(ops[2].op.is_none(), "the terminal carries no union");
-
-        let Some(pb::op::Op::Exec(e)) = &ops[1].op else {
-            panic!("the middle op is the copy")
-        };
+        // By POSITION no longer: the mkdir sits between the source and the
+        // exec, so index 1 is not the copy any more. Found by kind.
+        assert!(
+            ops.last().unwrap().op.is_none(),
+            "the terminal carries no union and is last"
+        );
+        let e = ops
+            .iter()
+            .find_map(|o| match &o.op {
+                Some(pb::op::Op::Exec(e)) => Some(e),
+                _ => None,
+            })
+            .expect("the copy");
         let cache = e
             .mounts
             .iter()
             .find(|m| m.mount_type == pb::MountType::Cache as i32)
             .expect("the cache is mounted");
         assert_eq!(cache.cache_opt.as_ref().unwrap().id, "go-mod");
-        assert_eq!(cache.input, -1, "we are reading it, not seeding it");
+        // IT HAS AN INPUT, and this assertion used to say the opposite -
+        // "we are reading it, not seeding it" - which sounds right and cost
+        // eight CI attempts. The input does not seed the mount here, it
+        // selects WHICH mount: `getRefCacheDir` keys on the id plus the
+        // input's ref, so reading earthly's cache means reproducing
+        // earthly's input.
+        assert_eq!(cache.input, 1, "the mkdir, so the key matches earthly's");
         assert_eq!(cache.output, -1, "a cache mount is not exportable");
 
         let out = e
@@ -2834,6 +3041,79 @@ mod tests {
         // appending an input must not renumber the existing ones.
         assert_eq!(e.mounts[0].input, 0);
         assert_eq!(inputs[0].digest, base_d);
+
+        // A MOUNT THAT ALREADY HAS AN INPUT still gets seeded, by replacing
+        // it. This is not an edge case: EVERY earthly cache mount has one -
+        // `AddMount(target, cacheContext.File(Mkdir("/cache")), ...)` - so
+        // the original `input < 0` filter meant the transform could never
+        // apply to a single real graph. It reported `seeds=4/4` resolved and
+        // rewrote nothing.
+        let existing = pb::Op {
+            inputs: vec![
+                pb::Input {
+                    digest: "sha256:base".into(),
+                    index: 0,
+                },
+                pb::Input {
+                    digest: "sha256:someref".into(),
+                    index: 0,
+                },
+            ],
+            op: Some(pb::op::Op::Exec(pb::ExecOp {
+                mounts: vec![
+                    pb::Mount {
+                        input: 0,
+                        dest: "/".into(),
+                        output: 0,
+                        ..Default::default()
+                    },
+                    pb::Mount {
+                        input: 1,
+                        selector: "/cache".into(),
+                        dest: "/go/pkg/mod".into(),
+                        output: -1,
+                        mount_type: pb::MountType::Cache as i32,
+                        cache_opt: Some(pb::CacheOpt {
+                            id: "go-mod".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let with_input = pb::Definition {
+            def: vec![existing.encode_to_vec()],
+            ..Default::default()
+        };
+        let mut gm = std::collections::BTreeMap::new();
+        gm.insert("go-mod".to_owned(), "reg/seed@sha256:bb".to_owned());
+        let out = super::seed_cache_mounts(&with_input, &gm);
+        assert_ne!(
+            out.def, with_input.def,
+            "a mount with an input is still seeded"
+        );
+        let e = out
+            .def
+            .iter()
+            .filter_map(|b| pb::Op::decode(b.as_slice()).ok())
+            .find_map(|o| match o.op {
+                Some(pb::op::Op::Exec(e)) => Some((o.inputs, e)),
+                _ => None,
+            })
+            .expect("the exec");
+        let (inputs, e) = e;
+        let m = &e.mounts[1];
+        assert!(
+            inputs[m.input as usize].digest.contains("seed") || m.input == 2,
+            "the cache mount points at the seed now, not at the old ref"
+        );
+        // AND THE SELECTOR GOES. It named a path inside the OLD input; the
+        // seed image's root is the cache contents, so keeping `/cache` would
+        // select a directory the seed does not have.
+        assert_eq!(m.selector, "", "the old input's selector does not apply");
 
         // A BARE DIGEST is refused rather than wrapped. `sha256:abc` is
         // what `build_subtree` answers with - content, no location - and
