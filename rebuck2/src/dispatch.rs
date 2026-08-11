@@ -87,6 +87,30 @@ pub enum Platform {
     Conflict(BTreeSet<String>),
 }
 
+impl Platform {
+    /// The one architecture this graph demands, if it demands one.
+    ///
+    /// Known from the GRAPH, before anyone decides where it goes, which is
+    /// what makes it usable for mirroring: `mirror_image` copies a base for
+    /// a named platform and the dispatch site was passing `None`, so every
+    /// base was mirrored for the coordinator's own architecture.
+    ///
+    /// That has never mattered because every worker was amd64 and a pinned
+    /// arm64 solve had nowhere to go - `not routed` on `+all-buildkitd` says
+    /// so in as many words. With one arm64 worker in the fleet it starts
+    /// mattering immediately, and it would surface as a worker pulling a
+    /// base for the wrong architecture.
+    ///
+    /// `Conflict` names none: guessing one would mirror a base for half of a
+    /// subtree that nowhere can build anyway.
+    pub fn pinned(&self) -> Option<&str> {
+        match self {
+            Platform::Pinned(p) => Some(p),
+            Platform::Any | Platform::Conflict(_) => None,
+        }
+    }
+}
+
 /// Which hazards the caller can neutralise, and therefore tolerate.
 ///
 /// A struct rather than positional bools. Three of them read
@@ -2288,6 +2312,24 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// A graph that pins a platform says which one, before anyone places it.
+    #[test]
+    fn a_pinned_graph_names_the_architecture_to_mirror_for() {
+        use super::Platform;
+        assert_eq!(Platform::Any.pinned(), None);
+        assert_eq!(
+            Platform::Pinned("linux/arm64".into()).pinned(),
+            Some("linux/arm64")
+        );
+        // A CONFLICT names no single architecture, and guessing one would
+        // mirror a base for the wrong half of a subtree that nowhere can run
+        // anyway. `inspect` already refuses it; this must not quietly pick.
+        assert_eq!(
+            Platform::Conflict(["linux/amd64".into(), "linux/arm64".into()].into()).pinned(),
+            None
+        );
+    }
+
     /// One graph shape for both halves of a seeding round trip.
     #[test]
     fn a_cache_probe_writes_or_reads_and_says_which() {

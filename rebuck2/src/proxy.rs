@@ -2803,7 +2803,22 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                     // a solve that stays home buys nothing at all.
                     let session = self.session_for(&meta);
                     let t = std::time::Instant::now();
-                    let portable = self.make_portable(&def, &session, mirror, None).await;
+                    // THE GRAPH'S OWN ARCHITECTURE, not ours. `mirror_image`
+                    // copies a base for a named platform and this passed
+                    // `None`, so every base was mirrored for the
+                    // coordinator's arch. Harmless while every worker was
+                    // amd64 and a pinned arm64 solve had nowhere to go -
+                    // `+all-buildkitd` reported exactly that in `not
+                    // routed` - and wrong the moment one arm64 worker
+                    // joins, when it would show up as a peer pulling a base
+                    // for the wrong architecture.
+                    let want = crate::dispatch::inspect(&def)
+                        .platform
+                        .pinned()
+                        .map(str::to_owned);
+                    let portable = self
+                        .make_portable(&def, &session, mirror, want.as_deref())
+                        .await;
                     t_portable = t.elapsed().as_millis() as u64;
                     // Portable means EVERY source is something a sessionless
                     // peer can fetch: nothing local, and every image already
