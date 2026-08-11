@@ -134,6 +134,8 @@ pub struct Proxy {
     /// limits before the session relay was instrumented and said plainly
     /// that the failing connection was the one we make.
     session_channel: Chan,
+    /// Kept so each Session can dial a connection of its own.
+    upstream: String,
     /// One dispatch at a time until something has been BUILT.
     ///
     /// The barrier that grafting needs and did not have. On a cold fleet the
@@ -223,12 +225,14 @@ impl Proxy {
                 .keep_alive_timeout(std::time::Duration::from_secs(60))
                 .keep_alive_while_idle(true))
         };
+        let upstream_kept = upstream.clone();
         let channel = endpoint(upstream.clone())?.connect().await?;
         let session_channel = endpoint(upstream)?.connect().await?;
         Ok(Proxy {
             client: control::control_client::ControlClient::new(channel.clone()),
             channel,
             session_channel,
+            upstream: upstream_kept,
             warmup: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             driver,
             wire: Default::default(),
@@ -577,12 +581,43 @@ impl control::control_server::Control for Proxy {
             };
             futures::future::ready(m.ok())
         });
-        // Its OWN connection, not the shared one. See `session_channel`.
-        let s = control::control_client::ControlClient::new(self.session_channel.clone())
-            .session(Request::from_parts(meta, ext, inbound))
-            .await?;
+        // ONE CONNECTION PER SESSION, not one shared by all of them.
+        //
+        // Giving Session its own channel stopped the top-level h2 collapse,
+        // and moved the failure one layer down: under daemon consolidation
+        // every nested earthly opens its own Session through this proxy, so
+        // a full +test-no-qemu has dozens of them, and they were all sharing
+        // the single session channel. A connection-level event still took
+        // the lot - it just took nested builds instead of the outer one,
+        // surfacing as `apply IF: read exit code: transport error`.
+        //
+        // Dialling per session costs a connect on localhost and buys
+        // isolation: one nested build's session can no longer end another's.
+        let mut c = match crate::proxy::session_endpoint(&self.upstream) {
+            Ok(ep) => match ep.connect().await {
+                Ok(ch) => control::control_client::ControlClient::new(ch),
+                // Fall back to the shared channel rather than failing the
+                // session: a build with a shared connection is what we had,
+                // and a build with none is a build that does not run.
+                Err(e) => {
+                    println!("[proxy] session dial failed, sharing: {e}");
+                    control::control_client::ControlClient::new(self.session_channel.clone())
+                }
+            },
+            Err(e) => {
+                println!("[proxy] session endpoint invalid, sharing: {e}");
+                control::control_client::ControlClient::new(self.session_channel.clone())
+            }
+        };
+        let s = c.session(Request::from_parts(meta, ext, inbound)).await?;
         let down = self.wire.clone();
         let out = s.into_inner().map(move |m| {
+            // `c` is captured so the connection outlives the stream. Dropping
+            // it here is the bug this file already documents once: the
+            // handler returns, the channel drops, and the still-running
+            // Session dies mid-build with the daemon reporting only
+            // "healthcheck failed ... EOF".
+            let _keepalive = &c;
             match &m {
                 Ok(msg) => down
                     .held()
@@ -1637,6 +1672,17 @@ fn min_siblings() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)
+}
+
+/// An endpoint shaped like the ones the proxy dials at startup.
+///
+/// Same keepalive: a Session can sit idle while a nested build runs, and
+/// anything that reaps idle connections takes the build with it.
+fn session_endpoint(upstream: &str) -> Result<tonic::transport::Endpoint, tonic::transport::Error> {
+    Ok(tonic::transport::Endpoint::new(upstream.to_owned())?
+        .http2_keep_alive_interval(std::time::Duration::from_secs(20))
+        .keep_alive_timeout(std::time::Duration::from_secs(60))
+        .keep_alive_while_idle(true))
 }
 
 /// Is this failure the connection's fault rather than the build's?
