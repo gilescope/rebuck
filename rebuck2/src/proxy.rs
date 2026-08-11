@@ -1753,6 +1753,7 @@ impl Proxy {
                         ),
                     }
                 }
+                crate::dispatch::note_seeds_resolved(ok.len());
                 ok
             })
             .await
@@ -2300,17 +2301,24 @@ pub async fn serve(
                 "[wire] verdict        : target={} solves={} routed={} home={} peak_solves={peak_solves} \
                  inflight={peak} \
                  occupancy={occupancy:.2} ceiling={ceiling:.2} ceiling_{machines}m={finite:.2} \
-                 dup={:.1} mounts_ms={} \
+                 dup={:.1} seeds={}/{} mounts_ms={} \
                  mount_leads={}",
                 std::env::var("REBUCK2_TARGET").unwrap_or_else(|_| "?".into()),
                 w.solves,
                 w.routed,
                 w.home,
-                if uniq > 0 {
+                    if uniq > 0 {
                     pairs as f64 / uniq as f64
                 } else {
                     0.0
                 },
+                // RESOLVED over CONFIGURED. Three seeding runs have now
+                // produced no seeding for three different mechanical
+                // reasons, and each time the question "did it even run" cost
+                // a log dig. `0/3` says it in the line the ledger is built
+                // from.
+                crate::dispatch::seeds_resolved(),
+                crate::dispatch::cache_seeds().len(),
                 lead_total_ms,
                 lead_total_n,
             );

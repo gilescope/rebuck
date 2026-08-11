@@ -417,6 +417,24 @@ pub fn cache_ids(def: &pb::Definition) -> BTreeSet<String> {
 /// Platform needs no condition: `consider` already refuses a candidate whose
 /// platform does not match the graph, so a peer that took the work matched
 /// it.
+/// How many configured seeds actually resolved.
+///
+/// A process-wide number because the report is assembled in a signal
+/// handler that holds no proxy. Three seeding runs have now produced no
+/// seeding for three different mechanical reasons - a binary path, a bare
+/// digest, and a cache id nobody had read off a real run - and each time
+/// "did it even run" cost a log dig. `seeds=0/3` in the verdict line answers
+/// it without one.
+static SEEDS_RESOLVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn note_seeds_resolved(n: usize) {
+    SEEDS_RESOLVED.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn seeds_resolved() -> usize {
+    SEEDS_RESOLVED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn trust_peer_verdicts() -> bool {
     static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *T.get_or_init(|| std::env::var("REBUCK2_TRUST_VERDICT").as_deref() == Ok("1"))
