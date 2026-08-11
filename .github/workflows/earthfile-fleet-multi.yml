@@ -479,11 +479,27 @@ jobs:
           # Stripping and re-matching, rather than enumerating the
           # combinations, because the combinations multiply and the table
           # would go stale the first time a target was added.
-          workload=${REF%-seed}
-          workload=${workload%-graft}
-          workload=${workload%-arm}
-          workload=${workload%-zstd}
-          workload=${workload%-nobase}
+          # UNTIL NOTHING MATCHES, not once each in order. Stripping in a
+          # fixed sequence only works if the branch names them in that
+          # sequence: `-ast-zstd-nobase` had `-zstd` tested before `-nobase`
+          # was removed, so it never matched, and the workload came out as
+          # `-ast-zstd` - which is not `*-ast` either, so the run would have
+          # quietly built +test-no-qemu-group2 under a branch called -ast.
+          #
+          # Found by running this loop against six names rather than by
+          # reading it.
+          workload=$REF
+          while :; do
+            before=$workload
+            for suffix in -seed -graft -arm -zstd -nobase; do
+              # QUOTED: unquoted, `$suffix` is taken as a glob pattern
+              # rather than a literal, which shellcheck SC2295 catches and
+              # which would misbehave the moment a suffix contained a `?`
+              # or a `*`.
+              workload=${workload%"$suffix"}
+            done
+            [ "$workload" = "$before" ] && break
+          done
           case "${T:-}" in
             "") case "$workload" in
                   *-binaries) target=+all-binaries ;;
@@ -513,7 +529,7 @@ jobs:
           # is not reachable for a workflow that lives off the default
           # branch, so an experiment is selected by where it is pushed.
           case "${SEED:-}" in
-            "") case "$REF" in *-seed) seed=1 ;; *) seed=0 ;; esac ;;
+            "") case "$REF" in *-seed*) seed=1 ;; *) seed=0 ;; esac ;;
             *)  seed="$SEED" ;;
           esac
           echo "seed caches: $seed"
@@ -526,7 +542,7 @@ jobs:
           # there and grafting costs a pull rather than a build. Nothing has
           # tested that, and `[wire] grafted` has read 0 in every run.
           case "${GRAFT:-}" in
-            "") case "$REF" in *-graft) graft=1 ;; *) graft=0 ;; esac ;;
+            "") case "$REF" in *-graft*) graft=1 ;; *) graft=0 ;; esac ;;
             *)  graft="$GRAFT" ;;
           esac
           echo "graft: $graft"
@@ -541,16 +557,31 @@ jobs:
           # it sounds, because dispatch is unreachable for a workflow that
           # lives off the default branch. The suffix has been the real
           # interface since `-binaries`; from here it is the only one.
-          case "$REF" in *-zstd) comp=zstd ;; *) comp="" ;; esac
+          case "$REF" in *-zstd*) comp=zstd ;; *) comp="" ;; esac
           echo "compression: ${comp:-buildkit default}"
           echo "compression=$comp" >> "$GITHUB_OUTPUT"
 
           # `-nobase`: skip the baseline leg. For comparing a MECHANISM
           # against itself, where the control is another fleet leg and the
           # baseline is dead weight.
-          case "$REF" in *-nobase) nobase=1 ;; *) nobase=0 ;; esac
+          # `*-nobase*`, not `*-nobase`. The suffixes compose in any order,
+          # so a trailing-only match reads `-ast-nobase-zstd` as not asking
+          # for it - the same order dependence the workload stripping above
+          # had, and it would present as a run that quietly did the opposite
+          # of its branch name.
+          case "$REF" in *-nobase*) nobase=1 ;; *) nobase=0 ;; esac
           echo "skip baseline: $nobase"
           echo "nobase=$nobase" >> "$GITHUB_OUTPUT"
+
+          # `-nobase` and `-seed` do not compose, and the failure is silent:
+          # the harvest reads base-bk, base-bk only exists because the
+          # baseline leg created it, and without one the harvest warns
+          # "nothing to harvest from" and the run measures an unseeded fleet
+          # while its branch name says otherwise. Said here, once, loudly.
+          if [ "$nobase" = "1" ] && [ "$seed" = "1" ]; then
+            echo "::error::-nobase and -seed cannot combine: the harvest reads base-bk, which only the baseline leg creates. This run would measure an UNSEEDED fleet under a branch called -seed."
+            exit 1
+          fi
 
           # WHICH ARCHITECTURE each worker runs on.
           #
@@ -571,7 +602,7 @@ jobs:
           # and a matrix that disagrees with the coordinator's barrier is
           # the `workers: 6` bug that once expanded to zero jobs.
           arm=${ARM:-0}
-          case "$REF" in *-arm) [ "$arm" = 0 ] && arm=2 ;; esac
+          case "$REF" in *-arm*) [ "$arm" = 0 ] && arm=2 ;; esac
           pairs=""
           i=0
           for n in $(echo "$list" | tr -cd '0-9,' | tr ',' ' '); do
