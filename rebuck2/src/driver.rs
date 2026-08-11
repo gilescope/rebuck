@@ -1730,6 +1730,14 @@ impl Driver {
                 return;
             }
             println!("[driver] prefetching {image_ref}: {n} consumers");
+        } else {
+            // The other reason, and it needs its own line: `None` here means
+            // the PROXY already knows the graph is shared - the op is in two
+            // solves, or this is a cut prefix, which is shared by
+            // definition. Without saying so the log shows a prefetch with no
+            // stated cause, and the placement-count gate it replaced is the
+            // obvious thing to blame it on.
+            println!("[driver] prefetching {image_ref}: shared before it was placed");
         }
         let this = self.clone();
         let r = image_ref.to_owned();

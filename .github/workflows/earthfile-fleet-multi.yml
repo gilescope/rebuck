@@ -1211,7 +1211,13 @@ jobs:
           # was prefetched turns a registry pull into a LOCAL hit. It has
           # been 0 in every run so far, because every blob was fetched
           # exactly once, at the moment it was needed.
-          grep -aE '^\[driver\] prefetch' proxy.log | sort | uniq -c | head -4 || true
+          # Counted by REASON, not by line. Every one of these names an
+          # image digest, so raw `uniq -c` deduplicates nothing and reports
+          # a column of 1s - which is how "prefetch announced 0 or 1 blob"
+          # took a whole run to notice.
+          grep -aE '^\[driver\] (prefetch|not prefetch)' proxy.log \
+            | sed -E 's,[^ ]*sha256:[0-9a-f]+,<img>,g; s,: [0-9]+ consumer,: N consumer,' \
+            | sort | uniq -c | sort -rn | head -6 || true
           grep -aE '^\[proxy\] (upstream solve failed|upstream Control\.Solve failed|retrying|session)' \
             proxy.log | sed 's/[0-9a-f]\{12,\}/<id>/g' | sort | uniq -c | sort -rn | head -8 || true
 
