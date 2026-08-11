@@ -1741,3 +1741,37 @@ Both legs stop early (the suite contains targets that fail by design), so
 "targets touched" is a coarse proxy - different targets cost differently.
 It is not a speed claim. It is the first evidence that the tax is
 addressable at all, after three mechanisms that only added to it.
+
+## Consolidation must stay, but the daemon it shares should be local
+
+earthly forwards its own `BUILDKIT_HOST` into every `RUN`, so a nested
+earthly shares the outer daemon instead of starting one. Three results
+bound the question.
+
+**Turning it off is catastrophic.** `consolidate=0` - the outer address
+passed via a config file so nothing is forwarded, and every nested build
+starts its own daemon - ran for over an hour against 5-10 minutes
+consolidated, and was cancelled rather than finished. So sharing a daemon
+is not the problem.
+
+**But the shared daemon is the coordinator.** In a fleet, "the outer
+daemon" is one machine's gateway, so a nested build on any worker dials
+back to it. The five leads that own a full `+test-no-qemu` critical path
+are all nested builds at 231-258s each - each longer than the entire 221s
+single-machine build, and clustered the way a queue clusters.
+
+**A local shared daemon is reachable after all.** The patch always carried
+the fix - forward `tcp://buildkitsandbox:8372`, a buildkit constant in
+every exec's `/etc/hosts`, identical everywhere and resolving locally -
+disabled as `if false` because under `NETWORK_MODE=cni` the name resolves
+to the exec itself. That was measured on ONE machine, where the CLI's
+address is already local, the funnel costs nothing and the safe branch is
+free. Re-enabled as a switch, the first full-target run produced ZERO h2
+protocol errors, where every previous full-target run collapsed with one.
+
+That last result came with a caveat worth keeping: the same run was
+reported as having DIED, and had not. `*failed*` markers are indented
+whenever earthly's target column is widened by a long target name, and the
+extraction was anchored at column 1 - so it found no failed targets, which
+is precisely the signature the died-check looks for. The verdict was an
+artefact of the instrument, not the run.
