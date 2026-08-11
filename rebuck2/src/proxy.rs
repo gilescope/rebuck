@@ -348,7 +348,23 @@ impl control::control_server::Control for Proxy {
         let out = self
             .client()
             .solve(Request::from_parts(meta, ext, req))
-            .await;
+            .await
+            .inspect_err(|e| {
+                // THE call whose failure the user sees. earthly blocks on
+                // Control.Solve, so whatever this returns becomes its final
+                // `Error:` line - and a full +test-no-qemu keeps ending on
+                // `h2 protocol error: error reading a body from connection`,
+                // which is hyper's phrasing and not Go's.
+                //
+                // The gateway-solve path was instrumented first and logged
+                // NOTHING across a whole failing run, which rules it out
+                // rather than confirming it. This is the other relay.
+                println!(
+                    "[proxy] upstream Control.Solve failed: {} {}",
+                    e.code(),
+                    e.message()
+                );
+            });
         let ms = t.elapsed().as_millis() as u64;
         let went = self.went.held().get(&build_id).cloned();
         let mut w = self.wire.held();
