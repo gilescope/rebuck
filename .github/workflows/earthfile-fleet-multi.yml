@@ -1205,9 +1205,21 @@ jobs:
           fi
           IFS=',' read -ra pairs <<< "$REBUCK2_SEED_IDS"
           for pair in "${pairs[@]}"; do
-            id=${pair%%:*}; path=${pair#*:}
-            [ -n "$id" ] && [ -n "$path" ] && [ "$id" != "$path" ] || {
-              echo "::warning::seed_ids: ignoring '$pair', wanted id:path"; continue; }
+            # SPLIT ON THE LAST COLON, not the first, and do not require
+            # the two halves to differ.
+            #
+            # A mount written without `id=` is keyed by buildkit on its
+            # destination, so the id IS the path and the pair reads
+            # `/go/pkg/mod:/go/pkg/mod`. The first version split on the
+            # first colon and then rejected id == path as malformed - a
+            # guard written before that case existed, which then threw away
+            # the two entries added specifically to cover it.
+            id=${pair%:*}; path=${pair##*:}
+            case "$pair" in *:*) ;; *)
+              echo "::warning::seed_ids: no colon in '$pair', wanted id:path"; continue ;; esac
+            case "$path" in /*) ;; *)
+              echo "::warning::seed_ids: '$path' is not an absolute mount path"; continue ;; esac
+            [ -n "$id" ] || { echo "::warning::seed_ids: empty id in '$pair'"; continue; }
             # Best effort, one at a time. An empty cache harvests an empty
             # layer and a missing one harvests nothing; either leaves the
             # worker exactly as cold as it is today, which is the whole
