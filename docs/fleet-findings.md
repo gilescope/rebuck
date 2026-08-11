@@ -2282,14 +2282,14 @@ runs, which is larger than any effect being looked for.
 
 The standing goal is larger and larger parts of it, so here is the ledger.
 
-| target                   | shape                                  | status                                           |
-| ------------------------ | -------------------------------------- | ------------------------------------------------ |
-| `+test-no-qemu-group1`   | one group, nested earthly, WITH DOCKER | parity, locally                                  |
-| `+test-no-qemu-group2`   | the same, one group                    | parity, in CI, six machines                      |
-| `+test-no-qemu-group10`  | the same, one group                    | where graft and cut-prefix were measured         |
-| `+test-no-qemu` (all 14) | 14 groups on one 192s base chain       | completes, parity, 508s vs 285s                  |
-| `+all-binaries`          | 5 cross-compiles off one `+code` stem  | **green both legs**, 262s vs 712s, 2.3x ceiling  |
-| `+lint-all`              | 3 independent lint targets, no docker  | parity, 92s vs 628s - and it found the retry bug |
+| target                   | shape                                  | status                                             |
+| ------------------------ | -------------------------------------- | -------------------------------------------------- |
+| `+test-no-qemu-group1`   | one group, nested earthly, WITH DOCKER | parity, locally                                    |
+| `+test-no-qemu-group2`   | the same, one group                    | parity, in CI, six machines                        |
+| `+test-no-qemu-group10`  | the same, one group                    | where graft and cut-prefix were measured           |
+| `+test-no-qemu` (all 14) | 14 groups on one 192s base chain       | completes, parity, 508s vs 285s                    |
+| `+all-binaries`          | 5 cross-compiles off one `+code` stem  | **green both legs**, 262s vs 712s, 2.3x ceiling    |
+| `+lint-all`              | 3 independent lint targets, no docker  | parity, 88s vs 252s after the retry fix (was 628s) |
 
 Everything above the last line is the same shape wearing different numbers:
 a long serial base chain, then nested earthly builds that each want a 600
@@ -2645,3 +2645,53 @@ it as a verdict would turn "this worker ran out of memory" into "your build
 fails", which is the confusion the predicate exists to prevent, pointed at
 the one case where another machine genuinely could do better. 128+N is a
 signal and stays retryable.
+
+## The verdict fix, measured: 628s -> 252s
+
+Same target, same rig, one change.
+
+|                       | before        | after         |
+| --------------------- | ------------- | ------------- |
+| baseline              | 92s           | 88s           |
+| fleet                 | **628s**      | **252s**      |
+| ratio                 | 6.8x          | **2.9x**      |
+| `verdict_stops_retry` | -             | **4**         |
+| parity                | same 1 failed | same 1 failed |
+| op duplication        | 1.3x          | 1.3x          |
+| occupancy             | 3.63          | 2.92          |
+
+```text
+[driver] subtree job 14 FAILED on worker 2 - not re-offering, the build itself did not succeed
+[driver] subtree job 18 FAILED on worker 2 - not re-offering ...
+[driver] subtree job 20 FAILED on worker 2 - not re-offering ...
+[driver] subtree job 21 FAILED on worker 2 - not re-offering ...
+```
+
+Four, which is the number of Go modules `+lint` loops over, each with its
+own failing `golangci-lint`. The mechanism counter agrees with the log and
+with the `not routed` table, which is the check that stopped three earlier
+mechanisms being credited with work they never did.
+
+**What is left is the other half of the same bug.** 252s against 88s, and
+the leads only account for about 79s of wall at this occupancy. The rest is
+four home rebuilds of a target that already failed on a peer: a verdict goes
+to `unplaced`, the requester builds it, and it fails again. Roughly 40s
+apiece, roughly 160s, which is most of the remaining gap.
+
+The obvious fix is to pass the peer's error to the client instead. The
+obvious fix is also the one that can report red for a build that is green,
+so it needs a condition rather than a decision. `verbatim` - the dispatched
+definition being byte-identical to the client's - is most of it, and cheap:
+`portable == def` at the dispatch site.
+
+It is not all of it, and `+lint` shows why. Its three cache mounts are
+lifted, so the peer ran the client's exact graph against a COLD `go-mod`,
+and a cold `go-mod` downloads modules. A network blip there is `exit code:
+1` from `go mod download` - a transient, reported as a verdict, on a build
+that would pass anywhere else. Principle 20's distinction again, from the
+other side: seeding a self-keying cache is safe because a wrong entry is
+never found, and TRUSTING a verdict from a cold one is a different claim
+entirely.
+
+So it goes behind a flag, off by default, and gets measured rather than
+argued about.
