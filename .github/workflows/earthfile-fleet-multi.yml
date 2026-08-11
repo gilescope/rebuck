@@ -731,6 +731,16 @@ jobs:
           # workflow was grepping only the [wire] summary out of proxy.log,
           # so the per-job timings the driver already prints never left the
           # runner.
+          echo "=== connections this gateway lost"
+          # Whose connection breaks when a target fails is the open question
+          # behind `h2 protocol error: error reading a body from connection`.
+          # The client reports it and names nothing on this side; if OUR
+          # server closed the connection it says so here, and if this is
+          # silent the break was somewhere else - the nested earthly talking
+          # to a daemon we do not front.
+          grep -a '^\[proxy\] connection ended' proxy.log | sort | uniq -c | head -5 || true
+          echo "   (silent = the gateway's own connections were fine)"
+
           echo "=== the leads that own the critical path"
           # One lead took 209s of a 525s wall - 40% of the wall clock in a
           # single job, which no number of machines can divide. Which job it
