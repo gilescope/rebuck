@@ -1691,6 +1691,26 @@ pub async fn serve(
                 // None = unlimited, matching tonic. A gateway that refuses
                 // the 201st stream mid-build fails the build.
                 .max_concurrent_streams(None)
+                // The OTHER two h2 limits, and the reason the same client
+                // error came back at full-target scale after
+                // `max_concurrent_streams` was already unlimited.
+                //
+                // `max_pending_accept_reset_streams` defaults to TWENTY - not
+                // 200 - and exceeding it sends a GOAWAY, which the client
+                // reports as `h2 protocol error: error reading a body from
+                // connection` and nothing else. Twenty is easy to exceed here
+                // for a specific reason: when one target fails, earthly
+                // cancels every solve still in flight, all at once. A full
+                // `+test-no-qemu` had 17 in flight plus a nested earthly per
+                // group, so ONE red test became a dead build - every other
+                // group dying simultaneously on `transport error`.
+                //
+                // Finite, not None: these are the RUSTSEC-2024-0003 and
+                // hyper#2877 DoS backstops, and a gateway on a CI runner
+                // still wants one. 10k is far above any burst a build can
+                // produce and far below a resource problem.
+                .max_pending_accept_reset_streams(10_000)
+                .max_local_error_reset_streams(10_000)
                 // Keepalive, because a nested earthly can sit idle while its
                 // own build runs and a dropped control stream is a dead
                 // build.
