@@ -2247,3 +2247,33 @@ build died before it could dispatch.
 The keepalive was added as a FIX for this symptom, in the commit that gave
 Session its own connection. It caused the failure it was meant to prevent,
 for a dozen runs.
+
+## Affinity and prefetch are in tension by construction
+
+Measured on the first fleet that completes. Prefetch works: `local=3` on a
+worker, the first non-zero local-hit count in this project, so a
+pre-positioned blob does turn a registry pull into a local one. The stated
+criterion is met.
+
+The shares are almost empty though - `prefetched 0/0`, `prefetched 1/1` -
+and the reason is structural rather than a bug. Prefetch announces a subtree
+result only when at least two workers have been sent the op that produced
+it, because pushing a leaf result to five machines that will never read it
+is bandwidth spent for nothing. Affinity's entire purpose is to make each
+op land on ONE machine: it took duplication from 2.2x to 1.0-1.4x.
+
+So affinity drives the consumer count towards one, and the prefetch gate
+fires at two. The better affinity works, the less there is to pre-position.
+With affinity on, prefetch reduces to base images - which are announced
+unconditionally from `make_portable`, since a base is shared by
+construction.
+
+That is not an argument against either. It says the gate is asking the wrong
+question: "how many machines HAVE been sent this" is a measurement of the
+past, and pre-positioning needs a prediction. The base chain is needed by
+everyone before anyone has asked for it, which is exactly why the
+unconditional base-image path is the one that fires.
+
+Wall clock is not the discriminator here: 483s against a 219s baseline with
+prefetch, 508s against 285s without. The baselines differ by 30% between
+runs, which is larger than any effect being looked for.
