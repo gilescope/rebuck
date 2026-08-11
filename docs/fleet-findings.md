@@ -2023,10 +2023,23 @@ home. True on a COLD fleet. On a warm one the chain is not work at all on a
 worker, it is a cache hit, so dispatching it is the fastest thing available
 and keeping it home means the coordinator builds all 192 seconds of it.
 
-The coordinator is the machine that stays cold, and that is now the
-asymmetry to exploit rather than the one to avoid. Its baseline-leg daemon
-is a different container from its fleet-leg daemon, so peer 0 enters the
-fleet leg cold while six workers are warm.
+**Corrected.** I wrote here that the coordinator stays cold because its two
+legs use different daemons. They do not. The baseline dials
+`tcp://$LAN:18372` and the proxy's upstream is `http://127.0.0.1:18372` -
+the same `own-bk` container. Peer 0 therefore enters the fleet leg having
+just built the entire target on that daemon: it is the WARMEST machine in
+the fleet.
+
+Which makes `REBUCK2_HOME_SLOTS=0` look very different. It exists to force
+dispatch - "otherwise peer 0 takes the work itself whenever it has room,
+which on an idle runner is always" - and what it actually forces is work OFF
+the only machine that already has the answer cached, and ONTO cold ones.
+Every fleet leg measured so far has been shipping work away from a warm
+daemon to machines that must rebuild or refetch it.
+
+That is not a small confound. It is a plausible explanation for the entire
+deficit, and it is a property of the harness rather than of distribution:
+running the baseline first, on the same daemon, is what warms peer 0.
 
 So the two mechanisms are not additive and may be opposed:
 
