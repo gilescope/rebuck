@@ -70,6 +70,68 @@ pub fn summary(enabled: &[(&'static str, bool)]) -> String {
 }
 
 #[cfg(test)]
+mod source_consistency {
+    /// Every name the report can print must have somewhere that counts it.
+    ///
+    /// The guard gave a false positive on its first real run: `cut_prefix`
+    /// was added to the summary list while the `applied()` call beside it
+    /// silently failed to land, so the report said ON BUT NEVER APPLIED for
+    /// a mechanism that had published three prefixes. A guard that can cry
+    /// wolf is worse than none - it was built precisely to be believed.
+    ///
+    /// Source-level because there is no way to reach every call site from a
+    /// test: they are inside async paths that need a fleet.
+    #[test]
+    fn every_reported_mechanism_has_a_counter() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut all = String::new();
+        for f in std::fs::read_dir(&dir).expect("src") {
+            let f = f.expect("entry").path();
+            if f.extension().is_some_and(|e| e == "rs") {
+                all.push_str(&std::fs::read_to_string(&f).expect("read"));
+            }
+        }
+        // Names the report claims to know about. Only the FIRST string of
+        // each ("name", condition) tuple - the condition contains string
+        // literals of its own, and the first version of this test tripped
+        // over the "1" in `Ok("1")`.
+        let mut listed: Vec<String> = Vec::new();
+        for (i, _) in all.match_indices("mech::summary(&[") {
+            let Some((block, _)) = all[i..].split_once("])") else {
+                continue;
+            };
+            for (j, _) in block.match_indices('(') {
+                // Skip whitespace: rustfmt puts multi-line tuples as
+                // `(\n    "name",` and the first version of this only
+                // matched the single-line ones - so it checked three names
+                // and silently skipped the very one that was broken.
+                let rest = block[j + 1..].trim_start();
+                if !rest.starts_with('"') {
+                    continue;
+                }
+                if let Some(end) = rest[1..].find('"') {
+                    let name = &rest[1..1 + end];
+                    if name.chars().all(|c| c.is_ascii_lowercase() || c == '_') && !name.is_empty()
+                    {
+                        listed.push(name.to_owned());
+                    }
+                }
+            }
+        }
+        assert!(!listed.is_empty(), "found no summary call to check");
+
+        for name in listed {
+            assert!(
+                all.contains(&format!("applied(\"{name}\")")),
+                "{name} is reported but nothing calls applied(\"{name}\") - \
+                 the report would say ON BUT NEVER APPLIED for a mechanism \
+                 that may be working perfectly"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn a_mechanism_that_is_on_and_never_fires_says_so() {

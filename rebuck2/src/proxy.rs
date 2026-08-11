@@ -2596,6 +2596,10 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                                             let bytes = pre.encode_to_vec();
                                             let n = portable.def.len();
                                             cell.get_or_init(|| async move {
+                                                // A prefix actually cut and
+                                                // published, not merely
+                                                // enabled.
+                                                crate::mech::applied("cut_prefix");
                                                 println!(
                                                     "[proxy] publishing a {ops}-op prefix before a {n}-op graph"
                                                 );
