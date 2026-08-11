@@ -5356,3 +5356,42 @@ is 2.97x at seven machines, so its best possible leg against a 212s baseline
 is about **71 seconds**. At 1050s the fleet is fifteen times off the ceiling
 its own workload permits. Whatever binds here is not Amdahl, which makes it
 the honest place to keep measuring.
+
+### The 12.5x nobody has looked at
+
+Following the identity through on `+test-ast` with `-balance`:
+
+| | |
+| ---------------------- | ---------------------------------- |
+| baseline, whole build | **212s** |
+| fleet `building` total | **4,521s** = 21.3x the whole baseline |
+| built duplication | 1.7x |
+| **unexplained** | **12.5x** |
+
+The fleet spends twenty-one times the entire single-machine build just
+*building*, and duplication accounts for 1.7 of it. The remaining **12.5x is
+not the scheduler, not queueing, and not rebuilt ops** - it is the same work
+costing twelve times more per unit when a worker does it than when the
+baseline daemon does it.
+
+Per lead that is 10.9 seconds of building for what the median worker-side
+line reports as 2.5 seconds, so the mean is dragged by long leads, and those
+long leads are where the 12.5x lives.
+
+Nothing measured today addresses this. Prefetch cut what a lead FETCHES;
+`-balance` cut what it WAITS for; neither touches what it costs to build
+once started. The candidates, in the order they should be eliminated:
+
+- **cold caches.** A worker's buildkit starts with nothing in its local
+  cache for this graph, so work the baseline gets from cache is recomputed.
+  `dup=1.7` counts ops rebuilt across WORKERS; it does not count ops the
+  baseline never rebuilt at all.
+- **cold cache mounts.** 359 of 414 leads name one, `mount arms cold p50` is
+  9,783ms, and the seeded arm has never had a single sample.
+- **unpack.** Every lead materialises a parent image; the registry serves it
+  in milliseconds and buildkit unpacks it, and nothing has ever timed the
+  second half.
+
+This is the largest unexplained number in the document and it has been
+derivable since the phase split landed. It is what "the fleet does 9x the
+work" (principle 21) was gesturing at without a denominator.
