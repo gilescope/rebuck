@@ -107,13 +107,29 @@ fn default_session() -> String {
 /// image has to be put there deliberately - `docker push` from the host, or
 /// `mirror_image` through a peer with a session. This says so rather than
 /// leaving it to be rediscovered.
-async fn base_is_reachable(base: &str) -> anyhow::Result<()> {
+async fn base_is_reachable(base: &str, registry: &str) {
+    // A WARNING, never a refusal, and that took two goes to accept.
+    //
+    // The check exists because `failed to load cache key: <ref>: not found`
+    // names the cache key and not the image. But it cannot tell ABSENT from
+    // UNREACHABLE: the first version refused a Docker Hub reference that
+    // plainly exists, and the second refused
+    // `host.docker.internal:15099/...` - which the buildkit container
+    // resolves perfectly well and the host running this check does not.
+    //
+    // Two false refusals of a working setup is enough. It says what it could
+    // not confirm and gets out of the way; buildkit is the authority on
+    // whether its own base resolves.
+    if !base.starts_with(registry) {
+        return;
+    }
     match crate::solve::image_blobs(base).await {
-        Some(b) if !b.is_empty() => Ok(()),
-        _ => anyhow::bail!(
-            "base image {base} does not resolve. The registry proxies blobs, not manifest \
-             tags, so a public image is not there unless it was put there - push it in \
-             (`docker push 127.0.0.1:<port>/library/...`) or name one the registry holds."
+        Some(b) if !b.is_empty() => {}
+        _ => println!(
+            "[check] cannot see {base} from here - it may still be fine, since the daemon \
+             resolves names this process does not. If the solve below fails with `not \
+             found`, that is why: the registry proxies blobs and not manifest tags, so a \
+             public image is only there if it was put there."
         ),
     }
 }
@@ -313,7 +329,7 @@ async fn main() -> Result<()> {
             // Best effort per pair, like the step it replaces: a cache that
             // cannot be harvested leaves that mount cold, which is what it
             // was anyway.
-            base_is_reachable(&base).await?;
+            base_is_reachable(&base, &registry).await;
             let mut failed = 0usize;
             for (id, dest) in &pairs {
                 if let Err(e) = harvest_one(&bk, &registry, &base, id, dest).await {
@@ -356,7 +372,7 @@ async fn main() -> Result<()> {
             let (src, dst) = (format!("seedcheck-src-{n}"), format!("seedcheck-dst-{n}"));
             let marker = "rebuck2-seed-marker";
 
-            base_is_reachable(&base).await?;
+            base_is_reachable(&base, &registry).await;
             println!("[check] writing {marker} into cache {src}");
             solve::build_subtree(
                 &bk,

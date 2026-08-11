@@ -751,7 +751,15 @@ pub fn harvest_graph(base: &str, cache_id: &str, dest: &str) -> pb::Definition {
                 pb::Mount {
                     input: 0,
                     dest: "/".into(),
-                    output: 1,
+                    output: -1,
+                    // READONLY, which is what gets it a mutable ref.
+                    // `PrepareMounts`: a root with no output is made mutable
+                    // only when `Readonly` is set, and left immutable
+                    // otherwise - so this flag is the difference between a
+                    // container that starts and `exit code: 1` before a
+                    // line runs. Backwards-looking, and it is buildkit's
+                    // spelling, not ours.
+                    readonly: true,
                     ..Default::default()
                 },
                 pb::Mount {
@@ -2579,24 +2587,30 @@ mod tests {
             "and index 0 is the seed, not the rootfs"
         );
 
-        // THE ROOTFS NEEDS AN OUTPUT TOO, or it is mounted immutable and
-        // nothing in the container can start.
+        // THE ROOTFS IS READONLY AND HAS NO OUTPUT, and both halves are
+        // load-bearing. Proven against a real daemon, not reasoned about -
+        // three earlier spellings each failed differently.
         //
-        // From buildkit's `PrepareMounts`: a BIND mount with an output
-        // becomes `makeMutable`, and the root-mount branch below only makes
-        // one when `m.Readonly` is set - so `readonly: false` with no output
-        // leaves the root as the immutable ref, which is the opposite of
-        // what the comment above that branch says it needs. The exec then
-        // fails as `exit code: 1` before running a line, which is how three
-        // attempts went on a `cp` that turned out to be innocent.
+        // `readonly: true` is what gets the root a MUTABLE ref, backwards as
+        // that reads: `PrepareMounts` makes one for a root with no output
+        // only when Readonly is set, and leaves it immutable otherwise. With
+        // `readonly: false, output: -1` the exec dies as `exit code: 1`
+        // before running a line.
         //
-        // Index 1, so index 0 stays the seed - the terminal selects 0.
+        // And no output, because buildkit numbers results by ORDER OF
+        // APPEARANCE among mounts that have one, not by the `output` value.
+        // With the root at `output: 1` and the seed at `output: 0` the
+        // exported layer was the busybox rootfs - 1.9 MB of /bin, plus a
+        // 97-byte diff holding `proc/` and `sys/`. Read out of the registry
+        // by hand, which is what turned "the seeded mount came up empty"
+        // into a five-minute fix.
         let root = e
             .mounts
             .iter()
             .find(|m| m.dest == "/")
             .expect("a rootfs is mounted");
-        assert_eq!(root.output, 1, "mutable, and not the exported result");
+        assert_eq!(root.output, -1, "the root is not the result");
+        assert!(root.readonly, "and readonly is what makes it startable");
 
         // The copy has to name both ends, or this harvests an empty layer
         // and every seeded worker starts exactly as cold as before while the
