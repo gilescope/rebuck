@@ -210,6 +210,40 @@ async fn main() -> Result<()> {
             traces::report(&legs, top);
             Ok(())
         }
+        "harvest-cache" => {
+            // `rebuck2 harvest-cache --bk <addr> --registry <host:port>
+            //  --id go-mod --dest /go/pkg/mod [--base busybox:1]`
+            //
+            // Publish a warm cache mount as an image, and print the digest.
+            // Feed it back as `REBUCK2_CACHE_SEEDS=go-mod=<digest>` and every
+            // dispatched graph naming that id starts from it instead of from
+            // nothing.
+            //
+            // A SUBCOMMAND rather than something the driver does on its own,
+            // and deliberately. Harvesting is a solve that can fail in its
+            // own ways - no shell in the base, an empty cache, a registry
+            // that will not take a 400 MiB layer - and the measurement it
+            // exists for is "does a seeded worker go faster", which needs
+            // the seed to be a fixed input to the run rather than a thing
+            // that may or may not have happened inside it.
+            let bk = args.opt("--bk").unwrap_or_else(|| "127.0.0.1:8372".into());
+            let registry = args
+                .opt("--registry")
+                .ok_or_else(|| anyhow::anyhow!("harvest-cache: --registry <host:port>"))?;
+            let id = args
+                .opt("--id")
+                .ok_or_else(|| anyhow::anyhow!("harvest-cache: --id <cache id>"))?;
+            let dest = args
+                .opt("--dest")
+                .ok_or_else(|| anyhow::anyhow!("harvest-cache: --dest <mount path>"))?;
+            let base = args.opt("--base").unwrap_or_else(|| "busybox:1".into());
+            let def = dispatch::harvest_graph(&base, &id, &dest);
+            // Job 0: this is not a subtree and shares no numbering with one.
+            let reference = solve::build_subtree(&bk, &registry, 0, def).await?;
+            println!("[harvest] {id} at {dest} -> {reference}");
+            println!("REBUCK2_CACHE_SEEDS={id}={reference}");
+            Ok(())
+        }
         "registry" => {
             let store_root: std::path::PathBuf = args
                 .opt("--store")

@@ -390,6 +390,118 @@ pub fn cache_ids(def: &pb::Definition) -> BTreeSet<String> {
     out
 }
 
+/// Take a warm cache mount OUT of a daemon, as a layer.
+///
+/// The other half of [`seed_cache_mounts`]. Seeding needs an image whose
+/// root IS the cache contents, and nothing in the Earthfile produces one -
+/// a cache mount is deliberately not exportable, which is why buildkit
+/// refuses `output` on one. So: mount the cache read-only beside an empty
+/// scratch mount, copy across, and let the scratch be the result.
+///
+/// Both halves are buildkit's own behaviour, in
+/// `frontend/gateway/container/container.go`:
+///
+/// * `MountType_BIND` with `Input == Empty` and an output becomes
+///   `makeMutable(m, nil)` - a fresh writable dir exported as the result.
+/// * `MountType_CACHE` becomes `MountableCache(ctx, m, ref, g)`, whose
+///   `ref` is the mount's input - the seeding path this feeds.
+///
+/// `base` only needs a shell and `cp`. It is a parameter rather than a
+/// constant because the harvest must run on a machine that can already pull
+/// it, and the fleet's mirror is the only registry every peer is known to
+/// reach.
+pub fn harvest_graph(base: &str, cache_id: &str, dest: &str) -> pb::Definition {
+    let src = pb::Op {
+        op: Some(pb::op::Op::Source(pb::SourceOp {
+            identifier: if base.contains("://") {
+                base.to_owned()
+            } else {
+                format!("docker-image://{base}")
+            },
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let src_bytes = src.encode_to_vec();
+    let src_digest = format!("sha256:{}", crate::store::sha256_hex(&src_bytes));
+
+    // `/.seed` and not `/out`: the harvest runs against whatever base the
+    // operator named, and a path that already exists would be shadowed by
+    // the mount and copied into itself.
+    const OUT: &str = "/.seed";
+    let exec = pb::Op {
+        inputs: vec![pb::Input {
+            digest: src_digest.clone(),
+            index: 0,
+        }],
+        op: Some(pb::op::Op::Exec(pb::ExecOp {
+            meta: Some(pb::Meta {
+                // `.` after the slash so dotfiles come too, and `|| true` so
+                // an EMPTY cache harvests an empty layer instead of failing
+                // the build. A missing seed is a cold worker, which is
+                // today's behaviour; a failed solve is a broken one.
+                args: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("cp -a {dest}/. {OUT}/ 2>/dev/null || true"),
+                ],
+                cwd: "/".into(),
+                ..Default::default()
+            }),
+            mounts: vec![
+                pb::Mount {
+                    input: 0,
+                    dest: "/".into(),
+                    output: -1,
+                    ..Default::default()
+                },
+                pb::Mount {
+                    input: -1,
+                    dest: dest.to_owned(),
+                    output: -1,
+                    readonly: true,
+                    mount_type: pb::MountType::Cache as i32,
+                    cache_opt: Some(pb::CacheOpt {
+                        id: cache_id.to_owned(),
+                        sharing: pb::CacheSharingOpt::Shared as i32,
+                    }),
+                    ..Default::default()
+                },
+                pb::Mount {
+                    input: -1,
+                    dest: OUT.into(),
+                    output: 0,
+                    mount_type: pb::MountType::Bind as i32,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let exec_bytes = exec.encode_to_vec();
+    let exec_digest = format!("sha256:{}", crate::store::sha256_hex(&exec_bytes));
+
+    pb::Definition {
+        def: vec![
+            src_bytes,
+            exec_bytes,
+            // The terminal: no union, one input, and LAST. loadLLB deletes
+            // exactly the last entry and hands anything else union-less to
+            // `ResolveOp`, which reports `no support for <nil>`.
+            pb::Op {
+                inputs: vec![pb::Input {
+                    digest: exec_digest,
+                    index: 0,
+                }],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ],
+        ..Default::default()
+    }
+}
+
 /// Give named cache mounts a starting point, so a cold worker is not cold.
 ///
 /// This is the answer to the largest measured cost in the project. Lifting a
@@ -1812,6 +1924,68 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// The graph that takes a warm mount OUT of a daemon.
+    ///
+    /// Both halves are checked against buildkit's own
+    /// `frontend/gateway/container/container.go`:
+    ///
+    /// * `MountType_BIND` with `Input == Empty` and an output is
+    ///   `makeMutable(m, nil)` - a fresh writable dir that becomes the
+    ///   result. That is where the copy lands.
+    /// * `MountType_CACHE` is `MountableCache(ctx, m, ref, g)` with `ref`
+    ///   being the mount's input, which is the seeding path this harvest
+    ///   feeds.
+    #[test]
+    fn the_harvest_graph_reads_a_cache_and_writes_a_layer() {
+        use bollard_buildkit_proto::pb;
+        use prost::Message;
+
+        let def = super::harvest_graph("busybox:1", "go-mod", "/go/pkg/mod");
+        let ops: Vec<pb::Op> = def
+            .def
+            .iter()
+            .map(|b| pb::Op::decode(b.as_slice()).unwrap())
+            .collect();
+
+        // Source, exec, terminal - and the terminal is LAST, which is the
+        // only place loadLLB will accept it.
+        assert_eq!(ops.len(), 3);
+        assert!(matches!(ops[0].op, Some(pb::op::Op::Source(_))));
+        assert!(ops[2].op.is_none(), "the terminal carries no union");
+
+        let Some(pb::op::Op::Exec(e)) = &ops[1].op else {
+            panic!("the middle op is the copy")
+        };
+        let cache = e
+            .mounts
+            .iter()
+            .find(|m| m.mount_type == pb::MountType::Cache as i32)
+            .expect("the cache is mounted");
+        assert_eq!(cache.cache_opt.as_ref().unwrap().id, "go-mod");
+        assert_eq!(cache.input, -1, "we are reading it, not seeding it");
+        assert_eq!(cache.output, -1, "a cache mount is not exportable");
+
+        let out = e
+            .mounts
+            .iter()
+            .find(|m| m.output == 0)
+            .expect("something has to be the result");
+        assert_eq!(out.input, -1, "scratch: buildkit makes it mutable for us");
+        assert_eq!(out.mount_type, pb::MountType::Bind as i32);
+
+        // The copy has to name both ends, or this harvests an empty layer
+        // and every seeded worker starts exactly as cold as before while the
+        // mechanism counts itself as applied.
+        let cmd = e.meta.as_ref().unwrap().args.join(" ");
+        assert!(cmd.contains(&cache.dest), "reads {}", cache.dest);
+        assert!(cmd.contains(&out.dest), "writes {}", out.dest);
+
+        // The dest is where the mount will be SEEDED, not where it is read.
+        // Getting these the same way round matters: the layer's root becomes
+        // the cache dir's initial contents.
+        assert_eq!(cache.dest, "/go/pkg/mod");
+    }
+
     #[test]
     fn cache_seed_pairs_are_read_or_reported() {
         let m = super::parse_cache_seeds(Some("go-mod=reg/a@sha256:1, npm=reg/b@sha256:2"));
