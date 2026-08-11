@@ -2178,35 +2178,55 @@ impl Proxy {
                 }
             }
         }
-        for name in names {
+        // CONCURRENTLY. Publishing was a serial `for ... .await`, which is
+        // invisible at one context and is the whole prologue at several:
+        // nothing can be dispatched until every `local://` a graph names has
+        // been uploaded, so N contexts meant N uploads end to end on the
+        // critical path before the first subtree could leave.
+        //
+        // `+test-ast` names one or two, so its 1240s reference is unaffected
+        // - with a single future this is the same single await it was.
+        // `+test-no-qemu` group 1 crosses into `./autocompletion`,
+        // `./dockerfile` and `./dockerfile2/subdir`, each bringing its own,
+        // and that is the run this is for.
+        //
+        // Safe because the OnceCell already deduplicates: concurrent callers
+        // for one key await the same init rather than racing to publish
+        // twice, which is the property that made the serial loop
+        // unnecessary rather than merely slow.
+        let publishes = names.into_iter().map(|name| {
             let key = (session.clone(), name.clone());
             let cell = self.cell(&key);
-            cell.get_or_init(|| async {
-                match crate::solve::publish_context(
-                    &mirror.buildkit,
-                    &mirror.registry,
-                    &session,
-                    &name,
-                )
-                .await
-                {
-                    Ok(reference) => {
-                        println!("[proxy] context {name:?} published as {reference}");
-                        self.wire.held().contexts_published += 1;
-                        Some(reference)
+            let session = session.clone();
+            async move {
+                cell.get_or_init(|| async {
+                    match crate::solve::publish_context(
+                        &mirror.buildkit,
+                        &mirror.registry,
+                        &session,
+                        &name,
+                    )
+                    .await
+                    {
+                        Ok(reference) => {
+                            println!("[proxy] context {name:?} published as {reference}");
+                            self.wire.held().contexts_published += 1;
+                            Some(reference)
+                        }
+                        // Remembered for this build rather than retried per
+                        // solve: eleven solves each re-attempting a publish
+                        // that cannot work is eleven times the wait for the
+                        // same answer.
+                        Err(e) => {
+                            println!("[proxy] context {name:?} not published: {e:#}");
+                            None
+                        }
                     }
-                    // Remembered for this build rather than retried per
-                    // solve: eleven solves each re-attempting a publish
-                    // that cannot work is eleven times the wait for the
-                    // same answer.
-                    Err(e) => {
-                        println!("[proxy] context {name:?} not published: {e:#}");
-                        None
-                    }
-                }
-            })
-            .await;
-        }
+                })
+                .await;
+            }
+        });
+        futures::future::join_all(publishes).await;
     }
 }
 
