@@ -53,12 +53,23 @@ pub fn report() -> Vec<(&'static str, u64)> {
 pub fn summary(enabled: &[(&'static str, bool)]) -> String {
     let counts: BTreeMap<&str, u64> = report().into_iter().collect();
     let mut out = Vec::new();
-    for (name, on) in enabled {
+    for (listed, on) in enabled {
         if !on {
             continue;
         }
+        // A GUARD is spelled with a leading `?` in the enabled list. The
+        // marker is for this function, never for the reader.
+        let guard = listed.starts_with('?');
+        let name = listed.strip_prefix('?').unwrap_or(listed);
         match counts.get(name) {
             Some(n) => out.push(format!("{name}={n}")),
+            // ZERO is not always a bug. `read_retry` and
+            // `verdict_stops_retry` are guards: the good day is the one
+            // where neither fires, and shouting ON BUT NEVER APPLIED at them
+            // teaches a reader to skim past the phrase - which is fatal,
+            // because the phrase exists for `cut_prefix` sitting silently
+            // disconnected, and that reading has been needed once already.
+            None if guard => out.push(format!("{name}=0 (never needed)")),
             None => out.push(format!("{name}=ON BUT NEVER APPLIED")),
         }
     }
@@ -66,6 +77,32 @@ pub fn summary(enabled: &[(&'static str, bool)]) -> String {
         "none enabled".to_owned()
     } else {
         out.join(" ")
+    }
+}
+
+#[cfg(test)]
+mod summary_shape {
+    /// Zero is not always a bug, and the report has to say which it is.
+    ///
+    /// `read_retry` and `verdict_stops_retry` are GUARDS - the good day is
+    /// the one where neither fires. Shouting ON BUT NEVER APPLIED at them
+    /// teaches a reader to skim past the phrase, which is fatal: it exists
+    /// for `cut_prefix` sitting silently disconnected, and that reading has
+    /// already been needed once.
+    #[test]
+    fn a_guard_that_never_fired_is_not_a_mechanism_that_never_ran() {
+        super::applied("ran_once");
+        let s = super::summary(&[
+            ("ran_once", true),
+            ("?a_guard", true),
+            ("never_wired", true),
+            ("switched_off", false),
+        ]);
+        assert!(s.contains("ran_once=1"), "{s}");
+        assert!(s.contains("a_guard=0 (never needed)"), "{s}");
+        assert!(!s.contains("?"), "the marker is not for the reader: {s}");
+        assert!(s.contains("never_wired=ON BUT NEVER APPLIED"), "{s}");
+        assert!(!s.contains("switched_off"), "{s}");
     }
 }
 
@@ -110,7 +147,9 @@ mod source_consistency {
                     continue;
                 }
                 if let Some(end) = rest[1..].find('"') {
-                    let name = &rest[1..1 + end];
+                    // The `?` marks a guard - "zero is fine here" - and
+                    // is not part of the name a counter must exist for.
+                    let name = rest[1..1 + end].trim_start_matches('?');
                     if name.chars().all(|c| c.is_ascii_lowercase() || c == '_') && !name.is_empty()
                     {
                         listed.push(name.to_owned());
