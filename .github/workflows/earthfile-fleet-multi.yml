@@ -491,6 +491,7 @@ jobs:
           SEED: ${{ inputs.seed_caches || '' }}
           GRAFT: ${{ inputs.graft || '' }}
           ARM: ${{ inputs.arm_workers || '' }}
+          NESTED: ${{ inputs.local_nested || '' }}
           REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -697,7 +698,16 @@ jobs:
           # Carries a hazard: nested builds under `--privileged
           # --entrypoint` have died on `could not connect to buildkit:
           # timeout 1m0s` when retargeted. That is why it is a switch.
-          case "$REF" in *-nested*) nested=1 ;; *) nested=0 ;; esac
+          # An explicit input WINS over the suffix, matching GRAFT beside
+          # it. Without this the job-level env would override a dispatch
+          # input with a value derived from the branch name alone - which is
+          # unreachable today, since dispatch inputs cannot reach a workflow
+          # off the default branch, and would be a silent trap the moment
+          # that changes.
+          case "${NESTED:-}" in
+            "") case "$REF" in *-nested*) nested=1 ;; *) nested=0 ;; esac ;;
+            *)  nested="$NESTED" ;;
+          esac
           echo "local nested: $nested"
           echo "nested=$nested" >> "$GITHUB_OUTPUT"
 
