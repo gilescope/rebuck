@@ -1009,6 +1009,14 @@ fn gating() -> bool {
 /// iteration optimising the wrong end.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Span {
+    /// Milliseconds after the FIRST solve that this one arrived.
+    ///
+    /// Duplicated from `arrivals` on purpose. That vector is appended on
+    /// arrival and this one on completion, so with eight solves in flight
+    /// the two are not index-aligned and no start can be paired with any
+    /// duration. Anything asking "how many were running at once" needs the
+    /// pair, so the pair rides together.
+    pub start: u64,
     pub total: u64,
     /// This exact graph had been solved before.
     pub resend: bool,
@@ -1021,6 +1029,11 @@ pub struct Span {
 }
 
 impl Span {
+    /// When it stopped, on the same clock as [`Span::start`].
+    pub fn end(&self) -> u64 {
+        self.start + self.total
+    }
+
     /// What dispatch cost that a local build would not have paid.
     ///
     /// Not `total - adopt`: the peer's build replaces work peer 0 would have
@@ -1030,6 +1043,52 @@ impl Span {
     pub fn tax(&self) -> u64 {
         self.portable + self.answer
     }
+}
+
+/// How many solves were running at once, and how much of the wall clock that
+/// filled.
+///
+/// The number principle 19 asks for. A fleet of six that never has more than
+/// one solve in flight is not slow because dispatch is slow - it is a
+/// workload with no seam, and every other figure in the report will be read
+/// wrongly without this one beside it.
+///
+/// `occupancy` is solve-time divided by the span it happened in: 1.0 is a
+/// queue, 5.0 is five machines genuinely busy. It is an area over a span
+/// rather than an average of a skewed sample, which is why a mean is the
+/// right shape here and is not elsewhere in this report.
+pub fn concurrency(spans: &[Span]) -> (usize, f64) {
+    if spans.is_empty() {
+        return (0, 0.0);
+    }
+    let mut edges: Vec<(u64, i32)> = Vec::with_capacity(spans.len() * 2);
+    for s in spans {
+        edges.push((s.start, 1));
+        edges.push((s.end(), -1));
+    }
+    // Ends before starts at the same instant, or a handover reads as an
+    // overlap and a strictly serial run reports a peak of two.
+    // -1 sorts before +1, which IS ends-before-starts. Writing `-d` here
+    // reverses it and a strictly serial run reports a peak of two; the test
+    // beside this caught exactly that, having been written from this comment.
+    edges.sort_by_key(|&(t, d)| (t, d));
+    let (mut now, mut peak) = (0i32, 0i32);
+    for (_, d) in &edges {
+        now += d;
+        peak = peak.max(now);
+    }
+    let first = spans.iter().map(|s| s.start).min().unwrap_or(0);
+    let last = spans.iter().map(|s| s.end()).max().unwrap_or(0);
+    let busy: u64 = spans.iter().map(|s| s.total).sum();
+    let wall = last.saturating_sub(first);
+    (
+        peak as usize,
+        if wall == 0 {
+            0.0
+        } else {
+            busy as f64 / wall as f64
+        },
+    )
 }
 
 /// Everything the SIGINT report is computed from.
@@ -1446,6 +1505,16 @@ impl Wire {
                 last.saturating_sub(first)
             );
         }
+        // Principle 19, printed rather than reasoned about afterwards. A peak
+        // of one over six machines is not a slow fleet, it is a workload
+        // with no seam - and every other figure here reads wrongly without
+        // it. `1.4x ceiling` beside `1.8x achieved` is the whole story;
+        // neither number alone is.
+        let (peak, occupancy) = concurrency(&self.spans);
+        println!(
+            "[wire] concurrency    : peak {peak} solves at once, occupancy {occupancy:.2} \
+             (1.00 = a queue; the ceiling is the machine count)"
+        );
         println!(
             "[wire] home peak      : {} of {} slots{}",
             self.peak_home,
@@ -2160,12 +2229,13 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         // until it is split into publish / peer build / answer, because two
         // of those three are not round-trips at all.
         let t_solve = std::time::Instant::now();
-        {
+        let arrived_at = {
             let mut w = self.wire.held();
             let first = *w.first_solve.get_or_insert(t_solve);
             let at = t_solve.duration_since(first).as_millis() as u64;
             w.arrivals.push(at);
-        }
+            at
+        };
         let mut t_portable = 0u64;
         let mut t_adopt = 0u64;
         // Publish any build context this graph needs, so the subtree stops
@@ -2866,6 +2936,7 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         };
         let answer = t_answer.elapsed().as_millis() as u64;
         self.wire.held().spans.push(Span {
+            start: arrived_at,
             total: t_solve.elapsed().as_millis() as u64,
             resend,
             portable: t_portable,
@@ -3199,6 +3270,39 @@ mod tests {
         assert_eq!(w.resends(), 2);
     }
 
+    /// Overlap is what a fleet is FOR, so it gets its own arithmetic.
+    #[test]
+    fn concurrency_separates_a_fleet_from_a_queue() {
+        let span = |start, total| super::Span {
+            start,
+            total,
+            ..Default::default()
+        };
+
+        // Five solves, one after another - six machines and a queue.
+        let queue: Vec<_> = (0..5).map(|i| span(i * 100, 100)).collect();
+        let (peak, occ) = super::concurrency(&queue);
+        assert_eq!(peak, 1, "a handover is not an overlap");
+        assert!((occ - 1.0).abs() < 1e-9, "occupancy {occ}, wanted 1.0");
+
+        // The same five, all at once.
+        let fleet: Vec<_> = (0..5).map(|_| span(0, 100)).collect();
+        let (peak, occ) = super::concurrency(&fleet);
+        assert_eq!(peak, 5);
+        assert!((occ - 5.0).abs() < 1e-9, "occupancy {occ}, wanted 5.0");
+
+        // And the shape a real run has: a serial stem, then a fan-out. Peak
+        // says the fan-out happened; occupancy says most of the clock was
+        // the stem, which is the half that gets forgotten.
+        let mut real = vec![span(0, 1000)];
+        real.extend((0..4).map(|_| span(1000, 100)));
+        let (peak, occ) = super::concurrency(&real);
+        assert_eq!(peak, 4);
+        assert!(occ < 1.3, "occupancy {occ} - a 91% serial run is not busy");
+
+        assert_eq!(super::concurrency(&[]), (0, 0.0));
+    }
+
     /// Sharedness must be asked of the graph that was OBSERVED.
     ///
     /// `op_solves` is keyed on the digest of each op as the client sent it.
@@ -3468,6 +3572,7 @@ mod tests {
     #[test]
     fn tax_excludes_the_work_the_peer_did_instead_of_us() {
         let dispatched = super::Span {
+            start: 0,
             total: 10_000,
             portable: 300,
             adopt: 9_000,
@@ -3477,6 +3582,7 @@ mod tests {
         assert_eq!(dispatched.tax(), 1_000);
         // A solve that stayed home pays no tax, however long it took.
         let home = super::Span {
+            start: 0,
             total: 10_000,
             portable: 0,
             adopt: 0,
