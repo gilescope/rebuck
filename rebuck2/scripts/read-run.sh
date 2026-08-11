@@ -38,6 +38,15 @@ echo; echo "── prefetch ─────────────────�
 grep -rah "prefetch: \|prefetched .* of my share\|no manifest URL for" "$dir" \
   | strip | sed -E 's,[^ ]*sha256:[0-9a-f]+,<img>,g' | sort | uniq -c | sort -rn | head -8
 
+echo; echo "── did prefetch broadcast, or split? ────────"
+# N == M on every worker means broadcast; N < M means the one-blob-one-worker
+# split. The mech counter cannot answer this: prefetch_broadcast is
+# incremented in the WORKER's process and mech::APPLIED is per-process, so
+# the coordinator's report never sees it. The evidence is here instead.
+grep -rah "prefetched [0-9]*/[0-9]* of my share" "$dir" | strip \
+  | sed -E 's/.*prefetched ([0-9]+)\/([0-9]+) of my share \(([0-9]+) announced\)/\1 of \3/' \
+  | sort | uniq -c | sort -rn | head -6
+
 echo; echo "── affinity and mechanisms ─────────────────"
 grep -rah "wire\] mechanisms\|op duplication\|mount arms" "$dir" | strip | sort -u
 
