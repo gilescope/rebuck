@@ -21,7 +21,7 @@ on:
       ports:
         description: space-separated ports to try
         type: string
-        default: 4317 4318 443 80 5090 5091 5092
+        default: 22 80 443 4317 4318
 
 permissions:
   contents: read
@@ -35,13 +35,18 @@ jobs:
         env:
           TOKEN: ${{ secrets.OTLP_TOKEN }}
           HOST: ${{ inputs.host || '81.2.89.216' }}
-          PORTS: ${{ inputs.ports || '4317 4318 443 80 5090 5091 5092' }}
+          PORTS: ${{ inputs.ports || '22 80 443 4317 4318' }}
         run: |
           set -uo pipefail
           # A TCP connect says the router forwards the port. The OTLP POST
           # then says whether what answers is our collector: 200 accepted,
           # 401 reachable but the token is wrong, anything else is some other
           # service on a port that happens to be open.
+          # 22 is the DISCRIMINATOR. It is forwarded (to .129) and ISPs do
+          # not usually block it, unlike 80 and 443 which residential lines
+          # very often do. If 22 answers, forwarding works and the WAN
+          # address is right, so a new rule for the collector will work too.
+          # If 22 is closed as well, this is CGNAT and no rule can help.
           for p in $PORTS; do
             if timeout 8 bash -c "cat < /dev/null > /dev/tcp/$HOST/$p" 2>/dev/null; then
               code=$(curl -sk -o /dev/null -m 12 -w '%{http_code}' \
