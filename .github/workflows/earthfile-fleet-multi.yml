@@ -665,8 +665,14 @@ jobs:
           EARTHLY_BUILDKIT_HOST="tcp://${LAN}:18372" \
             earthly $EARTHLY_FLAGS "$TARGET" > /tmp/baseline.log 2>&1 && rc=0 || rc=$?
           tail -20 /tmp/baseline.log
-          grep -ao "^[^ ]* \*failed\*" /tmp/baseline.log | sed 's/ \*failed\*//' \
-            | sort -u > /tmp/baseline.failed || true
+          # LEADING WHITESPACE, and it is not cosmetic. earthly right-aligns
+          # the target column to the longest target name in the run, so
+          # `*failed*` lines are indented in some runs and not others. The
+          # anchored form silently found ZERO failed targets in a run whose
+          # log plainly showed `./tests+fail-test *failed*` - which then
+          # tripped the died-check and compared the wrong sets for parity.
+          grep -aoE "^[[:space:]]*[^[:space:]]+ \*failed\*" /tmp/baseline.log \
+            | sed 's/^[[:space:]]*//;s/ \*failed\*//' | sort -u > /tmp/baseline.failed || true
           echo "BASELINE_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
           # HOW MUCH did this leg get through before it stopped? Both legs
           # abort on the same failed target, and "186s versus 525s" is only a
@@ -740,7 +746,14 @@ jobs:
           # shellcheck disable=SC2086 # a flag LIST: word-splitting is the point
           earthly $EARTHLY_FLAGS "$TARGET" > /tmp/fleet.log 2>&1 && rc=0 || rc=$?
           tail -60 /tmp/fleet.log
-          grep -ao "^[^ ]* \*failed\*" /tmp/fleet.log | sed 's/ \*failed\*//' | sort -u > /tmp/fleet.failed || true
+          # LEADING WHITESPACE, and it is not cosmetic. earthly right-aligns
+          # the target column to the longest target name in the run, so
+          # `*failed*` lines are indented in some runs and not others. The
+          # anchored form silently found ZERO failed targets in a run whose
+          # log plainly showed `./tests+fail-test *failed*` - which then
+          # tripped the died-check and compared the wrong sets for parity.
+          grep -aoE "^[[:space:]]*[^[:space:]]+ \*failed\*" /tmp/fleet.log \
+            | sed 's/^[[:space:]]*//;s/ \*failed\*//' | sort -u > /tmp/fleet.failed || true
           # HOW MUCH did this leg get through before it stopped? Both legs
           # abort on the same failed target, and "186s versus 525s" is only a
           # comparison if they attempted the same work first - a leg that

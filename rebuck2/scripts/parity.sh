@@ -64,7 +64,13 @@ failed_set() {
   # makes grep exit 1, and under `set -e` that killed this script - right
   # after the baseline came back green. The harness for measuring success
   # could only survive failure.
-  grep -ao "^[^ ]* \*failed\*" "$1" 2>/dev/null | sed 's/ \*failed\*//' | sort -u || true
+  # LEADING WHITESPACE is allowed, and that is not cosmetic. earthly
+  # right-aligns the target column to the longest target name in the run, so
+  # these lines are indented in some runs and not others - and the anchored
+  # form reported ZERO failed targets for a CI run whose log plainly showed
+  # `./tests+fail-test *failed*`, which then compared the wrong sets.
+  grep -aoE "^[[:space:]]*[^[:space:]]+ \*failed\*" "$1" 2>/dev/null \
+    | sed 's/^[[:space:]]*//;s/ \*failed\*//' | sort -u || true
 }
 
 echo "== baseline: $TARGET with no fleet at all"
