@@ -5066,3 +5066,35 @@ the mechanism touches, not by which target is cheapest to run.** Nine hours
 of this document were written against `+test-ast` because it is quick and
 nothing in it fails on purpose, and its bottleneck turned out not to be the
 one the wide target has.
+
+### `contexts published: 11` - the group-1 risk, finally read
+
+The pre-flight named context-publishing volume as the one group-1 hazard
+with no exclusion behind it: group 1 crosses into `./autocompletion`,
+`./dockerfile` and `./dockerfile2/subdir`, each bringing its own `local://`.
+The number was printed every run into `proxy.log`, which is uploaded as an
+artifact and which nothing I had been reading ever opened.
+
+From the successful `+test-no-qemu` run:
+
+```text
+[wire] contexts published: 11
+[wire] arrivals       : 150 solves spread over 511531ms (first 0, last 511531)
+[wire] op duplication : 5620 sent / 415 distinct = 13.5x sent, 1.7x built
+```
+
+**Eleven contexts.** Against the one or two `+test-ast` names - so the risk
+was real, it is five times the volume, and it was published concurrently
+because that run carried the `join_all` change made for exactly this target.
+Serially those eleven uploads would all have sat on the critical path before
+the first subtree could leave.
+
+A named risk, a fix built for it before it was measured, and the measurement
+arriving afterwards to say the risk was real. That is the right order by
+luck rather than by design - the fix went in because the serial loop was
+obviously wrong, not because anyone knew there would be eleven.
+
+`arrivals` is worth having too: 150 solves spread evenly across the whole
+511-second leg rather than arriving in a burst. The fleet is fed
+continuously, which is why `placing` is 0% and why queueing, not admission,
+was the thing worth fixing on the narrow target.
