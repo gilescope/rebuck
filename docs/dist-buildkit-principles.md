@@ -440,3 +440,51 @@ Corollary, and it is the honest cost: **we inherit the whole Control surface**
 we distribute any of it. Being a convincing daemon is most of the work of
 being one, and a client that hits an unimplemented method has been told, in
 effect, to change.
+
+## 16. Seed in pieces -- the first copy is the one that is one machine wide
+
+A cascade forms on its own and works. Measured on one full
+`+test-no-qemu`: worker 1 arrives first, finds nothing on any peer, and
+pulls **75 blobs from the coordinator against 3 from peers**; worker 2,
+arriving into a fleet that now holds something, gets **26 of 36 from
+peers**. Nobody designed that and nothing needs to: a bloom filter per
+peer is enough for the tree to build itself.
+
+What does not spread is the SEED. One machine pulls the whole base off the
+coordinator while the others wait for it to finish, because a peer cannot
+serve what it has not got yet. The cascade is only as fast as its root,
+and its root is one link.
+
+So give every blob an owner, computed from its own digest:
+
+    seeder_for(hash, peers)   // sorted peers, indexed by the digest's tail
+
+Six workers then take six different sixths off the coordinator **at the
+same time** and exchange the rest. In the time it used to take to seed one
+machine, six each hold a sixth -- and from then on any machine can be
+served from six sources at once rather than one.
+
+The property that makes it work is that nobody coordinates. Every worker
+computes the same owner from the same digest, so two of them never fetch
+the same blob and no message is needed to arrange it. That requires the
+function to be genuinely deterministic: sort the peer list first, or the
+answer depends on whichever order a hash map happened to iterate in, and
+the agreement it exists to provide is gone.
+
+It also requires the distribution to be even, which is easy to get wrong
+in a way that is invisible. The first version indexed by the digest's
+REVERSED hex digits, which puts the least-variable characters in the low
+bits; over 1200 hashes it sent almost everything to a single worker. A
+seed-splitter that silently does not split is worse than none, because it
+looks like it is working. Test the spread, not just the agreement.
+
+Costs and limits, because they decide when this is worth it:
+
+- It only pays when several machines want the same large blobs at once,
+  which is exactly the base-image case and not much else.
+- The serving side has to be willing to fetch what it does not hold -- and
+  only from the ORIGIN, never from another peer, or two workers can wait
+  on each other.
+- It shortens transfer, not unpack. Every machine still decompresses and
+  unpacks its own copy, so this is bounded by whatever fraction of the
+  cost is on the wire.
