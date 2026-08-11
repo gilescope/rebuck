@@ -240,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn gRPC_methods_are_not_targets_and_junk_is_skipped() {
+    fn grpc_methods_are_not_targets_and_junk_is_skipped() {
         let ms = 1_000_000u128;
         let jsonl = [
             "not json at all".to_owned(),
