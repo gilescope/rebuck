@@ -421,6 +421,17 @@ pub struct Driver {
     /// chain beneath it. Sound because an op's bytes embed its inputs'
     /// digests, so equal digests mean equal ancestry, transitively.
     built: tokio::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Image digest -> the worker that published it, recorded the instant it
+    /// says so.
+    ///
+    /// The blooms answer the same question and answer it too late: they are
+    /// gossiped on a tick, and a child is placed seconds after its parent
+    /// finishes. An affinity term that only saw parents from the previous
+    /// gossip round would fire rarely and read as a mechanism that does not
+    /// help - the exact failure this codebase keeps finding. This map is
+    /// exact, immediate, and has no false positives; the bloom stays as the
+    /// fallback for images a worker PULLED rather than built.
+    holder_of: tokio::sync::Mutex<std::collections::HashMap<String, u64>>,
     /// Distinct `(op, worker)` pairs - what the fleet will actually EXECUTE.
     ///
     /// Dispatch duplication is an upper bound and not the cost: a worker's
@@ -554,6 +565,7 @@ impl Driver {
             peak_inflight: Default::default(),
             dispatched_ops: Default::default(),
             built: Default::default(),
+            holder_of: Default::default(),
             op_by_worker: Default::default(),
             cache_by_worker: Default::default(),
             job_names: Default::default(),
@@ -857,6 +869,14 @@ impl Driver {
                             if let Some(r) = root {
                                 self.built.lock().await.insert(r, image_ref.clone());
                             }
+                            // Who holds it, by the digest a child will name.
+                            // `image_ref` is the bare `sha256:...` the builder
+                            // published; a child imports it as
+                            // `docker-image://<reg>/<repo>@sha256:...` and
+                            // `imported_images` hands back the bare hash, so
+                            // the two meet without either knowing a registry.
+                            let h = image_ref.trim_start_matches("sha256:").to_owned();
+                            self.holder_of.lock().await.insert(h, worker_id);
                         }
                         let (ms, caches) = {
                             let open = self.subtrees.lock().await;
@@ -1708,6 +1728,7 @@ impl Driver {
             let pairs = self.op_by_worker.lock().await;
             let mounts = self.cache_by_worker.lock().await;
             let blooms = self.blooms.lock().await;
+            let holders = self.holder_of.lock().await;
             candidates
                 .iter()
                 .map(|c| {
@@ -1724,13 +1745,28 @@ impl Driver {
                     // endpoint we cannot find scores zero imports, which is
                     // the safe direction - it loses a tie it might have won,
                     // rather than winning one it should not.
-                    let i = match endpoints.get(&c.id) {
-                        Some(e) => blooms
-                            .get(e)
-                            .map(|b| imports.iter().filter(|h| b.contains(h)).count())
-                            .unwrap_or(0),
-                        None => 0,
-                    };
+                    let i = imports
+                        .iter()
+                        .filter(|h| {
+                            // EXACT first. `holder_of` is written the moment a
+                            // worker reports a result; the bloom is gossiped
+                            // on a tick and a child is placed seconds after
+                            // its parent lands, so the bloom alone would miss
+                            // the case this term exists for.
+                            if holders.get(*h) == Some(&c.id) {
+                                return true;
+                            }
+                            // Then the bloom, which covers images a worker
+                            // PULLED rather than built. Keyed by endpoint; a
+                            // candidate we cannot map scores zero, losing a
+                            // tie it might have won rather than winning one
+                            // it should not.
+                            endpoints
+                                .get(&c.id)
+                                .and_then(|e| blooms.get(e))
+                                .is_some_and(|b| b.contains(h))
+                        })
+                        .count();
                     (c.id, crate::dispatch::warmth(n as u32, m as u32, i as u32))
                 })
                 .collect()
