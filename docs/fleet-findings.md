@@ -4908,3 +4908,59 @@ after the excluded index, which the verdict already knows.
 
 Measure which half the time is in before building anything. This document
 contains five mechanisms built before that question was asked.
+
+## The whole of `+test-no-qemu`, through the fleet, alive
+
+`-balance -sandbox`, six machines, no baseline. **It completed.**
+
+```text
+one machine ?s   6 machines 520s
+fleet failed: 1 target(s)
+[wire] verdict : solves=150 routed=127 home=20 peak_solves=10 occupancy=3.35 ceiling=2.99
+[wire] lead phases : placing 0s (0%) waiting 443s (27%) building 1196s (73%)
+[wire] home vertices : 404 ran in 737780ms, 249 cache hit(s)
+```
+
+All fourteen groups, one failed target - the same one the reference run
+failed - and no h2 collapse. The prediction held exactly: **no h2 error and
+the leg completes past 39 targets.**
+
+The cure was `REBUCK2_SANDBOX_HOST`, recorded in this document before today
+and switchable only through a `workflow_dispatch` input that a workflow off
+the default branch can never receive. Third mechanism today whose sole
+defect was being unreachable, after `LOCAL_NESTED` and the machine count -
+and the one that decided whether the mandate's own target ran at all.
+
+### And the two shipped fixes bought nothing here
+
+**520s against the reference's 525s.** Prefetch and `-balance`, worth 41% on
+`+test-ast`, are worth zero on this target.
+
+That is not a disappointment, it is principle 19 arriving with a
+demonstration. Look at where the time is:
+
+| | `+test-ast` | `+test-no-qemu` |
+| ------------ | ------------ | --------------- |
+| `waiting` | 3,670s (45%) | **443s (27%)** |
+| `building` | 4,521s (55%) | **1,196s (73%)** |
+| solves | 412 | 150 |
+| home vertices | 7s | **738s** |
+
+`-balance` attacks queueing. On `+test-ast` queueing was 65% before it and
+45% after; here it is 27% to begin with, so there is almost nothing for it
+to take. Prefetch attacks per-lead fetch cost across 412 leads; here there
+are 128.
+
+**A fix is worth what its target's bottleneck is worth.** Both fixes were
+found, sized and validated against a workload whose bottleneck this workload
+does not have. Nothing was wrong with either measurement; they simply do not
+transfer, and the phase split is what makes that legible instead of
+mysterious.
+
+The bottleneck here is `building` at 73%, plus 738 seconds of home vertex
+time behind the host-bind exclusions. That is the `WITH DOCKER` ceiling,
+already computed at 2.32x on six machines - and `occupancy 3.35` against
+`ceiling 2.99` says the fleet is already working harder than the graph's
+critical path permits.
+
+There is no scheduling work left worth doing on this target.
