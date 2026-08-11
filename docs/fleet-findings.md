@@ -3304,3 +3304,55 @@ So, going forward: fire the comparison and its control close together, and
 prefer the within-run instruments - occupancy, amplification, duplication,
 the mount arms - which are ratios inside a single run and immune to the
 whole question.
+
+## Seeding works, ships 300 MiB, and buys nothing on `+lint-all`
+
+Attempt eleven, the first harvest that presented earthly's own input bytes:
+
+```text
+[harvest] go-mod: using the input observed from a real graph
+[harvest] go-mod at /go/pkg/mod -> ...@sha256:57730aaa, 171.8 MiB
+[harvest] go-build at /root/.cache/go-build -> ...@sha256:eff9e2e9, 128.7 MiB
+[wire] mechanisms : affinity=14 seed_mounts=9 ... seeds=3/3
+```
+
+Three hundred megabytes of real cache, harvested from the baseline's daemon,
+published, resolved, pre-positioned, and grafted into nine dispatched
+graphs. Fourteen faults to get here.
+
+And the clock did not move:
+
+|                    | unseeded   | seeded, empty | **seeded, 300 MiB** |
+| ------------------ | ---------- | ------------- | ------------------- |
+| baseline           | 88s, 86s   | 90s, 88s      | **87s**             |
+| fleet              | 252s, 249s | 260s, 282s    | **252s**            |
+| mount-naming leads | -          | 24.7s, 34.3s  | **34.8s (n=6)**     |
+| amplification      | -          | 3.4x, 2.4x    | **3.1x**            |
+
+Within the run-to-run spread, which the concurrency finding above says is
+wider than it looks. Nothing here is a gain and nothing is a clear loss.
+
+**Why, and it is the prior holding up.** Two hours before this ran, the
+guess written down was that `go-mod` is the least worth shipping - its miss
+path is a download from a fast module proxy, while `go-build` and
+`golangci_lint` miss into CPU. What shipped was `go-mod` (171.8 MiB) and
+`go-build` (128.7 MiB). What did not ship was `golangci_lint`, at 0.0 MiB.
+
+And that 0.0 is **correct, not another fault**. `+lint` fails on the first
+Go module, so the baseline barely fills a golangci-lint cache before it
+stops. The cache that would have paid for this target is empty in the
+baseline because the target is red on purpose.
+
+So `+lint-all` cannot answer the question it was chosen to answer cheaply.
+It is the wrong target for seeding: the expensive cache never fills, and the
+two that do fill are the two the prior said would not pay.
+
+**What to do about it**, in order:
+
+- Measure on `+test-ast` instead. Nothing in it fails on purpose, so its
+  caches fill properly, and `+earthly` gives it a real Go compile to reuse.
+- Seed `go-build` alone and compare against seeding nothing. Shipping 171.8
+  MiB of module cache to save a fast download is the trade the prior says is
+  bad, and it can now be tested rather than argued.
+- Fire the pair back to back with nothing else running, per the concurrency
+  finding.
