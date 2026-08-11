@@ -108,6 +108,14 @@ type Published = std::sync::Arc<
 /// is timing measures mostly itself.
 static TAP_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static TAP_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Frames the tap saw but could not record, because `wire` was busy.
+///
+/// Non-zero is not a bug: it means the instrument declined to block the
+/// stream it was measuring, which is the whole design. It is reported
+/// because a silent drop turns "nothing happened" and "I was not looking"
+/// into the same number, and this session has now been misled by that
+/// confusion three separate times.
+static TAP_MISSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Note every vertex a status frame carries, keyed by digest.
 ///
@@ -708,8 +716,22 @@ impl control::control_server::Control for Proxy {
                 // the instrument on the critical path of the thing it is
                 // measuring, which is the one thing an instrument may not do.
                 if !resp.vertexes.is_empty() {
-                    if let Ok(mut w) = wire.lock() {
-                        note_vertices(&mut w.home_vertices, &resp.vertexes);
+                    // TRY, never block. `wire` is a std Mutex shared with the
+                    // placement path, and this closure runs inside a stream
+                    // poll on an async worker thread - blocking there while
+                    // another task holds the guard across an await is a
+                    // deadlock, not a slow path. That exact non-Send-guard
+                    // hazard has already been tripped three times in this
+                    // file for the same mutex.
+                    //
+                    // A dropped sample is the right trade and is COUNTED, so
+                    // "the tap saw nothing" and "the tap could not get in"
+                    // stay different statements.
+                    match wire.try_lock() {
+                        Ok(mut w) => note_vertices(&mut w.home_vertices, &resp.vertexes),
+                        Err(_) => {
+                            TAP_MISSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
                 TAP_US.fetch_add(
@@ -2505,8 +2527,10 @@ pub async fn serve(
                 TAP_US.load(std::sync::atomic::Ordering::Relaxed),
             );
             println!(
-                "[wire] status tap     : {frames} frame(s), {}ms total - what THIS instrument cost",
-                us / 1000
+                "[wire] status tap     : {frames} frame(s), {}ms total, {} missed (busy) \
+                 - what THIS instrument cost",
+                us / 1000,
+                TAP_MISSED.load(std::sync::atomic::Ordering::Relaxed)
             );
             println!(
                 "[wire] lead phases    : placing {}s ({:.0}%) waiting {}s ({:.0}%) building {}s ({:.0}%) \
