@@ -1724,6 +1724,15 @@ jobs:
           # against a 5x ceiling is a dispatcher with a problem, and until
           # these two lines existed the two were indistinguishable.
           grep -E '^\[wire\] (concurrency|amdahl ceiling|verdict|mount arms)' proxy.log || true
+
+          # WHERE a lead's time went, and what the instruments themselves
+          # cost. Both are new and both answer questions that have been open
+          # for several runs: building is roughly a quarter of lead_ms and
+          # nothing said what the rest was, and a 50-minute leg could not be
+          # told apart from an expensive tap without running it twice.
+          echo "=== where the time went, and what measuring it cost"
+          grep -E '^\[wire\] (lead phases|status tap|home vertices|service ms|grafted)' \
+            proxy.log || true
           # WORK AMPLIFICATION, which is the number that reframes all of
           # these. The fleet's lead time against the whole baseline wall: if
           # it is 9, the fleet did nine times the work and no scheduler
@@ -1811,6 +1820,15 @@ jobs:
           fi
           echo "=== the coordinator's registry"
           grep -E '^\[registry\] (served|  *[0-9]+ MiB|[0-9]+ blobs)' proxy.log || true
+
+          # DISTINCT against SERVED, and how much left the box. The ratio was
+          # reported as 93x from fleet-served over coordinator-distinct -
+          # two different registries - and the per-worker figure is the
+          # comparable one. It has never printed: the run carrying it died
+          # before its workers could.
+          echo "=== repetition, and which side of the wire"
+          grep -hE '^\[worker\] ([0-9]+ blobs over|of that,|served [0-9]+ MiB)' \
+            worker-*.log 2>/dev/null || true
           echo "   uploads far below blobs served means results were fetched"
           echo "   from the runners that built them, which is the whole point."
           echo "=== wall"
