@@ -4256,3 +4256,35 @@ choosing*, while two machines held four each and did nothing.
 
 More slots would not have helped. Spreading the work is the fix, which is
 what `-balance` does.
+
+### Pre-flight for `+test-no-qemu`, before spending ninety minutes on it
+
+Read the twelve unrun groups rather than discovering them at minute sixty.
+
+`tests/Earthfile` partitions them by hand, and they are not
+interchangeable. Group 2 - the only one ever run, and the workflow default -
+is almost all local targets: `+copy-test`, `+copy-tilde-test`,
+`+copy-keep-own-test`. The others are not.
+
+- **Group 1 crosses directories**: `./autocompletion+test-all`,
+  `./dockerfile+test-all`, `./dockerfile2/subdir+test`. Each sub-Earthfile
+  brings its own `local://` context, and the proxy publishes every one
+  before a graph naming it can leave. More contexts than any run so far has
+  handled, and `contexts published` is the line to watch.
+- **Group 3 uses secrets**: `+secrets-test`,
+  `+secrets-optional-prefix-test`. A dispatched solve is sessionless and has
+  nobody to ask for a secret.
+
+The second one looked like a predicted failure and is not, which is worth
+recording as the machinery working rather than as a near miss. `Verdict`
+carries a `secrets` flag, `dispatchable()` passes `serving_secrets: false`,
+and `REBUCK2_SERVE_SECRETS` is unset in the workflow - so a graph naming a
+secret is excluded from dispatch and builds at home. No failure, no
+distribution for those targets, and the run stays green.
+
+That is "fail open, never fail wrong" collecting on a bet made long before
+this target existed. The exclusion was written when a secret was simply
+fatal; it now protects a target nobody had in mind.
+
+The remaining risk is context publishing volume in group 1, which is
+measurable and has no exclusion behind it.
