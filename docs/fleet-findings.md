@@ -3509,3 +3509,49 @@ Worth noting what it cost to establish: one minute with the local rig,
 against a twenty-five minute fleet run that would have answered the same
 question with more noise. Principle 23, applied on purpose this time rather
 than after three runs.
+
+## What is built, what is on, and what has actually been measured
+
+An audit, because the answer surprised me and it decides what to run next
+rather than what to build next.
+
+| mechanism             | default | measured?                                                               |
+| --------------------- | ------- | ----------------------------------------------------------------------- |
+| `cut_prefix`          | **on**  | yes - 444s to 407s locally, and the +107s that took graft off           |
+| `affinity`            | **on**  | yes - op duplication 2.9x to 1.2x                                       |
+| `verdict_stops_retry` | **on**  | yes - +lint-all 628s to 252s                                            |
+| `read_retry`          | **on**  | guard; has never needed to fire                                         |
+| `prefetch`            | **on**  | partly - it announces, and no run isolates its effect                   |
+| `peer_cache_mounts`   | **on**  | yes, as a cost: it is what makes cold mounts possible                   |
+| `seed_mounts`         | off     | yes - ships 300 MiB, changes nothing on `+lint-all`                     |
+| `graft`               | off     | measured ON one shape (+107s) and never re-measured against a warm bank |
+| `trust_verdict`       | off     | **no**                                                                  |
+| `min_siblings`        | off     | **no**                                                                  |
+| `warm`                | off     | **no** - and its target was changed to `+deps` on a theory              |
+| `local_nested`        | off     | **no**                                                                  |
+| `fleet_cache`         | off     | measured once, badly - 755s against 590s                                |
+| `compression` (zstd)  | off     | **no**                                                                  |
+| `arm_workers`         | off     | **no** - the run is still going                                         |
+
+Five mechanisms have never been measured at all, and two more were measured
+once under conditions that no longer hold. That is not a backlog of work to
+build; it is a backlog of runs.
+
+The ones on by default all earned it with a number, which is the part to
+keep doing.
+
+**What that says about what to run next**, in order of expected value:
+
+1. **zstd on `+test-ast`.** 78% of lead time is layer materialisation and
+   the codec is a one-line setting. The instrument that says whether it can
+   possibly help - fetch time against unpack time - landed this hour and has
+   never run.
+2. **`graft` against a warm bank.** Its +107s was measured within a single
+   run, where the ancestor has to be built before it can be imported. Across
+   runs the bank already holds it. Nothing has tested that and the machinery
+   is all there.
+3. **`trust_verdict`.** Removes one of the two attempts a deterministic
+   failure costs, and every test target here has a red leg.
+
+And the discipline the audit exists to enforce: a mechanism that is off and
+unmeasured is not a feature, it is a hypothesis with code attached.
