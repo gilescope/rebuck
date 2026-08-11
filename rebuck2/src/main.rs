@@ -112,7 +112,23 @@ async fn harvest_one(
     // a cache mount's input is an image reference and has to name somewhere,
     // and `docker-image://sha256:...` parses nowhere.
     let reference = solve::pullable(registry, &digest);
-    println!("[harvest] {id} at {dest} -> {reference}");
+    // HOW MUCH came out, and it is not a nicety. A cache that was empty -
+    // because the baseline used a different id, or never touched it -
+    // harvests an empty layer, seeds nothing, and presents afterwards as
+    // "seeding did not pay". Those are opposite findings and the blob count
+    // is what separates them.
+    match solve::image_blobs(&reference).await {
+        Some(b) if !b.is_empty() => {
+            println!(
+                "[harvest] {id} at {dest} -> {reference}, {} blob(s)",
+                b.len()
+            )
+        }
+        _ => println!(
+            "[harvest] {id} at {dest} -> {reference}, but it names NO blobs - that cache \
+             was empty, so seeding it will change nothing"
+        ),
+    }
     println!("REBUCK2_CACHE_SEEDS={id}={reference}");
     Ok(())
 }
