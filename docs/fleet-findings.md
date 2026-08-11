@@ -2282,13 +2282,14 @@ runs, which is larger than any effect being looked for.
 
 The standing goal is larger and larger parts of it, so here is the ledger.
 
-| target                   | shape                                  | status                                          |
-| ------------------------ | -------------------------------------- | ----------------------------------------------- |
-| `+test-no-qemu-group1`   | one group, nested earthly, WITH DOCKER | parity, locally                                 |
-| `+test-no-qemu-group2`   | the same, one group                    | parity, in CI, six machines                     |
-| `+test-no-qemu-group10`  | the same, one group                    | where graft and cut-prefix were measured        |
-| `+test-no-qemu` (all 14) | 14 groups on one 192s base chain       | completes, parity, 508s vs 285s                 |
-| `+all-binaries`          | 5 cross-compiles off one `+code` stem  | **green both legs**, 262s vs 712s, 2.3x ceiling |
+| target                   | shape                                  | status                                           |
+| ------------------------ | -------------------------------------- | ------------------------------------------------ |
+| `+test-no-qemu-group1`   | one group, nested earthly, WITH DOCKER | parity, locally                                  |
+| `+test-no-qemu-group2`   | the same, one group                    | parity, in CI, six machines                      |
+| `+test-no-qemu-group10`  | the same, one group                    | where graft and cut-prefix were measured         |
+| `+test-no-qemu` (all 14) | 14 groups on one 192s base chain       | completes, parity, 508s vs 285s                  |
+| `+all-binaries`          | 5 cross-compiles off one `+code` stem  | **green both legs**, 262s vs 712s, 2.3x ceiling  |
+| `+lint-all`              | 3 independent lint targets, no docker  | parity, 92s vs 628s - and it found the retry bug |
 
 Everything above the last line is the same shape wearing different numbers:
 a long serial base chain, then nested earthly builds that each want a 600
@@ -2540,3 +2541,59 @@ experiment is chosen by where it is pushed.
 `-seed` keeps the default target deliberately. It selects a mechanism rather
 than a workload, and a mechanism has to be measured against the same graph
 it is meant to help.
+
+## A failing target cost six times what it should. Measured on `+lint-all`
+
+`+lint-all` was added as a cheap smoke target - three independent lint
+targets, no docker, no cache mount worth naming. It produced the worst ratio
+in the ledger and the clearest cause.
+
+|                | baseline | fleet                                  |
+| -------------- | -------- | -------------------------------------- |
+| wall           | **92s**  | **628s**                               |
+| failed targets | 1        | 1 - the same one, so parity            |
+| solves         |          | 19 seen, 15 routed, 4 home             |
+| op duplication |          | 290 sent / 62 distinct, **1.3x built** |
+| occupancy      |          | 3.63, peak 8                           |
+
+1.3x duplication and occupancy 3.63 - by every measure of *dispatch* this is
+the best run recorded. And it took nearly seven times the baseline.
+
+The per-solve lines say where:
+
+```text
+solve 15 : 105242..541322  total 436080
+solve 16 : 105243..569311  total 464068
+solve 17 : 105239..589879  total 484640
+solve 18 : 105244..593286  total 488042
+```
+
+Four solves, all starting in the same millisecond, each running seven to
+eight minutes, in a build whose single-machine total is ninety-two seconds.
+And `not routed`:
+
+```text
+{"fleet: build failed: solve: ... golangci-lint run ... exit code: 1": 4}
+```
+
+The same failure, four times. `+lint` fails on purpose in this tree, and
+`subtree_declined` re-offered it on any reason at all: peer 1 ran the whole
+lint and failed, peer 2 ran the whole lint and failed, and so on down the
+placement order before the requester finally built it at home and failed
+too.
+
+**A single machine pays a deterministic failure once. The fleet paid it per
+peer.** Nothing about the scheduler was wrong - it placed the work well, by
+its own numbers better than in any other run. It simply had no way to tell
+"this peer could not" from "this build does not succeed".
+
+The distinction is the same one `worth_retrying` draws for connections, one
+level up, and the bias has to point the same way: retrying a verdict costs
+time, refusing to retry a machine fault costs the build. So a verdict is
+matched on buildkit's own framing - the container ran and the process exited
+non-zero - and everything else stays retryable.
+
+Worth stating plainly, because it changes how the other numbers read: this
+suite contains targets that fail on purpose, and every fleet measurement
+taken on `+test-no-qemu-*` includes at least one of them. Some part of every
+"the fleet was slower by N seconds" in this document is this bug.
