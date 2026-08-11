@@ -3052,14 +3052,25 @@ seeded mount is not the warmed version of the unseeded one - it is a
 **separate cache directory**, initialised from the seed and never shared
 with the plain `go-mod` dir beside it.
 
-That is correct, and it has a consequence this project has to decide about:
-a worker that has built five leads and has a genuinely warm `go-mod` will,
-on being handed a seeded graph, start from the SEED instead. If the seed is
-older or thinner than what that worker already had, seeding makes it slower.
+**Correcting that, an hour later, before building anything on it.** The
+first reading was that this puts seeding and affinity in tension: a worker
+with a warm `go-mod`, handed a seeded graph, would start from the seed
+instead and might go slower. That is wrong, for a reason worth writing down.
 
-Which puts seeding and affinity back in tension, in a new way. Affinity
-exists to keep a worker meeting its own warm mount; seeding hands every
-worker the same one and, by keying, replaces rather than augments. The
-resolution is probably to seed only where a worker has no warm mount of that
-id already - `cache_by_worker` already tracks exactly that, for affinity -
-but nothing measured yet says how big the effect is in either direction.
+`cache_seeds()` is read once per run, so every dispatched graph naming
+`go-mod` carries the SAME seed ref, so every one of them keys to the same
+`go-mod:<seed>` directory on a given worker. That directory accumulates
+across leads exactly as the plain one would. There is no split and affinity
+keeps working: a worker that has built five seeded leads has a warm seeded
+mount, and the sixth meets it.
+
+What does split is HOME builds. Those solve the client's original graph, not
+the rewritten one, so they use the plain `go-mod` while every dispatched
+graph uses `go-mod:<seed>`. Two directories on peer 0, one of them per-run.
+That is a real cost and a small one - home builds are the minority by
+construction, `built at home` is 4 of 19 on this target - and it is
+disk rather than time.
+
+So: no machinery needed, and the `cache_by_worker` gate described above
+would have been solving a problem that does not exist. Reading the key
+construction was worth it anyway; assuming what it implied was not.
