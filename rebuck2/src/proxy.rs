@@ -345,6 +345,9 @@ impl control::control_server::Control for Proxy {
             req.cache = crate::solve::reference_export(&m.registry);
         }
         let t = std::time::Instant::now();
+        // Kept for one retry: the channel reconnects on the next request,
+        // but the request itself moves into the first attempt.
+        let again = (meta.clone(), req.clone());
         let out = self
             .client()
             .solve(Request::from_parts(meta, ext, req))
@@ -365,6 +368,30 @@ impl control::control_server::Control for Proxy {
                     e.message()
                 );
             });
+        // ONE retry, for the transport only. This is the call the client
+        // blocks on, so its failure is the whole build's failure - a full
+        // +test-no-qemu has died here repeatedly, taking thirteen groups
+        // that were fine down with the one that was not.
+        //
+        // Extensions belong to the inbound connection and the upstream call
+        // does not read them.
+        let out = match out {
+            Err(e) if worth_retrying(&e) => {
+                println!("[proxy] retrying Control.Solve once: {}", e.message());
+                let (meta, req) = again;
+                self.client()
+                    .solve(Request::from_parts(meta, Default::default(), req))
+                    .await
+                    .inspect_err(|e| {
+                        println!(
+                            "[proxy] Control.Solve retry failed too: {} {}",
+                            e.code(),
+                            e.message()
+                        );
+                    })
+            }
+            other => other,
+        };
         let ms = t.elapsed().as_millis() as u64;
         let went = self.went.held().get(&build_id).cloned();
         let mut w = self.wire.held();
@@ -1526,7 +1553,21 @@ fn report_gateway(wire: &std::sync::Mutex<Wire>, req: &gw::SolveRequest) -> bool
 /// deliberately contains targets that fail, so the distinction is not
 /// academic.
 fn worth_retrying(s: &tonic::Status) -> bool {
-    s.code() == tonic::Code::Unavailable
+    // The transport's own code.
+    if s.code() == tonic::Code::Unavailable {
+        return true;
+    }
+    // And buildkit's, which reports its transport failures as Unknown - the
+    // same code it uses for a build that FAILED. Found by instrumenting
+    // Control.Solve after a full +test-no-qemu kept dying:
+    //
+    //   upstream Control.Solve failed: Unknown error transport error
+    //
+    // Matched EXACTLY, not by substring. This suite is full of targets that
+    // fail on purpose and their error text is relayed verbatim, so a build
+    // whose own output mentions a transport error must not be rebuilt for
+    // saying so.
+    s.code() == tonic::Code::Unknown && s.message().trim() == "transport error"
 }
 
 /// How many reset streams hyper tolerates before it gives up on a connection.
@@ -2658,6 +2699,35 @@ mod tests {
         )));
         // Cancellation is the client's decision, not a fault to paper over.
         assert!(!super::worth_retrying(&Status::new(Code::Cancelled, "ctx")));
+
+        // The one that actually kills full-target runs, found by
+        // instrumenting Control.Solve:
+        //
+        //   upstream Control.Solve failed: Unknown error transport error
+        //
+        // buildkit reports its own transport failures as Unknown, which is
+        // also how it reports a build that FAILED - so the code alone cannot
+        // separate them and the message has to.
+        assert!(super::worth_retrying(&Status::new(
+            Code::Unknown,
+            "transport error"
+        )));
+        assert!(super::worth_retrying(&Status::new(
+            Code::Unknown,
+            " transport error\n"
+        )));
+
+        // EXACT, not "contains". This suite is full of targets that fail on
+        // purpose, and their error text is relayed verbatim - a build whose
+        // own output mentions a transport error must not be rebuilt for it.
+        assert!(!super::worth_retrying(&Status::new(
+            Code::Unknown,
+            "process \"/bin/sh\" did not complete successfully: transport error seen in log"
+        )));
+        assert!(!super::worth_retrying(&Status::new(
+            Code::Unknown,
+            "exit code 1"
+        )));
     }
 
     /// The h2 reset limit is a knob, so the question can be settled by an A/B.
