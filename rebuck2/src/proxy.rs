@@ -1508,6 +1508,7 @@ impl Wire {
                 ("?verdict_stops_retry", true),
                 ("trust_verdict", crate::dispatch::trust_peer_verdicts()),
                 ("min_siblings", min_siblings() > 0),
+                ("min_ops", crate::dispatch::min_ops() > 0),
                 (
                     "prefetch",
                     std::env::var("REBUCK2_PREFETCH").as_deref() == Ok("1")
@@ -2808,7 +2809,30 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 // written, making REBUCK2_MIN_SIBLINGS change a counter and
                 // nothing else. The A/B would have read "no effect" and the
                 // idea would have been discarded without ever being enabled.
-                let offer = allowed && worth && saturated && crowded;
+                // Is there enough WORK here to pay for the bytes?
+                //
+                // `+test-ast` dispatched 412 solves and moved 24.7 GiB to run
+                // a 204-second build - 73x. The median lead ran 2.6 seconds
+                // and fetched 26 MiB to do a `jq` and a `diff`. A lead costs
+                // what it fetches, so a graph smaller than its own base image
+                // is a straight loss however idle the fleet is.
+                //
+                // A different question from `crowded`, which asks whether
+                // anything else is in flight. That one is about whether
+                // dispatch can OVERLAP; this is whether it is worth doing at
+                // all, and it would not have stopped one of the 412.
+                let big_enough =
+                    !crate::dispatch::too_small_to_send(def.def.len(), crate::dispatch::min_ops());
+                if allowed && worth && saturated && crowded && !big_enough {
+                    crate::mech::applied("min_ops");
+                    *self
+                        .wire
+                        .held()
+                        .rejected
+                        .entry("smaller than the bytes it would drag".to_owned())
+                        .or_default() += 1;
+                }
+                let offer = allowed && worth && saturated && crowded && big_enough;
                 if allowed && worth && saturated && !crowded {
                     // Kept home BECAUSE of the rule - the outcome it exists
                     // to change.

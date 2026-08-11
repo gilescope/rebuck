@@ -50,6 +50,7 @@ on:
       - giles-dispatch-ci-ast-zstd
       - giles-dispatch-ci-ast-nobase
       - giles-dispatch-ci-ast-zstd-nobase
+      - giles-dispatch-ci-ast-minops-nobase
       - giles-dispatch-ci-ast-seed
       - giles-dispatch-ci-lint-graft
       - giles-dispatch-ci-buildkitd-arm
@@ -441,6 +442,7 @@ jobs:
       graft: ${{ steps.n.outputs.graft }}
       fleet: ${{ steps.n.outputs.fleet }}
       compression: ${{ steps.n.outputs.compression }}
+      minops: ${{ steps.n.outputs.minops }}
       nobase: ${{ steps.n.outputs.nobase }}
     steps:
       - id: n
@@ -491,7 +493,7 @@ jobs:
           workload=$REF
           while :; do
             before=$workload
-            for suffix in -seed -graft -arm -zstd -nobase; do
+            for suffix in -seed -graft -arm -zstd -minops -nobase; do
               # QUOTED: unquoted, `$suffix` is taken as a glob pattern
               # rather than a literal, which shellcheck SC2295 catches and
               # which would misbehave the moment a suffix contained a `?`
@@ -560,6 +562,16 @@ jobs:
           case "$REF" in *-zstd*) comp=zstd ;; *) comp="" ;; esac
           echo "compression: ${comp:-buildkit default}"
           echo "compression=$comp" >> "$GITHUB_OUTPUT"
+
+          # `-minops`: refuse to dispatch a graph smaller than the bytes it
+          # would drag across. `+test-ast` ran 412 solves, routed every one,
+          # moved 24.7 GiB, and took 1773s against a 204s baseline - the
+          # median lead fetched 26 MiB to run a `jq`. Twenty ops is a coarse
+          # floor and deliberately so: the cost of being wrong is one solve
+          # built at home, against a 73x failure if the floor is absent.
+          case "$REF" in *-minops*) minops=20 ;; *) minops=0 ;; esac
+          echo "min ops: ${minops:-off}"
+          echo "minops=$minops" >> "$GITHUB_OUTPUT"
 
           # `-nobase`: skip the baseline leg. For comparing a MECHANISM
           # against itself, where the control is another fleet leg and the
@@ -903,6 +915,7 @@ jobs:
       REBUCK2_TARGET: ${{ needs.plan.outputs.target }}
       REBUCK2_GRAFT: ${{ needs.plan.outputs.graft }}
       REBUCK2_COMPRESSION: ${{ needs.plan.outputs.compression }}
+      REBUCK2_MIN_OPS: ${{ needs.plan.outputs.minops }}
       REBUCK2_SKIP_BASELINE: ${{ needs.plan.outputs.nobase }}
       # ONE path for the binary in this job. It was written out twice and
       # the copies disagreed: the proxy step had `./rebuck2-repo/...` and

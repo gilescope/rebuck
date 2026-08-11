@@ -1547,6 +1547,43 @@ pub fn worth_offering(
 /// three of them have now been measured and all three cost more than they
 /// saved. This one at least SUBTRACTS handovers rather than adding them, but
 /// that is an argument, and arguments have lost to measurements every time.
+/// Is this graph too small to be worth sending anywhere?
+///
+/// A lead costs what it fetches. `+test-ast` dispatched 412 solves and moved
+/// 24.7 GiB to run a 204-second build: median lead 2.6s and 26 MiB, to run a
+/// `jq` and a `diff`. Fifty-four of those leads carried twenty ops or fewer,
+/// cost 232 seconds between them, and dragged 1.2 GiB to do work a single
+/// machine does in the noise.
+///
+/// Op count is a crude proxy for how much work a graph is, and deliberately
+/// so - principle 13. It is known before dispatch, it needs no history, and
+/// the failure it prevents is enormous while the cost of being wrong is one
+/// solve built at home. That asymmetry is what makes a crude rule the right
+/// one here.
+///
+/// The floor is INCLUSIVE at the other end: a graph with exactly `floor`
+/// ops travels. Zero disables it, which is today's behaviour and what every
+/// number in `docs/fleet-findings.md` was measured against.
+///
+/// Not the same question as `min_siblings`, which asks whether anything
+/// else is in flight. That one is about whether dispatch can overlap; this
+/// is about whether it is worth doing at all, and it would not have stopped
+/// any of the 412.
+pub fn too_small_to_send(ops: usize, floor: usize) -> bool {
+    floor > 0 && ops < floor
+}
+
+/// The op floor from the environment, read once.
+pub fn min_ops() -> usize {
+    static M: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("REBUCK2_MIN_OPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 pub fn affinity() -> bool {
     std::env::var("REBUCK2_AFFINITY").as_deref() == Ok("1")
 }
@@ -2650,6 +2687,26 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// A graph too small to be worth the bytes it drags across.
+    ///
+    /// `+test-ast` dispatched 412 solves and moved 24.7 GiB to run a
+    /// 204-second build. Median lead: 2.6s, 26 MiB fetched, for a `jq` and
+    /// a `diff`. A lead costs what it fetches, so a lead that fetches a base
+    /// image to run milliseconds of work is pure loss.
+    #[test]
+    fn a_graph_can_be_too_small_to_send() {
+        let keep = super::too_small_to_send;
+        // Off by default: zero means no floor, which is today's behaviour
+        // and what every number in the findings was measured against.
+        assert!(!keep(2, 0));
+        assert!(!keep(763, 0));
+        // With a floor, the tiny ones stay home and the big ones go.
+        assert!(keep(2, 20));
+        assert!(keep(16, 20));
+        assert!(!keep(20, 20), "the floor is inclusive - 20 ops clears it");
+        assert!(!keep(37, 20), "the median +test-ast lead still travels");
+        assert!(!keep(763, 20));
+    }
 
     /// The proxy writes these and the harvest reads them, in two processes
     /// and often two runs apart. One function each way, tested together.
