@@ -6,6 +6,12 @@
 # nothing either way - most routers do not hairpin - so ask a runner.
 name: otel reachability
 on:
+  # A push trigger as well as dispatch: workflow_dispatch only lists
+  # workflows present on the DEFAULT branch, and this one lives on a
+  # feature branch.
+  push:
+    branches: [giles-dispatch]
+    paths: ['.github/workflows/otel-reach.yml']
   workflow_dispatch:
     inputs:
       endpoint:
