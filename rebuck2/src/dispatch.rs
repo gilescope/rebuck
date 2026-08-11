@@ -578,34 +578,31 @@ impl LeadSplit {
     }
 }
 
-/// Split a lead into placing, waiting and building.
+/// Where one lead's wall clock went: placing, waiting, building.
 ///
-/// `accepted` and `started` are offsets from `opened`; `done` is the whole
-/// lead. `started == 0` means the worker never said - an older peer, or one
-/// that died - and the unknown collapses into WAITING rather than building,
-/// which is the pessimistic reading and the honest one: it says the fleet
-/// was slow to get going rather than crediting a build that may not have
-/// happened.
+/// `accepted` is milliseconds since the record opened, measured on the
+/// driver's own clock. `build_ms` is a DURATION reported by the worker, and
+/// deliberately not a timestamp: two machines' clocks are not promised to
+/// agree, and subtracting across them turns milliseconds of skew into a
+/// headline figure.
 ///
-/// Clamped throughout. `started` is reported by the worker and the rest is
-/// measured here, and clocks are not promised to agree across machines - an
-/// unclamped subtraction turns a 3ms skew into an eleven-day interval, which
-/// is exactly how a bogus number becomes a headline.
-pub fn lead_split(opened: u64, accepted: u64, started: u64, done: u64) -> LeadSplit {
+/// It is not a derived start either, and that distinction cost a rewrite.
+/// `done - build_ms` puts a build that filled its whole lead at zero, which
+/// is indistinguishable from "the worker never said" - so a busy worker
+/// would have been booked as a slow fleet, the one reading this split exists
+/// to prevent.
+///
+/// Clamped to the lead. A build longer than the interval containing it is
+/// transit, rounding, or two machines timing slightly different things; it
+/// takes what is left after `placing` and never wraps or borrows.
+pub fn lead_split(opened: u64, accepted: u64, build_ms: u64, done: u64) -> LeadSplit {
     let accepted = accepted.clamp(opened, done);
     let placing_ms = accepted - opened;
-    if started == 0 {
-        return LeadSplit {
-            placing_ms,
-            waiting_ms: done - accepted,
-            building_ms: 0,
-        };
-    }
-    let started = started.clamp(accepted, done);
+    let building_ms = build_ms.min(done - accepted);
     LeadSplit {
         placing_ms,
-        waiting_ms: started - accepted,
-        building_ms: done - started,
+        waiting_ms: (done - accepted) - building_ms,
+        building_ms,
     }
 }
 
@@ -2801,42 +2798,36 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
-    /// Where a lead's time went, when only three moments are recorded.
+    /// A build that fills the whole lead is not an unknown build.
     ///
-    /// 4,407 seconds of building against 14,812 of lead time on the same 414
-    /// leads. The 10,400 in between is offers, declines, queueing on a busy
-    /// worker, and the result coming back - and no remedy tried so far even
-    /// aims at it, because nothing said how big it was.
-    ///
-    /// Some of it is a fleet being USED: a lead waiting its turn behind two
-    /// others on the same worker is not waste. The split is the whole point.
+    /// The driver derives the start as `total - build_ms`, and `build_ms` is
+    /// the worker's own duration while `total` is measured here - so a lead
+    /// whose build occupied all of it lands on or past zero and trips the
+    /// "worker never said" sentinel. That would book a real build as WAITING,
+    /// which is the one reading that makes a busy fleet look like a slow one.
     #[test]
-    fn a_lead_splits_into_placing_waiting_and_building() {
-        let s = super::lead_split(0, 1_200, 5_000, 7_600);
-        assert_eq!(s.placing_ms, 1_200, "offered until a worker said yes");
-        assert_eq!(s.waiting_ms, 3_800, "accepted until it actually started");
-        assert_eq!(s.building_ms, 2_600, "started until the result landed");
-        assert_eq!(s.total_ms(), 7_600);
+    fn a_build_that_fills_the_lead_is_not_an_unknown_start() {
+        // A worker that reports no build time at all: every millisecond of
+        // the lead was spent somewhere other than building, and saying so is
+        // the pessimistic and honest reading.
+        let s = super::lead_split(0, 0, 0, 4_000);
+        assert_eq!(s.waiting_ms, 4_000);
 
-        // A worker that never reported starting - an older peer, or one that
-        // died - must not silently book its queue time as build time. The
-        // unknown collapses into `waiting`, which is the pessimistic side:
-        // it says the fleet was slow to get going rather than crediting a
-        // build that may not have happened.
-        let s = super::lead_split(0, 1_200, 0, 7_600);
+        // A build that filled the whole lead. Under the derived-start form
+        // this was arithmetically identical to the line above - which is why
+        // that form is gone.
+        let s = super::lead_split(0, 0, 4_000, 4_000);
         assert_eq!(
             (s.placing_ms, s.waiting_ms, s.building_ms),
-            (1_200, 6_400, 0)
+            (0, 0, 4_000),
+            "the worker spent the whole lead building"
         );
-
-        // Clocks are not promised to be monotonic ACROSS machines: the start
-        // is reported by the worker, the rest measured here. A start that
-        // appears to precede the offer is clamped rather than wrapping into
-        // an enormous unsigned number, which is how one of these becomes a
-        // headline figure that is pure arithmetic.
-        let s = super::lead_split(0, 5_000, 1_000, 7_600);
-        assert_eq!(s.placing_ms + s.waiting_ms + s.building_ms, 7_600);
-        assert_eq!(s.waiting_ms, 0, "no negative wait");
+        // And a build longer than the lead - transit, rounding, a worker
+        // that timed one thing while the driver timed another - is clamped
+        // to the lead rather than wrapping or stealing from `placing`.
+        let s = super::lead_split(0, 500, 9_000, 4_000);
+        assert_eq!((s.placing_ms, s.waiting_ms, s.building_ms), (500, 0, 3_500));
+        assert_eq!(s.total_ms(), 4_000);
     }
 
     /// An image already on the machine outranks an op already built there.

@@ -934,12 +934,12 @@ impl Driver {
                             // build began is `ms - build_ms` on one clock.
                             // Nothing crosses machines, so nothing can be
                             // skewed into a headline.
-                            let split = crate::dispatch::lead_split(
-                                0,
-                                offered_ms,
-                                ms.saturating_sub(build_ms),
-                                ms,
-                            );
+                            // The DURATION, not a derived start. Deriving
+                            // it as `ms - build_ms` puts a build that filled
+                            // its whole lead on zero, which is the sentinel
+                            // for "the worker never said" - and would book a
+                            // busy worker as a slow fleet.
+                            let split = crate::dispatch::lead_split(0, offered_ms, build_ms, ms);
                             self.placing_ms
                                 .fetch_add(split.placing_ms, Ordering::Relaxed);
                             self.waiting_ms
