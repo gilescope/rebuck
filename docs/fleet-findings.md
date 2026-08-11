@@ -5395,3 +5395,37 @@ once started. The candidates, in the order they should be eliminated:
 This is the largest unexplained number in the document and it has been
 derivable since the phase split landed. It is what "the fleet does 9x the
 work" (principle 21) was gesturing at without a denominator.
+
+### How to measure the 12.5x, without guessing which candidate it is
+
+The three candidates - cold buildkit cache, cold cache mounts, unpack - are
+not separable from anything currently printed. `took Xms ... in Wms` gives
+serve time and total, so `took - served` is build-plus-unpack together, and
+no line divides it.
+
+But there is a discriminator that needs no new theory: **time the same op
+digest on both sides.**
+
+The baseline leg runs every op on the coordinator's daemon and the status
+tap already records those timings by digest. A worker running a dispatched
+lead runs some of the SAME ops - the digest is `sha256:<hex of op bytes>`,
+confirmed in `vertex.go:337`, and identical bytes on either machine produce
+an identical key. So:
+
+- **worker time approximately equals baseline time** for the same digest -
+  then the 12.5x is not per-op cost at all, it is ops the fleet runs that
+  the baseline never ran, and the answer is in what gets dispatched rather
+  than how it executes.
+- **worker time greatly exceeds baseline time** for the same digest - then
+  it IS environmental, and the split between cache and unpack is the next
+  question rather than the first one.
+
+What it needs: the worker taps its own buildkit status the way the proxy
+does - the same `note_vertices`, twenty lines - and prints per-digest
+timings at exit. Then one run has both halves and the comparison is a join
+on the digest.
+
+Deliberately not building it now, with a run in flight. Recorded because the
+design is the part that was unclear, and because this document already
+contains five mechanisms built before anyone asked which candidate they
+addressed.
