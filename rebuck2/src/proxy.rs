@@ -2457,6 +2457,29 @@ pub async fn serve(
         let (lead_total_ms, lead_total_n) = driver_for_report.cache_lead_total();
         let (seeded_ms, seeded_n, cold_ms, cold_n) = driver_for_report.seeded_split().await;
         let (all_lead_ms, all_leads) = driver_for_report.lead_total();
+        // WHERE a lead's time went, which no run has ever said. The totals
+        // above put 14,812 seconds of lead against 4,407 of building on the
+        // same 414 leads, and the 10,400 in between could equally be a fleet
+        // failing to place work or a fleet busy doing it.
+        {
+            let (p, w, b) = driver_for_report.lead_phases();
+            let total = crate::dispatch::LeadSplit {
+                placing_ms: p,
+                waiting_ms: w,
+                building_ms: b,
+            };
+            let t = total.total_ms().max(1);
+            println!(
+                "[wire] lead phases    : placing {}s ({:.0}%) waiting {}s ({:.0}%) building {}s ({:.0}%) \
+                 - waiting is a worker BUSY, not a fleet failing",
+                p / 1000,
+                100.0 * p as f64 / t as f64,
+                w / 1000,
+                100.0 * w as f64 / t as f64,
+                b / 1000,
+                100.0 * b as f64 / t as f64,
+            );
+        }
         {
             let w = wire.held();
             // ONE LINE with the numbers a run is compared on, because the ledger

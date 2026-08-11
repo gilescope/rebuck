@@ -845,14 +845,18 @@ async fn lead_reply(
     // and that ran to a few hundred fetches for the whole run.
     let served_ms =
         crate::registry::SERVED_MS.load(std::sync::atomic::Ordering::Relaxed) - serve_ms_before;
+    let build_ms = t.elapsed().as_millis() as u64;
     println!(
-        "[worker] job {job} took {}ms ({} ops, {} KiB fetched in {served_ms}ms)",
-        t.elapsed().as_millis(),
+        "[worker] job {job} took {build_ms}ms ({} ops, {} KiB fetched in {served_ms}ms)",
         verdict.ops,
         moved / 1024
     );
     match out {
-        Ok(image_ref) => W2D::Led { job, image_ref },
+        Ok(image_ref) => W2D::Led {
+            job,
+            image_ref,
+            build_ms,
+        },
         // A failed subtree is the requester's to rebuild. Reporting it as a
         // decline rather than swallowing it is what stops them waiting.
         Err(e) => {

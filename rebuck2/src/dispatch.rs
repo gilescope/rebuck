@@ -557,6 +557,58 @@ pub fn cache_mount_shapes(def: &pb::Definition) -> BTreeSet<(String, bool)> {
 /// TAGS are skipped. `busybox:1` is a perfectly good import and a useless
 /// affinity signal: there is no digest to ask a bloom about, and guessing
 /// would put work on a machine for a reason nobody can check.
+/// Where one lead's wall clock went.
+///
+/// All four inputs are milliseconds since the subtree record opened, so a
+/// caller only has to subtract once and the arithmetic lives here.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct LeadSplit {
+    /// Offered until a worker accepted. Round trips and refusals.
+    pub placing_ms: u64,
+    /// Accepted until the worker started. Its queue, and a fleet being used.
+    pub waiting_ms: u64,
+    /// Started until the result landed. The only part any current remedy
+    /// aims at, and a quarter of the total.
+    pub building_ms: u64,
+}
+
+impl LeadSplit {
+    pub fn total_ms(&self) -> u64 {
+        self.placing_ms + self.waiting_ms + self.building_ms
+    }
+}
+
+/// Split a lead into placing, waiting and building.
+///
+/// `accepted` and `started` are offsets from `opened`; `done` is the whole
+/// lead. `started == 0` means the worker never said - an older peer, or one
+/// that died - and the unknown collapses into WAITING rather than building,
+/// which is the pessimistic reading and the honest one: it says the fleet
+/// was slow to get going rather than crediting a build that may not have
+/// happened.
+///
+/// Clamped throughout. `started` is reported by the worker and the rest is
+/// measured here, and clocks are not promised to agree across machines - an
+/// unclamped subtraction turns a 3ms skew into an eleven-day interval, which
+/// is exactly how a bogus number becomes a headline.
+pub fn lead_split(opened: u64, accepted: u64, started: u64, done: u64) -> LeadSplit {
+    let accepted = accepted.clamp(opened, done);
+    let placing_ms = accepted - opened;
+    if started == 0 {
+        return LeadSplit {
+            placing_ms,
+            waiting_ms: done - accepted,
+            building_ms: 0,
+        };
+    }
+    let started = started.clamp(accepted, done);
+    LeadSplit {
+        placing_ms,
+        waiting_ms: started - accepted,
+        building_ms: done - started,
+    }
+}
+
 pub fn imported_images(def: &pb::Definition) -> BTreeSet<String> {
     use prost::Message;
     def.def
@@ -2737,6 +2789,44 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// Where a lead's time went, when only three moments are recorded.
+    ///
+    /// 4,407 seconds of building against 14,812 of lead time on the same 414
+    /// leads. The 10,400 in between is offers, declines, queueing on a busy
+    /// worker, and the result coming back - and no remedy tried so far even
+    /// aims at it, because nothing said how big it was.
+    ///
+    /// Some of it is a fleet being USED: a lead waiting its turn behind two
+    /// others on the same worker is not waste. The split is the whole point.
+    #[test]
+    fn a_lead_splits_into_placing_waiting_and_building() {
+        let s = super::lead_split(0, 1_200, 5_000, 7_600);
+        assert_eq!(s.placing_ms, 1_200, "offered until a worker said yes");
+        assert_eq!(s.waiting_ms, 3_800, "accepted until it actually started");
+        assert_eq!(s.building_ms, 2_600, "started until the result landed");
+        assert_eq!(s.total_ms(), 7_600);
+
+        // A worker that never reported starting - an older peer, or one that
+        // died - must not silently book its queue time as build time. The
+        // unknown collapses into `waiting`, which is the pessimistic side:
+        // it says the fleet was slow to get going rather than crediting a
+        // build that may not have happened.
+        let s = super::lead_split(0, 1_200, 0, 7_600);
+        assert_eq!(
+            (s.placing_ms, s.waiting_ms, s.building_ms),
+            (1_200, 6_400, 0)
+        );
+
+        // Clocks are not promised to be monotonic ACROSS machines: the start
+        // is reported by the worker, the rest measured here. A start that
+        // appears to precede the offer is clamped rather than wrapping into
+        // an enormous unsigned number, which is how one of these becomes a
+        // headline figure that is pure arithmetic.
+        let s = super::lead_split(0, 5_000, 1_000, 7_600);
+        assert_eq!(s.placing_ms + s.waiting_ms + s.building_ms, 7_600);
+        assert_eq!(s.waiting_ms, 0, "no negative wait");
+    }
+
     /// An image already on the machine outranks an op already built there.
     ///
     /// Both avoid work; they are not the same size. Re-running an op costs

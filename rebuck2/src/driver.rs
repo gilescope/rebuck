@@ -337,6 +337,12 @@ struct Subtree {
     /// frequency in the source says nothing about time - but which ones the
     /// fleet actually SPENDS its seconds behind.
     started: std::time::Instant,
+    /// When the offer that was ACCEPTED went out, as ms since `started`.
+    ///
+    /// Driver-local, so no clock crosses a machine. Updated on every offer,
+    /// so after the last one it is the moment placement stopped costing
+    /// round trips and refusals - which is what `placing` means.
+    offered_ms: u64,
     caches: std::collections::BTreeSet<String>,
     /// Did this go out byte-identical to what the client sent?
     ///
@@ -393,6 +399,14 @@ pub struct Driver {
     /// rather than derived, because deriving it needs occupancy and a wall
     /// clock and gets rounded twice on the way.
     all_lead_ms: std::sync::atomic::AtomicU64,
+    /// Lead time, split three ways. See [`crate::dispatch::lead_split`].
+    ///
+    /// Every remedy tried so far aims at `building`, which is a quarter of
+    /// the total. These two say whether the rest is a fleet being slow to
+    /// place work or a fleet legitimately busy.
+    placing_ms: std::sync::atomic::AtomicU64,
+    waiting_ms: std::sync::atomic::AtomicU64,
+    building_ms: std::sync::atomic::AtomicU64,
     all_leads: std::sync::atomic::AtomicU64,
     /// The most subtrees ever in flight at once.
     ///
@@ -559,6 +573,9 @@ impl Driver {
             seeded_leads: Default::default(),
             cold_leads: Default::default(),
             all_lead_ms: Default::default(),
+            placing_ms: Default::default(),
+            waiting_ms: Default::default(),
+            building_ms: Default::default(),
             all_leads: Default::default(),
             cache_lead_ms: Default::default(),
             cache_leads: Default::default(),
@@ -841,7 +858,11 @@ impl Driver {
                     // the builder's mirror. The driver is told WHERE, and
                     // holds no bytes: principle 6, and the test for it is
                     // to look at this machine's disk afterwards.
-                    W2D::Led { job, image_ref } => {
+                    W2D::Led {
+                        job,
+                        image_ref,
+                        build_ms,
+                    } => {
                         // Read the open record BEFORE `led` consumes it: the
                         // timing and the cache ids live there, and the whole
                         // point is to attribute this job's seconds.
@@ -878,13 +899,15 @@ impl Driver {
                             let h = image_ref.trim_start_matches("sha256:").to_owned();
                             self.holder_of.lock().await.insert(h, worker_id);
                         }
-                        let (ms, caches) = {
+                        let (ms, caches, offered_ms) = {
                             let open = self.subtrees.lock().await;
                             match open.get(&job) {
-                                Some(st) => {
-                                    (st.started.elapsed().as_millis() as u64, st.caches.clone())
-                                }
-                                None => (0, Default::default()),
+                                Some(st) => (
+                                    st.started.elapsed().as_millis() as u64,
+                                    st.caches.clone(),
+                                    st.offered_ms,
+                                ),
+                                None => (0, Default::default(), 0),
                             }
                         };
                         let what = self
@@ -905,6 +928,24 @@ impl Driver {
                         {
                             self.all_lead_ms.fetch_add(ms, Ordering::Relaxed);
                             self.all_leads.fetch_add(1, Ordering::Relaxed);
+                            // `started` is derived, not measured: the worker
+                            // reports a DURATION and the driver knows when
+                            // the lead was last offered, so the moment the
+                            // build began is `ms - build_ms` on one clock.
+                            // Nothing crosses machines, so nothing can be
+                            // skewed into a headline.
+                            let split = crate::dispatch::lead_split(
+                                0,
+                                offered_ms,
+                                ms.saturating_sub(build_ms),
+                                ms,
+                            );
+                            self.placing_ms
+                                .fetch_add(split.placing_ms, Ordering::Relaxed);
+                            self.waiting_ms
+                                .fetch_add(split.waiting_ms, Ordering::Relaxed);
+                            self.building_ms
+                                .fetch_add(split.building_ms, Ordering::Relaxed);
                             if !caches.is_empty() {
                                 self.cache_lead_ms.fetch_add(ms, Ordering::Relaxed);
                                 self.cache_leads.fetch_add(1, Ordering::Relaxed);
@@ -1830,6 +1871,7 @@ impl Driver {
                 frontier: frontier.clone(),
                 placement,
                 started: std::time::Instant::now(),
+                offered_ms: 0,
                 // From the graph, not the verdict: `inspect` answers
                 // may-it-travel and does not carry the ids.
                 caches: {
@@ -2116,6 +2158,12 @@ impl Driver {
         match next {
             Some(peer) if peer != who => {
                 println!("[driver] subtree job {job} -> worker {peer} (after a decline)");
+                // Placement is still costing round trips, so the clock on
+                // `placing` keeps running. Stamped on EVERY offer, so what
+                // survives is the last one - the moment a worker took it.
+                if let Some(st) = self.subtrees.lock().await.get_mut(&job) {
+                    st.offered_ms = st.started.elapsed().as_millis() as u64;
+                }
                 self.tell(
                     peer,
                     D2W::Lead {
@@ -2275,6 +2323,21 @@ impl Driver {
         (
             self.all_lead_ms.load(Ordering::Relaxed),
             self.all_leads.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Lead time as `(placing, waiting, building)` milliseconds.
+    ///
+    /// `building` is what every remedy so far aims at and was a quarter of
+    /// the total in the run that prompted this. `placing` is offers and
+    /// refusals and is pure overhead. `waiting` is a lead sitting on a busy
+    /// worker, which is a fleet being USED - large is not automatically bad,
+    /// and confusing the two is why the 10,400-second gap went unexamined.
+    pub fn lead_phases(&self) -> (u64, u64, u64) {
+        (
+            self.placing_ms.load(Ordering::Relaxed),
+            self.waiting_ms.load(Ordering::Relaxed),
+            self.building_ms.load(Ordering::Relaxed),
         )
     }
 

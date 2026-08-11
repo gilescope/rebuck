@@ -151,6 +151,18 @@ pub enum W2D {
     Led {
         job: u64,
         image_ref: String,
+        /// How long the WORKER spent on it, start of solve to result.
+        ///
+        /// A DURATION and not a timestamp, deliberately. The driver measures
+        /// everything else against its own clock, and two machines' clocks
+        /// are not promised to agree - subtracting across them turns a few
+        /// milliseconds of skew into a headline figure. A duration needs no
+        /// agreement about when anything happened.
+        ///
+        /// Without it a lead is one interval: 14,812 seconds across 414
+        /// leads against 4,407 seconds of building, and no way to tell the
+        /// 10,400 in between from a fleet that is simply busy.
+        build_ms: u64,
     },
     /// "Place this for me." A worker that has subdivided its tree asks the
     /// driver to find a peer for one branch. The driver arbitrates; the
