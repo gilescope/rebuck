@@ -3274,3 +3274,33 @@ directory, and the observed inputs a run writes are for the run after it.
 leg, after the harvest. So a run harvests using what the previous run
 observed - which is the warm-CI case rather than a simulation of it, and
 what a permanent fleet does without being asked.
+
+## Concurrent runs distort the baseline, and this session ran three at a time
+
+`+all-buildkitd`'s baseline leg took **1161s** when it ran alone. The same
+leg, same target, same `ubuntu-latest` coordinator, took **over 3100s** in
+the mixed-architecture run - and the only difference outside the run was
+that two other fleet runs were in flight beside it, seven jobs each.
+
+Nothing inside the run explains it. The baseline runs before any worker is
+contacted, so the arm64 workers cannot be the cause; the coordinator does
+the same work either way.
+
+The likely mechanism is the hosted pool: a free public repo gets whatever
+hardware is spare, and twenty-one jobs asking at once is a different
+question from seven. Whatever the cause, the consequence for this document
+is the same.
+
+**Every wall-clock comparison here is between two legs of ONE run**, which
+is why the rig was built that way and why it survives this. A baseline and a
+fleet leg on the same runner in the same half hour see the same conditions.
+
+**Across runs is where it bites.** The `+lint-all` pair quoted at 2.3%
+apart, 88s and 86s, were fired minutes apart with similar load, and that is
+luck rather than design. A pair fired hours apart under different load could
+differ by three times, and the recorded numbers give no way to tell.
+
+So, going forward: fire the comparison and its control close together, and
+prefer the within-run instruments - occupancy, amplification, duplication,
+the mount arms - which are ratios inside a single run and immune to the
+whole question.
