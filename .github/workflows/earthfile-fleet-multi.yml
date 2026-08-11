@@ -73,12 +73,13 @@ on:
       warm_target:
         description: what to warm with
         type: string
-        # ./tests, not ./t. earthly ABBREVIATES the directory in its display
-        # names and in the target names it puts in OTLP spans, so the traces
-        # say `./t/integration-base+test-base` and there is no such path.
-        # Six warm-ups failed identically on "No Earthfile nor build.earth
-        # file found" because the target was copied out of a log.
-        default: ./tests/integration-base+test-base
+        # If a directory-qualified target is used here again: ./tests, not
+        # ./t. earthly ABBREVIATES the directory in its display names and in
+        # the target names it puts in OTLP spans, so the traces say
+        # `./t/integration-base+test-base` and there is no such path. Six
+        # warm-ups failed identically on "No Earthfile nor build.earth file
+        # found" because the target was copied out of a log.
+        default: '+deps'
       local_nested:
         description: a nested earthly uses the daemon on the machine running it (1/0)
         type: string
@@ -206,6 +207,23 @@ env:
   # to buildkit`. The worker substitutes its own routable address instead,
   # which is the one place the answer is known.
   REBUCK2_LOCAL_NESTED: ${{ inputs.local_nested || '0' }}
+  # Retracted and reinstated for a DIFFERENT reason, so the old note is
+  # wrong and worth correcting rather than deleting.
+  #
+  # Warming was ruled out structurally: making a graph portable rewrites its
+  # op digests, so a warm worker's buildkit cache can never key-match the
+  # dispatched graph, and one measured warm worker still fetched 354 MiB.
+  # That argument is sound and still holds - for buildkit's OP CACHE.
+  #
+  # It does not hold for CACHE MOUNTS, and they are where the time is. A
+  # cache mount is a directory, not a cache key: `go mod download` finds a
+  # module in /go/pkg/mod by module path and version, and does not care what
+  # digest the op carrying it had. So warming cannot make a worker skip an
+  # op, and CAN make the op it runs cheap - which against ~64 leads at ~24s
+  # apiece is the larger of the two prizes.
+  #
+  # Still off: affinity is the variable under test right now, and stacking
+  # two would make neither readable.
   REBUCK2_WARM: ${{ inputs.warm || '0' }}
   # Do not dispatch work that has nothing to overlap with. The traces put 192
   # of the baseline's 271 seconds in a base chain three targets deep, one at
@@ -225,7 +243,13 @@ env:
   REBUCK2_FRESH_FLEET: ${{ inputs.fresh_fleet || '1' }}
   REBUCK2_CONNS: ${{ inputs.conns || '' }}
   REBUCK2_KEEPALIVE_S: ${{ inputs.keepalive_s || '' }}
-  REBUCK2_WARM_TARGET: ${{ inputs.warm_target || './tests/integration-base+test-base' }}
+  # `+deps`, not the base chain, and that follows from the paragraph above.
+  # If warming buys a warm cache MOUNT rather than a cache hit, then the
+  # right warm-up is the cheapest target that fills the expensive mounts -
+  # and `+deps` is exactly `go mod download` into /go/pkg/mod behind
+  # `id=go-mod`, the costliest id in the table. The base chain fills them
+  # too, and takes minutes doing it.
+  REBUCK2_WARM_TARGET: ${{ inputs.warm_target || '+deps' }}
   # Pinned by digest like everything else here: a collector that changes
   # under us changes the data.
   OTEL_IMAGE: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.145.0

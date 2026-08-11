@@ -2371,3 +2371,38 @@ does not move the 24s leads, the conclusion is that lifted cache mounts are
 too expensive to dispatch behind and the policy should be to keep
 cache-mounted subtrees at home - which is the opposite of what
 `REBUCK2_PEER_CACHE_MOUNTS` was built to allow, and would be worth knowing.
+
+## Warming was buried for the right reason and the wrong scope
+
+The earlier finding - *Warming cannot work, because portability changes the
+cache keys* - is correct and stays. Making a graph portable rewrites the ops
+that name a local context or a base image, every digest downstream of them
+changes, and buildkit's cache is keyed on exactly those digests. A warm
+worker cannot key-match a dispatched graph. One measured warm worker still
+fetched 354 MiB, which is what that looks like.
+
+It applies to buildkit's **op cache**. It does not apply to **cache
+mounts**, and the previous section puts most of the time there.
+
+A cache mount is a directory, not a cache key:
+
+|                   | keyed on                     | survives a rewritten digest?   |
+| ----------------- | ---------------------------- | ------------------------------ |
+| buildkit op cache | the op digest, transitively  | no - that is the whole finding |
+| `go-mod` mount    | module path and version      | yes; `go` looks it up itself   |
+| `go-build` mount  | the compiler's own action id | yes                            |
+| `npm` mount       | package name and version     | yes                            |
+
+So warming cannot make a worker SKIP an op. It can make the op it runs
+cheap, and against ~64 leads at ~24s each that is the larger of the two
+prizes. The two claims are not in conflict; the first was simply stated
+about the whole of caching when it is true of half of it.
+
+Which also picks the warm-up target. If the prize is a filled mount rather
+than a cache hit, warm with the cheapest target that fills the expensive
+mounts - `+deps`, which is `go mod download` into `/go/pkg/mod` behind
+`id=go-mod`, the costliest id in the table. The base chain fills them too
+and takes minutes about it. The default moved accordingly.
+
+Still off, because affinity is the variable under test and two at once is
+neither.
