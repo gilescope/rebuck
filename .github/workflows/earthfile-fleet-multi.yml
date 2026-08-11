@@ -579,9 +579,13 @@ jobs:
                   # +test-misc, twelve independent groups and +test-no-qemu-
                   # slow. Fourteen siblings with no dependency between them,
                   # which is the shape a fleet exists for - against +all,
-                  # whose four children each hide a chain. Only group2 has
-                  # ever been run, and one group of fourteen is not a
-                  # measurement of what distribution is worth here.
+                  # whose four children each hide a chain.
+                  #
+                  # It HAS run: 186s on one machine against 525s on six,
+                  # which is 2.8x and the best ratio in the findings. That
+                  # was before prefetch worked at all and while two machines
+                  # sat idle, so it is a reference to beat rather than a
+                  # blank.
                   #
                   # Run it `-nobase` FIRST. The deliverable there is the
                   # failed-target count, not a clock: fourteen groups with a

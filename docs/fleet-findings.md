@@ -77,7 +77,7 @@ confident version first - which has happened to me, in this file, twice.
 | Whether the fleet repeats itself, and by how much | the coordinator reports 1.1x; the per-worker figure has never printed |
 | Whether placing a lead near its parent pays | `-balance-imports` in flight; it had to follow `-balance`, not precede it |
 | What made the reference run take 50 minutes | not the tap, which costs 1ms. Still unexplained |
-| What a 14-way target does | `+test-no-qemu` has never run |
+| What a 14-way target does with the fixes | it ran at 186s/525s BEFORE them - see the correction |
 
 **Retracted.** Written here confidently and wrong. Left in place with the
 correction attached, because a deleted mistake gets made again.
@@ -4042,7 +4042,7 @@ and the ladder turned out not to be the one I had in my head.
 | `+test-ast` | 3 AST groups | yes |
 | `+test-no-qemu-group2` | 1 of 14 | yes, the default |
 | **`+all`** | `+all-buildkitd`, `+all-binaries`, `+earthly-docker`, `+prerelease` | **never** |
-| **`+test-no-qemu`** | `+test-misc`, twelve groups, `+test-no-qemu-slow` | **never** |
+| `+test-no-qemu` | `+test-misc`, twelve groups, `+test-no-qemu-slow` | **yes** - 186s/525s, the best ratio here |
 
 Two things this corrects.
 
@@ -4502,8 +4502,9 @@ the right mechanism. But `+test-no-qemu` goes first, for three reasons that
 have nothing to do with which is more appealing.
 
 **It is the mandate.** "Larger and larger parts of the Earthfile" is the
-brief, and every measurement in this document comes from targets with three
-to five branches. Fourteen has never been tried.
+brief, and every measurement TODAY comes from targets with three to five
+branches. The fourteen-way target last ran before prefetch worked and
+before placement spread beyond four machines.
 
 **It is the only workload that can answer the question the others cannot.**
 `+test-ast`'s Amdahl ceiling is 2.97x at seven machines - the graph itself
