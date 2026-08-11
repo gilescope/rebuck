@@ -1011,6 +1011,24 @@ jobs:
             grep -aoE "^Error: .*" /tmp/baseline.log | tail -3
             echo "BASELINE_DIED=1" >> "$GITHUB_ENV"
           fi
+          # WHAT IT PRODUCED, not merely whether it complained.
+          #
+          # Parity has so far been a set of failed target names, which is the
+          # only claim a test target can support. A target that emits
+          # BINARIES can support a much stronger one: same inputs, same
+          # bytes, wherever the compile happened to run. `SAVE ARTIFACT ...
+          # AS LOCAL` puts them in ./build, and the Go builds here are
+          # deterministic - fixed ldflags, a fixed /earthly build path inside
+          # the image - so a difference is a real difference and not
+          # timestamp noise.
+          #
+          # Moved aside rather than deleted: the second leg must not be able
+          # to pass by leaving the first leg's files in place.
+          find build -type f -print0 2>/dev/null | sort -z \
+            | xargs -0r sha256sum > /tmp/baseline.artifacts || true
+          echo "baseline local artifact(s): $(wc -l < /tmp/baseline.artifacts | tr -d ' ')"
+          rm -rf "/tmp/baseline-build"
+          if [ -d build ]; then mv build "/tmp/baseline-build"; fi
 
 
       - name: the Earthfile, through the fleet
@@ -1094,6 +1112,12 @@ jobs:
           fi
 
           echo "FLEET_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
+          # Same snapshot as the baseline leg took; the reasoning is there.
+          find build -type f -print0 2>/dev/null | sort -z \
+            | xargs -0r sha256sum > /tmp/fleet.artifacts || true
+          echo "fleet local artifact(s): $(wc -l < /tmp/fleet.artifacts | tr -d ' ')"
+          rm -rf "/tmp/fleet-build"
+          if [ -d build ]; then mv build "/tmp/fleet-build"; fi
 
       - name: did the fleet change the answer
         run: |
@@ -1118,6 +1142,14 @@ jobs:
             echo "PARITY: the same $(wc -l < /tmp/baseline.failed | tr -d ' ') target(s) failed either way"
           else
             echo "::warning::the fleet changed the outcome - see the diff above"
+          fi
+          # Nothing to say for a test target, which writes no binaries.
+          if [ -s /tmp/baseline.artifacts ] || [ -s /tmp/fleet.artifacts ]; then
+            if diff -u /tmp/baseline.artifacts /tmp/fleet.artifacts; then
+              echo "BYTE PARITY: $(wc -l < /tmp/baseline.artifacts | tr -d ' ') local artifact(s), identical either way"
+            else
+              echo "::warning::the fleet produced different bytes - see the diff above"
+            fi
           fi
 
       - name: is the daemon still alive
