@@ -1635,6 +1635,8 @@ impl Wire {
                 ("?prefetch_broadcast", crate::worker::prefetch_broadcast()),
                 ("?balance", crate::dispatch::balance_warmth()),
                 ("peer_cache_mounts", crate::dispatch::policy().caches,),
+                ("?serve_secrets", serving_secrets()),
+                ("?forward_agent", forwarding_agent()),
                 (
                     "prefetch",
                     std::env::var("REBUCK2_PREFETCH").as_deref() == Ok("1")
@@ -2932,6 +2934,17 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 // ONCE PER SOLVE, here, rather than inside `dispatchable_when`
                 // which the ordering code calls speculatively per candidate.
                 // An inflated count is a different lie, not a safer one.
+                // The two CAPABILITY lifts, counted at the same decision. Both
+                // are off in every run so far, and either would otherwise
+                // change what may leave this machine while no report says it
+                // was on - the least acceptable place in this system for
+                // that to be true.
+                if allowed && serving_secrets() {
+                    crate::mech::applied("serve_secrets");
+                }
+                if allowed && forwarding_agent() {
+                    crate::mech::applied("forward_agent");
+                }
                 if allowed
                     && policy.caches
                     && verdict

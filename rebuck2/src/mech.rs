@@ -107,6 +107,105 @@ mod summary_shape {
 }
 
 #[cfg(test)]
+mod every_switch_is_reported {
+    /// The mirror of `source_consistency`, and the hole it left.
+    ///
+    /// That test proves every REPORTED name has a counter. It cannot prove
+    /// the converse - that every switch which changes behaviour is reported -
+    /// and three were not: `peer_cache_mounts`, set in every CI run and the
+    /// exception that makes seven dispatches in eight legal; `fleet_cache`;
+    /// and `warm`. Each acted, none appeared in the mechanisms line, and no
+    /// run could say whether any of them did anything.
+    ///
+    /// A switch not in the summary is not automatically a bug - most of
+    /// these name an address, a file or a size. So the exemptions are listed
+    /// WITH a reason, and adding a new behavioural flag means either
+    /// reporting it or saying here why it needs no report. Both are cheap;
+    /// silently doing neither is what this exists to stop.
+    #[test]
+    fn a_flag_that_changes_behaviour_appears_in_the_report() {
+        // NOT mechanisms: configuration, addresses, sizes, and the knobs of
+        // the synthetic LLB generator used by scripts/fleet.sh.
+        const CONFIG: &[&str] = &[
+            "REBUCK2_MIRROR",            // where the mirror is
+            "REBUCK2_TARGET",            // a label for the verdict line
+            "REBUCK2_COMPRESSION",       // exporter attrs, reported by the run itself
+            "REBUCK2_CONNS",             // connection pool size
+            "REBUCK2_KEEPALIVE_S",       // h2 keepalive
+            "REBUCK2_HOME_SLOTS",        // capacity, reported as `home peak`
+            "REBUCK2_CACHE_SEEDS",       // seeds, reported as `seeds=`
+            "REBUCK2_CACHE_SEEDS_FILE",  //   ditto
+            "REBUCK2_CACHE_INPUTS_FILE", //   ditto
+            "REBUCK2_EXEC_BASE",         // exec sandbox
+            "REBUCK2_KEEP_SCRATCH",      // debugging aid
+            "REBUCK2_NESTED_HOST",       // an address for local_nested
+            "REBUCK2_PREFETCH_LANES",    // concurrency of a reported mechanism
+            "REBUCK2_SECRET",            // a secret's value
+            "REBUCK2_GATE",              // reported as `not routed`
+            "REBUCK2_MIN_SIBLINGS",      // reported as min_siblings
+            "REBUCK2_MIN_OPS",           // reported as min_ops
+            "REBUCK2_GRAFT",             // reported on its own line
+            "REBUCK2_WARMUP",            // a count, not a switch
+            "REBUCK2_PREFETCH_ALL",      // reported as `prefetch_broadcast`
+            "REBUCK2_FLEET_CACHE",       // three-valued, and the mode is in
+            // the solve request rather than a
+            // decision this proxy takes
+            "REBUCK2_H", // llb generator
+            "REBUCK2_LLB_BASE",
+            "REBUCK2_LLB_CONTEXT",
+            "REBUCK2_LLB_HOSTNET",
+            "REBUCK2_LLB_N",
+            "REBUCK2_LLB_OUT",
+            "REBUCK2_LLB_PLATFORM",
+            "REBUCK2_LLB_WORK",
+        ];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut all = String::new();
+        for f in std::fs::read_dir(&dir).expect("src") {
+            let f = f.expect("entry").path();
+            if f.extension().is_some_and(|e| e == "rs") {
+                all.push_str(&std::fs::read_to_string(&f).expect("read"));
+            }
+        }
+        let mut vars: Vec<String> = Vec::new();
+        let bytes = all.as_bytes();
+        for (i, _) in all.match_indices("REBUCK2_") {
+            let mut j = i + "REBUCK2_".len();
+            while j < bytes.len() && (bytes[j].is_ascii_uppercase() || bytes[j] == b'_') {
+                j += 1;
+            }
+            let v = all[i..j].trim_end_matches('_').to_owned();
+            // `REBUCK2` on its own is prose - the binary's name in a comment
+            // or a log line - not an environment variable.
+            if v == "REBUCK2" {
+                continue;
+            }
+            if !vars.contains(&v) {
+                vars.push(v);
+            }
+        }
+        let mut unreported = Vec::new();
+        for v in vars {
+            if CONFIG.contains(&v.as_str()) {
+                continue;
+            }
+            // The counter name is the variable, lowercased and unprefixed -
+            // the convention every reported mechanism already follows.
+            let name = v.trim_start_matches("REBUCK2_").to_lowercase();
+            if !all.contains(&format!("applied(\"{name}\")")) {
+                unreported.push(format!("{v} -> expected applied(\"{name}\")"));
+            }
+        }
+        assert!(
+            unreported.is_empty(),
+            "these switches change behaviour and no run reports them; either \
+             count them or add them to CONFIG with a reason:\n  {}",
+            unreported.join("\n  ")
+        );
+    }
+}
+
+#[cfg(test)]
 mod source_consistency {
     /// Every name the report can print must have somewhere that counts it.
     ///
