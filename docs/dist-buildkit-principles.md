@@ -630,3 +630,38 @@ principle 11: the seam is a property of the graph, not of the dispatcher,
 and a graph with no seam has nothing to offer however good the dispatcher
 is. Finding out which of the two you are looking at is a ten-minute trace,
 and it is the cheapest work available.
+
+## 20. Only seed a cache whose contents key themselves
+
+Principle 18 says pre-position what the work will need. Cache mounts are the
+biggest thing there is to pre-position -- one measured run put ~64 leads at
+~24s each behind a cold `go-mod` -- and buildkit will let you: a cache mount
+with an `input` starts as a copy-on-write ref over that input.
+
+It will let you do it for **any** cache id, and that is the trap. A cache
+mount is a mutable directory with a name, and the name is the only contract.
+What is inside it is between the build and itself.
+
+Two kinds, and only one is safe to hand somebody:
+
+| kind            | example                                                            | why                                                                                                                  |
+| --------------- | ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| **self-keying** | `go-mod`, `go-build`, `npm`, `~/.cargo/registry`                   | every entry is addressed by content or by name+version, so a wrong entry cannot be *found*; a stale one is invisible |
+| **positional**  | a scratch dir, an output staging area, anything keyed only by path | the build looks up a path and takes what is there, so somebody else's contents are silently accepted as its own      |
+
+Seeding the first kind can only save time: worst case the seeded entry is
+never looked up, and it is dead weight on disk. Seeding the second can
+change what a build produces, which is principle 5's line -- a mechanism may
+make a build faster and must not be able to make one wrong.
+
+So the ids to seed are **named, never discovered**. It is tempting to
+harvest every id the graph mentions, since `cache_ids` already enumerates
+them and the cost table already ranks them by seconds. Do not: the ranking
+says which are expensive, not which are safe, and those are different
+questions. An operator naming `go-mod` is asserting something about Go's
+module cache that no amount of measurement can establish from outside.
+
+The corollary is that the mechanism has to be cheap to leave off. A missing
+seed is a cold mount, which is exactly today's behaviour, so every failure
+along the way -- no shell in the harvest base, an empty cache, a registry
+that will not take the layer -- degrades to "slower", never to "wrong".

@@ -870,10 +870,24 @@ pub fn affinity() -> bool {
 
 /// Images to start named cache mounts from, as `id=ref,id=ref`.
 ///
-/// Supplied rather than discovered, for now. Harvesting a warm mount off the
-/// coordinator is a separate job with its own failure modes; this makes the
-/// rewrite measurable without it, and an operator who already has a filled
-/// `/go/pkg/mod` published can point at it today.
+/// NAMED, never discovered, and that is principle 20 rather than a stage
+/// this will grow out of. `cache_ids` already enumerates every id a graph
+/// mentions and the cost table already ranks them by seconds, so harvesting
+/// the lot is a few lines away - and it would be wrong. The ranking says
+/// which are EXPENSIVE; it cannot say which are SAFE. A self-keying cache
+/// (`go-mod`, `go-build`, `npm`) addresses every entry by content or by
+/// name-and-version, so a seeded entry that does not belong simply is never
+/// looked up. A positional one - a scratch dir, an output staging area -
+/// hands somebody else's bytes to a build that asked for a path, and that
+/// is principle 5's line.
+///
+/// An operator writing `go-mod` here is asserting something about Go's
+/// module cache that no measurement from outside can establish.
+///
+/// The refs are produced by `rebuck2 harvest-cache`, which is a separate
+/// step for a separate reason: harvesting fails in its own ways, and the
+/// measurement this exists for needs the seed to be a fixed input to a run
+/// rather than something that may or may not have happened inside it.
 ///
 /// Read once, like every other policy here: a seed map that changed halfway
 /// through a build would give two identical subtrees different graphs.
