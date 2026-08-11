@@ -46,6 +46,7 @@ on:
       - giles-dispatch-ci-seed
       - giles-dispatch-ci-lint-seed
       - giles-dispatch-ci-binaries-seed
+      - giles-dispatch-ci-lint-graft
   workflow_dispatch:
     inputs:
       peer_cache_mounts:
@@ -362,7 +363,9 @@ env:
   # and it cost 107s: a handover here is a registry publish plus a pull on
   # every machine that wants it, and those constants dwarf the bytes. See
   # docs/fleet-findings.md.
-  REBUCK2_GRAFT: ${{ inputs.graft || '0' }}
+  # Resolved in `plan`, like the target and the seeding switch - a
+  # workflow-level env cannot see `needs`, and one place has to state it.
+
   REBUCK2_CUT_PREFIX: ${{ inputs.cut_prefix || '1' }}
   # Written before `earthly bootstrap` in BOTH jobs. earthly hands this to the
   # buildkitd container as EARTHLY_ADDITIONAL_BUILDKIT_CONFIG, and a daemon
@@ -406,12 +409,14 @@ jobs:
       count: ${{ steps.n.outputs.count }}
       target: ${{ steps.n.outputs.target }}
       seed: ${{ steps.n.outputs.seed }}
+      graft: ${{ steps.n.outputs.graft }}
     steps:
       - id: n
         env:
           W: ${{ inputs.workers || '6' }}
           T: ${{ inputs.target || '' }}
           SEED: ${{ inputs.seed_caches || '' }}
+          GRAFT: ${{ inputs.graft || '' }}
           REF: ${{ github.ref_name }}
         run: |
           set -euo pipefail
@@ -442,6 +447,7 @@ jobs:
           # combinations, because the combinations multiply and the table
           # would go stale the first time a target was added.
           workload=${REF%-seed}
+          workload=${workload%-graft}
           case "${T:-}" in
             "") case "$workload" in
                   *-binaries) target=+all-binaries ;;
@@ -468,6 +474,19 @@ jobs:
           esac
           echo "seed caches: $seed"
           echo "seed=$seed" >> "$GITHUB_OUTPUT"
+          # GRAFT, and the reason it is worth another look. It was measured
+          # at +107s and switched off - within a RUN, where the ancestor has
+          # to be built and published before anything can import it. Across
+          # runs it is a different proposition entirely: the bank restores
+          # the coordinator's store, so last run's subtrees are already
+          # there and grafting costs a pull rather than a build. Nothing has
+          # tested that, and `[wire] grafted` has read 0 in every run.
+          case "${GRAFT:-}" in
+            "") case "$REF" in *-graft) graft=1 ;; *) graft=0 ;; esac ;;
+            *)  graft="$GRAFT" ;;
+          esac
+          echo "graft: $graft"
+          echo "graft=$graft" >> "$GITHUB_OUTPUT"
 
   # One job per worker. They join the coordinator's mesh, lend their buildkitd
   # to it, and exit when it disconnects.
@@ -755,6 +774,7 @@ jobs:
       # Only so the one-line verdict can name itself. Nothing dispatches on
       # it - a target name is an earthly concept and the proxy sees LLB.
       REBUCK2_TARGET: ${{ needs.plan.outputs.target }}
+      REBUCK2_GRAFT: ${{ needs.plan.outputs.graft }}
       # ONE path for the binary in this job. It was written out twice and
       # the copies disagreed: the proxy step had `./rebuck2-repo/...` and
       # the harvest step `./rebuck2/...`, which is the WORKER job's layout.
