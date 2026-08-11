@@ -2953,3 +2953,37 @@ steps under `bash -e` whatever the script's own `set` says, so an assignment
 from a grep matching nothing exits the step. Matching nothing is the good
 news. A diagnostic added to make failures legible turned the best result in
 the ledger into a failure.
+
+## Seeding ran in the fleet, and changed nothing measurable
+
+Attempt six. `seeds=4/4`, all four cache ids harvested and resolved, and
+`check-seeding` passed inside the run - so the mechanism worked on that
+daemon, in that run, before the fleet leg started.
+
+|                    | unseeded (two runs) | seeded        |
+| ------------------ | ------------------- | ------------- |
+| baseline           | 88s, 86s            | 90s           |
+| fleet              | 252s, 249s          | **260s**      |
+| mount-naming leads | ~24s each           | **p50 24.7s** |
+
+Nothing moved. The seeded leads took what the cold ones took, to within the
+noise this target has already been shown to have.
+
+**Which of the two explanations it is, this run cannot say**, and that is a
+reporting failure rather than a null result. Every harvest reported `2
+blob(s)` - config plus one layer - and two is also exactly what an EMPTY
+cache produces. The count was added to tell "harvested nothing" from
+"seeding did not pay", and it cannot: those are the same two blobs.
+
+So the harvest now reports BYTES, and warns below 64 KiB. Until that number
+comes back, the honest position is that seeding has been shown to work and
+has not been shown to help, and the most likely reason is that the baseline
+leg did not leave those caches where the harvest looked - the baseline runs
+on `base-bk`, and whether a `+lint-all` baseline fills `go-mod` under that
+exact id is an assumption nobody has checked.
+
+The general shape has now bitten three times in this project: a mechanism
+reports that it ran, the effect is absent, and the instrument cannot
+separate "did nothing" from "did nothing useful". `mech::applied` was built
+for the first version of this, the blob count for the second, and the byte
+count for the third.

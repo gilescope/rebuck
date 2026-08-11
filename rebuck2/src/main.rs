@@ -153,14 +153,27 @@ async fn harvest_one(
     // HOW MUCH came out, and it is not a nicety. A cache that was empty -
     // because the baseline used a different id, or never touched it -
     // harvests an empty layer, seeds nothing, and presents afterwards as
-    // "seeding did not pay". Those are opposite findings and the blob count
-    // is what separates them.
+    // "seeding did not pay". Those are opposite findings.
+    //
+    // BYTES, not the blob count. The count read two for every id in the
+    // first run that seeded successfully - config plus one layer - and two
+    // is also what an EMPTY cache produces, so it could not tell a harvest
+    // that worked from one that found nothing. The size can.
     match solve::image_blobs(&reference).await {
         Some(b) if !b.is_empty() => {
+            let bytes: i64 = b.iter().map(|d| d.size).sum();
             println!(
-                "[harvest] {id} at {dest} -> {reference}, {} blob(s)",
-                b.len()
-            )
+                "[harvest] {id} at {dest} -> {reference}, {} blob(s), {:.1} MiB",
+                b.len(),
+                bytes as f64 / (1024.0 * 1024.0)
+            );
+            if bytes < 64 * 1024 {
+                println!(
+                    "[harvest] WARNING: {id} harvested under 64 KiB - that cache was \
+                     effectively empty, so seeding it changes nothing. Which is a \
+                     different finding from seeding not paying."
+                );
+            }
         }
         _ => println!(
             "[harvest] {id} at {dest} -> {reference}, but it names NO blobs - that cache \
