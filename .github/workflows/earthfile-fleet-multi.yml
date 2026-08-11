@@ -56,7 +56,7 @@ on:
       prefetch:
         description: announce a finished layer to the fleet before it is asked for (1/0)
         type: string
-        default: '0'
+        default: '1'
       min_siblings:
         description: keep a solve home unless this many are already in flight
         type: string
@@ -199,7 +199,12 @@ env:
   # NOTHING for the whole 284s baseline leg and nothing again until 227s into
   # the fleet leg, when the bulk transfer lands exactly as the fan-out wants
   # it - a layer finished minutes earlier sits on one machine until asked.
-  REBUCK2_PREFETCH: ${{ inputs.prefetch || '0' }}
+  # ON since the gate became a PREDICTION. While it counted placements it
+  # had nothing to announce - affinity drives an op towards one machine and
+  # the gate wanted two - and it measured shares of 0 and 1 blob against a
+  # base chain of 26. Gated on solve counts it should announce that chain.
+  # Off again, with the number, if it does not pay.
+  REBUCK2_PREFETCH: ${{ inputs.prefetch || '1' }}
   REBUCK2_FRESH_FLEET: ${{ inputs.fresh_fleet || '1' }}
   REBUCK2_CONNS: ${{ inputs.conns || '' }}
   REBUCK2_KEEPALIVE_S: ${{ inputs.keepalive_s || '' }}
