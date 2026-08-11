@@ -1667,17 +1667,31 @@ leads n=148 p50=2943ms p90=17479ms max=209141ms mean=12691ms
 op duplication 8.0x sent, 2.3x built
 ```
 
-It took two fixes to get here and neither was about placement.
+It took two fixes to get here, and one of them turned out not to be a fix.
 
-The first was the h2 one. earthly cancels every solve still in flight the
-moment a target fails, and hyper's `max_pending_accept_reset_streams`
-defaults to TWENTY - so with 16 solves in flight plus a nested earthly per
-group, one red test produced a RST_STREAM burst, a GOAWAY, and a build
-that died everywhere at once with `transport error`. Group-sized targets
-never reached the threshold, which is exactly why the bug waited for the
-biggest target to appear.
+**Corrected.** This section first claimed the h2 collapse was hyper's
+`max_pending_accept_reset_streams`, which defaults to TWENTY - plausible,
+since earthly cancels every solve in flight the moment a target fails, and
+a full run has 16 in flight plus a nested earthly per group. Raising it to
+10_000 was followed by one clean run, and that was recorded as proof.
 
-The second was in the measurement, not the code: a leg that DIES prints no
+It was one run and it was luck. Setting the limit to `none` - no limit at
+all - and the error came back:
+`Error: h2 protocol error: error reading a body from connection`, same
+place, after the same mass cancellation. So the reset limit was never the
+cause, and the run that appeared to confirm it confirmed nothing.
+
+What the evidence does support: earthly is Go, and that phrasing is
+hyper's, not Go's. The string reaching the user as earthly's exit error is
+a Rust error this proxy RELAYED - a call the proxy made, not one it
+served. The server-side connection log staying silent throughout fits the
+same reading, where before it was read as exoneration and is not: hyper
+answers a tripped limit with a GOAWAY and a graceful close, so
+`serve_connection` returns Ok and never logs. Instrumented now on the
+upstream side, which is where the next run will say.
+
+The other fix was real, and it was in the measurement rather than
+the code: a leg that DIES prints no
 `*failed*` markers at all, so it scored zero failed targets and beat a
 baseline that had one. The first full run was recorded as a win for the
 fleet. It is now judged on the exit code.
