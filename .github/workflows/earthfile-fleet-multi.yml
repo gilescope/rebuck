@@ -365,6 +365,12 @@ jobs:
             echo "EARTHLY_VERSION_FLAG_OVERRIDES=$(tr -d '\n' < earthbuild/.earthly_version_flag_overrides)"
           } >> "$GITHUB_ENV"
 
+      - name: what a machine is
+        run: |
+          set -euo pipefail
+          printf 'worker cores: %s  mem: %s\n' "$(nproc)" \
+            "$(awk '/MemTotal/{printf "%.1fGB", $2/1024/1024}' /proc/meminfo)"
+
       - name: buildkitd, the fork earthly needs
         run: |
           set -euo pipefail
@@ -559,6 +565,20 @@ jobs:
           else
             echo "bank: EMPTY - this run builds every prefix from nothing"
           fi
+
+      - name: what a machine is
+        run: |
+          set -euo pipefail
+          # Recorded, not assumed. Every ratio in docs/fleet-findings.md is
+          # "one machine against six", and until now the spec of a machine
+          # appeared in no run - only in GitHub's documentation for the
+          # public-runner tier. The fleet holds seven of these, so whether
+          # each is 2 or 4 cores changes the headline by a factor of two.
+          printf 'cores: %s  mem: %s  arch: %s\n' \
+            "$(nproc)" \
+            "$(awk '/MemTotal/{printf "%.1fGB", $2/1024/1024}' /proc/meminfo)" \
+            "$(uname -m)"
+          df -h / | awk 'NR==2{print "disk: " $4 " free of " $2}'
 
       - name: coordinator - gateway, driver and registry
         env:
