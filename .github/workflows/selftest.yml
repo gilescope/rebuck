@@ -50,6 +50,74 @@ jobs:
         working-directory: rebuck2
         run: cargo test --locked
 
+  # The cache-mount harvest, against a real daemon, in five minutes.
+  #
+  # Four separate faults have stopped a seeding run in the multi-runner
+  # workflow - a binary path from the wrong job's layout, a bare digest that
+  # is not a reference, a cache id nobody had read off a real run, and a
+  # missing URL scheme - and every one cost a twenty-five minute run to
+  # find, because nothing exercises `harvest-cache` except a run.
+  #
+  # An EMPTY cache is enough. The mechanism being smoke-tested is the path -
+  # dial the daemon, solve a graph with a cache mount and a scratch output,
+  # export it, turn the digest into something pullable - and none of that
+  # cares whether the cache had anything in it. Two of the four faults would
+  # have died here in seconds.
+  harvest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: rebuck2
+      - name: build
+        working-directory: rebuck2
+        run: cargo build --release --locked
+      - name: a daemon and a registry
+        run: |
+          set -euo pipefail
+          # Same pinned image as the fleet workflow: a smoke test against a
+          # different buildkit is a smoke test of a different thing.
+          docker run -d --name smoke-bk --privileged -p 28372:8372 \
+            -e BUILDKIT_TCP_TRANSPORT_ENABLED=true -e BUILDKIT_TLS_ENABLED=false \
+            earthbuild/buildkitd:v0.8.17 >/dev/null
+          ./rebuck2/target/release/rebuck2 registry --bind 0.0.0.0:15000 \
+            > registry.log 2>&1 &
+          for _ in $(seq 1 90); do
+            docker exec smoke-bk buildctl --addr tcp://127.0.0.1:8372 debug workers \
+              >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec smoke-bk buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null
+      - name: harvest an empty cache mount
+        run: |
+          set -euo pipefail
+          # NO SCHEME on --bk, deliberately. That is exactly how the fleet
+          # workflow calls it and exactly what died on `invalid URL, scheme
+          # is missing`; writing http:// here would test the fixed spelling
+          # rather than the one in use.
+          ./rebuck2/target/release/rebuck2 harvest-cache \
+            --bk 172.17.0.1:28372 --registry 172.17.0.1:15000 \
+            --id smoke-cache --dest /smoke/cache | tee harvest.out
+          line=$(grep -oE '^REBUCK2_CACHE_SEEDS=.*' harvest.out)
+          echo "harvested: $line"
+          # A REFERENCE, not a digest. `docker-image://sha256:...` parses
+          # nowhere, and the seeding path built exactly that for a commit.
+          case "$line" in
+            REBUCK2_CACHE_SEEDS=smoke-cache=172.17.0.1:15000/rebuck2/subtree@sha256:*) ;;
+            *) echo "::error::not a pullable reference: $line"; exit 1 ;;
+          esac
+      - name: what it left behind
+        if: always()
+        run: |
+          echo "=== registry"; tail -20 registry.log || true
+          echo "=== daemon"; docker logs --tail 20 smoke-bk 2>&1 || true
+
   populate:
     runs-on: ubuntu-latest
     permissions:
