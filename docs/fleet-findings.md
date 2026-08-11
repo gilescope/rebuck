@@ -4450,3 +4450,43 @@ If it is the second or third, the next move is `REBUCK2_PREFETCH_LANES`
 rather than abandoning the idea - the flag exists, defaults to 1, and has
 never been set. That is a cheaper follow-up than it looks, and worth knowing
 before reading a flat result as a verdict on broadcasting.
+
+## Next is coverage, not another `-ast` variation
+
+Deciding the order now, while the current run is still in flight, so the
+decision is not made by whichever result happens to be interesting.
+
+`-bcast` targets `building`, which is 55% and the largest term. It is still
+the right mechanism. But `+test-no-qemu` goes first, for three reasons that
+have nothing to do with which is more appealing.
+
+**It is the mandate.** "Larger and larger parts of the Earthfile" is the
+brief, and every measurement in this document comes from targets with three
+to five branches. Fourteen has never been tried.
+
+**It is the only workload that can answer the question the others cannot.**
+`+test-ast`'s Amdahl ceiling is 2.97x at seven machines - the graph itself
+does not permit more, so a fleet that beats one machine on it is impossible
+by construction, and 1050s against 212s was never going to become 200s.
+Principle 19 has been asserted in this document for a long time on the
+strength of small targets. A fourteen-way target is the first chance to test
+it rather than repeat it.
+
+**Its result changes what the next mechanism should be.** Every phase
+percentage here comes from a workload where two machines were idle for
+structural reasons. On a wider graph the split will be different, and
+tuning `-bcast` against `+test-ast`'s 55% risks tuning for a shape that does
+not occur at the size that matters.
+
+Pre-registered, so the result cannot be read generously:
+
+- **The deliverable is the failed-target list.** `-nobase` means no parity
+  check, so a target that fails needs chasing by hand before it counts
+  against the fleet.
+- **Ceiling above 6x** would be the first evidence that principle 19 is
+  about the workload rather than an excuse.
+- **All six machines working**, as in the `-balance` run. If a wider graph
+  re-concentrates, the queue penalty is too weak at this scale.
+- **A leg under 135 minutes**, or the workers hit their cap and the run
+  dies rather than degrading - which is the failure this session already
+  paid for once.
