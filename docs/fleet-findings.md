@@ -5677,3 +5677,48 @@ True of demand. This does not measure demand. The honest fix is to count
 what a graph NAMES rather than where it has been - `imported_images` already
 extracts exactly that, for affinity - but that is a mechanism change and it
 goes behind a flag, after a measurement, like everything else here.
+
+## The worker vertex tap costs 15%, and its number is confounded
+
+Parity passed, so this is a legitimate leg:
+
+| | `-balance` | `+ worker vertex tap` |
+| ---------- | ---------- | --------------------- |
+| fleet leg | 1050s | **1207s** |
+| lead time | 8,239s | **9,383s** |
+| occupancy | 7.94 | 7.86 |
+| `waiting` | 3,670s | 4,357s |
+| `building` | 4,521s | 5,026s |
+
+**No mechanism changed.** The only addition was the tap. Lead time rose 14%,
+the leg rose 15%, occupancy held - the identity again, and this time it is
+measuring my own overhead.
+
+The cause is where I put the call. `vertex_times` runs inside
+`build_subtree`, and `build_ms` is measured around the whole of that - so
+the tap's cost lands inside the number it exists to explain. Principle 16,
+in code I wrote two hours after writing the entry about it, having checked
+the PROXY tap for exactly this and never asked the same question of the
+worker one. The proxy tap reports `1ms across 3,321 frames`; the worker tap
+has no self-measurement at all.
+
+### And the number it produces cannot answer the question
+
+```text
+[worker] vertices : 593 ran in 4964419ms, 125 cache hit(s)
+```
+
+**4,964 seconds of vertex time on one worker, in a 1,207-second leg.**
+Buildkit runs vertices concurrently, so per-vertex wall clock sums to
+several times the elapsed time. The discriminator assumed vertex time and
+lead time were comparable quantities; they are not, and no ratio between
+them means what I said it would.
+
+So the split I designed to price the 12.5x measures nothing, and costs 15%
+to collect. It goes behind a flag, off, with both facts recorded at the
+call site.
+
+The 12.5x remains open. What it needs is a per-vertex comparison against the
+SAME digests on the baseline - the join that is blocked because the baseline
+bypasses the proxy - and no amount of one-sided instrumentation substitutes
+for it.

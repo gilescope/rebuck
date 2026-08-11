@@ -1045,7 +1045,23 @@ pub async fn build_subtree(
     // 1.7x and nothing says whether the rest is the same ops costing more
     // on a worker or ops the baseline never ran. The digest joins the two
     // halves and this is the half that was missing.
-    {
+    // OFF by default, and measured harmful. This runs inside the interval
+    // `build_ms` covers, so its cost lands inside the number it exists to
+    // explain: the leg went 1050s to 1207s and lead time 8,239s to 9,383s
+    // with no mechanism change. Principle 16, in code written two hours
+    // after the entry about it - I checked the PROXY tap for exactly this
+    // and never asked the same question here.
+    //
+    // Its output is confounded as well. One worker reported 4,964 seconds of
+    // vertex time inside a 1,207-second leg, because buildkit runs vertices
+    // concurrently and their wall clocks sum to several times the elapsed
+    // time. Vertex time and lead time are not comparable quantities, so the
+    // ratio the split was designed around means nothing.
+    //
+    // Kept because the collection is correct and a future comparison
+    // against the baseline's SAME digests would want it - that join is
+    // blocked only because the baseline bypasses the proxy.
+    if std::env::var("REBUCK2_WORKER_VERTICES").as_deref() == Ok("1") {
         let mut w = WORKER_VERTICES.lock().await;
         for (d, v) in vertex_times(bk_addr, &solve_ref).await {
             w.entry(d).or_insert(v);
