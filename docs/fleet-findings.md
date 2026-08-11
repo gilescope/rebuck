@@ -5471,6 +5471,23 @@ Two candidates, and the evidence does not yet separate them:
 The second is the one broadcast newly exposes, since the split guaranteed at
 most one fetcher per blob per worker set.
 
+**Both refuted, within the hour.** The blob path returning
+`application/octet-stream` is correct OCI - blobs are octet-stream and
+buildkit reads config blobs served that way routinely - and the manifest
+path sniffs its content type properly with `media_type_of`. And the store
+writes through a tmp file and renames, by design and with a comment saying
+why, so a reader cannot see a partially-written blob however many writers
+race.
+
+So the cause is **undetermined**. What is known: broadcast changes only
+which worker fetches which blob, the failure is a media-type mismatch on a
+specific digest during cache-key resolution, and it did not occur in three
+runs of the same target with the split. Recorded as open rather than
+diagnosed, because two plausible mechanisms have now been checked and
+neither survived - and a fix built on a third guess would be the sixth
+mechanism in this file built before anyone asked which candidate it
+addressed.
+
 **`-bcast` goes off.** It cut `waiting` 45% on the wide target for no clock,
 and on the narrow one it breaks the build. The mechanism is sound in
 principle - pre-positioning is principle 18 - and the implementation is not
