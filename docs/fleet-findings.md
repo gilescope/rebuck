@@ -4102,3 +4102,33 @@ So the repetition claim is retracted a second time and remains open. What is
 NOT open: `scripts/reserve-check.sh` shows a single daemon serving a base
 once and never again, chained or not - so whatever the fleet is repeating,
 it is not one machine re-materialising its own work.
+
+### The prefetch fix's own risk, stated before its result
+
+Written while the run is in flight, so it cannot be a post-hoc explanation
+of whatever comes back.
+
+The fix makes the driver resolve a bare digest through
+`FleetBlobs::by_hash`, once per subtree result. That path checks the local
+store first and then walks peers - and the coordinator usually will NOT have
+the manifest, because the worker pushed it to its own registry and the
+coordinator only acquires it when the requester pulls the result, which
+happens after.
+
+So the expected new load is roughly one peer round trip per lead, in a
+spawned task, bounded at five seconds per peer. On `+test-ast` that is ~400
+of them. Three ways this could read:
+
+- **Faster, announcements in the tens.** The fix worked and the signature
+  above is met.
+- **No change, announcements in the tens.** Prefetch reaches the right
+  content and the content is not the bottleneck - which would point at
+  `my_share` splitting it one-blob-one-worker, already built and gated
+  behind `-bcast`.
+- **Slower, with `nobody in the fleet holds <digest>` lines.** The manifest
+  lookup is costing more than the prefetch saves, and the answer is to
+  resolve from the requester's pull rather than ahead of it.
+
+The third is a real possibility and worth saying out loud: this session has
+already produced one mechanism that improved every number it aimed at and
+still made the run five times slower.
