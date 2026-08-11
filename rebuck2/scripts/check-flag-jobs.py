@@ -51,5 +51,30 @@ bad = [
 ]
 for v, r in bad:
     print(f"{v}: set in the coordinator job only, read by {r}", file=sys.stderr)
-print(f"{len(owner)} flag(s) in the workflow, {len(bad)} in the wrong job")
-sys.exit(1 if bad else 0)
+
+# Second check, from the other side: a flag DOCUMENTED for an operator that
+# nothing implements. REBUCK2_ADAPT sat in running-a-fleet.md's flag table
+# and in no .rs file - an operator setting it got silence and no effect,
+# which is the code-side defect this repo keeps finding, arriving from the
+# documentation instead. A doc mention counts as implemented if the binary
+# reads it OR the workflow's own shell expands it.
+shell_used = set(re.findall(r"\$\{?(REBUCK2_[A-Z_]+)[:}\s]", WF.read_text()))
+phantom = []
+for d in sorted((ROOT / "docs").glob("*.md")):
+    text = d.read_text()
+    for v in sorted(set(re.findall(r"REBUCK2_[A-Z_]+", text))):
+        if v == "REBUCK2" or v in reads or v in shell_used:
+            continue
+        # A doc may discuss a flag it is telling you NOT to use, so a
+        # sentence saying so is an acceptable answer.
+        if "does not exist" in text or "gone from" in text:
+            continue
+        phantom.append(f"{d.name}: {v} is documented and implemented nowhere")
+for line in phantom:
+    print(line, file=sys.stderr)
+
+print(
+    f"{len(owner)} flag(s) in the workflow, {len(bad)} in the wrong job, "
+    f"{len(phantom)} documented but unimplemented"
+)
+sys.exit(1 if (bad or phantom) else 0)
