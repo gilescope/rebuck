@@ -464,12 +464,23 @@ jobs:
             # documents, walked into two hours after writing the comment.
             WARM_HOST=$(hostname -I 2>/dev/null | awk '{print $1}')
             [ -n "$WARM_HOST" ] || WARM_HOST=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
-            ( cd earthbuild && EARTHLY_BUILDKIT_HOST="tcp://${WARM_HOST}:18372" \
-                EARTHLY_TLS_ENABLED=false EARTH_TLS_ENABLED=false \
-                EARTHLY_VERSION_FLAG_OVERRIDES="$(tr -d '\n' < .earthly_version_flag_overrides)" \
-                timeout 900 earthly --ci "$REBUCK2_WARM_TARGET" \
-                > "$GITHUB_WORKSPACE/warm-${WORKER_N}.log" 2>&1
-              echo "warm exit=$?" >> "$GITHUB_WORKSPACE/warm-${WORKER_N}.log" ) &
+            # The redirect goes on the GROUP, not on earthly. Attached to
+            # the inner command, anything failing before it - the cd, or the
+            # command substitution below under `set -e` - aborts the subshell
+            # before the file is ever created, and the only symptom is the
+            # check reporting "not warmed" for a warm-up that plainly
+            # started. Two runs were spent on that.
+            (
+              set +e
+              echo "warm: host=$WARM_HOST cwd=$PWD target=$REBUCK2_WARM_TARGET"
+              cd earthbuild || { echo "no earthbuild directory here"; exit 1; }
+              ov=$(tr -d '\n' < .earthly_version_flag_overrides) || ov=""
+              EARTHLY_BUILDKIT_HOST="tcp://${WARM_HOST}:18372" \
+              EARTHLY_TLS_ENABLED=false EARTH_TLS_ENABLED=false \
+              EARTHLY_VERSION_FLAG_OVERRIDES="$ov" \
+                timeout 900 earthly --ci "$REBUCK2_WARM_TARGET"
+              echo "warm exit=$?"
+            ) > "$GITHUB_WORKSPACE/warm-${WORKER_N}.log" 2>&1 &
             echo "warming $REBUCK2_WARM_TARGET in the background"
           fi
           # Its OWN registry, reachable only from this machine - which is the
