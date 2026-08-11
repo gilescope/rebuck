@@ -4662,3 +4662,31 @@ actually about - goes next on six machines. Tuning a weight against
 `+test-ast`, whose ceiling is 2.97x and where two machines are idle for
 structural reasons, is exactly the mistake the ordering argument warned
 about two sections up.
+
+### What the 525s reference is, exactly
+
+Checked before comparing anything to it, because "the previous run" is a
+phrase that hides how much moved in between.
+
+`3b4271e`, recorded **the same day** - not an old number from another era of
+this branch. But 291 commits back, **133 of them touching `rebuck2/src`**,
+and 20 of those name prefetch, balance, affinity, warmth, lead timing,
+timeouts or `by_hash`.
+
+So the comparison is fresh and it is not clean. If the leg improves, the two
+fixes measured on `+test-ast` are the largest known contributors and they
+are not the only changes. What can be said honestly:
+
+- **The direction is attributable.** Both measured fixes cut lead cost, and
+  nothing between the two commits was measured to make anything slower.
+- **The magnitude is not.** Any number I quote is "525s then, X now, with
+  133 source commits between", and that is the sentence to write rather
+  than a delta with a cause attached.
+- **The failed-target list is clean either way.** It is a count of what
+  broke, not a difference of two timings, which is exactly why the coverage
+  deliverable was chosen to be that and not a clock.
+
+The clean version of this experiment would have been to run `+test-no-qemu`
+at `3b4271e` and again at HEAD. That is two more 45-minute runs to attribute
+a number I already have a mechanism-level explanation for, and the mandate
+is coverage. Noted as the shortcut it is.
