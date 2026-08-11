@@ -340,7 +340,7 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
             // the mechanism costs exactly what it saves. Failures are
             // dropped - a blob that does not arrive now arrives lazily
             // later, which is what happens today.
-            D2W::Prefetch { digests } => {
+            D2W::Prefetch { digests, peers } => {
                 let n = digests.len();
                 let blobs = blobs.clone();
                 tokio::spawn(async move {
@@ -349,7 +349,7 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                     // `seeder_for` exists to prevent - and a prefetch makes
                     // it arrive EARLIER, so it would hurt more than the lazy
                     // path it replaces.
-                    let mine = blobs.my_share(digests).await;
+                    let mine = blobs.my_share(digests, &peers).await;
                     let share = mine.len();
                     let mut got = 0usize;
                     for d in mine {
@@ -876,14 +876,21 @@ impl RemoteBlobs {
     /// herd that `seeder_for` exists to prevent, arriving earlier and
     /// therefore hurting more. Each worker takes its own share; the rest
     /// reach it from peers, at six times the width, which is principle 16.
-    async fn my_share(&self, digests: Vec<Dig>) -> Vec<Dig> {
-        let ids: Vec<String> = {
+    async fn my_share(&self, digests: Vec<Dig>, fleet: &[String]) -> Vec<Dig> {
+        // The DRIVER's list, not this worker's gossip. Computed locally the
+        // shares do not partition: two workers with different peer sets both
+        // claim some blobs and neither claims others, so the split leaves
+        // gaps and duplicates simultaneously. Falls back to gossip only if
+        // the driver sent nothing.
+        let ids: Vec<String> = if fleet.is_empty() {
             let p = self.peers.lock().await;
             let mut v: Vec<String> = p.keys().cloned().collect();
             if !v.contains(&self.my_id) {
                 v.push(self.my_id.clone());
             }
             v
+        } else {
+            fleet.to_vec()
         };
         // Alone, or before any gossip has arrived, "my share" is everything -
         // there is nobody to split with, and fetching nothing would make the

@@ -1733,9 +1733,15 @@ impl Driver {
         }
         let ws = self.workers.lock().await;
         let n = ws.len();
+        // The authoritative peer list, sent WITH the announcement. Left to
+        // each worker's own gossip the shares do not partition: two workers
+        // computing from different peer sets both claim some blobs and
+        // neither claims others.
+        let peers: Vec<String> = ws.iter().map(|w| w.endpoint.clone()).collect();
         for w in ws.iter() {
             let _ = w.tx.send(D2W::Prefetch {
                 digests: digests.clone(),
+                peers: peers.clone(),
             });
         }
         drop(ws);

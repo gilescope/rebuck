@@ -242,6 +242,15 @@ pub enum D2W {
     /// Lead as a Ping.
     Prefetch {
         digests: Vec<Dig>,
+        /// Who is in the fleet, according to the driver.
+        ///
+        /// Carried rather than left to each worker's own gossip, because
+        /// the shares must PARTITION: two workers computing from
+        /// different peer sets both claim some blobs and neither claims
+        /// others, so the split leaves gaps and duplicates at the same
+        /// time. The driver is the only party that knows the list
+        /// authoritatively, and it is the party sending the message.
+        peers: Vec<String>,
     },
 }
 
@@ -395,7 +404,10 @@ mod tests {
         // worker built from one commit reads a Lead as a Ping - no error, no
         // mismatch, just a build doing the wrong thing. Append-only is the
         // whole contract and nothing else enforces it.
-        let last = D2W::Prefetch { digests: vec![] };
+        let last = D2W::Prefetch {
+            digests: vec![],
+            peers: vec![],
+        };
         let bytes = postcard::to_allocvec(&last).expect("encode");
         let idx = bytes[0];
 
@@ -425,14 +437,19 @@ mod tests {
                 hash: "abc".into(),
                 size: 7,
             }],
+            peers: vec!["w1".to_owned(), "w2".to_owned()],
         };
         let back: D2W =
             postcard::from_bytes(&postcard::to_allocvec(&sent).expect("encode")).expect("decode");
         match back {
-            D2W::Prefetch { digests } => {
+            D2W::Prefetch { digests, peers } => {
                 assert_eq!(digests.len(), 1);
                 assert_eq!(digests[0].hash, "abc");
                 assert_eq!(digests[0].size, 7);
+                // The peer list rides WITH the announcement, or each worker
+                // computes its share against a different fleet and the
+                // shares stop partitioning.
+                assert_eq!(peers, vec!["w1".to_owned(), "w2".to_owned()]);
             }
             other => panic!("decoded as {other:?}"),
         }
