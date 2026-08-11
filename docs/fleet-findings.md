@@ -2164,3 +2164,23 @@ content that is not there - which two mechanisms can cause, because both
 rewrite a graph to point at an image that must already exist. Grafting was
 the obvious suspect and has been eliminated: `REBUCK2_GRAFT: 0`, `grafted:
 0`, NotFound unchanged. `cut_prefix` is the other, and is on by default.
+
+### routed collapses when prefetch is on
+
+| run | prefetch | routed |
+| ----------- | -------- | ------ |
+| 31472465352 | 0 | 94 |
+| 31474229913 | 1 | 7 |
+| 31475431680 | 1 | 7 |
+| 31476911139 | 1 | 8 |
+
+Not subtle, and not noticed for three runs because the wall clock and the
+h2 error were what was being read. Two readings, and they are not
+equivalent: either prefetch occupies workers so they decline leads, or it
+stalls the dispatch path itself - `subtree_built` now takes `job_terminal`
+and then `op_by_worker` on the completion path, and `place_subtree` takes
+`op_by_worker` too, which is the shape a lock-order problem has.
+
+Worth recording separately from the h2 question, because it is a
+regression introduced by a mechanism rather than a pre-existing fault, and
+because a fleet that routes 8 solves is not a fleet.
