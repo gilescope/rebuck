@@ -766,3 +766,46 @@ required` names neither the image nor the field, `no active sessions` names
 neither the source nor the pull. Assume every identifier, address and
 reference has a normalisation step you have not done, and put it in a
 function with a test the first time you need it.
+
+## 23. Build the cheapest instrument first
+
+Principle 22 counted eight faults between a new caller and its first
+successful run. It ended at thirteen. Here is what each one cost, because
+the shape of that list is the principle:
+
+| faults  | found by                                    | cost each |
+| ------- | ------------------------------------------- | --------- |
+| 1-4     | a full multi-runner fleet run               | ~25 min   |
+| 5, 7-11 | a five-minute smoke job on a real daemon    | ~5 min    |
+| 12-13   | a local buildkitd with a registry beside it | ~2 min    |
+
+Fault 12 was disproved by one `docker run` in ten seconds - and three CI
+runs had already been spent on it, because the local rig did not exist yet
+and the CI rig did. The instrument that gets used is the one that exists,
+not the one that is appropriate.
+
+The tempting reading is "write more tests". That is not it: every fault
+above was at a seam with a live daemon on the other side, and a unit test
+cannot see any of them. The right reading is that **an integration rig is a
+thing you build once, early, and cheaply** - and that its value is measured
+in the latency of one iteration, not in coverage.
+
+What made the local rig cheap enough to be worth building at fault 12, and
+would have been just as cheap at fault 1:
+
+- **A container and a binary.** No fleet, no workers, no mesh. The question
+  was "does this graph solve", and one daemon can answer it.
+- **The smallest input that exercises the seam.** An EMPTY cache is enough
+  to test harvesting - dial, solve, export, name the result - because none
+  of that cares what was in the cache.
+- **An assertion that can fail for the interesting reason.** The round trip
+  writes a marker into cache A and reads it back out of cache B; B is a
+  different id, so a pass cannot come from meeting A's own warm mount. An
+  instrument that cannot report the bad news is decoration.
+
+And the counterpart, for when the rig says something surprising: **read the
+artefact, do not reason about it.** The seeded mount coming up empty was
+opaque until the harvested layer was pulled out of the registry with curl
+and untarred - 1.9 MB of `/bin` where a cache should have been, which named
+the bug immediately. Three earlier attempts had reasoned about the same
+symptom and got nowhere.
