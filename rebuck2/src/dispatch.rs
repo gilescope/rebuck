@@ -600,15 +600,22 @@ pub fn cache_probe_graph(base: &str, cache_id: &str, dest: &str, cmd: &str) -> p
                 ..Default::default()
             }),
             mounts: vec![
+                // OUTPUT 0, and it must exist. The terminal names `index: 0`
+                // of this exec, so an exec declaring no output 0 is a graph
+                // that cannot export - the first version had none, with a
+                // comment saying a probe exports nothing. It does not need
+                // the layer; it needs the index to be there.
                 pb::Mount {
                     input: 0,
                     dest: "/".into(),
-                    output: -1,
+                    output: 0,
                     ..Default::default()
                 },
                 pb::Mount {
                     input: -1,
                     dest: dest.to_owned(),
+                    // Never the cache: buildkit refuses to export one, which
+                    // is why `harvest_graph` copies out of it instead.
                     output: -1,
                     mount_type: pb::MountType::Cache as i32,
                     cache_opt: Some(pb::CacheOpt {
@@ -2267,13 +2274,26 @@ mod tests {
             .join(" ")
             .contains("touch /c/marker"));
 
-        // NO scratch output. The harvest needs one because it exports a
-        // layer; a probe only needs to succeed or fail, and an output mount
-        // it never writes to would export an empty layer on every check.
-        assert!(
-            e.mounts.iter().all(|m| m.output < 0 || m.dest == "/"),
-            "a probe exports nothing"
+        // THE ROOTFS IS THE OUTPUT, and it has to be something.
+        //
+        // The terminal names `index: 0` of the exec, so an exec declaring no
+        // output 0 is a graph that cannot export - and the first version of
+        // this had no output at all, with a confident comment saying a probe
+        // exports nothing. It does not need the LAYER; it needs the index to
+        // exist. Caught by reading the graph back rather than by running it,
+        // which would have been fault nine.
+        assert_eq!(
+            e.mounts
+                .iter()
+                .filter(|m| m.output == 0)
+                .map(|m| m.dest.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/"],
+            "exactly one output, and it is the rootfs"
         );
+        // Not the cache: buildkit refuses to export a cache mount, which is
+        // why `harvest_graph` copies out of one instead.
+        assert_eq!(cache.output, -1);
     }
 
     /// `id:path` pairs, and the shape that broke the shell version.
