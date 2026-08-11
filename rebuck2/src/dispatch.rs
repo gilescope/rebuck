@@ -1840,9 +1840,24 @@ pub fn offer_order(v: &Verdict, cands: &[Candidate], allow: Allow) -> Vec<u64> {
 ///
 /// Signed, because the answer is genuinely negative: a machine three deep is
 /// worse than an idle one however warm it is.
-pub fn offer_score(warmth: u32, queued: usize) -> i64 {
-    const QUEUED: i64 = 64;
-    i64::from(warmth) - (queued as i64) * QUEUED
+/// Warmth, less what is already waiting - with the brake scaled to how
+/// many preference terms are switched on.
+///
+/// Principle 27's second half, and it cost a run to learn. The counterweight
+/// was one queued lead cancels one warm item, sized when `warmth` counted
+/// one thing a candidate could be warm about. Adding parent-image affinity
+/// made it two, doubled the score a warm candidate carries, and left the
+/// brake alone: a machine holding a parent AND a mount needed three queued
+/// leads before an idle one could win. The leg went 1050s to 1475s, a
+/// machine went idle, and the new term fired 1,724 times against 361
+/// reorders.
+///
+/// `terms` is how many 64-point preferences are live, so the penalty per
+/// queued lead grows with them and one queued lead still cancels one warm
+/// thing however many kinds of warm there are.
+pub fn offer_score(warmth: u32, queued: usize, terms: usize) -> i64 {
+    const BIG: i64 = 64;
+    i64::from(warmth) - (queued as i64) * BIG * (terms.max(1) as i64)
 }
 
 /// Trade warmth against queue depth when ordering offers.
@@ -1884,7 +1899,16 @@ pub fn offer_order_warm(
             // a new lead would join. Off, the score is warmth alone and the
             // ordering is byte-for-byte what it was.
             std::cmp::Reverse(if balanced {
-                offer_score(warm(c.id), c.load.driver)
+                // TERMS, not a fixed penalty. `warmth` counts cache mounts
+                // always and parent images when `-imports` is on, so the
+                // brake has to know how many kinds of warm are live -
+                // principle 27's second half, learned by taking the leg from
+                // 1050s to 1475s with a brake sized for one term.
+                offer_score(
+                    warm(c.id),
+                    c.load.driver,
+                    1 + usize::from(imports_affinity()),
+                )
             } else {
                 i64::from(warm(c.id))
             }),
@@ -2846,6 +2870,33 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// The brake has to grow with the number of things it brakes.
+    ///
+    /// Measured: adding a second 64-point preference term - parent images
+    /// held - took the leg from 1050s to 1475s, put a machine back to idle,
+    /// and fired 1,724 times against the brake's 361 reorders. One queued
+    /// lead cancelled one warm item, so a candidate holding a parent AND a
+    /// mount needed three queued leads before an idle machine could win.
+    #[test]
+    fn the_penalty_scales_with_how_many_preferences_are_on() {
+        let s = super::offer_score;
+
+        // One term: today's shipped behaviour, unchanged. A queued lead
+        // cancels the one thing a candidate can be warm about.
+        assert_eq!(s(64, 1, 1), s(0, 0, 1));
+        assert!(s(64, 2, 1) < s(0, 0, 1));
+
+        // Two terms: a candidate warm on BOTH still loses to an idle machine
+        // at one queued lead, where before it took three.
+        assert_eq!(s(128, 1, 2), s(0, 0, 2));
+        assert!(s(128, 2, 2) < s(0, 0, 2));
+
+        // And warmth still decides between equals - the brake balances the
+        // preference, it does not replace it.
+        assert!(s(128, 1, 2) > s(64, 1, 2));
+        assert!(s(64, 0, 2) > s(0, 0, 2));
+    }
+
     /// Warmth has to be TRADED against queue depth, not ranked ahead of it.
     ///
     /// `offer_order_warm` sorts by `(Reverse(warm), Reverse(free), id)`, so
@@ -2862,21 +2913,21 @@ mod tests {
     fn a_queue_cancels_warmth_one_for_one() {
         let s = super::offer_score;
         // Nothing queued: warmth decides, exactly as before.
-        assert!(s(64, 0) > s(0, 0));
-        assert!(s(128, 0) > s(64, 0));
+        assert!(s(64, 0, 1) > s(0, 0, 1));
+        assert!(s(128, 0, 1) > s(64, 0, 1));
 
         // One warm item, one lead already waiting: no better than cold and
         // idle. The tie then falls to free capacity, which is the next key.
-        assert_eq!(s(64, 1), s(0, 0));
+        assert_eq!(s(64, 1, 1), s(0, 0, 1));
         // Two waiting and it is WORSE - the point of the whole change.
-        assert!(s(64, 2) < s(0, 0));
+        assert!(s(64, 2, 1) < s(0, 0, 1));
         // Two warm items outlast one queued lead, which is why this is a
         // trade and not a switch.
-        assert!(s(128, 1) > s(0, 0));
+        assert!(s(128, 1, 1) > s(0, 0, 1));
 
         // A cold machine with a queue is worse than a cold machine without,
         // so the comparator still spreads work among equals.
-        assert!(s(0, 3) < s(0, 1));
+        assert!(s(0, 3, 1) < s(0, 1, 1));
     }
 
     /// A build that fills the whole lead is not an unknown build.
