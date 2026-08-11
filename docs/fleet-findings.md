@@ -4487,10 +4487,16 @@ That is worth more: 525s is a number to beat, and the fixes since - prefetch
 from 9 applications to 421, and a queue-aware placement that put all six
 machines to work - are aimed at the two faults that run would have had.
 
-The rest of the plan stands: `-nobase` for the budget, twelve machines to
-test the ceiling claim, deliverable is the failed-target list. Only the
-justification was wrong, and it was wrong in the direction of underselling
-what already worked.
+The rest of the plan needed one fix, and it is the one-variable rule
+applied to my own plan. **Six machines first, not twelve.** The reference is
+525s on SIX runners; a twelve-machine leg beside it conflates the fixes with
+the machine count, and the prediction I registered - 525s to roughly
+350-400s - would not be testable against it.
+
+So: `-tests-balance-nobase` at six, which tests the prediction and produces
+the coverage list in one run. Then `-w12` afterwards as its own variable,
+against the six-machine number this run establishes. The `-w12` branch stays
+listed; it is simply second.
 
 ## Next is coverage, not another `-ast` variation
 
