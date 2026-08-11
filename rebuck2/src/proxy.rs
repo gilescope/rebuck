@@ -118,6 +118,22 @@ pub struct Proxy {
     /// the other way first.
     client: Client,
     channel: Chan,
+    /// A SECOND connection, carrying only `Session`.
+    ///
+    /// Session is long-lived, bidirectional, and carries filesync and
+    /// credentials - so when it dies the build dies, and it cannot be
+    /// retried the way a solve can. Multiplexed behind 163 gateway solves on
+    /// one h2 connection, any connection-level event takes it with them:
+    ///
+    ///     [proxy] session stream from daemon failed: Unknown error
+    ///     h2 protocol error: error reading a body from connection
+    ///
+    /// which earthly then prints as its own exit error, having been told
+    /// nothing about which of its many calls broke. Five rounds of fixes
+    /// went to the server side, to Control.Solve and to hyper's reset
+    /// limits before the session relay was instrumented and said plainly
+    /// that the failing connection was the one we make.
+    session_channel: Chan,
     /// One dispatch at a time until something has been BUILT.
     ///
     /// The barrier that grafting needs and did not have. On a cold fleet the
@@ -198,10 +214,21 @@ impl Proxy {
         upstream: String,
         driver: std::sync::Arc<crate::driver::Driver>,
     ) -> anyhow::Result<Self> {
-        let channel = tonic::transport::Endpoint::new(upstream)?.connect().await?;
+        // Keepalive on both: a Session can sit idle while a nested build
+        // runs, and an intermediary that reaps idle connections takes the
+        // build with it.
+        let endpoint = |u: String| -> anyhow::Result<tonic::transport::Endpoint> {
+            Ok(tonic::transport::Endpoint::new(u)?
+                .http2_keep_alive_interval(std::time::Duration::from_secs(20))
+                .keep_alive_timeout(std::time::Duration::from_secs(60))
+                .keep_alive_while_idle(true))
+        };
+        let channel = endpoint(upstream.clone())?.connect().await?;
+        let session_channel = endpoint(upstream)?.connect().await?;
         Ok(Proxy {
             client: control::control_client::ControlClient::new(channel.clone()),
             channel,
+            session_channel,
             warmup: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             driver,
             wire: Default::default(),
@@ -550,8 +577,8 @@ impl control::control_server::Control for Proxy {
             };
             futures::future::ready(m.ok())
         });
-        let s = self
-            .client()
+        // Its OWN connection, not the shared one. See `session_channel`.
+        let s = control::control_client::ControlClient::new(self.session_channel.clone())
             .session(Request::from_parts(meta, ext, inbound))
             .await?;
         let down = self.wire.clone();
