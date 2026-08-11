@@ -41,6 +41,10 @@ on:
       home_slots:
         description: "slots peer 0 keeps for itself - 0 forces dispatch"
         default: "0"
+      conns:
+        description: upstream connections; 1 shares Control and gateway as before the split
+        type: string
+        default: ''
       fresh_fleet:
         description: the baseline gets its own daemon, so the fleet's coordinator starts cold (1/0)
         type: string
@@ -193,6 +197,7 @@ env:
   # it - a layer finished minutes earlier sits on one machine until asked.
   REBUCK2_PREFETCH: ${{ inputs.prefetch || '0' }}
   REBUCK2_FRESH_FLEET: ${{ inputs.fresh_fleet || '1' }}
+  REBUCK2_CONNS: ${{ inputs.conns || '' }}
   REBUCK2_WARM_TARGET: ${{ inputs.warm_target || './tests/integration-base+test-base' }}
   # Pinned by digest like everything else here: a collector that changes
   # under us changes the data.

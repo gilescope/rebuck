@@ -228,20 +228,46 @@ impl Proxy {
                 .keep_alive_while_idle(true))
         };
         let upstream_kept = upstream.clone();
-        // The Control surface keeps a connection of its own: Control.Solve
-        // is what the client blocks on, and it should not share a connection
-        // with the gateway's hundreds of short calls.
-        let control_channel = endpoint(upstream.clone())?.connect().await?;
+        // HOW MANY connections, and whether Control shares one.
+        //
+        // Splitting these was meant to stop one connection-level event
+        // taking every stream. It may have bought a worse problem: on a
+        // single h2 connection a gateway call cannot overtake the
+        // Control.Solve that registers its job, and separate connections
+        // remove that ordering. The failing runs now say
+        //
+        //     upstream solve failed: ... no such job t7p8h37g7ses5...
+        //
+        // which is the daemon being asked about a build it has not been told
+        // about yet - and it appears first in the run AFTER the split.
+        //
+        // 1 restores the original shape: one connection for Control and the
+        // gateway together, which is what every run before the split used.
+        let conns: usize = std::env::var("REBUCK2_CONNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(4);
         let channel = endpoint(upstream.clone())?.connect().await?;
+        let control_channel = if conns == 1 {
+            channel.clone()
+        } else {
+            endpoint(upstream.clone())?.connect().await?
+        };
         let session_channel = endpoint(upstream.clone())?.connect().await?;
         // FOUR, which is a guess bounded on both sides: one connection
         // admits 250 concurrent streams and a run peaks well under 1000, so
         // four is enough; and each is an idle TCP connection to localhost
         // when unused, so being wrong upwards costs nothing measurable.
         let mut gw_pool = vec![channel];
-        for _ in 0..3 {
+        for _ in 1..conns {
             gw_pool.push(endpoint(upstream.clone())?.connect().await?);
         }
+        println!(
+            "[proxy] upstream connections: {} gateway, control {}",
+            gw_pool.len(),
+            if conns == 1 { "shared" } else { "its own" }
+        );
         Ok(Proxy {
             client: control::control_client::ControlClient::new(control_channel),
             session_channel,
