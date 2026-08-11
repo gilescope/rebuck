@@ -5098,3 +5098,46 @@ obviously wrong, not because anyone knew there would be eleven.
 511-second leg rather than arriving in a burst. The fleet is fed
 continuously, which is why `placing` is 0% and why queueing, not admission,
 was the thing worth fixing on the narrow target.
+
+## `trapped ops`: 5%, and I measured the wrong end
+
+```text
+[wire] trapped ops : 23 refused solve(s), 1012 ops, 55 past the last
+                     exclusion (5%) - what a cut could still send
+```
+
+Against a pre-registered threshold of "below 20% means the host bind is
+nearly the whole graph and 2.32x stands as physics". Five percent. By the
+rule I wrote, the cut is not worth building.
+
+**The rule was wrong, and the number says something better.**
+
+Five percent *after* the last exclusion means **ninety-five percent before
+it**. Twenty-three refused solves, 1,012 ops, and the average last exclusion
+sits at op 42 of 44 - host binds are at the END of a `WITH DOCKER` graph,
+not the start. Of course they are: the dind setup and the image loads happen
+after the dependencies are built, because they need them.
+
+So the dispatchable part is the **prefix**, not the suffix. And buildkit
+marshals in topological order, so those 957 ops do not depend on the
+excluded ones - they are exactly what a peer could build.
+
+`cut_prefix` already publishes a prefix of a graph as a separate image for
+peers to start from. It exists, it fires, and it is pointed at a different
+criterion. The fix is to point it at the FIRST exclusion instead of my
+suffix: dispatch everything before the host bind, keep the bind and its tail
+at home, let home build on top of what came back.
+
+I built an instrument to measure "what could still be sent" and defined it
+as the suffix, because the mental model was a poison spreading forwards.
+Dependencies run the other way. The number is right, the threshold was
+right, and the conclusion I attached to the threshold was backwards - which
+the number itself caught, because 5% is only disappointing if you assumed
+the wrong end mattered.
+
+**What is still unknown, and it is the same question as before.** Ops are
+not time. 95% of the ops being dispatchable says nothing about whether they
+hold any of the 869 seconds of home vertex time. The dind setup may be
+cheap and the tests it runs expensive, in which case the prefix is
+dependency-building already shared with other targets, and cutting buys
+nothing. That measurement remains unbuilt.
