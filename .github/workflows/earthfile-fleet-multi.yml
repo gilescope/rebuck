@@ -41,6 +41,10 @@ on:
       home_slots:
         description: "slots peer 0 keeps for itself - 0 forces dispatch"
         default: "0"
+      sandbox_host:
+        description: nested earthly dials the LOCAL daemon via buildkitsandbox (1/0)
+        type: string
+        default: '0'
       consolidate:
         description: nested earthly shares the outer daemon (1) or starts its own (0)
         type: string
@@ -136,6 +140,7 @@ env:
   REBUCK2_AFFINITY: ${{ inputs.affinity || '0' }}
   REBUCK2_H2_RESETS: ${{ inputs.h2_resets || '' }}
   REBUCK2_CONSOLIDATE: ${{ inputs.consolidate || '1' }}
+  REBUCK2_SANDBOX_HOST: ${{ inputs.sandbox_host || '0' }}
   # Cut the shared ancestry out as its own dispatch unit, publish it once,
   # and graft it into everything that follows.
   #
@@ -678,6 +683,19 @@ jobs:
           # The switch needs no patch: the forwarder reads the ENVIRONMENT, so
           # passing the same address through a config file instead tells the
           # outer earthly where to build while forwarding nothing.
+          # Share a daemon, but the LOCAL one. earthly forwards its own
+          # address into every nested build, which on one machine is a local
+          # daemon and in a fleet is the coordinator - so every nested build
+          # everywhere dials one machine. `buildkitsandbox` is a buildkit
+          # constant written into every exec's /etc/hosts, so the string is
+          # identical on every machine while resolving locally, which is both
+          # what fixes the funnel and what keeps forwarded RUNs mergeable.
+          #
+          # The patch has always carried this branch and it was `if false`,
+          # disabled because under NETWORK_MODE=cni the name resolves to the
+          # exec itself. That was measured on one machine, where the funnel
+          # costs nothing and the safer option is free.
+          export EARTHLY_SANDBOX_BUILDKIT_HOST="${REBUCK2_SANDBOX_HOST:-0}"
           if [ "${REBUCK2_CONSOLIDATE:-1}" = "1" ]; then
             export EARTHLY_BUILDKIT_HOST="tcp://${LAN}:1234"
           else

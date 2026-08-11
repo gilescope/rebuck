@@ -266,7 +266,18 @@ index 82b1e390..834c1c22 100644
 +		// buildkitsandbox then resolves to the exec itself and the dial is
 +		// refused (measured). Forward this CLI's own address, which an exec
 +		// CAN reach.
-+		if false {
++		//
++		// That measurement was taken on ONE machine, where "this CLI's
++		// address" is a local daemon and the difference is invisible. In a
++		// fleet it is not: the CLI's address is the coordinator's gateway, so
++		// every nested build on every worker dials back to one machine. The
++		// five leads that own a full +test-no-qemu critical path are all
++		// nested builds at 231-258s each, each longer than the entire 221s
++		// single-machine build and clustered the way a queue clusters.
++		//
++		// So the branch is a switch rather than a dead constant, and which
++		// one wins is a measurement, not an argument.
++		if os.Getenv("EARTHLY_SANDBOX_BUILDKIT_HOST") == "1" {
 +			// NOT this CLI's address. Ours names the daemon from the HOST --
 +			// a container IP, or a socket -- and neither means anything inside
 +			// an exec. sandboxBuildkitHost is how the same daemon is reached
