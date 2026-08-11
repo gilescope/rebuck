@@ -57,6 +57,12 @@ on:
       # target time this still answers the coverage question - how much of
       # the Earthfile survives the fleet - which is the one `+all` is for.
       - giles-dispatch-ci-all-nobase
+      # +all with the best placement known. It is the release chain -
+      # all-buildkitd, all-binaries, earthly-docker, prerelease - and three
+      # of its four children have been through the fleet individually while
+      # the whole has never run. -sandbox because earthly-docker and
+      # prerelease are the likeliest nested builds left in the tree.
+      - giles-dispatch-ci-all-balance-sandbox-nobase
       - giles-dispatch-ci-ast-imports
       - giles-dispatch-ci-ast-bcast
       - giles-dispatch-ci-ast-balance
