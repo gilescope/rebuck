@@ -5593,3 +5593,28 @@ already there for the driver: claimants first, then everyone else.
 
 Recorded because it is the kind of thing that shows up later as an
 unexplained slowdown in a mechanism nobody connected to bloom saturation.
+
+### The local rig cannot reproduce the `-bcast` failure, and cannot clear it
+
+`scripts/fleet.sh`, three daemons, six builds, `REBUCK2_PREFETCH_ALL=1`:
+six solves, six routed, zero failed, no media-type error.
+
+**That is not evidence.** The log contains no `prefetched` line at all -
+no announcement was ever made, so broadcast never fired. The rig's builds
+are synthetic and share no ops, so `consumers_of(op) >= 2` is never true and
+prefetch has nothing it considers worth announcing.
+
+Which is the same gap that made the rig useless for `-balance` earlier
+today: warmth requires shared work, and this generator produces none. The
+rig is excellent for anything one daemon can show - it settled the
+re-fetch question in a minute - and structurally blind to anything about
+sharing.
+
+So the media-type failure needs either a CI run or a generator that emits
+overlapping graphs. The second is the better investment and is not a
+five-minute job: it means synthesising a dependency graph with genuine
+common ancestors rather than N independent chains.
+
+Recorded because a clean local run is exactly the kind of result that talks
+you into re-enabling something. The mechanism did not fire; nothing was
+tested; `-bcast` stays off.
