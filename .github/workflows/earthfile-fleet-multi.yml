@@ -74,6 +74,10 @@ on:
       # not apply: use the good config and find out what breaks.
       - giles-dispatch-ci-tests-balance-nobase
       - giles-dispatch-ci-tests-balance-w12-nobase
+      # Whichever of the two the -ast run picks. Both are listed rather
+      # than one added later, because a branch that is pushed and does not
+      # trigger looks exactly like a run that failed to start.
+      - giles-dispatch-ci-tests-balance-imports-w12-nobase
       - giles-dispatch-ci-ast-minops-nobase
       - giles-dispatch-ci-ast-seed
       - giles-dispatch-ci-lint-graft
