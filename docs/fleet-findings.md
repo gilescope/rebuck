@@ -5429,3 +5429,53 @@ Deliberately not building it now, with a run in flight. Recorded because the
 design is the part that was unclear, and because this document already
 contains five mechanisms built before anyone asked which candidate they
 addressed.
+
+## `-bcast` on `+test-ast`: 353s, and the guard says it is not a win
+
+The leg came in at **353 seconds against a 1050s reference** - a third of
+the time, and far past the 840s the identity predicted. It is not a result.
+
+```text
+17 failure  did the fleet change the answer
+```
+
+The parity check failed, and the log says why:
+
+```text
+Error: async force execution for ./internal/earthfile/tests+base:
+  unlazy force execution: failed to load cache key:
+  unexpected media type application/octet-stream for sha256:37b8752f...: not found
+```
+
+The baseline touched five targets, the fleet four. **The leg was fast
+because it stopped early**, which is precisely the failure the
+`fleet touched N target(s)` counter and the parity gate were built to catch,
+and precisely the number I would have reported as a 3x win if either had
+been missing.
+
+### What broke
+
+`unexpected media type application/octet-stream` on a blob fetch. Broadcast
+makes every worker fetch every announced blob rather than its 1-in-N share,
+so a blob that one worker used to fetch is now fetched by six - and
+something in that path serves the wrong content type for the same digest.
+
+Two candidates, and the evidence does not yet separate them:
+
+- **the mesh fetch path**, which serves blobs by hash with no manifest
+  context and may be handing back a raw blob where a client expects a
+  descriptor's media type
+- **a race**: six concurrent fetchers for one digest through the
+  single-flight gate, where the loser reads a partially-written store entry
+
+The second is the one broadcast newly exposes, since the split guaranteed at
+most one fetcher per blob per worker set.
+
+**`-bcast` goes off.** It cut `waiting` 45% on the wide target for no clock,
+and on the narrow one it breaks the build. The mechanism is sound in
+principle - pre-positioning is principle 18 - and the implementation is not
+safe to run until the media-type failure is understood.
+
+Recorded as a correctness failure rather than a performance one, because
+that is what it is: the parity gate is the only reason this is not written
+up as the best result of the day.
