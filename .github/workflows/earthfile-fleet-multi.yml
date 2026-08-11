@@ -41,6 +41,10 @@ on:
       home_slots:
         description: "slots peer 0 keeps for itself - 0 forces dispatch"
         default: "0"
+      consolidate:
+        description: nested earthly shares the outer daemon (1) or starts its own (0)
+        type: string
+        default: '1'
       h2_resets:
         description: hyper's reset-stream limit; 'none' disables it (experiment)
         type: string
@@ -131,6 +135,7 @@ env:
   # of 1. Off until it is measured, like the other three.
   REBUCK2_AFFINITY: ${{ inputs.affinity || '0' }}
   REBUCK2_H2_RESETS: ${{ inputs.h2_resets || '' }}
+  REBUCK2_CONSOLIDATE: ${{ inputs.consolidate || '1' }}
   # Cut the shared ancestry out as its own dispatch unit, publish it once,
   # and graft it into everything that follows.
   #
@@ -657,9 +662,33 @@ jobs:
         run: |
           set -euo pipefail
           start=$SECONDS
+          # CONSOLIDATION, and whether it should survive a fleet.
+          #
+          # earthly forwards its own BUILDKIT_HOST into every RUN, so a nested
+          # earthly shares the outer daemon instead of starting one. On ONE
+          # machine that halved the baseline (292s -> 141s) because the shared
+          # daemon is local. In a fleet it is not local: it is the
+          # coordinator's gateway, so every nested build on every worker dials
+          # back to one machine and re-enters through one gateway.
+          #
+          # The five leads that own the critical path are all nested builds,
+          # at 231-258s each - longer than the entire 221s single-machine
+          # build, and clustered the way a queue clusters.
+          #
+          # The switch needs no patch: the forwarder reads the ENVIRONMENT, so
+          # passing the same address through a config file instead tells the
+          # outer earthly where to build while forwarding nothing.
+          if [ "${REBUCK2_CONSOLIDATE:-1}" = "1" ]; then
+            export EARTHLY_BUILDKIT_HOST="tcp://${LAN}:1234"
+          else
+            printf 'global:\n  buildkit_host: tcp://%s:1234\n  tls_enabled: false\n' "$LAN" \
+              > "$RUNNER_TEMP/fleet.yml"
+            export EARTHLY_CONFIG="$RUNNER_TEMP/fleet.yml"
+            unset EARTHLY_BUILDKIT_HOST EARTH_BUILDKIT_HOST
+            unset EARTHLY_TLS_ENABLED EARTH_TLS_ENABLED
+          fi
           # shellcheck disable=SC2086 # a flag LIST: word-splitting is the point
-          EARTHLY_BUILDKIT_HOST="tcp://${LAN}:1234" \
-            earthly $EARTHLY_FLAGS "$TARGET" > /tmp/fleet.log 2>&1 && rc=0 || rc=$?
+          earthly $EARTHLY_FLAGS "$TARGET" > /tmp/fleet.log 2>&1 && rc=0 || rc=$?
           tail -60 /tmp/fleet.log
           grep -ao "^[^ ]* \*failed\*" /tmp/fleet.log | sed 's/ \*failed\*//' | sort -u > /tmp/fleet.failed || true
           # HOW MUCH did this leg get through before it stopped? Both legs
