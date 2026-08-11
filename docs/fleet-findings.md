@@ -4345,3 +4345,49 @@ cleaner statement of why the op floor failed than the five-times-slower
 measurement was - it was optimising a term that is zero.
 
 That is the value of the split. Before it, every one of these was arguable.
+
+## `-balance`: 1240s to 1050s, and every machine finally works
+
+Trading warmth against queue depth, on top of the fixed prefetch. Same
+target, same 412 solves.
+
+| | prefetch only | `+ -balance` |
+| ------------------- | ------------- | ------------ |
+| **fleet leg** | 1240s | **1050s** |
+| baseline | 227s | 212s |
+| amplification | 44.5x | **38.9x** |
+| **placement spread** | 53/78/103/182, **2 idle** | **37/38/58/68/77/140, none idle** |
+| total lead time | 10,101s | **8,239s** |
+| `waiting` | 6,583s (65%) | **3,670s (45%)** |
+| `building` | 3,517s (35%) | 4,521s (55%) |
+| `placing` | 0s (0%) | 47s (1%) |
+| built duplication | 1.4x | 1.7x |
+
+**Every machine took work.** Six workers, none idle, and the biggest share
+fell from 182 placements to 140. The `balance` counter read 400 - it
+reordered the queue four hundred times, and `affinity` rose to 400 with it,
+so the two agreed on almost every placement rather than fighting.
+
+**Waiting fell by 2,913 seconds**, which is 44% of the number this was aimed
+at, and the wall clock moved 190s with it.
+
+Everything the trade predicted happened, including the costs.
+
+- `building` rose, 3,517s to 4,521s. That is the trade, made deliberately: a
+  cold machine taking work a warm one would have done pays for the parent it
+  does not have. Duplication rose with it, 1.4x to 1.7x, for the same
+  reason.
+- `placing` appeared: 47s, 1%. Non-zero for the first time, because a
+  candidate that would have been chosen outright is now sometimes passed
+  over and the offer goes further down the list.
+
+The two together cost about 1,050 seconds against 2,913 saved. Worth it, and
+it says exactly where the next gain is: **`-imports` and `-bcast` both aim at
+`building`**, which this run has just made the majority term. The sequencing
+argument from two sections up holds - `-imports` had to ride on top of
+`-balance` or it would have concentrated harder - and `-balance` is now in
+place for it.
+
+Two runs, two mechanisms, 1773s to 1050s. The first repaired something that
+had never worked; the second stopped a working mechanism from working too
+hard.
