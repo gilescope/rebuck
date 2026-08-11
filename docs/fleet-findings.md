@@ -4754,3 +4754,55 @@ was measured for. But two machines took 90 of 122 placements. On this
 workload the queue penalty is not enough - which is the shape principle 27
 predicts when the preference is strong and the work is lumpy, and it is the
 first evidence that the 64 constant is target-specific.
+
+### `WITH DOCKER` is undispatchable, and fail-closed caught it
+
+The seventeen exclusions in the coverage run deserved five minutes of
+reading rather than a guess, and the guess would have been wrong.
+
+The message names an env var - `env EARTHLY_DOCKER_LOAD_REGISTRY=...` - and
+earthbuild passes that as `llb.AddSecret(..., SecretAsEnv(true))`, whose
+value is just a list of image names, passed as a secret only "to prevent
+busting the cache, as the intermediate image names are different every
+time". That reads like a misclassification: a harmless secret refused as an
+unknown extension, and therefore unliftable by `REBUCK2_SERVE_SECRETS`,
+which exists precisely to lift secrets.
+
+It is not. From the fork's own proto:
+
+```text
+MountType_HOST_BIND MountType = 100 // Earthly specific.
+```
+
+**Type 100 is a host bind.** A path from the machine running the build, which
+a remote worker cannot satisfy at any price. The env var is just what else
+that op carries. Refusing it is correct and no flag should lift it.
+
+So the dispatch ceiling on `+test-no-qemu` is `WITH DOCKER`, and it is
+structural: those targets bind the host, and a host is the one thing a fleet
+cannot ship. Seventeen of 138 solves, and they are among the longest - 670
+seconds of coordinator building.
+
+### The comment that said this could not happen
+
+`dispatch.rs` reasons about exactly this case and concludes it cannot arise:
+
+> a host bind can only reach us from an earthly client, and those graphs are
+> already excluded by the secret and ssh mounts that come with it. Guessing
+> at a detection rule for an encoding this tree cannot produce would be a
+> check that never fires, tested by nothing.
+
+Host binds reached us thirteen times in one run. The reasoning was wrong -
+`WITH DOCKER` brings a host bind without bringing a secret or an ssh mount -
+and the code was right anyway, because the fail-closed branch beneath that
+comment caught every one:
+
+```rust
+// Fail CLOSED on anything else. A number we do not recognise is a
+// fork extension whose requirements we cannot see.
+if !KNOWN_MOUNTS.contains(&m.mount_type) {
+```
+
+An allow-list caught what the argument for not needing one said would never
+arrive. That is the whole case for allow-lists over reasoning, and it is
+worth more than the finding it produced.
