@@ -223,7 +223,7 @@ index 82b1e390..834c1c22 100644
  	if isInteractive {
  		c.mts.Final.RanInteractive = true
  
-@@ -3569,3 +3576,94 @@ func strIf(condition bool, str string) string {
+@@ -3569,3 +3576,105 @@ func strIf(condition bool, str string) string {
  
  	return ""
  }

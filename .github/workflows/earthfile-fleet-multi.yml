@@ -340,6 +340,22 @@ jobs:
               echo "rebuck2/patches/README.md."
               exit 1
             }
+          # APPLIED is not the same as applied WHOLE. A hunk header carries
+          # the line counts of its own body, so editing the body without
+          # updating the header makes git read only as many lines as the
+          # header claims, apply that much, and exit 0. The dropped remainder
+          # here was a function definition whose caller DID apply, and the
+          # failure surfaced two steps later as `undefined: sortedKeys` -
+          # nowhere near the patch, in a file nobody had touched.
+          # shellcheck disable=SC2013 # Go identifiers: no spaces to split on
+          for sym in $(grep -oE '^\+func [a-zA-Z]+' \
+              "$GITHUB_WORKSPACE/rebuck2/patches/earthbuild-consolidated-plus-784.patch" \
+              | sed 's/^+func //' | sort -u); do
+            grep -rqF "func $sym(" earthbuild || {
+              echo "::error::the patch applied but dropped func $sym - check its @@ line counts"
+              exit 1
+            }
+          done
           ( cd earthbuild && go build -o /usr/local/bin/earthly ./cmd/earthly )
           earthly --version
           # Thirteen feature flags the test targets assume. Missing it does
@@ -482,6 +498,22 @@ jobs:
               echo "rebuck2/patches/README.md."
               exit 1
             }
+          # APPLIED is not the same as applied WHOLE. A hunk header carries
+          # the line counts of its own body, so editing the body without
+          # updating the header makes git read only as many lines as the
+          # header claims, apply that much, and exit 0. The dropped remainder
+          # here was a function definition whose caller DID apply, and the
+          # failure surfaced two steps later as `undefined: sortedKeys` -
+          # nowhere near the patch, in a file nobody had touched.
+          # shellcheck disable=SC2013 # Go identifiers: no spaces to split on
+          for sym in $(grep -oE '^\+func [a-zA-Z]+' \
+              "$GITHUB_WORKSPACE/rebuck2/patches/earthbuild-consolidated-plus-784.patch" \
+              | sed 's/^+func //' | sort -u); do
+            grep -rqF "func $sym(" earthbuild || {
+              echo "::error::the patch applied but dropped func $sym - check its @@ line counts"
+              exit 1
+            }
+          done
           ( cd earthbuild && go build -o /usr/local/bin/earthly ./cmd/earthly )
           earthly --version
           # Thirteen feature flags the test targets assume. Missing it does
