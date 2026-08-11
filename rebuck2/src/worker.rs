@@ -453,6 +453,7 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                 continue;
             }
             D2W::Exit => {
+                fetch_summary();
                 println!("[worker] driver said exit — done");
                 return Ok(());
             }
@@ -886,6 +887,35 @@ async fn lead_reply(
 }
 
 /// `std::env::consts::ARCH` in the spelling buildkit platforms use.
+/// One line saying where this worker's time went.
+///
+/// A lead costs what it fetches - 87% of lead time in a measured run was in
+/// the seventeen leads that moved more than a MiB, at 7.2 MB/s. That rate
+/// is two things at once: GETTING the bytes, which this worker's registry
+/// does and times, and UNPACKING them, which buildkit does and does not.
+///
+/// The per-lead line carries both, but forty of those need adding up before
+/// they say anything. This is the total, once, where a reader will find it.
+fn fetch_summary() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let bytes = crate::registry::SERVED_BYTES.load(Relaxed);
+    let ms = crate::registry::SERVED_MS.load(Relaxed);
+    if bytes == 0 {
+        println!("[worker] served nothing - every input was already here");
+        return;
+    }
+    let mib = bytes as f64 / 1048576.0;
+    println!(
+        "[worker] served {mib:.0} MiB in {ms}ms ({:.1} MB/s from this registry - \
+         the REST of a lead's time is unpack)",
+        if ms > 0 {
+            mib / (ms as f64 / 1000.0)
+        } else {
+            0.0
+        }
+    );
+}
+
 fn arch() -> &'static str {
     match std::env::consts::ARCH {
         "aarch64" => "arm64",
