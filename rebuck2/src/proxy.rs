@@ -152,6 +152,15 @@ pub struct Proxy {
     /// is the same sequence with this step already paid for by a previous
     /// generation, which is why 0 beats 1.
     warmup: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Have the cache seeds been announced to the fleet yet?
+    ///
+    /// Once per process. A seed is named by every graph carrying that cache
+    /// id, so without this it would be announced on every dispatch.
+    /// Arc, not a bare AtomicBool: `Proxy` is Clone and is cloned per call,
+    /// so an unshared flag would be "once per clone", which is once per
+    /// dispatch - exactly the thing it exists to prevent. The compiler
+    /// caught this one; the semantics would not have shown up in a log.
+    seeds_announced: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Who places dispatched work. The gateway holds the client's Solve; the
     /// driver decides which machine builds it, using the arbitration workers
     /// already get. Not a peer list of our own - see M4.5.
@@ -312,6 +321,7 @@ impl Proxy {
             gw_pool,
             next_gw: Default::default(),
             warmup: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            seeds_announced: Default::default(),
             driver,
             wire: Default::default(),
             mirror: None,
@@ -1845,7 +1855,23 @@ impl Proxy {
         // already reach, so it neither needs mirroring nor should be
         // mirrored - putting it earlier would send it round the base-image
         // path and copy a cache image through peer 0 for no reason.
-        crate::dispatch::seed_cache_mounts(&out, crate::dispatch::cache_seeds())
+        //
+        // Which also means it misses the prefetch that the base-image path
+        // does on the way past, and a seed is the single best thing in the
+        // build to pre-position: every graph naming that cache id wants it,
+        // on every machine, and it is large by construction. So announce it
+        // here, once.
+        let seeds = crate::dispatch::cache_seeds();
+        if !seeds.is_empty()
+            && !self
+                .seeds_announced
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            for reference in seeds.values() {
+                self.driver.prefetch_image(reference).await;
+            }
+        }
+        crate::dispatch::seed_cache_mounts(&out, seeds)
     }
 
     /// Materialise every `local://` source this graph names.
