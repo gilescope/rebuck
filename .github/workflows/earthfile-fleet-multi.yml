@@ -41,6 +41,10 @@ on:
       home_slots:
         description: "slots peer 0 keeps for itself - 0 forces dispatch"
         default: "0"
+      fresh_fleet:
+        description: the baseline gets its own daemon, so the fleet's coordinator starts cold (1/0)
+        type: string
+        default: '1'
       prefetch:
         description: announce a finished layer to the fleet before it is asked for (1/0)
         type: string
@@ -183,6 +187,7 @@ env:
   # the fleet leg, when the bulk transfer lands exactly as the fan-out wants
   # it - a layer finished minutes earlier sits on one machine until asked.
   REBUCK2_PREFETCH: ${{ inputs.prefetch || '0' }}
+  REBUCK2_FRESH_FLEET: ${{ inputs.fresh_fleet || '1' }}
   REBUCK2_WARM_TARGET: ${{ inputs.warm_target || './tests/integration-base+test-base' }}
   # Pinned by digest like everything else here: a collector that changes
   # under us changes the data.
@@ -439,7 +444,7 @@ jobs:
           # our own with gRPC on 8372, the port the fork's tcp template sets.
           BK_IMAGE=${BK_IMAGE:-earthbuild/buildkitd:v0.8.17}
           docker pull "$BK_IMAGE"
-          docker rm -f own-bk >/dev/null 2>&1 || true
+          docker rm -f own-bk base-bk >/dev/null 2>&1 || true
           docker run -d --name own-bk --privileged -p 18372:8372 \
             -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
             -e BUILDKIT_TLS_ENABLED=false \
@@ -812,7 +817,7 @@ jobs:
           # our own with gRPC on 8372, the port the fork's tcp template sets.
           BK_IMAGE=${BK_IMAGE:-earthbuild/buildkitd:v0.8.17}
           docker pull "$BK_IMAGE"
-          docker rm -f own-bk >/dev/null 2>&1 || true
+          docker rm -f own-bk base-bk >/dev/null 2>&1 || true
           docker run -d --name own-bk --privileged -p 18372:8372 \
             -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
             -e BUILDKIT_TLS_ENABLED=false \
@@ -896,9 +901,41 @@ jobs:
           # be asked at all. `+base` resolved 696 times for 4232s of span
           # time is either the finding of the week or nothing.
           export OTEL_RESOURCE_ATTRIBUTES="rebuck2.leg=baseline,rebuck2.target=$TARGET"
+          # ITS OWN DAEMON, and this is not tidiness - it removes a
+          # confound that has been under every speed number in this project.
+          #
+          # The baseline used to dial 18372, which is `own-bk`, which is also
+          # the proxy's upstream. So the baseline BUILT THE WHOLE TARGET on
+          # the daemon the fleet leg then used, and peer 0 entered the fleet
+          # leg as the warmest machine present. HOME_SLOTS=0 then forced
+          # every solve off that warm daemon onto cold workers, which is a
+          # plausible explanation for the entire deficit and is a property of
+          # the harness rather than of distribution.
+          #
+          # Both legs now start from an equally cold daemon, which is the
+          # comparison the numbers were always claimed to be.
+          if [ "${REBUCK2_FRESH_FLEET:-1}" = "1" ]; then
+            # Step-local in the daemon step, so named again here rather than
+            # inherited - and pinned to the same tag, or the two legs would
+            # differ by buildkit version as well as by warmth.
+            BK_IMAGE=${BK_IMAGE:-earthbuild/buildkitd:v0.8.17}
+            docker rm -f base-bk >/dev/null 2>&1 || true
+            docker run -d --name base-bk --privileged -p 28372:8372 \
+              -e BUILDKIT_TCP_TRANSPORT_ENABLED=true -e BUILDKIT_TLS_ENABLED=false \
+              "$BK_IMAGE" >/dev/null
+            for _ in $(seq 1 90); do
+              docker exec base-bk buildctl --addr tcp://127.0.0.1:8372 debug workers \
+                >/dev/null 2>&1 && break
+              sleep 1
+            done
+            BASE_PORT=28372
+          else
+            BASE_PORT=18372
+          fi
+          echo "baseline daemon: $BASE_PORT (18372 = shared with the fleet)"
           # shellcheck disable=SC2086 # a flag LIST: word-splitting is the point
           EARTHLY_CONFIG="$RUNNER_TEMP/base.yml" \
-          EARTHLY_BUILDKIT_HOST="tcp://${LAN}:18372" \
+          EARTHLY_BUILDKIT_HOST="tcp://${LAN}:${BASE_PORT}" \
             earthly $EARTHLY_FLAGS "$TARGET" > /tmp/baseline.log 2>&1 && rc=0 || rc=$?
           tail -20 /tmp/baseline.log
           # LEADING WHITESPACE, and it is not cosmetic. earthly right-aligns
