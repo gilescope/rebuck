@@ -6,6 +6,16 @@
 //! digests, and reconstructing a target from those means decoding a base64
 //! `llb.customname` and hoping.
 //!
+//! What this deliberately does NOT report is a serial fraction. The finding
+//! that 71% of `+test-no-qemu` is a serial base chain came from READING the
+//! timeline - `+earthly-docker` runs 0-187s, everything else waits, the
+//! tests run 192-271s - and two attempts to compute it automatically both
+//! failed. Span overlap says 0% serial, because earthly holds a target's
+//! span open while it WAITS and 36 blocked spans look like 36 running ones.
+//! Counting only leaf spans says 25-44%, over a third of the wall clock,
+//! because it discards too much. A number that contradicts the analysis it
+//! is meant to support is worse than no number.
+//!
 //! Split BY LEG, which is the whole point. Aggregated across a run, `+base`
 //! looked like 696 resolutions costing 4232s - an obvious thing to memoise.
 //! Per leg it says the opposite: the baseline resolves it 575 times at 3.0s
@@ -32,6 +42,11 @@ pub struct Leg {
     pub label: String,
     pub wall_ms: f64,
     pub targets: BTreeMap<String, Tally>,
+    /// Every target span as (start, end) nanoseconds, so concurrency over
+    /// time can be recovered. Durations alone cannot say how much of the
+    /// wall clock had only one thing running, which is the number that caps
+    /// what any distribution can do.
+    pub spans: Vec<(u128, u128)>,
 }
 
 /// Spans longer than this are the umbrella ones - `main`, the whole target -
@@ -64,7 +79,7 @@ pub fn parse(jsonl: &str) -> Vec<Leg> {
                     else {
                         continue;
                     };
-                    let ms = match (
+                    let (st, en) = match (
                         sp["startTimeUnixNano"]
                             .as_str()
                             .and_then(|s| s.parse::<u128>().ok()),
@@ -72,9 +87,10 @@ pub fn parse(jsonl: &str) -> Vec<Leg> {
                             .as_str()
                             .and_then(|s| s.parse::<u128>().ok()),
                     ) {
-                        (Some(a), Some(b)) if b >= a => (b - a) as f64 / 1e6,
+                        (Some(a), Some(b)) if b >= a => (a, b),
                         _ => continue,
                     };
+                    let ms = (en - st) as f64 / 1e6;
                     let leg = legs.entry(tid.to_owned()).or_default();
                     if leg.label.is_empty() {
                         leg.label = tag
@@ -91,6 +107,7 @@ pub fn parse(jsonl: &str) -> Vec<Leg> {
                         t.count += 1;
                         t.total_ms += ms;
                         t.each.push(ms);
+                        leg.spans.push((st, en));
                     }
                 }
             }
