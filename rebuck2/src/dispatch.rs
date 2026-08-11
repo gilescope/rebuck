@@ -2029,6 +2029,15 @@ mod tests {
             "build failed: solve: process \"sh -c echo hi\" did not complete \
              successfully: exit code: 2"
         ));
+
+        // The report trims a verdict to its exit code, and the reason is
+        // length: buildkit inlines the whole environment into the message,
+        // and one of these ran to 700 characters and made `not routed`
+        // unreadable. This is the split that does it.
+        let long = "build failed: solve: Unknown error process \"/bin/sh -c \
+                    GOLANG_VERSION=1.26.5 ... golangci-lint run\" did not complete \
+                    successfully: exit code: 1";
+        assert_eq!(long.rsplit("exit code:").next().map(str::trim), Some("1"));
     }
 
     /// The graph that takes a warm mount OUT of a daemon.

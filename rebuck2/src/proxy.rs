@@ -3121,7 +3121,17 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                                 // hazard we named is working as intended,
                                 // and a graph that dies after being accepted
                                 // is a hazard we failed to name.
-                                let inspect_was_wrong = why.contains("build failed");
+                                // A VERDICT is not a dispatch failure, and
+                                // counting it as one is how `not routed`
+                                // read as "the fleet refused four" for a
+                                // lint that the fleet ran perfectly well and
+                                // that simply fails. Separate bucket,
+                                // separate wording, because the two lead
+                                // somewhere completely different: a refusal
+                                // is ours to fix, a failing build is the
+                                // build's.
+                                let verdict = crate::dispatch::is_build_verdict(&why);
+                                let inspect_was_wrong = !verdict && why.contains("build failed");
                                 if self.wire.held().routed == 0 || inspect_was_wrong {
                                     println!(
                                         "[proxy] {} graph carries {:?}",
@@ -3138,12 +3148,21 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                                 // idle and one lead taken read as "fleet took
                                 // nothing" five times over, which named the
                                 // outcome and hid the cause.
-                                *self
-                                    .wire
-                                    .held()
-                                    .rejected
-                                    .entry(format!("fleet: {why}"))
-                                    .or_default() += 1;
+                                let bucket = if verdict {
+                                    // Trimmed to the target and the code. The
+                                    // whole message is a shell line with the
+                                    // environment inlined - one of them ran
+                                    // to 700 characters in `not routed` and
+                                    // made the table unreadable.
+                                    format!(
+                                        "the BUILD failed on a peer (not a dispatch \
+                                         problem): exit code {}",
+                                        why.rsplit("exit code:").next().unwrap_or("?").trim()
+                                    )
+                                } else {
+                                    format!("fleet: {why}")
+                                };
+                                *self.wire.held().rejected.entry(bucket).or_default() += 1;
                             }
                         }
                     } else {
