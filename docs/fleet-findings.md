@@ -4455,6 +4455,43 @@ rather than abandoning the idea - the flag exists, defaults to 1, and has
 never been set. That is a cheaper follow-up than it looks, and worth knowing
 before reading a flat result as a verdict on broadcasting.
 
+## Correction: `+test-no-qemu` has been run, and at parity
+
+Two sections below I wrote that it "has never run" and built a coverage plan
+on it. That is false, and the counter-evidence is in this file - *The whole
+of `+test-no-qemu`, at parity*:
+
+```text
+one machine 186s   6 machines 525s
+PARITY: the same 1 target(s) failed either way
+gateway solves 163 - routed 130 - peak in flight 14
+op duplication 8.0x sent, 2.3x built
+```
+
+All fourteen groups, six runners, one target failing both ways. Principle
+18's fetch timeline comes from that same run.
+
+**How I got it wrong:** I grepped `docs/fleet-findings.md` for
+`test-no-qemu`, filtered out `group2` to remove the default-target noise,
+and read the remainder as talk about a target nobody had run. The section
+that says otherwise was in the output; I built the plan without opening it.
+
+**What it changes, and it is mostly good.** 186s against 525s is a ratio of
+2.8x - far better than anything `+test-ast` has managed, and the best result
+in this document. The wide target was already the fleet's best case before
+today's fixes, which is exactly what principle 19 predicts and I was about
+to claim as untested.
+
+So the coverage run is a **re-run with a reference**, not a first attempt.
+That is worth more: 525s is a number to beat, and the fixes since - prefetch
+from 9 applications to 421, and a queue-aware placement that put all six
+machines to work - are aimed at the two faults that run would have had.
+
+The rest of the plan stands: `-nobase` for the budget, twelve machines to
+test the ceiling claim, deliverable is the failed-target list. Only the
+justification was wrong, and it was wrong in the direction of underselling
+what already worked.
+
 ## Next is coverage, not another `-ast` variation
 
 Deciding the order now, while the current run is still in flight, so the
