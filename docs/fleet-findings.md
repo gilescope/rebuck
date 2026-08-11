@@ -77,6 +77,9 @@ confident version first - which has happened to me, in this file, twice.
 | That ceiling is 2.32x on six machines | 670s of 2,120s serial by construction |
 | **And cutting at the exclusion does not raise it** | 13s before the first exclusion against 2,223s from it on - 1% |
 | A red run can be a green experiment | coordinator green, one worker exiting non-zero, intermittent |
+| `-bcast` breaks the build on `+test-ast` | parity failed, one target unreached, media type unexplained |
+| **The leg is lead time over concurrency** | 8,239s / 7.85 = 1049 against a measured 1050s |
+| `+test-ast` is 15x off its own ceiling | 2.97x at seven machines means a 71s best leg against 1050s |
 
 **Open.** Believed for a reason, not measured.
 
@@ -85,7 +88,8 @@ confident version first - which has happened to me, in this file, twice.
 | How much of the fleet's traffic crosses a wire | `SERVED_BYTES` mixes loopback with peer serving; `SERVED_LOCAL_BYTES` exists and has never reported |
 | Whether the fleet repeats itself, and by how much | the coordinator reports 1.1x; the per-worker figure has never printed |
 | What made the reference run take 50 minutes | not the tap, which costs 1ms. Still unexplained |
-| Whether pre-positioning layers on every worker pays | `-bcast` in flight, against `building` at 69-73% |
+| **What the 12.5x is** | fleet builds 21.3x the baseline, duplication explains 1.7x |
+| Why `-bcast` breaks `+test-ast` | two hypotheses checked and refuted; cause unknown |
 
 **Retracted.** Written here confidently and wrong. Left in place with the
 correction attached, because a deleted mistake gets made again.
