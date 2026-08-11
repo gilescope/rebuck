@@ -329,6 +329,12 @@ const KNOWN_MOUNTS: [i32; 5] = [
 ///
 /// With no exclusions it returns the whole graph, so the figure means the
 /// same thing whether or not anything was refused.
+///
+/// `ops` is `def.def.len()`, which INCLUDES the terminal op that `loadLLB`
+/// strips. So a suffix of 1 is the terminal alone and means nothing
+/// dispatchable - read 1 as 0. Not corrected for here, because subtracting
+/// a terminal that may or may not be past the exclusion would make the
+/// number harder to check against the graph it came from.
 pub fn suffix_past_exclusions(ops: usize, exclusions: &[(usize, Exclusion)]) -> usize {
     match exclusions.iter().map(|(i, _)| *i).max() {
         None => ops,
