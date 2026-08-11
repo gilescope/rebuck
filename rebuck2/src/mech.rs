@@ -195,8 +195,13 @@ mod every_switch_is_reported {
             "REBUCK2_MIN_OPS",           // reported as min_ops
             "REBUCK2_GRAFT",             // reported on its own line
             "REBUCK2_WARMUP",            // a count, not a switch
-            "REBUCK2_PREFETCH_ALL",      // reported as `prefetch_broadcast`
-            "REBUCK2_FLEET_CACHE",       // three-valued, and the mode is in
+            // Worker-side and per-process, like PREFETCH_ALL: the counter
+            // would live in the worker's map and this report could never see
+            // it. Its evidence is the worker's own `vertices` line.
+            // Measured harmful and off - see the call site in solve.rs.
+            "REBUCK2_WORKER_VERTICES",
+            "REBUCK2_PREFETCH_ALL", // reported as `prefetch_broadcast`
+            "REBUCK2_FLEET_CACHE",  // three-valued, and the mode is in
             // the solve request rather than a
             // decision this proxy takes
             "REBUCK2_H", // llb generator
