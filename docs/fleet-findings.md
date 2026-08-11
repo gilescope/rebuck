@@ -2489,13 +2489,20 @@ event. That is a different fault to any of the five already eliminated -
 keepalive, reset limits, connection sharing, session isolation, the daemon
 being killed - and it is the first one that names a method.
 
-The obvious suspect, unverified: earthly issues `ReadFile` and `ReadDir`
-against refs from solves we ROUTED, so the ref belongs to a build that
-happened on another machine and this daemon never created it. The call order
-in the same report is dense with `read_dir` and `read_file`, and the failure
-lands at the end of the run, which is when earthly reads results. A daemon
-should return an error for an unknown ref rather than unwind, so if that is
-the trigger there is a buildkit bug under it as well as ours.
+The obvious suspect was that earthly reads results at the END of a run and
+reads them against refs from solves we ROUTED - a ref belonging to a build
+another machine did, which this daemon never created. **Refuted before it
+could become theory number seven**, by reading the handler rather than
+reasoning about it: `getImmutableRef` returns
+`no such ref: %s, all %+v` for an id it does not hold, and the nil path
+below it returns `os.ErrNotExist`. An unknown ref is an error, not an
+unwind, and `LocalMounter(nil).Mount()` does not fault either - `lm.mounts`
+stays nil and `mount.All(nil, dest)` is harmless.
+
+So the trigger is something else in that handler, and the honest position is
+that it is not yet known. Five theories have already been eliminated by
+guessing the right grep before the run; guessing a sixth from a truncated
+stack is how this hunt has been going wrong. The panic header decides it.
 
 What is missing is the panic line itself: `docker logs --tail 25` captured
 the bottom of the stack and cut off the header that says why. Widened, and
