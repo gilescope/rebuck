@@ -71,6 +71,8 @@ confident version first - which has happened to me, in this file, twice.
 | A brake sized for one preference does not hold two | the imports term fired 1724x against 361 reorders |
 | The instruments are not the problem | the status tap: 1ms across 3004 frames |
 | **The whole of `+test-no-qemu` runs through the fleet** | 520s, fourteen groups, one failed target matching the reference |
+| **Every named target runs through the fleet** | `+all` at 2,724s with zero failed targets was the last |
+| `+all` is a chain, not a fan-out | occupancy 0.99 against a 2.81 ceiling, `building` 84% |
 | The h2 collapse is cured by `REBUCK2_SANDBOX_HOST` | it died at 39 targets without it, completed with it |
 | A fix is worth what its target's bottleneck is worth | prefetch and `-balance`: 41% on `+test-ast`, 0% here |
 | `WITH DOCKER` cannot be dispatched | mount type 100 is `HOST_BIND` in earthly's fork |
@@ -5775,3 +5777,41 @@ inside each stage rather than between them.
 So `+all` is the target that most wants a fleet by size and least by shape.
 It ran, it produced the same artifacts, and no amount of distribution will
 make a four-link chain shorter than its longest link.
+
+## Where this stands, with the Earthfile exhausted
+
+Every named target has been through the fleet. The coverage question has no
+larger part left to ask, so what remains is entirely about speed - and the
+plain statement is that **the fleet is slower than one machine on every
+target measured.**
+
+| target | one machine | six machines | why |
+| ------ | ----------- | ------------ | --- |
+| `+test-ast` | 212s | 1050s | 12.5x unexplained per-unit build cost |
+| `+test-no-qemu` | 186s | 517s | host binds cap it at 2.32x, and it is at 2.8x slower |
+| `+all` | not measured | 2,724s | a four-stage chain; occupancy 0.99 |
+
+Three different reasons, and only one of them is a scheduling problem.
+
+**`+all` is shape.** Four dependent stages. No scheduler shortens a chain,
+and the run proves the machinery handles it rather than that it should.
+
+**`+test-no-qemu` is the Earthfile.** `WITH DOCKER` binds a host, seventeen
+solves cannot leave, and 2.32x is arithmetic. Raising it means changing what
+earthbuild's targets do, not what this dispatcher does.
+
+**`+test-ast` is ours.** Its graph permits 2.97x at seven machines - a 71s
+leg - and it takes 1050s. Fifteen times off, and 12.5x of it is the same
+work costing more per unit on a worker than on the baseline daemon. That is
+the only number left that a change to this codebase could move, and it is
+the one still unexplained.
+
+Today moved that target 1773s -> 1050s by repairing two mechanisms that had
+never worked. Neither touched the 12.5x. Everything that did get measured
+against it - seeding, compression, the op floor, imports, broadcast - either
+missed the binding term or made things worse.
+
+So the honest next step is not another mechanism. It is the baseline-side
+instrument that makes the 12.5x attributable, and it is blocked on one
+design decision: the baseline deliberately bypasses the proxy, which is
+correct and which is also why nothing can see inside it.
