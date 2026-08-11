@@ -445,6 +445,73 @@ pub async fn publish_context(
     })
 }
 
+/// The blobs an image manifest names: its config and every layer.
+///
+/// Pure, because the interesting failure is a manifest shape we do not
+/// expect - a manifest LIST rather than a manifest, an empty layers array,
+/// a digest without its algorithm - and none of those need a registry to
+/// reproduce.
+pub fn manifest_blobs(json: &str) -> Vec<crate::mesh::Dig> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    // A manifest list names manifests, not layers. Following it would need
+    // another fetch and a platform choice; returning nothing leaves the lazy
+    // path exactly as it was, which is the right failure for an advisory
+    // mechanism.
+    let mut out = Vec::new();
+    for key in ["config"] {
+        if let (Some(d), Some(sz)) = (v[key]["digest"].as_str(), v[key]["size"].as_i64()) {
+            out.push(crate::mesh::Dig {
+                hash: d.trim_start_matches("sha256:").to_owned(),
+                size: sz,
+            });
+        }
+    }
+    for l in v["layers"].as_array().into_iter().flatten() {
+        if let (Some(d), Some(sz)) = (l["digest"].as_str(), l["size"].as_i64()) {
+            out.push(crate::mesh::Dig {
+                hash: d.trim_start_matches("sha256:").to_owned(),
+                size: sz,
+            });
+        }
+    }
+    out
+}
+
+/// Ask the mirror what an image is made of.
+///
+/// Best effort by design: this feeds a PREFETCH, and a prefetch that cannot
+/// find out what to fetch leaves the lazy path untouched.
+pub async fn image_blobs(image_ref: &str) -> Option<Vec<crate::mesh::Dig>> {
+    let r = image_ref
+        .strip_prefix("docker-image://")
+        .unwrap_or(image_ref);
+    let (host, rest) = r.split_once('/')?;
+    let (repo, reference) = match rest.rsplit_once('@') {
+        Some((repo, dig)) => (repo, dig.to_owned()),
+        None => {
+            let (repo, tag) = rest.rsplit_once(':')?;
+            (repo, tag.to_owned())
+        }
+    };
+    let url = format!("http://{host}/v2/{repo}/manifests/{reference}");
+    let body = reqwest::Client::new()
+        .get(&url)
+        .header(
+            "Accept",
+            "application/vnd.oci.image.manifest.v1+json,\
+             application/vnd.docker.distribution.manifest.v2+json",
+        )
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    Some(manifest_blobs(&body))
+}
+
 /// Copy a registry image into the mirror, so a peer can fetch it without
 /// credentials.
 ///
@@ -690,6 +757,45 @@ pub fn published_reference(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_manifest_names_its_config_and_layers_or_nothing() {
+        use super::manifest_blobs;
+
+        let m = r#"{
+          "schemaVersion": 2,
+          "config": {"digest":"sha256:cfg","size":1234},
+          "layers": [
+            {"digest":"sha256:aaa","size":100},
+            {"digest":"sha256:bbb","size":200}
+          ]
+        }"#;
+        let b = manifest_blobs(m);
+        assert_eq!(b.len(), 3, "config plus two layers");
+        // The algorithm prefix is stripped: the mesh keys blobs by bare hash
+        // and a prefetch for `sha256:aaa` would warm nothing that a fetch for
+        // `aaa` later consults.
+        assert_eq!(b[0].hash, "cfg");
+        assert_eq!(b[1].hash, "aaa");
+        assert_eq!(b[1].size, 100);
+
+        // A manifest LIST names manifests, not layers. Following it needs
+        // another fetch and a platform choice; returning nothing leaves the
+        // lazy path exactly as it was, which is the right failure for
+        // something advisory.
+        let list = r#"{"schemaVersion":2,
+          "mediaType":"application/vnd.oci.image.index.v1+json",
+          "manifests":[{"digest":"sha256:zzz","size":9}]}"#;
+        assert!(manifest_blobs(list).is_empty(), "no layers, no guesses");
+
+        // And nothing that is not a manifest is a panic.
+        assert!(manifest_blobs("not json").is_empty());
+        assert!(manifest_blobs("{}").is_empty());
+        assert!(
+            manifest_blobs(r#"{"layers":[{"digest":"sha256:x"}]}"#).is_empty(),
+            "a layer with no size is not a Dig"
+        );
+    }
     use super::*;
 
     #[test]

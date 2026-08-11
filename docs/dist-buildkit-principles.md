@@ -539,3 +539,49 @@ The habits that actually caught these, in order of how often they worked:
   definitions of "serial fraction" gave 0% and 25-44% where the hand
   reading says 71%. Neither shipped. A confident wrong number next to
   sound ones poisons all of them.
+
+## 18. Pre-position assets against the work that is coming
+
+Fetching on demand is correct and it is late. Correctness is why it
+survives - a worker that pulls what it needs when it needs it is always
+right - but "when it needs it" is the moment the work is due to start, so
+the transfer is on the critical path by construction.
+
+The timeline that makes the case, from one full `+test-no-qemu`:
+
+| time                | phase                         | blobs a worker fetched |
+| ------------------- | ----------------------------- | ---------------------- |
+| join -> +284s       | the baseline leg runs         | **none at all**        |
+| +2s into the fleet  | fleet leg starts              | 2                      |
+| +32s                | still early                   | 16                     |
+| +227s               | base chain nearly done        | 33                     |
+| +302s               | fan-out starting              | 62                     |
+
+Two idle windows, both wasted. The workers moved nothing for 284 seconds
+while a machine they could see was building the very image they would need.
+Then the bulk of the transfer landed exactly as the fan-out began - the
+layer that finished minutes earlier had sat on one machine until somebody
+asked.
+
+So: when an asset becomes available and its consumer is still building,
+send it. The build of layer N+1 is free time for distributing layer N, and
+a chain three deep gives you that window twice.
+
+What makes this safe to do speculatively:
+
+- **Advisory, never required.** A prefetch that fails, arrives late, or is
+  ignored leaves exactly the lazy pull that would have happened anyway. It
+  can make a build faster and must not be able to make one wrong -
+  principle 5 again, applied to bytes instead of work.
+- **Fetch by the same path a build would.** Warm what would have been
+  pulled, through local-then-peer-then-origin, or the prefetch populates
+  something the real fetch does not consult.
+- **Never block the taker.** Prefetching in the foreground would occupy the
+  machine that a Lead is about to be offered to, which costs precisely what
+  it saves.
+
+And the limit worth stating, because it decides whether this is worth
+building at all: pre-positioning shortens TRANSFER, not unpack. Every
+machine still decompresses its own copy. It pays when the wire is on the
+critical path and the window is genuinely idle - which here it is, for 284
+seconds at a stretch.

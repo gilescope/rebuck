@@ -41,6 +41,10 @@ on:
       home_slots:
         description: "slots peer 0 keeps for itself - 0 forces dispatch"
         default: "0"
+      prefetch:
+        description: announce a finished layer to the fleet before it is asked for (1/0)
+        type: string
+        default: '0'
       min_siblings:
         description: keep a solve home unless this many are already in flight
         type: string
@@ -169,6 +173,11 @@ env:
   # a time - dispatching it cost +90s and could gain nothing, because there
   # is no second piece of work to run beside it.
   REBUCK2_MIN_SIBLINGS: ${{ inputs.min_siblings || '0' }}
+  # Pre-position layers against work that has not started. Workers fetch
+  # NOTHING for the whole 284s baseline leg and nothing again until 227s into
+  # the fleet leg, when the bulk transfer lands exactly as the fan-out wants
+  # it - a layer finished minutes earlier sits on one machine until asked.
+  REBUCK2_PREFETCH: ${{ inputs.prefetch || '0' }}
   REBUCK2_WARM_TARGET: ${{ inputs.warm_target || './t/integration-base+test-base' }}
   # Pinned by digest like everything else here: a collector that changes
   # under us changes the data.

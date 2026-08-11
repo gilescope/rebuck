@@ -219,6 +219,30 @@ pub enum D2W {
         job: u64,
         why: String,
     },
+    /// These blobs will be wanted. Fetch them NOW, before anyone asks.
+    ///
+    /// Distribution is otherwise entirely lazy, and the trace timeline says
+    /// what that costs: workers fetch nothing for the whole 284s baseline
+    /// leg, then nothing again until 227s into the fleet leg - the bulk
+    /// transfer lands exactly when the base chain finishes and the fan-out
+    /// wants it. The layer that finished five minutes earlier sat on one
+    /// machine until somebody asked.
+    ///
+    /// So the driver says so as soon as an image exists, while its consumer
+    /// is still building on top of it. Combined with `seeder_for`, six
+    /// workers take six different sixths off the origin at once, and the
+    /// fan-out waits only for the layer that was genuinely not ready.
+    ///
+    /// Advisory, always: a worker that ignores this, or fails every fetch,
+    /// builds exactly what it would have built anyway, one lazy pull later.
+    ///
+    /// APPENDED LAST, and it has to be: postcard encodes enum variants by
+    /// INDEX, so inserting one anywhere else silently renumbers every
+    /// variant after it and a worker built from the other commit reads a
+    /// Lead as a Ping.
+    Prefetch {
+        digests: Vec<Dig>,
+    },
 }
 
 /// Worker → driver, each on a fresh bi-stream (header, then raw bytes for Put).
@@ -361,6 +385,58 @@ pub async fn recv_raw(r: &mut RecvStream, size: u64) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn prefetch_is_the_last_variant_and_stays_there() {
+        use super::D2W;
+
+        // postcard encodes an enum variant by its INDEX. Insert one anywhere
+        // but the end and every variant after it silently renumbers, so a
+        // worker built from one commit reads a Lead as a Ping - no error, no
+        // mismatch, just a build doing the wrong thing. Append-only is the
+        // whole contract and nothing else enforces it.
+        let last = D2W::Prefetch { digests: vec![] };
+        let bytes = postcard::to_allocvec(&last).expect("encode");
+        let idx = bytes[0];
+
+        // Every other variant must encode to a LOWER index, which is the
+        // machine-checkable form of "Prefetch is last".
+        for other in [
+            D2W::Welcome {
+                decentralized: false,
+            },
+            D2W::Exit,
+            D2W::Ping { vitals: None },
+            D2W::Blooms { peers: vec![] },
+            D2W::Finalize { shard: 0, of: 1 },
+        ] {
+            let b = postcard::to_allocvec(&other).expect("encode");
+            assert!(
+                b[0] < idx,
+                "{other:?} encodes at {} but Prefetch is {idx} - a variant was inserted, not appended",
+                b[0]
+            );
+        }
+
+        // And it survives a round trip with a payload, since an empty vec
+        // would pass even if the fields were wrong.
+        let sent = D2W::Prefetch {
+            digests: vec![super::Dig {
+                hash: "abc".into(),
+                size: 7,
+            }],
+        };
+        let back: D2W =
+            postcard::from_bytes(&postcard::to_allocvec(&sent).expect("encode")).expect("decode");
+        match back {
+            D2W::Prefetch { digests } => {
+                assert_eq!(digests.len(), 1);
+                assert_eq!(digests[0].hash, "abc");
+                assert_eq!(digests[0].size, 7);
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+    }
     use super::*;
 
     #[test]

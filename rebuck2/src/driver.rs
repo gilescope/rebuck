@@ -446,6 +446,13 @@ pub struct Driver {
     mesh_ep: tokio::sync::OnceCell<Endpoint>,
 }
 
+/// Announce a finished layer to the fleet before anyone asks for it?
+///
+/// Off by default, like every mechanism here, so its effect is one variable.
+fn prefetch_ahead() -> bool {
+    std::env::var("REBUCK2_PREFETCH").as_deref() == Ok("1")
+}
+
 impl Driver {
     pub fn new(store: Arc<Store>, cfg: DriverCfg) -> Arc<Self> {
         let cores = std::thread::available_parallelism()
@@ -1647,6 +1654,36 @@ impl Driver {
 
     /// Send one frame to one worker, if it is still connected. A worker
     /// that has gone costs us the offer, not the build.
+    /// Tell every worker that these blobs are coming, before they ask.
+    ///
+    /// Distribution is otherwise lazy to a fault. The trace timeline: workers
+    /// fetch NOTHING across the whole 284s baseline leg, and nothing again
+    /// until 227s into the fleet leg, when the bulk transfer lands exactly as
+    /// the base chain finishes and the fan-out wants it. A layer that was
+    /// finished minutes earlier sat on one machine until somebody asked for
+    /// it.
+    ///
+    /// Advisory. A worker that drops this builds what it would have built
+    /// anyway, one lazy pull later, so it can never fail a build - which is
+    /// why it is broadcast without waiting for or checking a reply.
+    async fn prefetch_everywhere(self: &Arc<Self>, digests: Vec<crate::mesh::Dig>) {
+        if digests.is_empty() {
+            return;
+        }
+        let ws = self.workers.lock().await;
+        let n = ws.len();
+        for w in ws.iter() {
+            let _ = w.tx.send(D2W::Prefetch {
+                digests: digests.clone(),
+            });
+        }
+        drop(ws);
+        println!(
+            "[driver] prefetch: {} blob(s) announced to {n} worker(s)",
+            digests.len()
+        );
+    }
+
     async fn tell(self: &Arc<Self>, worker: u64, msg: D2W) {
         let ws = self.workers.lock().await;
         if let Some(w) = ws.iter().find(|w| w.id == worker) {
@@ -1834,6 +1871,18 @@ impl Driver {
         let Some(st) = self.subtrees.lock().await.remove(&job) else {
             return;
         };
+        // THE moment the layer exists and its consumer is still building on
+        // top of it - principle 18. Announce it before anyone asks, so the
+        // fan-out that will want it is not the thing that starts the
+        // transfer.
+        if prefetch_ahead() {
+            let this = self.clone();
+            let r = image_ref.clone();
+            tokio::spawn(async move {
+                let digests = crate::solve::image_blobs(&r).await.unwrap_or_default();
+                this.prefetch_everywhere(digests).await;
+            });
+        }
         match st.requester {
             Requester::Worker(id) => self.tell(id, D2W::Placed { job, image_ref }).await,
             Requester::Gateway(tx) => {

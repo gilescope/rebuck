@@ -320,6 +320,31 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                 println!("[worker] subtree {job} placed, pull from {image_ref}");
                 continue;
             }
+            // Fetch what will be wanted, before it is wanted.
+            //
+            // In the BACKGROUND and never blocking the control loop: this
+            // worker must stay able to take a Lead while it prefetches, or
+            // the mechanism costs exactly what it saves. Failures are
+            // dropped - a blob that does not arrive now arrives lazily
+            // later, which is what happens today.
+            D2W::Prefetch { digests } => {
+                let n = digests.len();
+                let blobs = blobs.clone();
+                tokio::spawn(async move {
+                    let mut got = 0usize;
+                    for d in digests {
+                        // `get` walks local, then peers by bloom, then the
+                        // driver - the same path a lazy fetch takes, so a
+                        // prefetch warms exactly what a build would have
+                        // pulled and nothing else.
+                        if exec::Blobs::get(&*blobs, &d).await.is_ok() {
+                            got += 1;
+                        }
+                    }
+                    println!("[worker] prefetched {got}/{n}");
+                });
+                continue;
+            }
             D2W::Unplaced { job, why } => {
                 println!("[worker] subtree {job} unplaced ({why}) - building it here");
                 continue;
