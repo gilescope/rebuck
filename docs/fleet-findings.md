@@ -4172,3 +4172,59 @@ mount costs ~24s and a parent image transfer is the same order. The fix is
 that warmth must be traded against queue depth rather than ranked ahead of
 it - a warm machine with five leads waiting is worse than a cold machine
 with none, and the current comparator cannot express that.
+
+## Prefetch, once it worked: 1773s to 1240s
+
+The A/B for the bare-digest fix. Same target, same 412 solves, same 23,690
+ops sent - as clean a comparison as this workload gives.
+
+| | before | after |
+| ----------------------- | -------- | -------- |
+| **fleet leg** | **1773s** | **1240s** |
+| baseline | 204s | 227s |
+| amplification | 73.0x | **44.5x** |
+| `prefetch` applied | 9 | **421** |
+| blobs per announcement | 2, 4, 6 | 5, 6, 8, 13 |
+| total lead time | 14,812s | **10,101s** |
+| worker-side build time | 4,407s | 3,518s |
+| mount arms, cold p50 | 16,472ms | **9,783ms** |
+| built duplication | 1.5x | 1.4x |
+
+**Thirty percent off the fleet leg**, and the pre-registered signature was
+met on every point: announcements in the tens rather than twos, `prefetched
+N/N` with N above zero on most workers, and the cold-mount median cut by
+41%. The mechanism went from firing nine times on six base images to firing
+421 times on the content the fleet actually moves.
+
+It is still 5.5x slower than one machine. But this is the first change in
+the project to move the headline by more than noise, and it did it by
+repairing something that had never worked rather than by adding anything.
+
+### And the phase split, first reading
+
+```text
+[wire] lead phases : placing 0s (0%) waiting 6583s (65%) building 3517s (35%)
+```
+
+**Placing is zero.** Offers are never refused, so choosing a worker costs
+nothing measurable - the entire offer/decline/re-offer protocol, which three
+sections of this document worried about, is free. Retire that concern.
+
+**Sixty-five percent is waiting**: 6,583 seconds of leads sitting on a busy
+worker while another machine is idle. That is the concentration finding
+priced, and it is now the largest number in the system by a wide margin -
+larger than all the building, and far larger than anything seeding,
+compression or the op floor could ever have reached.
+
+`-balance` is the experiment that addresses it, and it is already built.
+
+### The instruments are exonerated
+
+```text
+[wire] status tap : 3004 frame(s), 1ms total, 0 missed (busy)
+```
+
+**One millisecond**, across three thousand frames. So the 50-minute
+reference leg was not the tap, and the suspicion that had me rewriting it
+twice was wrong - which is exactly what that self-measurement was added to
+settle, and it settled it without a second run costing forty minutes.
