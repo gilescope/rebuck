@@ -83,6 +83,7 @@ on:
       # trigger looks exactly like a run that failed to start.
       - giles-dispatch-ci-tests-balance-imports-w12-nobase
       - giles-dispatch-ci-tests-balance-nested-w12-nobase
+      - giles-dispatch-ci-tests-balance-sandbox-nobase
       - giles-dispatch-ci-ast-minops-nobase
       - giles-dispatch-ci-ast-seed
       - giles-dispatch-ci-lint-graft
@@ -480,6 +481,7 @@ jobs:
       bcast: ${{ steps.n.outputs.bcast }}
       balance: ${{ steps.n.outputs.balance }}
       nested: ${{ steps.n.outputs.nested }}
+      sandbox: ${{ steps.n.outputs.sandbox }}
       nobase: ${{ steps.n.outputs.nobase }}
     steps:
       - id: n
@@ -555,7 +557,7 @@ jobs:
             # leaves a stray `1` on the workload.
             workload=${workload%-w[0-9]}
             workload=${workload%-w[0-9][0-9]}
-            for suffix in -seed -graft -arm -zstd -minops -imports -bcast -balance -nested -nobase; do
+            for suffix in -seed -graft -arm -zstd -minops -imports -bcast -balance -nested -sandbox -nobase; do
               # QUOTED: unquoted, `$suffix` is taken as a glob pattern
               # rather than a literal, which shellcheck SC2295 catches and
               # which would misbehave the moment a suffix contained a `?`
@@ -708,6 +710,18 @@ jobs:
           # unreachable today, since dispatch inputs cannot reach a workflow
           # off the default branch, and would be a silent trap the moment
           # that changes.
+          # `-sandbox`: forward `tcp://buildkitsandbox:8372` into every exec,
+          # a buildkit constant in each one's /etc/hosts that resolves
+          # locally. DIFFERENT from -nested, which rewrites the graph: this
+          # one changes what earthly hands its nested builds.
+          #
+          # The findings record it producing ZERO h2 protocol errors on a
+          # full target where every previous run collapsed with one - and the
+          # coverage run just died on exactly that error, with the switch off.
+          case "$REF" in *-sandbox*) sandbox=1 ;; *) sandbox=0 ;; esac
+          echo "sandbox host: $sandbox"
+          echo "sandbox=$sandbox" >> "$GITHUB_OUTPUT"
+
           case "${NESTED:-}" in
             "") case "$REF" in *-nested*) nested=1 ;; *) nested=0 ;; esac ;;
             *)  nested="$NESTED" ;;
@@ -1098,6 +1112,7 @@ jobs:
       REBUCK2_COMPRESSION: ${{ needs.plan.outputs.compression }}
       REBUCK2_MIN_OPS: ${{ needs.plan.outputs.minops }}
       REBUCK2_AFFINITY_IMPORTS: ${{ needs.plan.outputs.imports }}
+      REBUCK2_SANDBOX_HOST: ${{ needs.plan.outputs.sandbox }}
       REBUCK2_BALANCE: ${{ needs.plan.outputs.balance }}
       REBUCK2_SKIP_BASELINE: ${{ needs.plan.outputs.nobase }}
       # ONE path for the binary in this job. It was written out twice and
