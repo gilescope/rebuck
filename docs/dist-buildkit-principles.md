@@ -862,6 +862,15 @@ Ask of every solve, before dispatching it: is there more work here than it
 costs to place work at all? If not, keep it home. Idle machines are not a
 reason to send it - they are a reason to send something else.
 
+> **Measured, and it does not hold as a rule.** A 20-op floor on
+> `+test-ast` halved lead round trips and cut op duplication five-fold, and
+> still made the run about five times slower - because the seventeen graphs
+> it kept home included ones the whole build waited on. Op count measures
+> size; what decides is criticality. The toll is real, the floor is off by
+> default, and the version of this that survives is the observation, not the
+> rule: **small work is cheap to keep and cheap to send, so size is the
+> wrong question.**
+>
 > **Corrected the same day.** This principle first read "a lead costs what
 > it fetches", and the byte number behind it was loopback traffic, not
 > network - see the correction in `fleet-findings.md`. Across 414 leads,

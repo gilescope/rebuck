@@ -1684,12 +1684,31 @@ impl Wire {
             }
         };
         let (h, a) = (mean(&self.home_ms), mean(&self.away_ms));
-        println!(
-            "[wire] service ms     : home {h} ({}) away {a} ({}) ratio {:.2}",
-            self.home_ms.len(),
-            self.away_ms.len(),
-            if h == 0 { 0.0 } else { a as f64 / h as f64 }
-        );
+        // BOTH EMPTY is not "home and away cost the same" - it is this line
+        // not applying to this workload, and it printed `home 0 (0) away 0
+        // (0) ratio 0.00` for two whole runs while I read it as data.
+        //
+        // The buckets are filled from Control.Solve, keyed by its `ref`. With
+        // earthly there is ONE Control.Solve for the entire build and the
+        // placement decisions all happen on inner GATEWAY solves, under
+        // different ids - so the lookup misses every time and lands in the
+        // "never placed" arm. A gateway solve returns in ~1ms and is not a
+        // build time either, so there is no home-side equivalent of the
+        // driver's lead timings, and that gap is exactly what stopped the
+        // min_ops run from being diagnosable.
+        if self.home_ms.is_empty() && self.away_ms.is_empty() {
+            println!(
+                "[wire] service ms     : NOT MEASURED - every solve is an inner gateway \
+                 solve, and this pair is keyed by the outer Control.Solve ref"
+            );
+        } else {
+            println!(
+                "[wire] service ms     : home {h} ({}) away {a} ({}) ratio {:.2}",
+                self.home_ms.len(),
+                self.away_ms.len(),
+                if h == 0 { 0.0 } else { a as f64 / h as f64 }
+            );
+        }
         for (i, s) in self.spans.iter().enumerate() {
             println!(
                 "[wire] solve {i} ms     : {}..{} total {} = portable {} + peer {} \

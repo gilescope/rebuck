@@ -3732,3 +3732,61 @@ move" - it moves almost nothing, twice. It is **"why does a machine that
 already holds a layer materialise it again for the next lead"**, which is a
 question about buildkitd's content store and the refs we hand it, and it is
 worth more than any transport work on the list.
+
+## The 20-op floor is harmful, and every per-lead number improved
+
+`-ast-minops`, floor 20, same target, own baseline leg. Cancelled at 96
+minutes with the fleet leg 85 minutes in and roughly half done - against
+1773 seconds for the whole thing ungated. Per solve that is about **five
+times slower**.
+
+The gate itself worked exactly as specified:
+
+```text
+[wire] mechanisms : ... min_ops=17 ...
+[wire] not routed : {"considered": 110, "smaller than the bytes it would drag": 17}
+```
+
+And everything it was supposed to improve, it improved:
+
+| | ungated | floor 20 |
+| ------------------------ | -------------- | -------------- |
+| lead round trip, cold p50 | 16472ms (n=359) | **8745ms (n=82)** |
+| ops sent / distinct | 23.0x | **4.6x** |
+| (op, worker) pairs built | 1.5x | **1.2x** |
+| smallest lead dispatched | 2 ops | 29 ops |
+| worker-side lead p50 | 2583ms | 2471ms |
+
+Halved round trips, a fifth of the op duplication, and the same per-lead
+cost. Then it took five times as long.
+
+So the loss is in the seventeen solves it kept home, and the reason is the
+thing the rule got wrong: **op count measures size, and the fleet's problem
+is criticality.** A three-op `FROM ... / RUN ...` at the head of the chain
+is small and everything waits on it. Keeping it home does not save a
+placement toll; it serialises the build behind one machine, and on this run
+that machine was also the gateway.
+
+That is a sharper statement of principle 11 (subdivide at the narrowest
+declared seam) than I had: the seam is not about size either way. Small
+work is cheap to keep AND cheap to send; what decides is how much waits
+behind it.
+
+### The instrument that would have proved it is dead
+
+```text
+[wire] service ms : home 0 (0) away 0 (0) ratio 0.00
+```
+
+Zero home solves and zero away solves in a run that placed 82 and kept 17.
+The buckets fill from `Control.Solve`, keyed by its `ref`. Under earthly
+there is ONE `Control.Solve` for the whole build; every placement decision
+happens on an inner gateway solve with a different id, so the lookup misses
+and lands in the "never placed" arm every time. It has been printing
+`0 (0) 0 (0) ratio 0.00` for at least two runs and I read it as data.
+
+A gateway solve returns a ref in about a millisecond, so it is not a build
+time either: **there is no home-side equivalent of the driver's lead
+timings.** That absence is why this run could not be diagnosed from its own
+output, and it is now the next thing to build - the line says NOT MEASURED
+rather than zeros in the meantime.
