@@ -488,3 +488,54 @@ Costs and limits, because they decide when this is worth it:
 - It shortens transfer, not unpack. Every machine still decompresses and
   unpacks its own copy, so this is bounded by whatever fraction of the
   cost is on the wire.
+
+## 17. The instrument is part of the system, and it lies too
+
+Every mechanism here is judged by a measurement, so a wrong measurement is
+worse than a wrong mechanism: it is a wrong mechanism that gets kept, or a
+right one that gets thrown away. In one day of work on this branch the
+instruments produced eight distinct false readings, and they fall into
+four shapes worth naming.
+
+**A failure that produces no evidence scores best.** earthly prints
+`*failed*` once per target it ran and failed. A build that DIES prints
+none of them, so the leg with zero failed targets was the one that
+crashed, and it beat a leg that merely had a red test. The parity check
+called it a win for the fleet. Judge on the exit code, and treat "no
+evidence of failure" as a distinct outcome from "evidence of no failure".
+
+**An aggregate over a bimodal distribution describes neither mode.**
+`+base` averaged 3.0s in one leg and 20.5s in the other, reported as a
+6.7x tax. Its real shape is p50=0ms across 575 cache hits plus nine spans
+of 191-282s that are targets BLOCKED on a dependency. The mean was
+arithmetically correct and pointed at a fix that would have done nothing.
+Print p50 and the tail, or print nothing.
+
+**An instrument's own text is indistinguishable from its output.** CI
+echoes each step's script, so the line that would print `not warmed`
+greps exactly like the printing of it. Three iterations of "did the
+warm-up run?" were answered by reading the script back as evidence. The
+same shape: `git apply --check ... | head -5; echo rc=$?` reports HEAD's
+status, and printed rc=0 for a patch that was already broken.
+
+**A pattern that matches sometimes is worse than one that never matches.**
+earthly right-aligns its target column to the longest target name in the
+run, so `*failed*` lines are indented in some runs and not others. An
+anchored pattern found them for weeks and then silently found none - which
+is the died-check's signature, so a red test was reported as a crash.
+
+The habits that actually caught these, in order of how often they worked:
+
+- **Verify the instrument against a case where the answer is known.** The
+  patch checker was proven by breaking a patch; the graph invariants by
+  reversing op order and disabling pruning. Both found bugs in the
+  checker rather than the code.
+- **Keep the raw logs.** Every diagnosis that took a 20-minute round trip
+  took it because the run had answered a question nobody had asked yet.
+- **Distrust a clean number from a new instrument.** Each of the eight was
+  caught because the previous one had taught that lesson, and the first
+  few were not caught at all.
+- **Refuse to ship a metric that contradicts a finding you trust.** Two
+  definitions of "serial fraction" gave 0% and 25-44% where the hand
+  reading says 71%. Neither shipped. A confident wrong number next to
+  sound ones poisons all of them.
