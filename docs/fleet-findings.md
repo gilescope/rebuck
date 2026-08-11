@@ -4132,3 +4132,43 @@ of them. Three ways this could read:
 The third is a real possibility and worth saying out loud: this session has
 already produced one mechanism that improved every number it aimed at and
 still made the run five times slower.
+
+## Affinity concentrates work onto whoever is already warm
+
+Placements per worker, three runs, six workers available in every one:
+
+| run | spread | idle workers |
+| ---------------- | ------------------- | ------------ |
+| `+test-ast` ungated | 223 / 125 / 63 / 3 | **2 of 6** |
+| `+test-ast` floor 20 | 46 / 37 / 10 | **3 of 6** |
+| `+test-ast` reference | 153 / 142 / 81 / 3 | **2 of 6** |
+
+Two or three machines never take a single lead, and one takes more than
+half. That is not a scheduling accident - it is `offer_order_warm` doing
+exactly what it says:
+
+```rust
+able.sort_by_key(|c| (Reverse(warm(c.id)), Reverse(c.load.free()), c.id));
+```
+
+Warmth is the FIRST key and free capacity the second, so warmth dominates
+lexicographically: a warm worker with one free slot beats a cold worker with
+sixteen, every time, and the warm worker gets warmer with each lead it
+takes. The only thing stopping runaway concentration is `free() > 0`.
+
+This is very likely where the 10,400 seconds of non-building lead time
+lives. `lead_ms` runs from the offer to the result, so a lead queued behind
+five others on the warm machine books all of that as lead time - and the
+split now in the code will say whether it is `waiting` (queued, a fleet
+being used) or `placing` (offers and refusals, pure overhead). No decline
+line appears anywhere in three runs' logs, which points hard at `waiting`.
+
+If that is right, then every remedy aimed at making a lead cheaper -
+seeding, compression, prefetch, the op floor - has been working on a quarter
+of the problem while two machines sat idle for the whole run.
+
+The fix is not to remove affinity. Warmth is real and measured: a cold cache
+mount costs ~24s and a parent image transfer is the same order. The fix is
+that warmth must be traded against queue depth rather than ranked ahead of
+it - a warm machine with five leads waiting is worse than a cold machine
+with none, and the current comparator cannot express that.
