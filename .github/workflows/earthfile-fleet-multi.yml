@@ -1023,8 +1023,8 @@ jobs:
           # means the h2 error the user sees is a call this proxy made and
           # relayed - which is consistent with the phrasing, since earthly is
           # Go and 'h2 protocol error' is hyper's wording, not Go's.
-          grep -aE '^\[proxy\] (upstream solve failed|upstream Control\.Solve failed|retrying the solve once)' \
-            proxy.log | sort | uniq -c | head -8 || true
+          grep -aE '^\[proxy\] (upstream solve failed|upstream Control\.Solve failed|retrying|session stream)' \
+            proxy.log | sed 's/[0-9a-f]\{12,\}/<id>/g' | sort | uniq -c | sort -rn | head -8 || true
 
           echo "=== the leads that own the critical path"
           # One lead took 209s of a 525s wall - 40% of the wall clock in a

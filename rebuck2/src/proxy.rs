@@ -523,11 +523,31 @@ impl control::control_server::Control for Proxy {
         let (meta, ext, stream) = request.into_parts();
         let up = self.wire.clone();
         let inbound = stream.filter_map(move |m| {
-            if let Ok(msg) = &m {
-                up.held()
+            match &m {
+                Ok(msg) => up
+                    .held()
                     .session_to_daemon
-                    .fetch_add(msg.data.len() as u64, Ordering::Relaxed);
-            }
+                    .fetch_add(msg.data.len() as u64, Ordering::Relaxed),
+                // A dropped error here is INVISIBLE and not harmless. The
+                // session carries filesync and credentials, and `m.ok()`
+                // turns a stream error into a clean end-of-stream - so
+                // buildkitd sees the session close normally, any filesync
+                // still in flight fails, and it reports the Solve as
+                // `transport error`, which earthly prints as `h2 protocol
+                // error: error reading a body from connection`.
+                //
+                // That chain is why three rounds of instrumenting Solve
+                // found nothing: the failure is one relay upstream and this
+                // line ate the evidence.
+                Err(e) => {
+                    println!(
+                        "[proxy] session stream from client failed: {} {}",
+                        e.code(),
+                        e.message()
+                    );
+                    0
+                }
+            };
             futures::future::ready(m.ok())
         });
         let s = self
@@ -536,11 +556,23 @@ impl control::control_server::Control for Proxy {
             .await?;
         let down = self.wire.clone();
         let out = s.into_inner().map(move |m| {
-            if let Ok(msg) = &m {
-                down.held()
+            match &m {
+                Ok(msg) => down
+                    .held()
                     .session_to_client
-                    .fetch_add(msg.data.len() as u64, Ordering::Relaxed);
-            }
+                    .fetch_add(msg.data.len() as u64, Ordering::Relaxed),
+                // This direction IS propagated - the client sees it - but it
+                // is still worth naming here, because the client's report of
+                // it names nothing on this side.
+                Err(e) => {
+                    println!(
+                        "[proxy] session stream from daemon failed: {} {}",
+                        e.code(),
+                        e.message()
+                    );
+                    0
+                }
+            };
             m
         });
         Ok(Response::new(Box::pin(out)))
