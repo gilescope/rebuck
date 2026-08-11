@@ -1397,6 +1397,12 @@ pub struct Wire {
     /// actually observable. These two are what would have to predict it.
     /// Home vertex digest -> (ms, cached). See `note_vertices`.
     pub home_vertices: std::collections::BTreeMap<String, (u64, bool)>,
+    /// `(total ops, ops past the last exclusion)` for every refused solve.
+    ///
+    /// The question the WITH DOCKER ceiling turns on: is a refused graph
+    /// mostly dispatchable work trapped behind one host bind, or is the host
+    /// bind the work?
+    pub trapped_ops: Vec<(usize, usize)>,
     pub home_ms: Vec<u64>,
     pub away_ms: Vec<u64>,
     /// How long each `Control.Solve` took - the call the CLIENT blocks on,
@@ -1837,6 +1843,23 @@ impl Wire {
         // daemon builds only home work, so every vertex it reports is home
         // work, timed by the thing that ran it.
         let (ran, home_ms, cached) = home_work(&self.home_vertices);
+        // Is a refused graph mostly work trapped behind one refusal, or is
+        // the refusal the work? The WITH DOCKER ceiling turns on this and no
+        // run has ever said.
+        if !self.trapped_ops.is_empty() {
+            let n = self.trapped_ops.len();
+            let total: usize = self.trapped_ops.iter().map(|(t, _)| t).sum();
+            let trapped: usize = self.trapped_ops.iter().map(|(_, s)| s).sum();
+            println!(
+                "[wire] trapped ops    : {n} refused solve(s), {total} ops, {trapped} past the \
+                 last exclusion ({:.0}%) - what a cut could still send",
+                if total > 0 {
+                    100.0 * trapped as f64 / total as f64
+                } else {
+                    0.0
+                }
+            );
+        }
         println!(
             "[wire] home vertices  : {ran} ran in {home_ms}ms, {cached} cache hit(s) \
              - the only measure of what did NOT leave"
@@ -3011,6 +3034,18 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                         .map(|e| format!("excluded: {e:?} {detail:?}"))
                         .unwrap_or_else(|| "excluded: platform".to_owned());
                     *self.wire.held().rejected.entry(why).or_default() += 1;
+                    // HOW MUCH of this graph is trapped behind the refusal.
+                    // dispatchable_when is one `any`, so a single host bind
+                    // keeps every op home including those with no host bind.
+                    // The suffix past the last excluded index is what a cut
+                    // could still send away, and whether that is worth
+                    // building a cut for is the open question on the
+                    // WITH DOCKER ceiling - 670 seconds of coordinator
+                    // building on one run, and nothing says which side of
+                    // the exclusion it sat on.
+                    let trapped =
+                        crate::dispatch::suffix_past_exclusions(verdict.ops, &verdict.exclusions);
+                    self.wire.held().trapped_ops.push((verdict.ops, trapped));
                 }
                 // Draw ONCE, and only among solves that COULD move. Two
                 // calls advance the cursor twice, so the peer that gets the

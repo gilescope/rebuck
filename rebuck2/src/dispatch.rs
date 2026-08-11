@@ -313,6 +313,29 @@ const KNOWN_MOUNTS: [i32; 5] = [
     pb::MountType::Tmpfs as i32,
 ];
 
+/// Ops past the last exclusion: what a cut could still send away.
+///
+/// `dispatchable_when` is one `any`, so a single host bind keeps a whole
+/// graph home - on a `WITH DOCKER` target, the dind setup poisoning the test
+/// that follows it. The exclusion already carries the offending op's index
+/// and buildkit marshals a definition in topological order, so everything
+/// past the last excluded index depends on the prefix and on nothing else
+/// that is refused.
+///
+/// This does not cut anything. It is the number that says whether cutting
+/// would be worth building: a large suffix means a `WITH DOCKER` target is
+/// mostly dispatchable work trapped behind a host bind, a small one means
+/// the host bind IS the work and the ceiling stands.
+///
+/// With no exclusions it returns the whole graph, so the figure means the
+/// same thing whether or not anything was refused.
+pub fn suffix_past_exclusions(ops: usize, exclusions: &[(usize, Exclusion)]) -> usize {
+    match exclusions.iter().map(|(i, _)| *i).max() {
+        None => ops,
+        Some(last) => ops.saturating_sub(last + 1),
+    }
+}
+
 fn hazards(op: &pb::Op) -> Vec<Exclusion> {
     let mut out = Vec::new();
     // Sources first: an op that is not an Exec can still ground a subtree.
@@ -2870,6 +2893,42 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// How much of an excluded graph could still travel, if it were cut.
+    ///
+    /// `dispatchable_when` is one `any`, so a single host bind keeps a whole
+    /// graph home - the dind setup poisoning the test after it. The
+    /// exclusion already carries the offending op's INDEX, and buildkit
+    /// marshals a definition in topological order, so everything past the
+    /// last excluded index is a suffix that depends on the prefix and
+    /// nothing else that is refused.
+    ///
+    /// Whether cutting there is worth anything is the open question. This is
+    /// the number that answers it, and it costs one field in a log line
+    /// rather than a subsystem.
+    #[test]
+    fn the_suffix_past_the_last_exclusion_is_measurable() {
+        use super::Exclusion::{CacheMount, SshAgent};
+        let f = super::suffix_past_exclusions;
+
+        // Nothing excluded: the whole graph could go, which is what
+        // dispatchable already says. Reported as the full size rather than
+        // zero, so the number means the same thing in both cases.
+        assert_eq!(f(100, &[]), 100);
+
+        // One exclusion early: almost everything is potentially cuttable.
+        assert_eq!(f(100, &[(3, SshAgent)]), 96);
+        // One late: almost nothing, and this is the case that says do not
+        // bother building the cut.
+        assert_eq!(f(100, &[(97, CacheMount)]), 2);
+        // The LAST one decides, not the first - a graph refused twice is
+        // only clean past both.
+        assert_eq!(f(100, &[(3, SshAgent), (97, CacheMount)]), 2);
+        // The terminal op cannot be a suffix on its own.
+        assert_eq!(f(100, &[(99, SshAgent)]), 0);
+        // An index past the end is a bug elsewhere, not a panic here.
+        assert_eq!(f(10, &[(50, SshAgent)]), 0);
+    }
+
     /// The brake has to grow with the number of things it brakes.
     ///
     /// Measured: adding a second 64-point preference term - parent images
