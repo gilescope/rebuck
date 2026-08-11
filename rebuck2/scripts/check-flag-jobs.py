@@ -66,8 +66,13 @@ for d in sorted((ROOT / "docs").glob("*.md")):
         if v == "REBUCK2" or v in reads or v in shell_used:
             continue
         # A doc may discuss a flag it is telling you NOT to use, so a
-        # sentence saying so is an acceptable answer.
-        if "does not exist" in text or "gone from" in text:
+        # sentence saying so is an acceptable answer - but PER FLAG, near
+        # the mention. The first version tested the whole file, so one
+        # documented removal exempted every phantom beside it, and a planted
+        # REBUCK2_PHANTOM sailed through. The proof-it-can-fail step caught
+        # that; the commit message written before running it did not.
+        near = " ".join(ln for ln in text.split("\n") if v in ln)
+        if "does not exist" in near or "gone from" in near:
             continue
         phantom.append(f"{d.name}: {v} is documented and implemented nowhere")
 for line in phantom:
