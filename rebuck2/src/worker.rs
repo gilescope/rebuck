@@ -410,6 +410,11 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                     let mine = blobs.my_share(digests, &peers).await;
                     let share = mine.len();
                     let mut got = 0usize;
+                    // BEHIND the gate, not around each fetch: holding it for
+                    // the loop is what stops six announcements interleaving
+                    // into six concurrent pulls. Acquired after `my_share`
+                    // so a worker with nothing to do does not queue.
+                    let _lane = prefetch_gate().acquire().await;
                     for d in mine {
                         // `get` walks local, then peers by bloom, then the
                         // driver - the same path a lazy fetch takes, so a
@@ -643,6 +648,34 @@ async fn serve_get(
 // is what the split needs - but warming attacks the same 192s chain more
 // simply, so this waits on that result rather than both landing at once.
 #[allow(dead_code)]
+/// How many prefetch fetches a worker runs at once.
+///
+/// ONE, and the reason is principle 18's last clause: a prefetch must never
+/// block the taker. Each announcement spawns its own task, so a build that
+/// publishes six subtrees in a minute has six loops pulling megabytes
+/// through the same store the real fetches use - and the real fetch is the
+/// one somebody is waiting on.
+///
+/// Serialising them costs nothing that matters. Pre-positioning is
+/// speculative by construction: arriving second is the whole point, and a
+/// prefetch that loses a race to the build it was warming has still done no
+/// harm.
+fn prefetch_permits(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1)
+}
+
+/// The permits themselves, shared by every prefetch task in the process.
+fn prefetch_gate() -> &'static Semaphore {
+    static G: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
+    G.get_or_init(|| {
+        Semaphore::new(prefetch_permits(
+            std::env::var("REBUCK2_PREFETCH_LANES").ok().as_deref(),
+        ))
+    })
+}
+
 fn seeder_for(hash: &str, peers: &[String]) -> Option<String> {
     if peers.is_empty() {
         return None;
@@ -1463,6 +1496,20 @@ async fn sync_shard(
 
 #[cfg(test)]
 mod tests {
+
+    /// How many prefetches a worker runs at once, and why it is one.
+    #[test]
+    fn prefetch_concurrency_defaults_to_one_and_can_be_raised() {
+        assert_eq!(super::prefetch_permits(None), 1, "one, unless asked");
+        assert_eq!(super::prefetch_permits(Some("4")), 4);
+        // A zero would deadlock every prefetch task forever on a semaphore
+        // that never issues, and the tasks hold a clone of the store. Read
+        // as "the default", not as "off": switching prefetch off is
+        // REBUCK2_PREFETCH, and two knobs that both claim to disable it is
+        // how a mechanism ends up measured while running.
+        assert_eq!(super::prefetch_permits(Some("0")), 1);
+        assert_eq!(super::prefetch_permits(Some("banana")), 1);
+    }
 
     #[test]
     fn a_share_is_a_share_and_alone_means_everything() {
