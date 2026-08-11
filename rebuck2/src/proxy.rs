@@ -1045,6 +1045,53 @@ impl Span {
     }
 }
 
+/// The most a fleet could ever do to this run, from Amdahl.
+///
+/// The serial fraction is the wall time during which at most ONE solve was
+/// in flight: milliseconds where no second piece of work existed to give
+/// anybody. `1/s` is then the speedup an infinite fleet would reach.
+///
+/// The honest caveat, because this number will be quoted: a stretch of
+/// concurrency 1 means no second solve was RUNNING, and the reason might be
+/// a dependency - which is a real ceiling - or a dispatcher that declined to
+/// place one, which is not. Read it beside `not routed` and `placed`. It is
+/// a bound on what the graph offers, and it becomes a bound on the fleet
+/// only when dispatch is otherwise healthy.
+pub fn ceiling(spans: &[Span]) -> f64 {
+    if spans.is_empty() {
+        return 1.0;
+    }
+    let mut edges: Vec<(u64, i32)> = Vec::with_capacity(spans.len() * 2);
+    for s in spans {
+        edges.push((s.start, 1));
+        edges.push((s.end(), -1));
+    }
+    edges.sort_by_key(|&(t, d)| (t, d));
+    let (mut now, mut at, mut serial, mut wall) = (0i32, edges[0].0, 0u64, 0u64);
+    for &(t, d) in &edges {
+        let dt = t.saturating_sub(at);
+        if now >= 1 {
+            wall += dt;
+            if now == 1 {
+                serial += dt;
+            }
+        }
+        now += d;
+        at = t;
+    }
+    if wall == 0 {
+        return 1.0;
+    }
+    let s = serial as f64 / wall as f64;
+    // Zero serial time is unbounded, and "inf" is not a thing to print. The
+    // sample size is the honest stand-in: it is what this run actually had
+    // to spread.
+    if s == 0.0 {
+        return spans.len() as f64;
+    }
+    1.0 / s
+}
+
 /// How many solves were running at once, and how much of the wall clock that
 /// filled.
 ///
@@ -1511,9 +1558,15 @@ impl Wire {
         // it. `1.4x ceiling` beside `1.8x achieved` is the whole story;
         // neither number alone is.
         let (peak, occupancy) = concurrency(&self.spans);
+        let ceiling = ceiling(&self.spans);
         println!(
             "[wire] concurrency    : peak {peak} solves at once, occupancy {occupancy:.2} \
-             (1.00 = a queue; the ceiling is the machine count)"
+             (1.00 = a queue)"
+        );
+        println!(
+            "[wire] amdahl ceiling : {ceiling:.2}x - the most ANY fleet could do to this \
+             graph, from the {:.0}% of wall clock with one solve in flight",
+            if ceiling > 0.0 { 100.0 / ceiling } else { 0.0 }
         );
         println!(
             "[wire] home peak      : {} of {} slots{}",
@@ -3301,6 +3354,36 @@ mod tests {
         assert!(occ < 1.3, "occupancy {occ} - a 91% serial run is not busy");
 
         assert_eq!(super::concurrency(&[]), (0, 0.0));
+    }
+
+    /// The ceiling, from the same sweep.
+    #[test]
+    fn the_ceiling_comes_out_of_the_shape_of_the_run() {
+        let span = |start, total| super::Span {
+            start,
+            total,
+            ..Default::default()
+        };
+
+        // Nothing overlaps: every millisecond is serial and no number of
+        // machines helps.
+        let queue: Vec<_> = (0..5).map(|i| span(i * 100, 100)).collect();
+        assert!((super::ceiling(&queue) - 1.0).abs() < 1e-9);
+
+        // Everything overlaps: unbounded, reported as the sample size since
+        // "infinity" is not a useful thing to print.
+        let fleet: Vec<_> = (0..5).map(|_| span(0, 100)).collect();
+        assert!(super::ceiling(&fleet) >= 5.0);
+
+        // 1000ms of stem then a 100ms fan-out - 1100ms wall, 1000 of it
+        // serial. 1/0.909 = 1.1, and that is the whole of what six machines
+        // can do to this graph.
+        let mut real = vec![span(0, 1000)];
+        real.extend((0..4).map(|_| span(1000, 100)));
+        let c = super::ceiling(&real);
+        assert!((c - 1.1).abs() < 0.01, "ceiling {c}, wanted 1.10");
+
+        assert_eq!(super::ceiling(&[]), 1.0);
     }
 
     /// Sharedness must be asked of the graph that was OBSERVED.
