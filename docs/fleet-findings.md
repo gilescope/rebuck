@@ -4313,3 +4313,35 @@ that loop.
 
 Sequence, then: `-balance` alone (in flight), then
 `-balance-imports`, then `-bcast`. `-minops` stays off - measured harmful.
+
+## Every mechanism, against the bucket it can actually reach
+
+The phase split makes this checkable for the first time. A lead is
+`placing + waiting + building`, measured at 0% / 65% / 35%, so a mechanism
+that cannot name its bucket cannot be argued for.
+
+| mechanism | bucket | why |
+| --------- | ------ | --- |
+| `-balance` | **waiting** | spreads leads off the machine they queue on |
+| `-imports` | building | places a lead where its parent already is, so buildkit's pull is local. `build_ms` brackets `build_subtree`, and the parent pull happens inside it |
+| `-bcast` | building | pre-positions announced layers on every worker rather than one, so the pull finds them present |
+| prefetch fix | building | done: 4,407s -> 3,518s, and 30% off the leg |
+| seeding | building | a warm cache mount, inside the same bracket |
+| `-zstd` | building | cheaper unpack, same bracket |
+| `-minops` | *none* | it removed leads rather than making them cheaper, and measured 5x worse |
+| `min_siblings` | *none* | gates on queue depth to decide whether to dispatch at all; the queue is the problem, not the trigger |
+
+Two things fall out.
+
+**Everything except `-balance` competes for the same 35%.** Seeding,
+compression, prefetch, imports and broadcast all shorten `building`, and
+`building` is a third of lead time. Perfect success on every one of them
+cannot reach the other 65%.
+
+**`-minops` and `min_siblings` do not appear.** Both decide *whether* to
+dispatch, and the phase split says the dispatch decision costs nothing:
+`placing 0s (0%)`. There is no bucket for them to improve, which is a
+cleaner statement of why the op floor failed than the five-times-slower
+measurement was - it was optimising a term that is zero.
+
+That is the value of the split. Before it, every one of these was arguable.
