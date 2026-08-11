@@ -5039,3 +5039,30 @@ got a third faster and the leg did not move, because the leg is not bound by
 them: 738 seconds of home vertex time, overlapping, behind the host-bind
 exclusions. Shortening the longest leads in a build whose limit is the work
 that cannot leave changes the shape and not the clock.
+
+### `-bcast` belongs on the wide target, not the narrow one
+
+The bucket table said `-bcast` aims at `building`, and the plan had it
+queued against `+test-ast`. The phase splits say that is backwards.
+
+| target | `building` |
+| ------ | ---------- |
+| `+test-ast` | 4,521s of 8,239s (55%) |
+| `+test-no-qemu` | 1,196s of 1,639s (**73%**) |
+
+`-bcast` pre-positions announced layers on every worker instead of one. Its
+whole effect lands in `building`, and `building` is 73% of the wide target
+and 55% of the narrow one - so the same mechanism has half again as much to
+reach for on `+test-no-qemu`.
+
+The lane risk cuts the other way and has to be weighed with it: 128 leads
+here against 414 there, so a single prefetch lane carries far fewer
+announcements and is less likely to saturate. Both considerations point the
+same direction, which is unusual enough to note.
+
+So `-bcast` runs on `+test-no-qemu` when it runs. The generalisation worth
+keeping is smaller than the reordering: **choose the target by which bucket
+the mechanism touches, not by which target is cheapest to run.** Nine hours
+of this document were written against `+test-ast` because it is quick and
+nothing in it fails on purpose, and its bottleneck turned out not to be the
+one the wide target has.
