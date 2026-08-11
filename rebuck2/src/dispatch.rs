@@ -313,6 +313,46 @@ const KNOWN_MOUNTS: [i32; 5] = [
     pb::MountType::Tmpfs as i32,
 ];
 
+/// Home vertex milliseconds either side of the first exclusion.
+///
+/// `trapped ops` established that 95% of a `WITH DOCKER` graph precedes its
+/// host bind. Ops are not time, and treating them as one is exactly how
+/// `-minops` became a mechanism five times slower - so this is the same
+/// split, measured in milliseconds, and it is the number that decides
+/// whether cutting at the exclusion pays.
+///
+/// The mapping needs no new plumbing. A buildkit vertex digest is
+/// `sha256:<hex of the op bytes>` - the form `graft_built` already computes
+/// to find built ancestors - so the timings the status tap collects can be
+/// attributed to op positions directly.
+///
+/// A CACHED vertex counts in neither total: no work happened, and adding a
+/// zero to `before` would make a lucky graph look like a cheap prefix. A
+/// digest the stream never mentioned counts nowhere either, for the reason
+/// that runs through this whole file: "not measured" and "measured zero"
+/// must not produce the same number.
+pub fn split_home_ms(
+    digests: &[String],
+    first_exclusion: usize,
+    timed: &BTreeMap<String, (u64, bool)>,
+) -> (u64, u64) {
+    let (mut before, mut after) = (0u64, 0u64);
+    for (i, d) in digests.iter().enumerate() {
+        let Some((ms, cached)) = timed.get(d) else {
+            continue;
+        };
+        if *cached {
+            continue;
+        }
+        if i < first_exclusion {
+            before += ms;
+        } else {
+            after += ms;
+        }
+    }
+    (before, after)
+}
+
 /// Ops past the last exclusion: what a cut could still send away.
 ///
 /// `dispatchable_when` is one `any`, so a single host bind keeps a whole
@@ -2899,6 +2939,49 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// Where the TIME sits in a refused graph, not just the ops.
+    ///
+    /// `trapped ops` said 95% of a `WITH DOCKER` graph precedes its host
+    /// bind. Ops are not time, and the whole `-minops` lesson is that using
+    /// them as one is how you get a mechanism five times slower. This is the
+    /// same split measured in milliseconds.
+    ///
+    /// The mapping exists after all: a buildkit vertex digest is
+    /// `sha256:<hex of the op bytes>`, which `graft_built` already computes
+    /// to find built ancestors. So the home-vertex timings can be attributed
+    /// to op positions without any new plumbing.
+    #[test]
+    fn home_time_splits_at_the_first_exclusion() {
+        let ms: std::collections::BTreeMap<String, (u64, bool)> = [
+            ("sha256:a".to_owned(), (100u64, false)),
+            ("sha256:b".to_owned(), (900u64, false)),
+            ("sha256:c".to_owned(), (50u64, false)),
+            // Cached: no work happened, so it belongs in neither total.
+            ("sha256:d".to_owned(), (0u64, true)),
+        ]
+        .into_iter()
+        .collect();
+        let digests = ["sha256:a", "sha256:b", "sha256:c", "sha256:d"].map(String::from);
+
+        // Exclusion at index 2: a and b precede it, c and d do not.
+        let (before, after) = super::split_home_ms(&digests, 2, &ms);
+        assert_eq!(
+            (before, after),
+            (1000, 50),
+            "d is cached and counts nowhere"
+        );
+
+        // Exclusion first: nothing precedes it, and that is the case that
+        // says a cut buys nothing however many ops are involved.
+        assert_eq!(super::split_home_ms(&digests, 0, &ms), (0, 1050));
+
+        // A digest the status stream never mentioned contributes nothing
+        // rather than defaulting to zero-and-counted - the two are the same
+        // number and different facts.
+        let sparse = std::collections::BTreeMap::new();
+        assert_eq!(super::split_home_ms(&digests, 2, &sparse), (0, 0));
+    }
+
     /// How much of an excluded graph could still travel, if it were cut.
     ///
     /// `dispatchable_when` is one `any`, so a single host bind keeps a whole

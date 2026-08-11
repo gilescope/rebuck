@@ -1403,6 +1403,10 @@ pub struct Wire {
     /// mostly dispatchable work trapped behind one host bind, or is the host
     /// bind the work?
     pub trapped_ops: Vec<(usize, usize)>,
+    /// Every refused graph as `(op digests in order, first excluded index)`,
+    /// so home vertex TIME can be split at the exclusion once the run ends.
+    /// Ops are not time, and this is the difference between the two.
+    pub refused_shape: Vec<(Vec<String>, usize)>,
     pub home_ms: Vec<u64>,
     pub away_ms: Vec<u64>,
     /// How long each `Control.Solve` took - the call the CLIENT blocks on,
@@ -1846,6 +1850,26 @@ impl Wire {
         // Is a refused graph mostly work trapped behind one refusal, or is
         // the refusal the work? The WITH DOCKER ceiling turns on this and no
         // run has ever said.
+        // The same split in MILLISECONDS, which is the number that decides
+        // whether cutting at the exclusion pays. 95% of a WITH DOCKER
+        // graph's OPS precede its host bind; if 5% of its SECONDS do, the
+        // cut moves nothing worth moving.
+        if !self.refused_shape.is_empty() {
+            let (mut before, mut after) = (0u64, 0u64);
+            for (digests, first) in &self.refused_shape {
+                let (b, a) = crate::dispatch::split_home_ms(digests, *first, &self.home_vertices);
+                before += b;
+                after += a;
+            }
+            let t = (before + after).max(1);
+            println!(
+                "[wire] refused time   : {}s before the first exclusion, {}s from it on \
+                 ({:.0}% dispatchable if cut) - ops are not time",
+                before / 1000,
+                after / 1000,
+                100.0 * before as f64 / t as f64
+            );
+        }
         if !self.trapped_ops.is_empty() {
             let n = self.trapped_ops.len();
             let total: usize = self.trapped_ops.iter().map(|(t, _)| t).sum();
@@ -3045,7 +3069,24 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                     // the exclusion it sat on.
                     let trapped =
                         crate::dispatch::suffix_past_exclusions(verdict.ops, &verdict.exclusions);
-                    self.wire.held().trapped_ops.push((verdict.ops, trapped));
+                    // The digests this graph's ops will appear under in the
+                    // status stream. Same form graft_built uses, so the home
+                    // timings can be attributed to positions later - the
+                    // graph is gone by the time the report runs.
+                    let digests: Vec<String> = def
+                        .def
+                        .iter()
+                        .map(|b| format!("sha256:{}", crate::store::sha256_hex(b)))
+                        .collect();
+                    let first = verdict
+                        .exclusions
+                        .iter()
+                        .map(|(i, _)| *i)
+                        .min()
+                        .unwrap_or(0);
+                    let mut w = self.wire.held();
+                    w.trapped_ops.push((verdict.ops, trapped));
+                    w.refused_shape.push((digests, first));
                 }
                 // Draw ONCE, and only among solves that COULD move. Two
                 // calls advance the cursor twice, so the peer that gets the
