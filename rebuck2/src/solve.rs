@@ -753,6 +753,35 @@ pub async fn daemon_platforms(bk_addr: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The cache mounts a daemon holds, by the id it keys them under.
+///
+/// buildkit names a cache mount record `cached mount <dest> from <manager>`,
+/// plus ` with id "<id>"` when the id differs from the dest - see
+/// `MountManager.getRefCacheDir`. So the daemon's own accounting can be
+/// asked which ids exist and how big they are, which is the question a
+/// harvest that returned 0.0 MiB leaves open.
+///
+/// Returns `(description, bytes)` for cache-mount records only. Best effort:
+/// a daemon that will not answer leaves the caller exactly as informed as it
+/// was.
+pub async fn cache_mounts(addr: &str) -> Vec<(String, i64)> {
+    let Ok(mut c) = connect(addr).await else {
+        return Vec::new();
+    };
+    let Ok(resp) = c.disk_usage(control::DiskUsageRequest::default()).await else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, i64)> = resp
+        .into_inner()
+        .record
+        .into_iter()
+        .filter(|r| r.record_type == "cachemount" || r.description.starts_with("cached mount "))
+        .map(|r| (r.description, r.size))
+        .collect();
+    out.sort_by_key(|(d, sz)| (std::cmp::Reverse(*sz), d.clone()));
+    out
+}
+
 /// What a failed solve actually printed, from `Control.Status`.
 ///
 /// A `Solve` answers with a code and a sentence. The container's own output

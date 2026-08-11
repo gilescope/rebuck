@@ -343,6 +343,28 @@ async fn main() -> Result<()> {
             // cannot be harvested leaves that mount cold, which is what it
             // was anyway.
             base_is_reachable(&base, &registry).await;
+            // WHAT IS ACTUALLY THERE, before harvesting anything.
+            //
+            // Four harvests came back at 0.0 MiB and the run could not say
+            // whether the ids were wrong, the daemon was the wrong one, or
+            // the baseline simply had not filled them. The daemon keeps its
+            // own accounting and names each cache mount the way
+            // `getRefCacheDir` builds the name, so it can be asked.
+            let held = solve::cache_mounts(&bk).await;
+            if held.is_empty() {
+                println!("[harvest] {bk} reports NO cache mounts at all");
+            } else {
+                println!("[harvest] {bk} holds {} cache mount(s):", held.len());
+                for (what, sz) in held.iter().take(12) {
+                    println!("[harvest]   {:>9.1} MiB  {what}", *sz as f64 / 1048576.0);
+                }
+                // A SEEDED mount reads 0.0 MiB here however much it holds:
+                // its size is the copy-on-write diff over the seed, not the
+                // total. Observed locally - a mount seeded from a 30 MiB
+                // image, read back successfully, reported 0.0. So this table
+                // answers "was the cache filled by a build" and not "how
+                // much can be read out of it".
+            }
             let mut failed = 0usize;
             for (id, dest) in &pairs {
                 if let Err(e) = harvest_one(&bk, &registry, &base, id, dest).await {
