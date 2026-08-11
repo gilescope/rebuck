@@ -988,3 +988,27 @@ equal.** Put the counterweight in the same term as the preference.
 The tell that this is happening is not slowness. It is an idle worker in a
 system reporting high occupancy - the busy machines are genuinely busy, so
 every average looks healthy. Count the machines that did nothing.
+
+### The brake has to scale with the preference, and I got that wrong
+
+Measured the day after the brake worked. A second affinity term was added -
+score a candidate on the parent images it already holds, which is sound and
+addresses a real cost - and the leg went **1050s back up to 1475s**.
+
+`waiting` rose 2,849 seconds, one machine went idle again, and the new term
+fired 1,724 times against the brake's 361 reorders.
+
+The counterweight was one queued job cancels one warm item. Adding a second
+64-point term doubled the thing being braked and left the brake alone, so a
+candidate holding a parent AND a warm mount needed three queued jobs before
+an idle machine could win. The preference had simply outgrown its brake.
+
+So the rule needs its second half: **a counterweight sized against one
+preference term is not sized against two.** Whenever you add a reason to
+prefer a machine, either the new term is worth less than the existing ones,
+or the penalty per unit of queue goes up with them. Nothing warns you -
+each term is individually defensible, the sort still compiles, and the only
+symptom is the ratchet coming back.
+
+The number to watch is the ratio of applications: a preference term firing
+five times per brake application is not being traded against anything.
