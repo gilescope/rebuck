@@ -715,3 +715,52 @@ Where amplification comes from, in the order they were found:
 So: report the amplification beside the wall clock, always. A fleet at 1.0x
 amplification and poor occupancy is a scheduling problem. A fleet at 9x is
 not, and no amount of work on the scheduler will make it one.
+
+## 22. A new caller at an old seam inherits every unstated convention
+
+`harvest-cache` is about eighty lines: build a small graph, solve it against
+a daemon, publish the result. Everything it does, this codebase already did
+somewhere. It took **seven** attempts to run once, and not one of the seven
+was the mechanism being built.
+
+| # | fault                            | the convention nobody had written down                                  |
+| - | -------------------------------- | ----------------------------------------------------------------------- |
+| 1 | `No such file or directory`      | the binary lives at a different path in each CI job                     |
+| 2 | `docker-image://sha256:...`      | `build_subtree` answers with content, and the caller names the location |
+| 3 | seeded ids nobody uses           | cache ids come off a run's cost table, not off the Earthfile            |
+| 4 | `invalid URL, scheme is missing` | a daemon address is a URL to tonic and a `host:port` to everybody else  |
+| 5 | `object required`                | hand-built LLB must qualify an image name; `llb.Image` does it for you  |
+| 6 | `wanted id:path`                 | a mount with no `id=` is keyed on its destination, so id == path        |
+| 7 | `no active sessions`             | a sessionless solve cannot reach Docker Hub                             |
+
+Read the last column again: **every one is a fact this project already knew
+and had encoded in exactly one place.** Number 7 is written in
+`fleet-findings.md` in capital letters. Number 2 is the reason
+`published_reference` returns a bare digest and has a paragraph explaining
+it. Number 5 was latent in three copies of the same prefixing rule, two of
+which were right.
+
+The lesson is not "be more careful". It is that a convention held in one
+call site is not a convention, it is a coincidence, and the second caller is
+where you find out. Concretely:
+
+- **When a second caller appears, look for the first one's line.** Every
+  fault above was fixed by moving a rule out of the original call site into
+  a named function - `pullable`, `llb_source`, `daemon_url`,
+  `image_identifier`, `parse_seed_pairs`. None needed new logic.
+- **Feedback speed is the whole cost.** Faults 1-4 cost a 25-minute fleet
+  run each. Then a five-minute smoke test against a real daemon was added
+  and it caught 5 and 7 on its first two runs, one apiece. The mechanism was
+  never the expensive part; the loop was.
+- **Fail loudly at the seam, not at the end.** Every one of these was found
+  in about a minute once the run finished, because the harvest step warns
+  per-pair instead of assuming success. A silent seam would have presented
+  as "seeding does not pay", and that is a conclusion, not a bug report.
+
+The general shape, for anything driving buildkit from outside: the LLB
+wire format is permissive and the daemon is not. It will accept a graph
+that no resolver can parse, then fail somewhere unrelated - `object
+required` names neither the image nor the field, `no active sessions` names
+neither the source nor the pull. Assume every identifier, address and
+reference has a normalisation step you have not done, and put it in a
+function with a test the first time you need it.
