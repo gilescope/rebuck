@@ -530,6 +530,13 @@ async fn serve_get(
 ///
 /// Sorted first, so the answer cannot depend on the order a peer map happens
 /// to iterate in - that would defeat the agreement it exists to provide.
+// Not yet wired. The requesting side is easy; the SERVING side is the part
+// that matters and it needs a driver handle threaded into `serve_get`, which
+// today deliberately holds only the store ("it does not walk the fleet on
+// someone else's behalf"). Fetch-through to the DRIVER only is loop-free and
+// is what the split needs - but warming attacks the same 192s chain more
+// simply, so this waits on that result rather than both landing at once.
+#[allow(dead_code)]
 fn seeder_for(hash: &str, peers: &[String]) -> Option<String> {
     if peers.is_empty() {
         return None;
