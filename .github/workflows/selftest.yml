@@ -122,6 +122,20 @@ jobs:
             sleep 1
           done
           docker exec smoke-bk buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null
+          # PUT THE BASE IN OURSELVES, because the registry's pull-through
+          # is BLOB-only: a manifest tag it does not hold is a 404, with no
+          # upstream consulted (see the GET arm of `/manifests/`). That is
+          # coherent - the mirror is filled by `mirror_image` through a peer
+          # WITH a session, and pull-through only covers blob gaps - but it
+          # means a bare `library/busybox:1` is not there to be had.
+          #
+          # Pushed to 127.0.0.1, pulled from 172.17.0.1. Same registry, two
+          # addresses: docker only allows an insecure push to loopback
+          # without daemon config, and the buildkit container cannot reach
+          # loopback on the host.
+          docker pull -q busybox:1 >/dev/null
+          docker tag busybox:1 127.0.0.1:15000/library/busybox:1
+          docker push -q 127.0.0.1:15000/library/busybox:1
       - name: harvest an empty cache mount
         run: |
           set -euo pipefail

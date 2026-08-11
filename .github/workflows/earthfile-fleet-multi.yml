@@ -1027,7 +1027,12 @@ jobs:
           # address is !isLocal and earthly simply connects.
           LAN=$(hostname -I | awk '{print $1}')
           echo "LAN=$LAN" >> "$GITHUB_ENV"
-          # PULL-THROUGH, for the harvest's base image and nothing else.
+          # PULL-THROUGH. It was added for the harvest's base and does not
+          # in fact serve it - the registry proxies BLOBS, and a manifest
+          # tag it does not hold is a 404 with no upstream consulted, so the
+          # base is pushed in from the host instead. Kept because it is the
+          # documented fallback for a peer with no credentials (principle 9)
+          # and costs nothing when nothing asks.
           #
           # `build_subtree` solves without a session and a sessionless solve
           # cannot reach Docker Hub - buildkit asks the session for
@@ -1238,6 +1243,21 @@ jobs:
           # first colon and rejected `id == path`, which is every mount
           # buildkit keys on its destination. It now lives in Rust with a
           # test per shape.
+          # PUT THE BASE IN OURSELVES, because the registry's pull-through
+          # is BLOB-only: a manifest tag it does not hold is a 404, with no
+          # upstream consulted (see the GET arm of `/manifests/`). That is
+          # coherent - the mirror is filled by `mirror_image` through a peer
+          # WITH a session, and pull-through only covers blob gaps - but it
+          # means a bare `library/busybox:1` is not there to be had.
+          #
+          # Pushed to 127.0.0.1, pulled from 172.17.0.1. Same registry, two
+          # addresses: docker only allows an insecure push to loopback
+          # without daemon config, and the buildkit container cannot reach
+          # loopback on the host.
+          docker pull -q busybox:1 >/dev/null
+          docker tag busybox:1 127.0.0.1:15000/library/busybox:1
+          docker push -q 127.0.0.1:15000/library/busybox:1
+
           # CAN this daemon be seeded at all? Thirty seconds, before the
           # twenty-five minutes that would otherwise be needed to find out.
           # It writes a marker into one cache mount, harvests it, and reads
