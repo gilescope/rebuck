@@ -376,6 +376,14 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
             Ok(frame) => match frame? {
                 Some(msg) => msg,
                 None => {
+                    // BOTH exits, not just the polite one. `D2W::Exit`
+                    // called this and a closed stream did not, so the serve
+                    // summary printed only when the driver got to say
+                    // goodbye - and in every fleet run so far it did not.
+                    // Every worker log this session ends on this line, which
+                    // is why SERVED_LOCAL_BYTES has never once reported the
+                    // local-versus-remote split it was built for.
+                    fetch_summary();
                     println!("[worker] driver closed control stream — done");
                     return Ok(());
                 }
