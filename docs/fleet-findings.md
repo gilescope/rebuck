@@ -1913,3 +1913,28 @@ The two knobs that could still change that both attack the chain rather
 than the placement: warming it onto the workers in the window they already
 spend idle, and splitting the seed so six machines fetch a sixth each
 instead of one machine fetching all of it.
+
+## How big the layers are, and what that implies for splitting the seed
+
+Measured on one full `+test-no-qemu`, from the coordinator's registry:
+
+```text
+served 269 requests, 617 MiB
+26 blobs over 1MiB, 527 MiB of the total
+largest: 65, 64, 63, 47, 37, 36, 31, 24 MiB
+```
+
+So the base chain moves as a few dozen large layers, not thousands of small
+ones - three of them are ~64 MiB and together are 192 MiB.
+
+That decides the shape of the seed split. Blob granularity is enough: 26
+large blobs across six workers is about four each, so the critical path for
+seeding the fleet falls from 527 MiB pulled serially by one machine to the
+LARGEST SINGLE BLOB, 65 MiB, which one machine must still pull whole. A blob
+cannot be range-split without teaching both ends about ranges, and at 65 MiB
+against 527 MiB there is no reason to.
+
+The same numbers say what pre-positioning cannot fix. 617 MiB has to be
+decompressed and unpacked on every machine that uses it however it arrives,
+and that cost is per-machine by construction - see principle 18's limit.
+Splitting the seed shortens the wire, and only the wire.
