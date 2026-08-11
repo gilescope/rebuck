@@ -3197,6 +3197,36 @@ impl crate::registry::FleetBlobs for Driver {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn only_content_with_more_than_one_consumer_is_worth_pushing() {
+        let d = super::Driver::for_test();
+
+        // Nothing known: not shared, so not pushed. This is the case that
+        // matters most - the first version fired on EVERY finished subtree,
+        // and most subtrees are leaf results exactly one machine will read.
+        assert_eq!(d.consumers_of("op-unknown").await, 0);
+
+        {
+            let mut pairs = d.op_by_worker.lock().await;
+            // one op, one worker, twice: still one consumer. Counting
+            // PAIRINGS rather than distinct workers would call this two and
+            // push a leaf result to the whole fleet.
+            pairs.insert(("leaf".to_owned(), 1));
+            pairs.insert(("leaf".to_owned(), 1));
+            // and one op wanted by three machines
+            pairs.insert(("shared".to_owned(), 1));
+            pairs.insert(("shared".to_owned(), 2));
+            pairs.insert(("shared".to_owned(), 3));
+        }
+
+        assert_eq!(d.consumers_of("leaf").await, 1, "a leaf has one consumer");
+        assert_eq!(d.consumers_of("shared").await, 3, "distinct workers, not pairings");
+
+        // The rule, stated as the code applies it.
+        assert!(d.consumers_of("leaf").await < 2, "leaf: do not pre-position");
+        assert!(d.consumers_of("shared").await >= 2, "shared: pre-position");
+    }
     use super::*;
 
     fn test_driver(local_exec: bool) -> Arc<Driver> {
