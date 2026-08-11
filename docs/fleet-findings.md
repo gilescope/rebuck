@@ -5004,3 +5004,38 @@ Recording step 2 as unbuilt rather than discovering it after reading a
 promising number off step 1. The temptation with a good result is to skip
 straight to the mechanism, and this document is largely a record of what
 that costs.
+
+### `-sandbox` cut the critical-path leads by a third, and `-nested` is now doubtful
+
+Lead durations from the successful `+test-no-qemu` run, deduplicated:
+
+```text
+298 lead lines (each logged twice), p50 2,265ms, p90 18,742ms
+longest, distinct: 163,698ms  162,742ms  162,284ms
+```
+
+Three leads at **~163 seconds**, against the five at **231-258s** recorded
+before `-sandbox`. So forwarding `buildkitsandbox` into the execs took about
+a third off the builds that own the critical path - which is the mechanism
+working exactly as described, on the leads it was described for.
+
+What is left is probably work. Three leads at 163s, if they serialise, is
+489 seconds of a 520-second leg: **the critical path is now three nested
+builds and almost nothing else.**
+
+That makes `-nested` doubtful rather than promising. It attacks the same
+leads by a different route - rewriting the graph's `BUILDKIT_HOST` instead
+of changing what earthly hands the exec - and `-sandbox` has already made
+those builds local. Two mechanisms for one problem, one of them measured to
+work, and no evidence the remaining 163s is transport rather than
+compilation.
+
+It stays wired and stays off. The case for running it would be evidence that
+those 163 seconds contain waiting rather than building, and the phase split
+cannot see inside a lead.
+
+This also explains the 520s against the reference's 525s. The critical leads
+got a third faster and the leg did not move, because the leg is not bound by
+them: 738 seconds of home vertex time, overlapping, behind the host-bind
+exclusions. Shortening the longest leads in a build whose limit is the work
+that cannot leave changes the shape and not the clock.
