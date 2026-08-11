@@ -606,12 +606,27 @@ jobs:
           # shellcheck disable=SC2086 # a flag LIST: word-splitting is the point
           EARTHLY_CONFIG="$RUNNER_TEMP/base.yml" \
           EARTHLY_BUILDKIT_HOST="tcp://${LAN}:18372" \
-            earthly $EARTHLY_FLAGS "$TARGET" > /tmp/baseline.log 2>&1 || true
+            earthly $EARTHLY_FLAGS "$TARGET" > /tmp/baseline.log 2>&1 && rc=0 || rc=$?
           tail -20 /tmp/baseline.log
           grep -ao "^[^ ]* \*failed\*" /tmp/baseline.log | sed 's/ \*failed\*//' \
             | sort -u > /tmp/baseline.failed || true
           echo "BASELINE_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
           echo "baseline: $((SECONDS - start))s, $(wc -l < /tmp/baseline.failed | tr -d ' ') failed"
+          # A build that DIED is not a build that passed. Judged on the EXIT
+          # CODE, not the success banner: a fleet log carries the nested
+          # earthly builds' own banners, so grepping for one finds a success
+          # belonging to somebody else. earthly prints
+          # `*failed*` per target it ran and failed; a transport error, an
+          # OOM or a killed daemon prints none of them, so the count is zero
+          # and the leg scores BETTER than one with a merely red test. A full
+          # +test-no-qemu died on `h2 protocol error` at 497s and was
+          # reported as beating a baseline that had one failure.
+          if [ "$rc" -ne 0 ] && [ ! -s /tmp/baseline.failed ]; then
+            echo "::error::the baseline leg neither succeeded nor named a failed target - it died"
+            grep -aoE "^Error: .*" /tmp/baseline.log | tail -3
+            echo "BASELINE_DIED=1" >> "$GITHUB_ENV"
+          fi
+
 
       - name: the Earthfile, through the fleet
         working-directory: earthbuild
@@ -622,10 +637,25 @@ jobs:
           start=$SECONDS
           # shellcheck disable=SC2086 # a flag LIST: word-splitting is the point
           EARTHLY_BUILDKIT_HOST="tcp://${LAN}:1234" \
-            earthly $EARTHLY_FLAGS "$TARGET" > /tmp/fleet.log 2>&1 || true
+            earthly $EARTHLY_FLAGS "$TARGET" > /tmp/fleet.log 2>&1 && rc=0 || rc=$?
           tail -60 /tmp/fleet.log
           grep -ao "^[^ ]* \*failed\*" /tmp/fleet.log | sed 's/ \*failed\*//' | sort -u > /tmp/fleet.failed || true
           echo "fleet failed targets: $(wc -l < /tmp/fleet.failed | tr -d ' ')"
+          # A build that DIED is not a build that passed. Judged on the EXIT
+          # CODE, not the success banner: a fleet log carries the nested
+          # earthly builds' own banners, so grepping for one finds a success
+          # belonging to somebody else. earthly prints
+          # `*failed*` per target it ran and failed; a transport error, an
+          # OOM or a killed daemon prints none of them, so the count is zero
+          # and the leg scores BETTER than one with a merely red test. A full
+          # +test-no-qemu died on `h2 protocol error` at 497s and was
+          # reported as beating a baseline that had one failure.
+          if [ "$rc" -ne 0 ] && [ ! -s /tmp/fleet.failed ]; then
+            echo "::error::the fleet leg neither succeeded nor named a failed target - it died"
+            grep -aoE "^Error: .*" /tmp/fleet.log | tail -3
+            echo "FLEET_DIED=1" >> "$GITHUB_ENV"
+          fi
+
           echo "FLEET_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
 
       - name: did the fleet change the answer
@@ -635,6 +665,10 @@ jobs:
           # WITH the fleet is ours - and one does:
           # `copy-test-verbose-output` asserts earthly did not transfer a file
           # it does not need, and this fleet publishes the whole context.
+          if [ -n "${BASELINE_DIED:-}${FLEET_DIED:-}" ]; then
+            echo "::error::a leg died, so there is nothing to compare"
+            exit 1
+          fi
           if diff -u /tmp/baseline.failed /tmp/fleet.failed; then
             echo "PARITY: the same $(wc -l < /tmp/baseline.failed | tr -d ' ') target(s) failed either way"
           else
