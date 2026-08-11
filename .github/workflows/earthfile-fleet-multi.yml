@@ -56,7 +56,12 @@ on:
       warm_target:
         description: what to warm with
         type: string
-        default: ./t/integration-base+test-base
+        # ./tests, not ./t. earthly ABBREVIATES the directory in its display
+        # names and in the target names it puts in OTLP spans, so the traces
+        # say `./t/integration-base+test-base` and there is no such path.
+        # Six warm-ups failed identically on "No Earthfile nor build.earth
+        # file found" because the target was copied out of a log.
+        default: ./tests/integration-base+test-base
       local_nested:
         description: a nested earthly uses the daemon on the machine running it (1/0)
         type: string
@@ -178,7 +183,7 @@ env:
   # the fleet leg, when the bulk transfer lands exactly as the fan-out wants
   # it - a layer finished minutes earlier sits on one machine until asked.
   REBUCK2_PREFETCH: ${{ inputs.prefetch || '0' }}
-  REBUCK2_WARM_TARGET: ${{ inputs.warm_target || './t/integration-base+test-base' }}
+  REBUCK2_WARM_TARGET: ${{ inputs.warm_target || './tests/integration-base+test-base' }}
   # Pinned by digest like everything else here: a collector that changes
   # under us changes the data.
   OTEL_IMAGE: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.145.0
@@ -523,8 +528,14 @@ jobs:
           # warm-up, it is contention - it competes for the same four cores
           # with the work it was meant to accelerate. The exit line only
           # appears once it finished.
-          if grep -q '^warm exit=' "$f"; then
-            echo "warm finished: $(grep '^warm exit=' "$f")"
+          if grep -q '^warm exit=0' "$f"; then
+            echo "warm finished clean: $(grep '^warm exit=' "$f")"
+          elif grep -q '^warm exit=' "$f"; then
+            # LOUD. A warm-up that ran and failed looked exactly like one
+            # that never started, four runs in a row, and each time the fleet
+            # leg was measured as though the workers had been warmed.
+            echo "::warning::warming FAILED - this run measures a cold fleet"
+            grep -aoE "^Error: .*" "$f" | tail -2
           else
             echo "::warning::warming did not finish - it competed with the build it meant to help"
           fi
