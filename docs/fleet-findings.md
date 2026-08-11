@@ -4844,3 +4844,28 @@ the coordinator loaded - and that is the mesh problem this project already
 solves for base images, applied to a registry earthly stands up per build.
 Whether that is worth doing is a real question. Pretending the scheduler
 can reach it is not.
+
+### How much of the Earthfile is behind the host bind
+
+**Thirty of earthbuild's 192 Earthfiles contain `WITH DOCKER`** - 16% of the
+files, and they are not evenly spread: five uses in the root Earthfile, two
+in `tests/`, the rest in the per-test directories the groups pull in.
+
+So the ceiling is not a corner case and it is not most of the tree either.
+It is one construct, used in a sixth of the files, holding a third of one
+target's work.
+
+Which makes the size of the prize legible. Making `WITH DOCKER` dispatchable
+would raise `+test-no-qemu`'s ceiling from 3.2x toward whatever the
+dependency graph allows, and it would do nothing at all for `+test-ast`,
+`+lint-all` or `+all-binaries`, none of which use it. It is a targeted piece
+of work with a bounded payoff, not a general improvement.
+
+And it is the only remaining item on this list that raises a CEILING rather
+than approaching one. Every other mechanism - prefetch, balance, imports,
+broadcast, seeding, compression - moves the fleet closer to a limit set by
+the workload. This moves the limit.
+
+Whether to do it is a judgement about how much `WITH DOCKER` matters to the
+builds someone actually wants distributed. What is no longer in doubt is
+that no amount of scheduling reaches past it.
