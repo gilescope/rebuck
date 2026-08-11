@@ -143,6 +143,16 @@ async fn harvest_one(
     dest: &str,
     input: Option<(Vec<u8>, String)>,
 ) -> anyhow::Result<()> {
+    // WHICH PATH, per id. The count alone cannot say that `go-mod` was
+    // observed and `go-build` was not, and a partial file is the likely
+    // shape - a run only records the ids the graphs it saw actually mount.
+    println!(
+        "[harvest] {id}: {}",
+        match &input {
+            Some(_) => "using the input observed from a real graph",
+            None => "RECONSTRUCTING earthly's input, which has been measured wrong",
+        }
+    );
     let def = dispatch::harvest_graph_with(base, id, dest, input);
     // Job 0: this is not a subtree and shares no numbering with one.
     let digest = solve::build_subtree(bk, registry, 0, def).await?;
