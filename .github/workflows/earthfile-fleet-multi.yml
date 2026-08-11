@@ -521,6 +521,22 @@ jobs:
           fi
           tail -3 "$f"
 
+      # KEEP the worker's logs too. Three iterations went into asking whether
+      # a warm-up ran, by grepping a job log where the echoed SCRIPT and the
+      # actual output look identical - "not warmed" matched the line that
+      # PRINTS "not warmed" more than once. The coordinator's logs have been
+      # uploaded since this morning for exactly this reason.
+      - name: keep this worker's logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: worker-${{ matrix.n }}-logs-${{ github.run_attempt }}
+          path: |
+            warm-${{ matrix.n }}.log
+            worker-${{ matrix.n }}.log
+          if-no-files-found: warn
+          retention-days: 7
+
       - name: where did this worker's blobs come from
         if: always()
         env:
