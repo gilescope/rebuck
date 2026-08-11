@@ -1182,6 +1182,20 @@ jobs:
           done
           echo "=== dispatchable at all?"
           grep -E '^\[wire\] (mechanisms|gateway solves|solves routed|built at home|placed|not routed)' proxy.log || true
+          # Principle 19: the ceiling beside the result, in the log rather
+          # than worked out afterwards from a wall clock. A run at 1.8x
+          # against a 1.4x ceiling is a graph with no seam; the same 1.8x
+          # against a 5x ceiling is a dispatcher with a problem, and until
+          # these two lines existed the two were indistinguishable.
+          grep -E '^\[wire\] (concurrency|amdahl ceiling)' proxy.log || true
+          # A WARNING, deliberately not an error. Peak 1 across N machines is
+          # usually the graph and occasionally us, and a gate that cannot
+          # tell the difference would go red on a correct run of a serial
+          # target.
+          peak=$(grep -oE '^\[wire\] concurrency *: peak [0-9]+' proxy.log | grep -oE '[0-9]+$' | tail -1)
+          if [ "${peak:-0}" -le 1 ] && [ "${MACHINES:-1}" -gt 1 ]; then
+            echo "::warning::peak concurrency ${peak:-0} across $MACHINES machines - nothing overlapped, so no wall-clock claim can be made either way"
+          fi
           echo "=== which RUNNER took what"
           grep -oE -- '-> worker [0-9]+' proxy.log | sort | uniq -c || true
 
