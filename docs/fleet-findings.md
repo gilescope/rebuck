@@ -2132,3 +2132,35 @@ rewritten graph names - which is what `REBUCK2_PREFETCH` does, and is now
 the only member of this family left untested. It does not need cache keys to
 match: it puts the bytes where the pull will look, and the pull is
 `docker-image://mirror/x@sha256:...` by digest.
+
+## The h2 collapse: five theories eliminated, by evidence
+
+Two days, five fixes, none of which changed the symptom. Recorded because
+the eliminations are worth as much as a cause would be, and because each
+theory was plausible when it was formed:
+
+| theory | why it looked right | how it died |
+| ------ | ------------------- | ----------- |
+| our server refuses a stream | the client reports a protocol error | `max_concurrent_streams(None)` changed nothing |
+| hyper's reset limit (default 20) | earthly mass-cancels on failure | raised to 10k, then removed entirely; error persisted |
+| the failing call is `Control.Solve` | it is what the client blocks on | retried; the retry itself was cancelled |
+| one connection carries everything | streams share a fate | Control, gateway pool, per-Session - unchanged |
+| the daemon is dying | simultaneous unrelated failures | `own-bk: running exit=0 oom=false restarts=0` |
+
+The session relay, once instrumented, said the failing connection is the one
+this proxy MAKES rather than the one it serves - and then the session
+lifetimes said those "failures" were nested builds ending normally. So the
+error the user sees is relayed from somewhere that is not obviously broken.
+
+What is left, and what the evidence now points at, is a NotFound:
+
+```text
+[proxy] upstream solve failed: Some requested entity was not found
+[proxy] upstream Control.Solve failed: Unknown error transport error
+```
+
+One of each, in every failing run. A NotFound is a graph referring to
+content that is not there - which two mechanisms can cause, because both
+rewrite a graph to point at an image that must already exist. Grafting was
+the obvious suspect and has been eliminated: `REBUCK2_GRAFT: 0`, `grafted:
+0`, NotFound unchanged. `cut_prefix` is the other, and is on by default.
