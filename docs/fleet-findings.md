@@ -1695,3 +1695,35 @@ in flight, 148 leads against 56. It is the first workload whose shape could
 pay for six machines. It still does not - 525s against 186s - because the
 per-lead tax is unchanged, but the ceiling that made the question moot is
 gone.
+
+## Affinity: the first mechanism that subtracts instead of adding
+
+Least-loaded-first is load BALANCING, and balancing is the wrong default
+for this workload. It spreads work sharing a base across machines, and
+every machine that touches a layer pays to pull, decompress and unpack it
+into its own snapshotter. `REBUCK2_AFFINITY=1` prefers a peer that already
+holds the subtree's ancestry, subject to capacity - the free-slot filter
+still runs first, so a warm peer that would decline is still not asked.
+
+Full `+test-no-qemu`, six runners:
+
+| affinity | built duplication | routed | targets touched (base/fleet) |
+| -------- | ----------------- | ------ | ---------------------------- |
+| off      | 2.2x              | 127    | 51 / 46                      |
+| on       | 1.3x              | 167    | 48 / 85                      |
+
+Duplication 2.2x -> 1.3x against an ideal of 1.0, and the fleet routed
+MORE while duplicating less. This is the first change here that made the
+fleet do more work rather than less.
+
+The wall clocks are not directly comparable and the run says so, which is
+the point of measuring work attempted: with affinity the fleet got through
+85 targets to the baseline's 48, where without it the fleet managed 46 to
+the baseline's 51. Per target that is 577s/85 = 6.8s against the
+baseline's 221s/48 = 4.6s - a tax of ~1.5x, where the same arithmetic
+before affinity gave ~4.8x.
+
+Both legs stop early (the suite contains targets that fail by design), so
+"targets touched" is a coarse proxy - different targets cost differently.
+It is not a speed claim. It is the first evidence that the tax is
+addressable at all, after three mechanisms that only added to it.
