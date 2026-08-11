@@ -1654,6 +1654,28 @@ impl Driver {
 
     /// Send one frame to one worker, if it is still connected. A worker
     /// that has gone costs us the offer, not the build.
+    /// Pre-position an image that MANY machines will want.
+    ///
+    /// The caller decides that, and the distinction is the whole mechanism:
+    /// the first version fired on every finished subtree, including leaf
+    /// results that only the requester would ever want, which spends
+    /// bandwidth to make a machine hold something it will never read.
+    ///
+    /// Fire this for content that is shared BY CONSTRUCTION - a mirrored
+    /// base image, a prefix cut extracted because several graphs share it -
+    /// not for whatever happened to finish.
+    pub async fn prefetch_image(self: &Arc<Self>, image_ref: &str) {
+        if !prefetch_ahead() {
+            return;
+        }
+        let this = self.clone();
+        let r = image_ref.to_owned();
+        tokio::spawn(async move {
+            let digests = crate::solve::image_blobs(&r).await.unwrap_or_default();
+            this.prefetch_everywhere(digests).await;
+        });
+    }
+
     /// Tell every worker that these blobs are coming, before they ask.
     ///
     /// Distribution is otherwise lazy to a fault. The trace timeline: workers
@@ -1871,18 +1893,6 @@ impl Driver {
         let Some(st) = self.subtrees.lock().await.remove(&job) else {
             return;
         };
-        // THE moment the layer exists and its consumer is still building on
-        // top of it - principle 18. Announce it before anyone asks, so the
-        // fan-out that will want it is not the thing that starts the
-        // transfer.
-        if prefetch_ahead() {
-            let this = self.clone();
-            let r = image_ref.clone();
-            tokio::spawn(async move {
-                let digests = crate::solve::image_blobs(&r).await.unwrap_or_default();
-                this.prefetch_everywhere(digests).await;
-            });
-        }
         match st.requester {
             Requester::Worker(id) => self.tell(id, D2W::Placed { job, image_ref }).await,
             Requester::Gateway(tx) => {

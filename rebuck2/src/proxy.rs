@@ -1363,6 +1363,15 @@ impl Proxy {
                 {
                     Ok(reference) => {
                         println!("[proxy] base {r} mirrored as {reference}");
+                        // A BASE image is shared by construction: every graph
+                        // that names it needs it, on whichever machine it
+                        // lands. That is the signal a prefetch wants, and the
+                        // one the first version did not use - it fired on
+                        // every finished subtree, most of which only the
+                        // requester will ever want. Pre-position what is
+                        // shared; leave a leaf result to the one machine
+                        // asking for it.
+                        self.driver.prefetch_image(&reference).await;
                         Some(reference)
                     }
                     Err(e) => {
@@ -2348,10 +2357,21 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                                                 // graph as before. A failed
                                                 // optimisation must not fail a
                                                 // build.
-                                                self.driver
+                                                let r = self
+                                                    .driver
                                                     .lead_subtree(bytes, Vec::new())
                                                     .await
-                                                    .ok()
+                                                    .ok();
+                                                // A PREFIX exists precisely
+                                                // because several graphs share
+                                                // it - the second signal worth
+                                                // pre-positioning on, and it
+                                                // is known to be shared before
+                                                // anyone asks for it.
+                                                if let Some(ref image) = r {
+                                                    self.driver.prefetch_image(image).await;
+                                                }
+                                                r
                                             })
                                             .await;
                                             let built = self.driver.built_ops().await;
