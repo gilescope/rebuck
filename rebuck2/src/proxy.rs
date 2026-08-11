@@ -1447,6 +1447,10 @@ impl Wire {
             crate::mech::summary(&[
                 ("affinity", crate::dispatch::affinity()),
                 ("seed_mounts", !crate::dispatch::cache_seeds().is_empty()),
+                // Always on - there is no knob, because a replayed read is
+                // free when it is not needed. The counter is here so a run
+                // that survived one says so.
+                ("read_retry", true),
                 ("min_siblings", min_siblings() > 0),
                 (
                     "prefetch",
@@ -2016,6 +2020,31 @@ fn worth_retrying(s: &tonic::Status) -> bool {
     // whose own output mentions a transport error must not be rebuilt for
     // saying so.
     s.code() == tonic::Code::Unknown && s.message().trim() == "transport error"
+}
+
+/// As [`worth_retrying`], but for a gateway READ, which may be replayed.
+///
+/// `ReadFile`, `ReadDir` and `StatFile` are pure functions of a ref. Asking
+/// twice cannot double-execute a build, so they can afford a broader test
+/// than a Solve can - and they need one. A run reached 14 of 15 targets,
+/// named zero failed targets and then stopped on
+///
+///     Error: h2 protocol error: error reading a body from connection
+///
+/// with the daemon still up, no OOM and no restart, having stack-dumped
+/// inside `_LLBBridge_ReadFile_Handler`. Whatever unwound there, the read
+/// itself is replayable, and the alternative to replaying it is that the
+/// whole build stops after doing all of its work.
+///
+/// Still ANCHORED, not a substring search of the whole message. This suite
+/// contains targets that fail on purpose and their output is relayed
+/// verbatim, so a test that prints the words "h2 protocol error" must not
+/// make the proxy re-read a ref that is genuinely gone.
+fn worth_retrying_read(s: &tonic::Status) -> bool {
+    if worth_retrying(s) {
+        return true;
+    }
+    s.code() == tonic::Code::Unknown && s.message().trim_start().starts_with("h2 protocol error")
 }
 
 /// How many reset streams hyper tolerates before it gives up on a connection.
@@ -3043,9 +3072,29 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
     ) -> Result<Response<gw::ReadFileResponse>, Status> {
         trace(&self.wire, "read_file");
         let (meta, ext, req) = request.into_parts();
-        self.gw()
+        // ONCE, and on whichever connection the pool hands out next. A
+        // gateway read is a pure function of a ref, so replaying it cannot
+        // double-execute anything - and a run that reached 14 of 15 targets
+        // stopped on a broken body in exactly this call.
+        let again = (meta.clone(), req.clone());
+        match self
+            .gw()
             .read_file(Request::from_parts(meta, ext, req))
             .await
+        {
+            Err(e) if worth_retrying_read(&e) => {
+                println!("[proxy] retrying read_file once: {}", e.message());
+                let (meta, req) = again;
+                self.gw()
+                    .read_file(Request::from_parts(meta, Default::default(), req))
+                    .await
+                    .inspect(|_| crate::mech::applied("read_retry"))
+                    .inspect_err(|e| {
+                        println!("[proxy] read_file retry failed too: {}", e.message());
+                    })
+            }
+            other => other,
+        }
     }
     async fn read_dir(
         &self,
@@ -3053,9 +3102,29 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
     ) -> Result<Response<gw::ReadDirResponse>, Status> {
         trace(&self.wire, "read_dir");
         let (meta, ext, req) = request.into_parts();
-        self.gw()
+        // ONCE, and on whichever connection the pool hands out next. A
+        // gateway read is a pure function of a ref, so replaying it cannot
+        // double-execute anything - and a run that reached 14 of 15 targets
+        // stopped on a broken body in exactly this call.
+        let again = (meta.clone(), req.clone());
+        match self
+            .gw()
             .read_dir(Request::from_parts(meta, ext, req))
             .await
+        {
+            Err(e) if worth_retrying_read(&e) => {
+                println!("[proxy] retrying read_dir once: {}", e.message());
+                let (meta, req) = again;
+                self.gw()
+                    .read_dir(Request::from_parts(meta, Default::default(), req))
+                    .await
+                    .inspect(|_| crate::mech::applied("read_retry"))
+                    .inspect_err(|e| {
+                        println!("[proxy] read_dir retry failed too: {}", e.message());
+                    })
+            }
+            other => other,
+        }
     }
     async fn stat_file(
         &self,
@@ -3063,9 +3132,29 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
     ) -> Result<Response<gw::StatFileResponse>, Status> {
         trace(&self.wire, "stat_file");
         let (meta, ext, req) = request.into_parts();
-        self.gw()
+        // ONCE, and on whichever connection the pool hands out next. A
+        // gateway read is a pure function of a ref, so replaying it cannot
+        // double-execute anything - and a run that reached 14 of 15 targets
+        // stopped on a broken body in exactly this call.
+        let again = (meta.clone(), req.clone());
+        match self
+            .gw()
             .stat_file(Request::from_parts(meta, ext, req))
             .await
+        {
+            Err(e) if worth_retrying_read(&e) => {
+                println!("[proxy] retrying stat_file once: {}", e.message());
+                let (meta, req) = again;
+                self.gw()
+                    .stat_file(Request::from_parts(meta, Default::default(), req))
+                    .await
+                    .inspect(|_| crate::mech::applied("read_retry"))
+                    .inspect_err(|e| {
+                        println!("[proxy] stat_file retry failed too: {}", e.message());
+                    })
+            }
+            other => other,
+        }
     }
     async fn evaluate(
         &self,
@@ -3195,6 +3284,45 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
 
 #[cfg(test)]
 mod tests {
+    /// A gateway READ may be retried where a solve may not.
+    #[test]
+    fn a_read_is_safe_to_replay_and_a_failed_build_is_not() {
+        use tonic::{Code, Status};
+        let read = super::worth_retrying_read;
+
+        // Everything the connection predicate already accepts.
+        assert!(read(&Status::new(Code::Unavailable, "")));
+        assert!(read(&Status::new(Code::Unknown, "transport error")));
+
+        // And the one that killed a run: hyper's wording, relayed as
+        // Unknown, which the connection predicate declines because it
+        // matches its message exactly.
+        let h2 = Status::new(
+            Code::Unknown,
+            "h2 protocol error: error reading a body from connection",
+        );
+        assert!(read(&h2), "a broken body mid-read is worth reading again");
+        assert!(
+            !super::worth_retrying(&h2),
+            "and the SOLVE predicate still declines it - a build that ran is \
+             not re-run because its stream broke afterwards"
+        );
+
+        // A build that failed is not a transport problem, whatever it says.
+        // These targets fail on purpose and their text is relayed verbatim,
+        // so a test asserting on the words `h2 protocol error` must not
+        // cause a re-read of a ref that is genuinely absent.
+        assert!(!read(&Status::new(
+            Code::Unknown,
+            "./tests+fail-test: exit code 1: h2 protocol error is what it printed",
+        )));
+        assert!(!read(&Status::new(
+            Code::NotFound,
+            "no such ref: abc, all []"
+        )));
+        assert!(!read(&Status::new(Code::Unknown, "")));
+    }
+
     #[test]
     fn work_with_no_siblings_stays_home() {
         use super::worth_dispatching_now;
