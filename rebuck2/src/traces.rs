@@ -20,6 +20,10 @@ use std::collections::BTreeMap;
 pub struct Tally {
     pub count: u64,
     pub total_ms: f64,
+    /// Every duration. These spans include waiting, so a mean over hundreds
+    /// of cache hits and nine multi-minute blocks describes neither - the
+    /// distribution is the only sound reading.
+    pub each: Vec<f64>,
 }
 
 /// A leg of a run: one earthly invocation, one trace tree.
@@ -86,12 +90,20 @@ pub fn parse(jsonl: &str) -> Vec<Leg> {
                         let t = leg.targets.entry(name.to_owned()).or_default();
                         t.count += 1;
                         t.total_ms += ms;
+                        t.each.push(ms);
                     }
                 }
             }
         }
     }
-    let mut out: Vec<Leg> = legs.into_values().collect();
+    // A file holds one trace id per nested earthly, and most carry only gRPC
+    // spans. Kept, they bury the legs that matter under empty tables and -
+    // worse - stop the two-leg comparison firing, because there are then
+    // forty legs rather than two.
+    let mut out: Vec<Leg> = legs
+        .into_values()
+        .filter(|l| !l.targets.is_empty())
+        .collect();
     out.sort_by(|a, b| b.wall_ms.total_cmp(&a.wall_ms));
     out
 }
@@ -111,25 +123,37 @@ pub fn report(legs: &[Leg], top: usize) {
         let mut rows: Vec<(&String, &Tally)> = leg.targets.iter().collect();
         rows.sort_by(|a, b| b.1.total_ms.total_cmp(&a.1.total_ms));
         println!(
-            "{:44} {:>5} {:>9} {:>8}",
-            "target", "n", "total s", "mean s"
+            "{:44} {:>5} {:>9} {:>9} {:>6}",
+            "target", "n", "p50 ms", "max s", ">60s"
         );
         for (name, t) in rows.into_iter().take(top) {
+            let mut d = t.each.clone();
+            d.sort_by(f64::total_cmp);
             println!(
-                "{:44} {:5} {:9.1} {:8.1}",
+                "{:44} {:5} {:9.0} {:9.1} {:6}",
                 &name[..44.min(name.len())],
                 t.count,
-                t.total_ms / 1000.0,
-                t.total_ms / t.count as f64 / 1000.0
+                d[d.len() / 2],
+                d[d.len() - 1] / 1000.0,
+                d.iter().filter(|x| **x > 60_000.0).count()
             );
         }
     }
     // The comparison the split exists for: same target, two legs.
     if legs.len() == 2 {
         println!("\n== the same target in both legs (mean seconds)");
+        // The ratio column NAMED. Unlabelled it printed 0.1x for a target
+        // costing seven times more in the fleet, which reads as the fleet
+        // being ten times faster - the same misreading this tool exists to
+        // prevent.
+        let a0 = &legs[0].label[..8.min(legs[0].label.len())];
+        let b0 = &legs[1].label[..8.min(legs[1].label.len())];
         println!(
-            "{:44} {:>10} {:>10} {:>7}",
-            "target", &legs[0].label, &legs[1].label, "ratio"
+            "{:44} {:>10} {:>10} {:>11}",
+            "target",
+            &legs[0].label,
+            &legs[1].label,
+            format!("{a0}/{b0}")
         );
         let mut names: Vec<&String> = legs[0].targets.keys().collect();
         names.sort_by_key(|n| -(legs[0].targets[*n].total_ms as i64));
@@ -140,11 +164,11 @@ pub fn report(legs: &[Leg], top: usize) {
             };
             let (ma, mb) = (a.total_ms / a.count as f64, b.total_ms / b.count as f64);
             println!(
-                "{:44} {:10.1} {:10.1} {:7.1}x",
+                "{:44} {:10.1} {:10.1} {:10.1}x",
                 &n[..44.min(n.len())],
                 ma / 1000.0,
                 mb / 1000.0,
-                if ma > 0.0 { mb / ma } else { 0.0 }
+                if mb > 0.0 { ma / mb } else { 0.0 }
             );
         }
     }
@@ -216,6 +240,37 @@ mod tests {
             (fleet.total_ms / fleet.count as f64) / (base.total_ms / base.count as f64) > 6.0,
             "the fleet's unit is dearer, which is the finding"
         );
+    }
+
+    #[test]
+    fn traces_with_no_targets_are_not_legs() {
+        // A real file has dozens of trace ids: every nested earthly gets its
+        // own, and most carry only gRPC spans. Reported as legs they bury
+        // the two that matter under empty tables - and, worse, they stop the
+        // two-leg comparison from firing, because there are then 40 legs
+        // rather than 2.
+        let ms = 1_000_000u128;
+        let jsonl = [
+            line(
+                "aaaa000000000000",
+                Some("baseline"),
+                &[("main", 0, 100_000 * ms), ("+work", 0, 5_000 * ms)],
+            ),
+            line(
+                "eeee000000000000",
+                None,
+                &[("moby.buildkit.v1.frontend.LLBBridge/ReadFile", 0, 5 * ms)],
+            ),
+            line(
+                "ffff000000000000",
+                None,
+                &[("moby.filesync.v1.FileSync/DiffCopy", 0, 9 * ms)],
+            ),
+        ]
+        .join("\n");
+        let legs = parse(&jsonl);
+        assert_eq!(legs.len(), 1, "only the invocation that built something");
+        assert_eq!(legs[0].label, "baseline");
     }
 
     #[test]
