@@ -2166,6 +2166,42 @@ mod tests {
         // below it for nothing.
         let same = super::seed_cache_mounts(&def, &Default::default());
         assert_eq!(same.def, def.def);
+
+        // THE TERMINAL IS STILL LAST, on a graph that has one. `loadLLB`
+        // deletes exactly the final entry and hands anything else
+        // union-less to `ResolveOp`, whose default arm reports
+        // `no support for <nil>` - a day went on that message once, and this
+        // transform PREPENDS ops, which is the operation most likely to do
+        // it again. Proven by appending instead: it fails, here.
+        let with_terminal = pb::Definition {
+            def: {
+                let mut d = def.def.clone();
+                let exec_d = format!("sha256:{}", crate::store::sha256_hex(&d[1]));
+                d.push(
+                    pb::Op {
+                        inputs: vec![pb::Input {
+                            digest: exec_d,
+                            index: 0,
+                        }],
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                );
+                d
+            },
+            ..Default::default()
+        };
+        let out = super::seed_cache_mounts(&with_terminal, &seeds);
+        let last = pb::Op::decode(out.def.last().unwrap().as_slice()).unwrap();
+        assert!(last.op.is_none(), "the terminal must still be last");
+        assert_eq!(
+            out.def
+                .iter()
+                .filter(|b| pb::Op::decode(b.as_slice()).is_ok_and(|o| o.op.is_none()))
+                .count(),
+            1,
+            "and there must be exactly one of it"
+        );
     }
 
     /// A warm cache MOUNT outranks a warm op, and by how much.
