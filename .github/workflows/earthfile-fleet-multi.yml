@@ -37,7 +37,12 @@ on:
   # The test side is 71% serial and caps at 1.4x by Amdahl however well the
   # fleet works; this side is the shape a build farm is actually for.
   push:
-    branches: [giles-dispatch-ci, giles-dispatch-ci-binaries, giles-dispatch-ci-seed]
+    branches:
+      - giles-dispatch-ci
+      - giles-dispatch-ci-binaries
+      - giles-dispatch-ci-lint
+      - giles-dispatch-ci-all
+      - giles-dispatch-ci-seed
   workflow_dispatch:
     inputs:
       peer_cache_mounts:
@@ -396,9 +401,15 @@ jobs:
           # bank key is the one that hurts when they disagree: a run would
           # restore the test groups' bank, build something else, and save it
           # back under the same name.
+          # One branch per experiment, and the suffix picks the target.
+          # `-seed` is not in here on purpose: it selects a MECHANISM, not a
+          # workload, so it keeps the default target and the seeded and
+          # unseeded runs are comparable.
           case "${T:-}" in
             "") case "$REF" in
                   *-binaries) target=+all-binaries ;;
+                  *-lint)     target=+lint-all ;;
+                  *-all)      target=+all ;;
                   *)          target=+test-no-qemu-group2 ;;
                 esac ;;
             *)  target="$T" ;;
