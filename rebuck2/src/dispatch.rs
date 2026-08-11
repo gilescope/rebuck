@@ -739,8 +739,18 @@ pub fn resolve_cache_id(want: &str, held: &[String]) -> Option<String> {
 ///     mountOpts = append(mountOpts, llb.SourcePath("/cache"))
 /// ```
 ///
-/// The bytes matter, not the intent: `getRefCacheDir` keys on the input's
-/// ref, so identical LLB is the whole requirement.
+/// The bytes matter, not the intent, and the reason is sharper than it
+/// first looks. A cache ref's `ID()` is `identity.NewID()` - RANDOM, chosen
+/// when the record is created, not derived from content. So `getRefCacheDir`
+/// keying on `ref.ID()` means an op that differs by one field does not get a
+/// nearly-right key, it gets a brand new record with a brand new random id
+/// and therefore a fresh empty directory.
+///
+/// Identical LLB reaches the same ref only because buildkit DEDUPS within
+/// one daemon: the same digest finds the existing record. Across daemons the
+/// ids are unrelated, which is fine here - each worker builds its own
+/// directory from the seed image - but it does mean "the same bytes" is a
+/// requirement and not an optimisation.
 pub fn earthly_cache_context() -> Vec<u8> {
     pb::Op {
         op: Some(pb::op::Op::File(pb::FileOp {
@@ -947,9 +957,12 @@ pub fn harvest_graph_with(
     // daemon held 1.71 GB under these exact ids while the harvest reported
     // 0.0 MiB.
     //
-    // Reconstructed rather than approximated: identical LLB gives an
-    // identical digest gives the same ref gives the same key. 0o644 is
-    // earthly's default mode for a cache mount, from the same function.
+    // A FALLBACK ONLY, and a measured-wrong one: see `cache_mount_inputs`.
+    // The ref id is random per record, so an op that differs by one field
+    // gets a fresh record and a fresh empty directory rather than anything
+    // approximately right. 0o644 is earthly's default mode for a cache
+    // mount, from the same function - and matching the mode was not
+    // sufficient.
     // Taken from a real graph when we have one, reconstructed only as a
     // fallback - see `cache_mount_inputs` for why the fallback is a guess.
     let (mkdir_bytes, selector) =
