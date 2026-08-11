@@ -75,9 +75,16 @@ on:
         type: string
         default: '0'
       seed_ids:
+        # The third has no `id=` in the Earthfile, so buildkit keys it on the
+        # destination path and the id IS the path - hence the repetition.
+        # Included because +lint-all is the cheap seeding target and
+        # golangci-lint's cache is where its time goes: the baseline fills it
+        # once and reuses it across four modules, each peer starts empty.
+        # Self-keying, so principle 20 allows it - golangci-lint uses the Go
+        # build cache format and addresses entries by content.
         description: which cache mounts to harvest, as `id:path` pairs
         type: string
-        default: 'go-mod:/go/pkg/mod,go-build:/root/.cache/go-build'
+        default: 'go-mod:/go/pkg/mod,go-build:/root/.cache/go-build,/root/.cache/golangci_lint:/root/.cache/golangci_lint'
       prefetch:
         description: announce a finished layer to the fleet before it is asked for (1/0)
         type: string
@@ -279,7 +286,7 @@ env:
   # dispatch.rs for the three conditions, one of which +lint-all does not
   # meet.
   REBUCK2_TRUST_VERDICT: ${{ inputs.trust_verdict || '0' }}
-  REBUCK2_SEED_IDS: ${{ inputs.seed_ids || 'go-mod:/go/pkg/mod,go-build:/root/.cache/go-build' }}
+  REBUCK2_SEED_IDS: ${{ inputs.seed_ids || 'go-mod:/go/pkg/mod,go-build:/root/.cache/go-build,/root/.cache/golangci_lint:/root/.cache/golangci_lint' }}
   # A FILE, not a variable. The seeds are harvested after the proxy is
   # already running, so a variable set at that point would never reach it;
   # `cache_seeds()` reads this lazily on the first dispatch.
