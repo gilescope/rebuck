@@ -1501,6 +1501,18 @@ fn report_gateway(wire: &std::sync::Mutex<Wire>, req: &gw::SolveRequest) -> bool
     resend
 }
 
+/// Is this failure the connection's fault rather than the build's?
+///
+/// `Unavailable` is tonic's code for "the transport did not work" - a
+/// reconnect, a GOAWAY, a peer that went away mid-body. A build that FAILED
+/// comes back as `Unknown` carrying buildkit's message, and retrying that
+/// doubles the cost of every red target while changing nothing. This suite
+/// deliberately contains targets that fail, so the distinction is not
+/// academic.
+fn worth_retrying(s: &tonic::Status) -> bool {
+    s.code() == tonic::Code::Unavailable
+}
+
 /// How many reset streams hyper tolerates before it gives up on a connection.
 ///
 /// `None` = no limit, and that is an EXPERIMENT rather than a setting: it
@@ -2374,6 +2386,9 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         // Always peer 0: it holds the client's job, and after adoption the
         // graph is a fetch rather than a build.
         let t_answer = std::time::Instant::now();
+        // Kept for a possible second attempt: a tonic Channel reconnects on
+        // the next request, but the request itself moves into the first one.
+        let again = (meta.clone(), req.clone());
         let out = self
             .gw()
             .solve(Request::from_parts(meta, ext, req))
@@ -2392,7 +2407,27 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                     e.code(),
                     e.message()
                 );
-            })?;
+            });
+        // ONE more, and only for the transport. A single blip currently kills
+        // a build that was otherwise fine and takes the other thirteen groups
+        // with it; a rebuild is idempotent by cache key, so the worst case is
+        // paying for the work twice, which principle 5 already accepts.
+        //
+        // Extensions are not carried over: they belong to the INBOUND
+        // connection and the upstream call does not read them.
+        let out = match out {
+            Err(e) if worth_retrying(&e) => {
+                println!("[proxy] retrying the solve once: {}", e.message());
+                let (meta, req) = again;
+                self.gw()
+                    .solve(Request::from_parts(meta, Default::default(), req))
+                    .await
+                    .inspect_err(|e| {
+                        println!("[proxy] retry failed too: {} {}", e.code(), e.message());
+                    })?
+            }
+            other => other?,
+        };
         let answer = t_answer.elapsed().as_millis() as u64;
         self.wire.held().spans.push(Span {
             total: t_solve.elapsed().as_millis() as u64,
@@ -2583,6 +2618,32 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_broken_connection_is_worth_retrying() {
+        use tonic::{Code, Status};
+
+        // A relayed solve that fails because the CONNECTION died should be
+        // tried again - the channel reconnects, and a rebuild is idempotent
+        // by cache key, so at worst it costs the work twice, which principle
+        // 5 already accepts. One transport blip currently kills a build that
+        // was otherwise fine, and it takes the other thirteen groups with it.
+        assert!(super::worth_retrying(&Status::new(Code::Unavailable, "h2")));
+
+        // A solve that fails because the BUILD failed must not be. Retrying
+        // it doubles the cost of every red target and changes nothing - and
+        // this suite deliberately contains targets that fail.
+        assert!(!super::worth_retrying(&Status::new(
+            Code::Unknown,
+            "exit 1"
+        )));
+        assert!(!super::worth_retrying(&Status::new(
+            Code::NotFound,
+            "no ref"
+        )));
+        // Cancellation is the client's decision, not a fault to paper over.
+        assert!(!super::worth_retrying(&Status::new(Code::Cancelled, "ctx")));
+    }
+
     /// The h2 reset limit is a knob, so the question can be settled by an A/B.
     #[test]
     fn the_reset_limit_can_be_lifted_for_an_experiment() {
