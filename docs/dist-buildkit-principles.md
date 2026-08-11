@@ -856,68 +856,56 @@ Two corollaries worth having:
   paid never fills. The cheap target could not answer the question, and
   nothing about the mechanism was wrong.
 
-## 25. A lead has a fixed toll, so the smallest job pays the most
+## 25. A lead's cost barely depends on what is in it
 
-Ask of every solve, before dispatching it: is there more work here than it
-costs to place work at all? If not, keep it home. Idle machines are not a
-reason to send it - they are a reason to send something else.
+Measured across 414 leads on `+test-ast`: the median ran 2.6 seconds to do a
+`jq` and a `diff`, and duration barely varies with the graph. Bytes served
+correlate with lead duration at **r = 0.06**; op count with bytes at 0.32.
+Placing work costs what it costs, near enough regardless of the work.
 
-> **Measured, and it does not hold as a rule.** A 20-op floor on
-> `+test-ast` halved lead round trips and cut op duplication five-fold, and
-> still made the run about five times slower - because the seventeen graphs
-> it kept home included ones the whole build waited on. Op count measures
-> size; what decides is criticality. The toll is real, the floor is off by
-> default, and the version of this that survives is the observation, not the
-> rule: **small work is cheap to keep and cheap to send, so size is the
-> wrong question.**
->
-> **Corrected the same day.** This principle first read "a lead costs what
-> it fetches", and the byte number behind it was loopback traffic, not
-> network - see the correction in `fleet-findings.md`. Across 414 leads,
-> bytes served correlate with lead duration at r = 0.06. The toll is real
-> and near-constant; it is just not made of bytes on a wire.
+**The occupancy tell.** That run read occupancy 8.41 against a graph ceiling
+of 3.50, and both numbers were right. The ceiling is what the graph permits;
+being above it means the fleet was busier than its own critical path, which
+is only possible if distribution ADDED work rather than dividing it. When
+those two disagree in that direction, the overhead is the finding - do not
+go looking for a scheduling bug.
 
-`+test-ast` is the case. 412 solves, every one routed, none kept home; 204
-seconds baseline against 1773 in the fleet. The median lead ran 2.6 seconds
-to do a `jq` and a `diff`, and re-materialised ~26 MiB the machine already
-had in order to do it. Lead duration barely varies with what is in the
-lead: that is the toll.
+### What this principle used to say, and why it was wrong twice
 
-**73x.** Not 73% slower - 73 times the work, to produce the same artifacts.
+It first said **"a lead costs what it fetches"**, on a byte count that was
+loopback traffic rather than network. Then it said **"so refuse to dispatch
+a graph smaller than the toll"**, and that was tested: a 20-op floor halved
+lead round trips, cut op duplication five-fold, and made the run about five
+times slower - because the seventeen graphs it kept home included ones the
+whole build waited on.
 
-Occupancy read 8.41 against a graph ceiling of 3.50, and both numbers are
-right. The ceiling is what the graph permits; being above it means the
-fleet was busier than its own critical path, which is only possible if
-distribution added work rather than dividing it. When those two disagree in
-that direction, the overhead IS the finding - do not go looking for the
-scheduling bug.
+Both errors are the same error. A fixed toll is a real observation, but
+"therefore refuse small work" does not follow from it, because **size does
+not predict what a job costs the BUILD.** A three-op `FROM ... / RUN ...` at
+the head of the chain is small and everything waits on it.
 
-The proxy cannot know a graph's runtime, and does not need to. Op count is
-a crude proxy, known before dispatch, needing no history - principle 13.
-The asymmetry is what licenses the crudeness: being wrong costs one solve
-built at home; being absent cost 73x. Crude is not the same as arbitrary,
-though, and op count is weaker than it looked: against bytes served it
-correlates at 0.32. It is a proxy for the SIZE OF THE JOB, which is the
-thing that has to beat the toll - not for anything about transport.
+What did follow, once the toll was split into `placing / waiting /
+building`, is that the toll is not a dispatch cost at all: `placing` measured
+**0s (0%)**. Choosing a worker is free. The near-constant per-lead cost is
+queueing and re-materialisation - principles 27 and 18 - and both are fixed
+by placing work better, never by placing less of it.
 
-Distinguish this from a cap on WORKERS, which I wrote, tested, and removed
-in the same hour because it rested on reading 162 machine-seconds as wall
-clock. That retraction stands. This is a different question asked of a
-different object: not how many machines should participate, but whether
-this particular graph is worth a machine at all. Also not `min_siblings`,
-which asks whether anything else is in flight - that governs whether
-dispatch can OVERLAP, and it would not have stopped one of the 412.
+The floor ships, off by default, because the code is cheap and a
+criticality-aware version would want somewhere to hang. Nothing recommends
+turning it on.
 
-The general form, for any system that moves work to where the capacity is:
-the unit of dispatch has a floor price, and it is set by the context the
-work needs, not by the work. Below that floor, the fastest scheduler in the
-world loses to doing nothing.
+### The part worth keeping
 
-And the corollary the correction taught: **when you find a large number,
-find out what it is a number OF before you build on it.** The 24.7 GiB was
-a real counter, correctly incremented, measuring loopback. The 73x needed
-no explaining to be true - I explained it anyway, and the explanation was
-the part that was wrong.
+Two things generalise, and neither is the rule this principle started as.
+
+**A near-constant unit cost is a scaling limit, not a filter.** If every
+dispatch costs about the same, the answer is fewer, larger units - or a
+cheaper unit - not a size test at the door. The size test optimises a term
+that measured zero.
+
+**Distinguish this from a cap on WORKERS**, which I also wrote, tested and
+removed - that one rested on reading 162 machine-seconds as wall clock, and
+the retraction stands.
 
 ## 26. A mechanism and its absence must not print the same thing
 
