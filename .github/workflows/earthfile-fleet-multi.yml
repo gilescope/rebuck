@@ -1078,6 +1078,22 @@ jobs:
             echo "::warning::the fleet changed the outcome - see the diff above"
           fi
 
+      - name: is the daemon still alive
+        if: always()
+        run: |
+          set -uo pipefail
+          # The explanation the connection fixes keep failing to be. Several
+          # unrelated calls failing in the same instant, on SEPARATE
+          # connections, is what a daemon going away looks like - and four
+          # rounds of connection isolation have not stopped it, which is
+          # evidence against every theory that assumes the daemon is fine.
+          echo "own-bk: $(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} restarts={{.RestartCount}}' own-bk 2>&1)"
+          echo "--- its last words:"
+          docker logs --tail 25 own-bk 2>&1 | tail -25 || true
+          echo "--- host memory:"
+          free -m 2>/dev/null | head -2 || true
+          dmesg 2>/dev/null | grep -ci "out of memory\|oom-kill" || echo "0 oom lines (or dmesg not readable)"
+
       - name: what the fleet did
         if: always()
         env:
