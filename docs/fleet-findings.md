@@ -3579,3 +3579,49 @@ measured here would gain from a platform-diverse fleet.
 
 It needs a quiet pool and one run at a time, which is now the standing rule
 rather than a preference.
+
+## `+test-ast`: 73x amplification, and the byte model at its extreme
+
+The target chosen because nothing in it fails on purpose. It produced the
+worst result recorded, by a wide margin, and it is the clearest single piece
+of evidence in this document.
+
+|                   | baseline | fleet                                     |
+| ----------------- | -------- | ----------------------------------------- |
+| wall              | **204s** | **1773s**                                 |
+| failed targets    | 0        | 0 - parity                                |
+| solves            |          | 412, **all 412 routed, 0 home**           |
+| leads             |          | 414, **14,812s of lead work**             |
+| **amplification** |          | **73x**                                   |
+| occupancy         |          | 8.41, against a 7-machine ceiling of 3.50 |
+| total fetched     |          | **24.7 GiB**                              |
+
+Occupancy above the ceiling is not an error in either number. The ceiling is
+what the GRAPH allows; occupancy above it means the fleet was busier than
+the graph's own critical path - because distribution ADDED the work rather
+than dividing it.
+
+**24.7 gigabytes moved to run a 204-second build.** Median lead: 2.6
+seconds, 26 MiB fetched. Every one of those 412 tiny AST tests - `jq`, a
+`diff`, milliseconds of real work - was dispatched, and each had to
+materialise the `+earthly` image before it could run.
+
+This is the byte model from two sections up, taken to its conclusion. A lead
+costs what it fetches; a lead that fetches 26 MiB to run a `diff` is pure
+loss; and 412 of them is 73x.
+
+**It also settles a question I retracted an hour ago for the wrong reason.**
+I removed a worker-count cap because I had confused machine-seconds with
+wall clock, and that retraction stands - capping WORKERS was not justified.
+Capping which SOLVES are worth dispatching is a different rule and this is
+overwhelming evidence for it: 54 of 376 leads had 20 ops or fewer, cost 232
+seconds between them, and fetched 1.2 GiB to do work that a single machine
+does in the noise.
+
+The gate has to be on the solve, not the fleet: **do not dispatch a graph
+whose work is smaller than the bytes it would drag across.** Op count is a
+crude proxy for the first and is known before dispatch; the base image size
+is known too, because we mirrored it.
+
+`min_siblings` exists, is off, and gates on queue depth rather than size -
+it would not have stopped any of this.
