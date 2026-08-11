@@ -164,9 +164,6 @@ env:
   # Pinned by digest like everything else here: a collector that changes
   # under us changes the data.
   OTEL_IMAGE: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.145.0
-  OTEL_TRACES_EXPORTER: otlp
-  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
-  OTEL_EXPORTER_OTLP_ENDPOINT: http://127.0.0.1:4317
   # Cut the shared ancestry out as its own dispatch unit, publish it once,
   # and graft it into everything that follows.
   #
@@ -483,7 +480,7 @@ jobs:
           WORKER_N: ${{ matrix.n }}
         run: |
           set -uo pipefail
-          f="warm-${WORKER_N}.log"
+          f="$GITHUB_WORKSPACE/warm-${WORKER_N}.log"
           [ -f "$f" ] || { echo "not warmed"; exit 0; }
           # A warm-up still running when the fleet leg starts is not a
           # warm-up, it is contention - it competes for the same four cores
@@ -508,6 +505,15 @@ jobs:
   coordinator:
     needs: plan
     runs-on: ubuntu-latest
+    env:
+      # HERE, not workflow-wide. Set for every job, a worker's earthly also
+      # tries to export - to 127.0.0.1:4317 on a machine with no collector -
+      # and every build on every worker then retries until it gives up,
+      # logging `traces export: exporter export timeout` and slowing the work
+      # being measured. Found in a warm-up build's own log.
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://127.0.0.1:4317
     # 150, not 60. Sized for ONE group when that is what this built; the
     # whole `+test-no-qemu` is twelve of them and runs TWICE - baseline then
     # fleet. The first attempt was killed at 60 minutes, 51 of them into a
