@@ -4532,3 +4532,41 @@ Pre-registered, so the result cannot be read generously:
 - **A leg under 135 minutes**, or the workers hit their cap and the run
   dies rather than degrading - which is the failure this session already
   paid for once.
+
+### A quantitative prediction for the coverage re-run
+
+The old `+test-no-qemu` numbers, plus today's measured deltas, give
+something falsifiable rather than a hope.
+
+Last time, six runners: **186s / 525s**, 163 gateway solves, 130 routed,
+peak 14 in flight, 148 leads at p50 2,943ms and max 209,141ms, duplication
+8.0x sent and 2.3x built.
+
+What has changed since, all measured on `+test-ast`:
+
+| change | effect there |
+| ------ | ------------ |
+| prefetch actually announces | leg -30%, cold mount p50 -41% |
+| warmth traded against queue | leg -15%, every machine working, `waiting` -44% |
+
+Neither is workload-specific: one repairs a manifest lookup, the other a
+sort key. So the honest prediction for six runners is **525s falling to
+roughly 350-400s**, and I will take anything under 450s as the fixes
+carrying across and anything over 500s as them not.
+
+Three specific things to check, each of which can fail on its own.
+
+- **That 209-second lead.** It is 40% of the whole leg on its own. If it is
+  a single test group, no amount of placement helps and the ceiling is that
+  lead - which would be principle 19 in its purest form.
+- **Duplication 2.3x built.** `-balance` pushed `+test-ast`'s from 1.4x to
+  1.7x by design. On a wider graph with less sharing the same trade should
+  cost less, so 2.3x should not get much worse; if it does, the queue
+  penalty is mis-weighted for graphs this shape.
+- **Twelve machines against six.** The old run peaked at 14 in flight on six
+  runners, so it was queue-bound in exactly the way `-balance` addresses.
+  Twelve should help more here than it would on `+test-ast`, where peak was
+  11 and the graph's ceiling is 2.97x.
+
+If 525s does not move, the fixes are `+test-ast` artefacts and this document
+has been measuring one target's quirks all day.
