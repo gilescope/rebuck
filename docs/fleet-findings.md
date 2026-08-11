@@ -66,7 +66,9 @@ confident version first - which has happened to me, in this file, twice.
 | Choosing a worker costs nothing | `placing 0s (0%)` - no offer was ever refused |
 | Queueing WAS the largest cost | `waiting 6583s (65%)`; trading warmth against queue depth cut it to 3670s (45%) |
 | Spreading beats concentrating, and costs what it should | 1240s -> 1050s, no idle machine, `building` up 1004s against `waiting` down 2913s |
-| **Building is now the majority term** | 4521s (55%) - what `-imports` and `-bcast` aim at |
+| **Building is now the majority term** | 4521s (55%) - what `-bcast` aims at |
+| Placing a lead near its parent does not pay as weighted | `-imports`: 1050s -> 1475s, `waiting` +2849s, a machine idle again |
+| A brake sized for one preference does not hold two | the imports term fired 1724x against 361 reorders |
 | The instruments are not the problem | the status tap: 1ms across 3004 frames |
 
 **Open.** Believed for a reason, not measured.
@@ -75,7 +77,6 @@ confident version first - which has happened to me, in this file, twice.
 | -------- | -------------- |
 | How much of the fleet's traffic crosses a wire | `SERVED_BYTES` mixes loopback with peer serving; `SERVED_LOCAL_BYTES` exists and has never reported |
 | Whether the fleet repeats itself, and by how much | the coordinator reports 1.1x; the per-worker figure has never printed |
-| Whether placing a lead near its parent pays | `-balance-imports` in flight; it had to follow `-balance`, not precede it |
 | What made the reference run take 50 minutes | not the tap, which costs 1ms. Still unexplained |
 | What a 14-way target does with the fixes | it ran at 186s/525s BEFORE them - see the correction |
 
@@ -4333,7 +4334,7 @@ that cannot name its bucket cannot be argued for.
 | mechanism | bucket | why |
 | --------- | ------ | --- |
 | `-balance` | **waiting** | spreads leads off the machine they queue on |
-| `-imports` | building | places a lead where its parent already is, so buildkit's pull is local. `build_ms` brackets `build_subtree`, and the parent pull happens inside it |
+| `-imports` | building, **but it costs more in waiting** | it does reach `building` - 4521s to 4249s - and put 2849s back into `waiting` by sending leads to the machine that already had a queue. Off. |
 | `-bcast` | building | pre-positions announced layers on every worker rather than one, so the pull finds them present |
 | prefetch fix | building | done: 4,407s -> 3,518s, and 30% off the leg |
 | seeding | building | a warm cache mount, inside the same bracket |
