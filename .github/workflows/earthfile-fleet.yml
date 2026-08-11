@@ -54,7 +54,7 @@ on:
         default: "off"
       graft:
         description: "import an already-built ancestor instead of rebuilding it"
-        default: "1"
+        default: "0"
       cut_prefix:
         description: "publish the shared ancestry as its own subtree, once"
         default: "1"

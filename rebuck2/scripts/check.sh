@@ -15,6 +15,9 @@ echo "== fmt"
 cargo fmt --check
 echo "== clippy (-D warnings, as CI)"
 cargo clippy --all-targets --locked -- -D warnings
+echo "== workflow defaults"
+bash scripts/check-workflow-defaults.sh
+
 echo "== tests"
 cargo test --locked
 echo

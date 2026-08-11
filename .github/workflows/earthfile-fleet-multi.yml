@@ -91,7 +91,12 @@ on:
         default: "off"
       graft:
         description: "import an already-built ancestor instead of rebuilding it"
-        default: "1"
+        # OFF, and the env expression below cannot enforce that on its own:
+        # `inputs.graft || '0'` never sees an empty value while THIS default
+        # is non-empty, so the fallback was unreachable and grafting ran in
+        # every run after the commit that supposedly disabled it. Grafting is
+        # measured at +107s, so several "honest" comparisons carried it.
+        default: "0"
       cut_prefix:
         description: "publish the shared ancestry as its own subtree, once"
         default: "1"
