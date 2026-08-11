@@ -720,7 +720,7 @@ not, and no amount of work on the scheduler will make it one.
 
 `harvest-cache` is about eighty lines: build a small graph, solve it against
 a daemon, publish the result. Everything it does, this codebase already did
-somewhere. It took **seven** attempts to run once, and not one of the seven
+somewhere. It took **eight** attempts to run once, and not one of the eight
 was the mechanism being built.
 
 | # | fault                            | the convention nobody had written down                                  |
@@ -732,13 +732,15 @@ was the mechanism being built.
 | 5 | `object required`                | hand-built LLB must qualify an image name; `llb.Image` does it for you  |
 | 6 | `wanted id:path`                 | a mount with no `id=` is keyed on its destination, so id == path        |
 | 7 | `no active sessions`             | a sessionless solve cannot reach Docker Hub                             |
+| 8 | `HTTP response to HTTPS client`  | publishing is insecure per-solve; PULLING needs daemon config           |
 
 Read the last column again: **every one is a fact this project already knew
-and had encoded in exactly one place.** Number 7 is written in
-`fleet-findings.md` in capital letters. Number 2 is the reason
-`published_reference` returns a bare digest and has a paragraph explaining
-it. Number 5 was latent in three copies of the same prefixing rule, two of
-which were right.
+and had encoded in exactly one place.** Number 7 is written in `fleet-
+findings.md` in capital letters. Number 8 is a comment in the very workflow
+that then starts a daemon without the config that comment describes. Number 2
+is the reason `published_reference` returns a bare digest, and has a paragraph
+explaining it. Number 5 was latent in three copies of one prefixing rule, two
+of which were right.
 
 The lesson is not "be more careful". It is that a convention held in one
 call site is not a convention, it is a coincidence, and the second caller is
@@ -750,8 +752,8 @@ where you find out. Concretely:
   `image_identifier`, `parse_seed_pairs`. None needed new logic.
 - **Feedback speed is the whole cost.** Faults 1-4 cost a 25-minute fleet
   run each. Then a five-minute smoke test against a real daemon was added
-  and it caught 5 and 7 on its first two runs, one apiece. The mechanism was
-  never the expensive part; the loop was.
+  and it caught 5, 7 and 8 on its first three runs, one apiece. The
+  mechanism was never the expensive part; the loop was.
 - **Fail loudly at the seam, not at the end.** Every one of these was found
   in about a minute once the run finished, because the harvest step warns
   per-pair instead of assuming success. A silent seam would have presented
