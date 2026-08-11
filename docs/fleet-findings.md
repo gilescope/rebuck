@@ -3221,3 +3221,54 @@ what a permanent fleet does naturally.
 Two other numbers from the same run, both the best recorded: op duplication
 **1.2x** and amplification **3.4x**, down from 1.6x and 3.9x. Neither is
 attributable to seeding, which shipped nothing.
+
+## How cache-mount seeding works, end to end
+
+Thirteen faults and nine runs got here by accretion, so here it is in one
+piece. Read this instead of the chronology if you only want the mechanism.
+
+**The problem.** Lifting a cache mount is what makes a subtree dispatchable
+at all - otherwise it is grounded to the machine holding the mount - but
+lifting the hazard does not lift the cost. The worker builds against its own
+mount, which is empty, so a `go mod download` the coordinator did once is
+done again per machine. Measured at ~24s a lead across 64 leads.
+
+**The four things buildkit does that decide the design:**
+
+| fact                                                                                           | where                   | consequence                                                  |
+| ---------------------------------------------------------------------------------------------- | ----------------------- | ------------------------------------------------------------ |
+| a cache dir is keyed `id` + `":" + ref.ID()` when the mount has an input                       | `getRefCacheDir`        | the input selects WHICH directory, not just its contents     |
+| `ref.ID()` is `identity.NewID()` - random per record                                           | `cache/metadata.go`     | a near-miss op gets a fresh empty dir, never a partial match |
+| a dir with no existing record is created as copy-on-write over the input                       | `getRefCacheDirNoCache` | an input IS a seed                                           |
+| earthly mounts every cache with an input: `Scratch().File(Mkdir("/cache"))`, selector `/cache` | `runmount.go`           | nothing here works without reproducing that input exactly    |
+
+**The path, as built:**
+
+1. The proxy observes every graph earthly sends and lifts the exact input op
+   behind each cache id - `cache_mount_inputs`, bytes verbatim. Written to
+   `cache-inputs.tsv` under the banked store.
+2. `harvest-cache` reads that file, and for each `id:path` pair resolves the
+   id against what the daemon actually holds - exact match, then unique tail
+   match, since an unnamed mount is keyed `/run/cache/<hash>/<target>`.
+3. It solves a graph that mounts that cache read-only beside a scratch
+   output and copies across, then publishes the scratch as an image. The
+   rootfs is `readonly: true` with no output, which is what gets it a
+   mutable ref and keeps it out of the results.
+4. `seed_cache_mounts` rewrites dispatched graphs: for each seeded id, the
+   cache mount's input is REPLACED by the seed image and the old selector
+   cleared. Every dispatched graph in a run carries the same seed, so they
+   all key to one directory per worker and it accumulates normally.
+5. The seed is pre-positioned like any other layer, and resolved before use
+   so a seed nobody can pull is dropped rather than becoming a hard
+   dependency.
+
+**What is measured, and what is not.** The round trip is proven against a
+real daemon by `scripts/seed-check.sh` in about a minute, including at 200
+MiB where the per-worker cost is under a second. Whether it makes a fleet
+faster is not measured: the harvest has only just started reading the right
+directory, and the observed inputs a run writes are for the run after it.
+
+**The timing, which is a feature.** The proxy sees graphs during the fleet
+leg, after the harvest. So a run harvests using what the previous run
+observed - which is the warm-CI case rather than a simulation of it, and
+what a permanent fleet does without being asked.
