@@ -259,19 +259,9 @@ impl Proxy {
         // days were spent reading it as an answer from buildkitd.
         //
         // Anything non-zero here must exceed 5 minutes to be safe.
-        let ka: u64 = std::env::var("REBUCK2_KEEPALIVE_S")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        // See `keepalive`, which is now the only place that decides this.
         let endpoint = move |u: String| -> anyhow::Result<tonic::transport::Endpoint> {
-            let e = tonic::transport::Endpoint::new(u)?;
-            Ok(if ka == 0 {
-                e
-            } else {
-                e.http2_keep_alive_interval(std::time::Duration::from_secs(ka))
-                    .keep_alive_timeout(std::time::Duration::from_secs(ka * 3))
-                    .keep_alive_while_idle(true)
-            })
+            Ok(with_keepalive(tonic::transport::Endpoint::new(u)?))
         };
         let upstream_kept = upstream.clone();
         // HOW MANY connections, and whether Control shares one.
@@ -2014,15 +2004,60 @@ fn min_siblings() -> usize {
         .unwrap_or(0)
 }
 
-/// An endpoint shaped like the ones the proxy dials at startup.
+/// How often to ping upstream, if at all. ONE rule, for every connection.
 ///
-/// Same keepalive: a Session can sit idle while a nested build runs, and
-/// anything that reaps idle connections takes the build with it.
+/// It was two, and they disagreed. The startup endpoints were changed to
+/// default OFF after the arithmetic below was worked out; `session_endpoint`
+/// kept a hard-coded 20 seconds, with a comment reasoning that a Session
+/// sits idle while a nested build runs and something must hold it open. The
+/// reasoning is fine and the number is fatal, and the connection that then
+/// failed was a Session:
+///
+///     [proxy] session ... ended: h2 protocol error: error reading a body
+///
+/// From grpc-go's `http2_server.go`, vendored into the buildkitd we talk to:
+/// `maxPingStrikes = 2`, and `EnforcementPolicy.MinTime` defaulting to five
+/// minutes. A ping sooner than MinTime is a strike whether or not a stream
+/// is active; three strikes is GOAWAY with ENHANCE_YOUR_CALM and
+/// `too_many_pings`. tonic then reports the closed connection as `transport
+/// error`, which is its own Display string and not the daemon's - two days
+/// went into reading that as an answer from buildkitd.
+///
+/// So anything under five minutes is REFUSED rather than applied. Clamping
+/// it up would be worse: the operator would get a keepalive they did not ask
+/// for and the log would agree with them.
+fn keepalive(raw: Option<&str>) -> Option<std::time::Duration> {
+    const MIN_TIME_S: u64 = 300;
+    let n: u64 = raw?.parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    if n < MIN_TIME_S {
+        println!(
+            "[proxy] REBUCK2_KEEPALIVE_S={n} is under grpc-go's {MIN_TIME_S}s MinTime - \
+             every ping would be a strike and three is GOAWAY. Running with no keepalive."
+        );
+        return None;
+    }
+    Some(std::time::Duration::from_secs(n))
+}
+
+/// Apply [`keepalive`] to an endpoint.
+fn with_keepalive(e: tonic::transport::Endpoint) -> tonic::transport::Endpoint {
+    match keepalive(std::env::var("REBUCK2_KEEPALIVE_S").ok().as_deref()) {
+        Some(d) => e
+            .http2_keep_alive_interval(d)
+            .keep_alive_timeout(d * 3)
+            .keep_alive_while_idle(true),
+        None => e,
+    }
+}
+
+/// An endpoint shaped like the ones the proxy dials at startup.
 fn session_endpoint(upstream: &str) -> Result<tonic::transport::Endpoint, tonic::transport::Error> {
-    Ok(tonic::transport::Endpoint::new(upstream.to_owned())?
-        .http2_keep_alive_interval(std::time::Duration::from_secs(20))
-        .keep_alive_timeout(std::time::Duration::from_secs(60))
-        .keep_alive_while_idle(true))
+    Ok(with_keepalive(tonic::transport::Endpoint::new(
+        upstream.to_owned(),
+    )?))
 }
 
 /// Is this failure the connection's fault rather than the build's?
@@ -3347,6 +3382,27 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
 
 #[cfg(test)]
 mod tests {
+    /// The keepalive rule is arithmetic, so it belongs in one place.
+    ///
+    /// grpc-go, vendored into the buildkitd we talk to: `maxPingStrikes = 2`
+    /// and `EnforcementPolicy.MinTime` defaulting to five minutes. Any ping
+    /// interval under that earns a strike whether or not a stream is active,
+    /// and three strikes is GOAWAY / ENHANCE_YOUR_CALM / `too_many_pings`.
+    #[test]
+    fn a_keepalive_under_five_minutes_is_refused_not_applied() {
+        use std::time::Duration;
+        let k = super::keepalive;
+        assert_eq!(k(None), None, "off by default");
+        assert_eq!(k(Some("0")), None, "and off is spelled zero");
+        // The value that was hard-coded on the session connection, and the
+        // one the arithmetic says is fatal.
+        assert_eq!(k(Some("20")), None, "20s earns a strike every 20s");
+        assert_eq!(k(Some("299")), None, "just under MinTime is still under");
+        assert_eq!(k(Some("300")), Some(Duration::from_secs(300)));
+        assert_eq!(k(Some("600")), Some(Duration::from_secs(600)));
+        assert_eq!(k(Some("banana")), None, "unparseable is off, not fatal");
+    }
+
     /// A gateway READ may be retried where a solve may not.
     #[test]
     fn a_read_is_safe_to_replay_and_a_failed_build_is_not() {
