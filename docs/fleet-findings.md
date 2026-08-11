@@ -4969,3 +4969,38 @@ already computed at 2.32x on six machines - and `occupancy 3.35` against
 critical path permits.
 
 There is no scheduling work left worth doing on this target.
+
+### What `trapped ops` will and will not settle
+
+Written before the number, and the second half matters more than the first.
+
+**The threshold.** Suffix above 50% of refused ops: most of a `WITH DOCKER`
+graph is clean work sitting behind one host bind, and pointing `cut_prefix`
+at the excluded index is worth building. Below 20%: the bind is nearly the
+whole graph, and the 2.32x ceiling stands as physics. Between: marginal, and
+the answer depends on something this number does not measure.
+
+**What it cannot settle, whatever it says.** Ops are not time. A suffix of
+80% of the ops could be 5% of the seconds - one `RUN` that takes four
+minutes and forty trivial ops after it. So a large suffix is **necessary and
+not sufficient**: it says a cut is possible, never that it pays.
+
+That distinction is the whole lesson of `-minops`, which counted ops as a
+proxy for work, was measured five times slower, and taught that op count
+measures size while the fleet's problem is elsewhere. The same proxy is
+being used again here, for a different question, and it deserves the same
+suspicion.
+
+So the honest ladder is:
+
+1. `trapped ops` says whether a cut is **possible** - one run, already going.
+2. If it is, attributing the 738 seconds of home vertex time to before and
+   after the excluded index says whether it **pays** - a second instrument,
+   not yet built, and buildkit's vertex digests do not map to our op indices
+   without work.
+3. Only then is there a case for building the cut.
+
+Recording step 2 as unbuilt rather than discovering it after reading a
+promising number off step 1. The temptation with a good result is to skip
+straight to the mechanism, and this document is largely a record of what
+that costs.
