@@ -2290,6 +2290,7 @@ The standing goal is larger and larger parts of it, so here is the ledger.
 | `+test-no-qemu` (all 14) | 14 groups on one 192s base chain       | completes, parity, 508s vs 285s                    |
 | `+all-binaries`          | 5 cross-compiles off one `+code` stem  | **green both legs**, 262s vs 712s, 2.3x ceiling    |
 | `+lint-all`              | 3 independent lint targets, no docker  | parity, 88s vs 252s after the retry fix (was 628s) |
+| `+all-buildkitd`         | multi-arch buildkitd, needs qemu       | baseline leg alone ran past 55 min - see below     |
 
 Everything above the last line is the same shape wearing different numbers:
 a long serial base chain, then nested earthly builds that each want a 600
@@ -2530,14 +2531,16 @@ confirmed on duplication and unproven on time.
 branch - the API resolves a workflow by its presence there - so an
 experiment is chosen by where it is pushed.
 
-| branch                        | target                 | what it asks                                  |
-| ----------------------------- | ---------------------- | --------------------------------------------- |
-| `giles-dispatch-ci`           | `+test-no-qemu-group2` | the default rig; 1.4x ceiling                 |
-| `giles-dispatch-ci-binaries`  | `+all-binaries`        | five independent compiles; 2.3x ceiling       |
-| `giles-dispatch-ci-lint`      | `+lint-all`            | three cheap independent targets, no docker    |
-| `giles-dispatch-ci-buildkitd` | `+all-buildkitd`       | multi-arch buildkitd; the qemu path           |
-| `giles-dispatch-ci-all`       | `+all`                 | binaries plus two multi-arch images           |
-| `giles-dispatch-ci-seed`      | the DEFAULT target     | seeded mounts, so it is comparable with `-ci` |
+| branch                         | target                 | what it asks                                  |
+| ------------------------------ | ---------------------- | --------------------------------------------- |
+| `giles-dispatch-ci`            | `+test-no-qemu-group2` | the default rig; 1.4x ceiling                 |
+| `giles-dispatch-ci-binaries`   | `+all-binaries`        | five independent compiles; 2.3x ceiling       |
+| `giles-dispatch-ci-lint`       | `+lint-all`            | three cheap independent targets, no docker    |
+| `giles-dispatch-ci-buildkitd`  | `+all-buildkitd`       | multi-arch buildkitd; the qemu path           |
+| `giles-dispatch-ci-all`        | `+all`                 | binaries plus two multi-arch images           |
+| `giles-dispatch-ci-seed`       | the DEFAULT target     | seeded mounts, so it is comparable with `-ci` |
+| `giles-dispatch-ci-lint-seed`  | `+lint-all`, seeded    | the same, fifteen minutes instead of forty    |
+| `giles-dispatch-ci-lint-graft` | `+lint-all`, grafting  | can a WARM bank make grafting pay?            |
 
 `-seed` keeps the default target deliberately. It selects a mechanism rather
 than a workload, and a mechanism has to be measured against the same graph
