@@ -41,6 +41,7 @@ on:
       - giles-dispatch-ci
       - giles-dispatch-ci-binaries
       - giles-dispatch-ci-lint
+      - giles-dispatch-ci-buildkitd
       - giles-dispatch-ci-all
       - giles-dispatch-ci-seed
   workflow_dispatch:
@@ -409,6 +410,12 @@ jobs:
             "") case "$REF" in
                   *-binaries) target=+all-binaries ;;
                   *-lint)     target=+lint-all ;;
+                  # Multi-arch buildkitd on its own. It is the only untested
+                  # thing inside `+all`, and the only one that needs qemu -
+                  # `+test-no-qemu` exists because that path is painful here
+                  # - so it is worth finding out cheaply rather than ninety
+                  # minutes into the big target.
+                  *-buildkitd) target=+all-buildkitd ;;
                   *-all)      target=+all ;;
                   *)          target=+test-no-qemu-group2 ;;
                 esac ;;
