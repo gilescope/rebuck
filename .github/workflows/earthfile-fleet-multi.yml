@@ -50,6 +50,7 @@ on:
       - giles-dispatch-ci-ast-zstd
       - giles-dispatch-ci-ast-nobase
       - giles-dispatch-ci-ast-zstd-nobase
+      - giles-dispatch-ci-ast-minops
       - giles-dispatch-ci-ast-minops-nobase
       - giles-dispatch-ci-ast-seed
       - giles-dispatch-ci-lint-graft
