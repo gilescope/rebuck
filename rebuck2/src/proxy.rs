@@ -1594,8 +1594,10 @@ impl Wire {
         );
         for (i, s) in self.spans.iter().enumerate() {
             println!(
-                "[wire] solve {i} ms     : total {} = portable {} + peer {} + answer {} \
-                 (tax {})",
+                "[wire] solve {i} ms     : {}..{} total {} = portable {} + peer {} \
+                 + answer {} (tax {})",
+                s.start,
+                s.end(),
                 s.total,
                 s.portable,
                 s.adopt,
