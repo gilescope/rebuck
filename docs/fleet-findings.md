@@ -2695,3 +2695,36 @@ entirely.
 
 So it goes behind a flag, off by default, and gets measured rather than
 argued about.
+
+## What seeding should and should not be expected to buy
+
+Written before the first seeded run returns, because the cost table cannot
+settle it afterwards: a lead is counted under every cache id it names, so
+all four ids score nearly the same seconds and none of them is separable
+from the others. Only seeding subsets across runs can tell them apart.
+
+The prior, so the result can disagree with something:
+
+| cache                        | what a cold one costs                                                   | seed likely to pay? |
+| ---------------------------- | ----------------------------------------------------------------------- | ------------------- |
+| `go-build`                   | recompiling the dependency tree - CPU, minutes                          | **yes**             |
+| `/root/.cache/golangci_lint` | re-type-checking every package                                          | **yes**             |
+| `go-mod`                     | `go mod download` - network, and the network on a GitHub runner is good | **doubtful**        |
+
+`go-mod` is the big one and probably the least worth shipping. Its
+alternative is a fetch from the module proxy, which on a hosted runner is
+fast; the seed is hundreds of megabytes that every worker must pull AND
+unpack. Principle 18's last clause applies exactly here - pre-positioning
+shortens transfer, not unpack - and a cache whose miss path is a fast
+download is the worst trade available.
+
+`go-build` and `golangci_lint` are the opposite: their miss path is CPU that
+no amount of bandwidth avoids, and it is paid per worker per module.
+`+lint-all` loops over four Go modules, so the baseline fills those caches
+once and reuses them three times while each peer starts empty. That is the
+best explanation on offer for a lint costing the baseline ~15s and a peer
+~40s.
+
+So the failure this predicts, if seeding does not pay: the whole thing is
+dominated by shipping and unpacking `go-mod`, and the answer is to seed the
+compute caches and let the module cache download itself.
