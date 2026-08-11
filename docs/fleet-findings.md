@@ -2009,3 +2009,33 @@ The lesson generalises past this bug. A relay that drops errors is not
 quiet, it is lying, and it took five attempts at the wrong component before
 anyone asked the relay what it had seen. Principle 17's third shape - an
 instrument that cannot be distinguished from its own silence.
+
+## Warming inverts the argument for keeping serial work at home
+
+The warm-up builds the base chain on each worker in the window they would
+otherwise spend idle - `+earthly-docker` through to `SAVE IMAGE`, ~500 lines
+of build output per machine, `warm exit=0` on all six. Each worker therefore
+enters the fleet leg with the chain already in its own daemon cache.
+
+That inverts the `MIN_SIBLINGS` argument. Its reasoning was: the base chain
+is serial, so dispatching it gains nothing and pays a handover - keep it
+home. True on a COLD fleet. On a warm one the chain is not work at all on a
+worker, it is a cache hit, so dispatching it is the fastest thing available
+and keeping it home means the coordinator builds all 192 seconds of it.
+
+The coordinator is the machine that stays cold, and that is now the
+asymmetry to exploit rather than the one to avoid. Its baseline-leg daemon
+is a different container from its fleet-leg daemon, so peer 0 enters the
+fleet leg cold while six workers are warm.
+
+So the two mechanisms are not additive and may be opposed:
+
+| configuration          | who builds the base chain | expected |
+| ---------------------- | ------------------------- | -------- |
+| cold, dispatch         | a worker, from nothing    | 192s + transfer |
+| cold, MIN_SIBLINGS     | the coordinator           | 192s, no transfer |
+| warm, dispatch         | a warm worker: cache hit  | ~0 |
+| warm, MIN_SIBLINGS     | the cold coordinator      | 192s |
+
+If that table is right, `warm=1` wants `MIN_SIBLINGS=0`, and the two should
+never be measured together without saying which is expected to dominate.
