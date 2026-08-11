@@ -1802,3 +1802,35 @@ collapse is caused by the funnel and not by anything unfixable, which
 makes the next question worth asking: whether retrying a relayed solve
 once on `Unavailable` survives the same mass cancellation without
 relocating any work, and so without breaking `remote-test`.
+
+## What the traces say, which is not what the counts said
+
+earthly has been emitting OTLP spans all along and every run logged
+`traces export: exporter export timeout` while throwing them away. Collected,
+they name targets directly, and one run of the full `+test-no-qemu` gives
+two traces - one per leg:
+
+| leg               | target spans | span time | `+base` | `+base` mean |
+| ----------------- | ------------ | --------- | ------- | ------------ |
+| baseline (274.6s) | 1215         | 9713s     | 575x    | 3.0s         |
+| fleet (364.7s)    | 236          | 5250s     | 121x    | 20.5s        |
+
+`+base` resolved 696 times across the job looked like the finding of the
+week: 28% of all target time, the same target over and over, obviously
+something to memoise. Split by leg it says the opposite. The repetition is
+earthly's, not the fleet's - ONE machine does it 575 times and still
+finishes in 275s, because there it costs 3s. The fleet does it a fifth as
+often at seven times the price.
+
+So there is no redundant work to remove. The fleet's problem has only ever
+been the price of a unit, and this is the third instrument to say so
+independently: leads at 4.8x their local equivalent, op duplication at
+2.2x before affinity, and now a `FROM` at 7x. A `FROM` is a pull and an
+unpack, which is exactly the cost a cold machine pays and a warm one does
+not.
+
+That is also a warning about aggregate counts. `+base 696x, 4232s` was a
+real number, correctly computed, pointing at a fix that would have done
+nothing - and it took a per-leg tag to see it. Three instruments have now
+had to be corrected before they told the truth; this one was correct and
+still misleading until it was split.
