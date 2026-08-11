@@ -51,6 +51,12 @@ on:
       - giles-dispatch-ci-ast-nobase
       - giles-dispatch-ci-ast-zstd-nobase
       - giles-dispatch-ci-ast-minops
+      # `+all` with no baseline leg. The big target's baseline is itself an
+      # hour-scale build, and the job cap is 150 minutes: run both legs and
+      # the fleet leg gets killed rather than measured. Against a KNOWN
+      # target time this still answers the coverage question - how much of
+      # the Earthfile survives the fleet - which is the one `+all` is for.
+      - giles-dispatch-ci-all-nobase
       - giles-dispatch-ci-ast-minops-nobase
       - giles-dispatch-ci-ast-seed
       - giles-dispatch-ci-lint-graft
