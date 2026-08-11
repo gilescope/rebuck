@@ -2458,3 +2458,60 @@ reaches the per-platform targets through `COPY`, and earthly only writes
 `SAVE ARTIFACT ... AS LOCAL` for targets named on the command line. So there
 were genuinely no local files to hash, on either leg, and the check
 correctly said nothing rather than passing vacuously.
+
+## The h2 error is the daemon dying in ReadFile, not our connection
+
+Sixth theory, and the first with a stack trace attached.
+
+`+test-no-qemu-group2`, affinity on. The fleet leg reached 14 of 15 targets,
+named zero failed targets, and then earthly stopped with
+
+```text
+Error: h2 protocol error: error reading a body from connection
+```
+
+Our proxy logged one matching event - a session ending after 6673ms with the
+same message - and `own-bk` was `running exit=0 oom=false restarts=0`, so
+none of the "the daemon went away" theories fit either.
+
+But the daemon's log ended in a goroutine dump, and the frame above the
+gRPC plumbing is:
+
+```text
+github.com/moby/buildkit/frontend/gateway/pb._LLBBridge_ReadFile_Handler
+    /src/frontend/gateway/pb/gateway.pb.go:3241
+google.golang.org/grpc.(*Server).processUnaryRPC
+```
+
+So the daemon blew up inside a gateway **ReadFile**, which is a call this
+proxy relays, and the h2 error is the downstream consequence rather than the
+event. That is a different fault to any of the five already eliminated -
+keepalive, reset limits, connection sharing, session isolation, the daemon
+being killed - and it is the first one that names a method.
+
+The obvious suspect, unverified: earthly issues `ReadFile` and `ReadDir`
+against refs from solves we ROUTED, so the ref belongs to a build that
+happened on another machine and this daemon never created it. The call order
+in the same report is dense with `read_dir` and `read_file`, and the failure
+lands at the end of the run, which is when earthly reads results. A daemon
+should return an error for an unknown ref rather than unwind, so if that is
+the trigger there is a buildkit bug under it as well as ours.
+
+What is missing is the panic line itself: `docker logs --tail 25` captured
+the bottom of the stack and cut off the header that says why. Widened, and
+the daemon log is now an artifact - five theories were eliminated by
+guessing the right grep before the run, and this is the run that showed
+guessing has a limit.
+
+Affinity, from the same run, and it works:
+
+|                       | before | after                     |
+| --------------------- | ------ | ------------------------- |
+| op duplication, built | 2.9x   | **1.9x**                  |
+| `affinity` applied    | -      | 74                        |
+| peak in flight        | 22     | 17                        |
+| occupancy             | -      | 3.49                      |
+| cache-mount lead time | -      | 1,817,318ms over 51 leads |
+
+Wall clock is not readable from this run - the leg died - so affinity is
+confirmed on duplication and unproven on time.

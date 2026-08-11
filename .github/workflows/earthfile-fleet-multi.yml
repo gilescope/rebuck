@@ -1285,8 +1285,26 @@ jobs:
           # rounds of connection isolation have not stopped it, which is
           # evidence against every theory that assumes the daemon is fine.
           echo "own-bk: $(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} restarts={{.RestartCount}}' own-bk 2>&1)"
+          # THE PANIC LINE, not the last 25 frames of the stack under it.
+          #
+          # `--tail 25` caught the bottom of a goroutine dump ending in
+          # `_LLBBridge_ReadFile_Handler` and cut off the one line that says
+          # WHY - which is the line the whole "h2 protocol error" hunt has
+          # been missing through five eliminated theories. A stack trace is
+          # hundreds of lines; the header is one.
+          docker logs own-bk > /tmp/own-bk.log 2>&1 || true
+          echo "--- did it panic?"
+          grep -anE "^(panic|fatal error):|runtime error:|invalid memory address|SIGSEGV" \
+            /tmp/own-bk.log | head -5 || echo "no panic line"
+          # And the twenty lines after the FIRST one, which is where the
+          # offending call is named.
+          first=$(grep -anE "^(panic|fatal error):" /tmp/own-bk.log | head -1 | cut -d: -f1)
+          if [ -n "${first:-}" ]; then
+            echo "--- from the panic:"
+            sed -n "${first},$((first + 20))p" /tmp/own-bk.log
+          fi
           echo "--- its last words:"
-          docker logs --tail 25 own-bk 2>&1 | tail -25 || true
+          tail -25 /tmp/own-bk.log || true
           echo "--- host memory:"
           free -m 2>/dev/null | head -2 || true
           dmesg 2>/dev/null | grep -ci "out of memory\|oom-kill" || echo "0 oom lines (or dmesg not readable)"
@@ -1460,5 +1478,9 @@ jobs:
             /tmp/baseline.failed
             /tmp/fleet.targets
             /tmp/baseline.targets
+            # The daemon's own log. It carried a goroutine dump ending in
+            # `_LLBBridge_ReadFile_Handler` that the step could only print
+            # the tail of, and there was no copy to go back to.
+            /tmp/own-bk.log
           if-no-files-found: warn
           retention-days: 7
