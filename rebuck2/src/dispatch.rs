@@ -492,6 +492,42 @@ pub fn is_build_verdict(why: &str) -> bool {
     !(129..=192).contains(&code)
 }
 
+/// An image name as an LLB source identifier buildkit will accept.
+///
+/// `llb.Image("busybox:1")` normalises before building the op. Hand-built
+/// LLB does not, and buildkit's `NewImageIdentifier` runs containerd's
+/// `reference.Parse` and then insists the result has an `Object` - a tag or
+/// a digest. Containerd's parser wants a registry host to find one, so
+/// `busybox:1` yields nothing and the solve dies as
+///
+///     failed to load cache key: object required
+///
+/// which names neither the image nor the field it is complaining about.
+///
+/// Every other identifier this crate writes is fully qualified already -
+/// mirrored bases are `host/repo@sha256:...` - so the harvest was the first
+/// caller to find this, and it found it in the five-minute smoke test
+/// rather than in a twenty-five minute fleet run.
+pub fn image_identifier(name: &str) -> String {
+    if name.contains("://") {
+        return name.to_owned();
+    }
+    // A host has a dot, a colon, or is `localhost`. Anything else is a
+    // Docker Hub short name and needs the library path spelled out, exactly
+    // as `reference.ParseNormalizedNamed` would.
+    let first = name.split('/').next().unwrap_or(name);
+    let has_host =
+        name.contains('/') && (first.contains('.') || first.contains(':') || first == "localhost");
+    let full = if has_host {
+        name.to_owned()
+    } else if name.contains('/') {
+        format!("docker.io/{name}")
+    } else {
+        format!("docker.io/library/{name}")
+    };
+    format!("docker-image://{full}")
+}
+
 /// Take a warm cache mount OUT of a daemon, as a layer.
 ///
 /// The other half of [`seed_cache_mounts`]. Seeding needs an image whose
@@ -515,11 +551,7 @@ pub fn is_build_verdict(why: &str) -> bool {
 pub fn harvest_graph(base: &str, cache_id: &str, dest: &str) -> pb::Definition {
     let src = pb::Op {
         op: Some(pb::op::Op::Source(pb::SourceOp {
-            identifier: if base.contains("://") {
-                base.to_owned()
-            } else {
-                format!("docker-image://{base}")
-            },
+            identifier: image_identifier(base),
             ..Default::default()
         })),
         ..Default::default()
@@ -2083,6 +2115,32 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// The shapes `image_identifier` has to get right.
+    #[test]
+    fn a_short_image_name_is_qualified_the_way_buildkit_expects() {
+        let f = super::image_identifier;
+        assert_eq!(f("busybox:1"), "docker-image://docker.io/library/busybox:1");
+        assert_eq!(f("alpine"), "docker-image://docker.io/library/alpine");
+        // A user's repo on Docker Hub: `docker.io`, but no `library`.
+        assert_eq!(
+            f("earthbuild/buildkitd:v1"),
+            "docker-image://docker.io/earthbuild/buildkitd:v1"
+        );
+        // A real host is left alone. A dot, a colon or `localhost` is what
+        // distinguishes one from a Docker Hub namespace - the same rule
+        // containerd's ParseNormalizedNamed uses, and the reason
+        // `earthbuild/buildkitd` is NOT a host called `earthbuild`.
+        assert_eq!(f("ghcr.io/x/y:v2"), "docker-image://ghcr.io/x/y:v2");
+        assert_eq!(
+            f("172.17.0.1:15000/r/s@sha256:aa"),
+            "docker-image://172.17.0.1:15000/r/s@sha256:aa"
+        );
+        assert_eq!(f("localhost:5000/x:1"), "docker-image://localhost:5000/x:1");
+        // Already an identifier: untouched, whatever the scheme.
+        assert_eq!(f("docker-image://x/y:1"), "docker-image://x/y:1");
+        assert_eq!(f("git://h/r.git#main"), "git://h/r.git#main");
+    }
+
     /// When may a peer's failure be reported as the client's?
     ///
     /// Only when the peer ran what the client asked for. Making a graph
@@ -2195,6 +2253,20 @@ mod tests {
         use bollard_buildkit_proto::pb;
         use prost::Message;
 
+        // FULLY QUALIFIED, and the short form must be made so.
+        //
+        // `llb.Image("busybox:1")` normalises before building the op;
+        // hand-built LLB does not, and buildkit's
+        // `NewImageIdentifier` runs containerd's `reference.Parse` and then
+        // insists on `ref.Object`. Given `busybox:1` that parse yields no
+        // object and the solve dies as
+        //
+        //     failed to load cache key: object required
+        //
+        // which names neither the image nor the field. Every other
+        // identifier this crate writes happens to be fully qualified
+        // already - mirrored bases are `host/repo@sha256:...` - so the
+        // harvest was the first to find it.
         let def = super::harvest_graph("busybox:1", "go-mod", "/go/pkg/mod");
         let ops: Vec<pb::Op> = def
             .def
@@ -2205,7 +2277,19 @@ mod tests {
         // Source, exec, terminal - and the terminal is LAST, which is the
         // only place loadLLB will accept it.
         assert_eq!(ops.len(), 3);
-        assert!(matches!(ops[0].op, Some(pb::op::Op::Source(_))));
+        let Some(pb::op::Op::Source(src)) = &ops[0].op else {
+            panic!("the first op is the base image")
+        };
+        assert_eq!(
+            src.identifier, "docker-image://docker.io/library/busybox:1",
+            "a short image name has to be qualified before buildkit sees it"
+        );
+        // A name that is already qualified is left exactly as written.
+        let q = super::harvest_graph("ghcr.io/x/y:v2", "id", "/d");
+        let Some(pb::op::Op::Source(s2)) = &pb::Op::decode(q.def[0].as_slice()).unwrap().op else {
+            panic!()
+        };
+        assert_eq!(s2.identifier, "docker-image://ghcr.io/x/y:v2");
         assert!(ops[2].op.is_none(), "the terminal carries no union");
 
         let Some(pb::op::Op::Exec(e)) = &ops[1].op else {
