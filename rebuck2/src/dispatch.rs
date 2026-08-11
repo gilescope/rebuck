@@ -643,6 +643,20 @@ pub fn seed_cache_mounts(def: &pb::Definition, seeds: &BTreeMap<String, String>)
     let mut seed_digest: BTreeMap<String, String> = BTreeMap::new();
     let mut present: BTreeSet<String> = def.def.iter().map(|b| digest(b)).collect();
     for image in seeds.values().collect::<BTreeSet<_>>() {
+        // REFUSED, not wrapped. `sha256:abc` is content with no location -
+        // what `build_subtree` answers with - and `docker-image://sha256:abc`
+        // parses nowhere. The seeding path emitted exactly that for one
+        // commit and it would have failed quietly, because the resolve check
+        // drops a seed it cannot read and the run then reports that seeding
+        // did not pay for a mechanism that never addressed anything.
+        // `solve::pullable` is what turns one into the other.
+        if image.starts_with("sha256:") {
+            println!(
+                "[dispatch] seed {image} is a bare digest, not a reference - \
+                 needs a registry in front of it (see solve::pullable). Skipping."
+            );
+            continue;
+        }
         let (bytes, d) = source_for(image);
         if present.insert(d.clone()) {
             added.push(bytes);
@@ -2340,6 +2354,18 @@ mod tests {
         // appending an input must not renumber the existing ones.
         assert_eq!(e.mounts[0].input, 0);
         assert_eq!(inputs[0].digest, base_d);
+
+        // A BARE DIGEST is refused rather than wrapped. `sha256:abc` is
+        // what `build_subtree` answers with - content, no location - and
+        // `docker-image://sha256:abc` parses nowhere. The seeding path built
+        // exactly that for one commit, and it would have failed quietly:
+        // the resolve check drops a seed it cannot read, so the run reports
+        // that seeding did not pay for a mechanism that never addressed
+        // anything. `solve::pullable` is what turns one into the other.
+        let mut bare = std::collections::BTreeMap::new();
+        bare.insert("go-mod".to_owned(), "sha256:deadbeef".to_owned());
+        let out = super::seed_cache_mounts(&def, &bare);
+        assert_eq!(out.def, def.def, "a bare digest seeds nothing");
 
         // Nothing to seed is the identity, byte for byte. A transform that
         // rewrites a graph it had no reason to touch changes every digest
