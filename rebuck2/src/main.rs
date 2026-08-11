@@ -16,6 +16,7 @@ mod exec;
 mod gateway;
 mod github;
 mod lease;
+mod mech;
 mod mesh;
 mod norm;
 mod proxy;

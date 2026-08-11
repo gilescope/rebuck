@@ -1773,6 +1773,7 @@ impl Driver {
             });
         }
         drop(ws);
+        crate::mech::applied("prefetch");
         println!(
             "[driver] prefetch: {} blob(s) announced to {n} worker(s)",
             digests.len()

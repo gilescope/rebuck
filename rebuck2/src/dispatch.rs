@@ -677,6 +677,7 @@ pub fn offer_order_warm(
     // Warmest first, then emptiest so the work starts soonest. Ties on id,
     // so two drivers deciding from the same state offer in the same order
     // rather than crossing over.
+    let before: Vec<u64> = able.iter().map(|c| c.id).collect();
     able.sort_by_key(|c| {
         (
             std::cmp::Reverse(warm(c.id)),
@@ -684,6 +685,12 @@ pub fn offer_order_warm(
             c.id,
         )
     });
+    // APPLIED means the order changed, not that the flag was on. An
+    // affinity that never reorders anything is indistinguishable from one
+    // that is switched off, and that distinction has cost three mechanisms.
+    if before != able.iter().map(|c| c.id).collect::<Vec<u64>>() {
+        crate::mech::applied("affinity");
+    }
     able.into_iter().map(|c| c.id).collect()
 }
 

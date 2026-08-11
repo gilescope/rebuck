@@ -1248,6 +1248,21 @@ impl Wire {
         sizes.sort_unstable();
         let median = sizes.get(sizes.len() / 2).copied().unwrap_or(0);
         println!("[wire] ---- what this build looked like ----");
+        // ON is not the claim; APPLIED is. A mechanism enabled by the
+        // environment and never reached is reported as such, because three
+        // of them have now been measured as "does not help" while never
+        // running at all.
+        println!(
+            "[wire] mechanisms   : {}",
+            crate::mech::summary(&[
+                ("affinity", crate::dispatch::affinity()),
+                ("min_siblings", min_siblings() > 0),
+                (
+                    "prefetch",
+                    std::env::var("REBUCK2_PREFETCH").as_deref() == Ok("1")
+                ),
+            ])
+        );
         println!("[wire] gateway solves : {}", self.solves);
         println!("[wire] ops total      : {}", self.ops);
         println!(
@@ -2264,6 +2279,9 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 // idea would have been discarded without ever being enabled.
                 let offer = allowed && worth && saturated && crowded;
                 if allowed && worth && saturated && !crowded {
+                    // Kept home BECAUSE of the rule - the outcome it exists
+                    // to change.
+                    crate::mech::applied("min_siblings");
                     *self
                         .wire
                         .held()

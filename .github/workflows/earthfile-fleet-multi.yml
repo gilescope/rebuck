@@ -1107,7 +1107,7 @@ jobs:
             sleep 1
           done
           echo "=== dispatchable at all?"
-          grep -E '^\[wire\] (gateway solves|solves routed|built at home|placed|not routed)' proxy.log || true
+          grep -E '^\[wire\] (mechanisms|gateway solves|solves routed|built at home|placed|not routed)' proxy.log || true
           echo "=== which RUNNER took what"
           grep -oE -- '-> worker [0-9]+' proxy.log | sort | uniq -c || true
 
