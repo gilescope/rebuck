@@ -621,8 +621,47 @@ pub fn worth_offering(
     est_p90.unwrap_or(running_for) > STALL
 }
 
+/// Should placement prefer a peer that already holds the subtree's ancestry?
+///
+/// OFF by default, like every other mechanism here, and for the same reason:
+/// three of them have now been measured and all three cost more than they
+/// saved. This one at least SUBTRACTS handovers rather than adding them, but
+/// that is an argument, and arguments have lost to measurements every time.
+pub fn affinity() -> bool {
+    std::env::var("REBUCK2_AFFINITY").as_deref() == Ok("1")
+}
+
 /// Who to offer this subtree to, best first. Empty means build it yourself.
+// Affinity-free form. The driver always passes a warmth function now, so
+// this survives as the definition of the default order and is what the
+// ordering tests pin.
+#[allow(dead_code)]
 pub fn offer_order(v: &Verdict, cands: &[Candidate], allow: Allow) -> Vec<u64> {
+    offer_order_warm(v, cands, allow, &|_| 0)
+}
+
+/// [`offer_order`], preferring a peer that already holds this subtree's
+/// ancestry.
+///
+/// `warm(id)` is how much of this work that peer has already done - ops it
+/// has built before. Least-loaded-first alone is load BALANCING, and
+/// balancing is the wrong default here: it spreads work that shares
+/// ancestry across machines, and every machine that touches a layer pays to
+/// pull, decompress and unpack it into its own snapshotter. Measured on a
+/// full `+test-no-qemu`: `op duplication 2.3x built`, every op materialised
+/// on 2.3 machines against an ideal of 1.
+///
+/// Affinity is applied SUBJECT to capacity, never instead of it - the
+/// `free() > 0` filter still runs first, so a warm peer that would decline
+/// is still not asked. Within what is left, warmth outranks emptiness and
+/// emptiness breaks ties, so this refines the old order rather than
+/// replacing it.
+pub fn offer_order_warm(
+    v: &Verdict,
+    cands: &[Candidate],
+    allow: Allow,
+    warm: &dyn Fn(u64) -> u32,
+) -> Vec<u64> {
     let mut able: Vec<&Candidate> = cands
         .iter()
         .filter(|c| {
@@ -635,10 +674,16 @@ pub fn offer_order(v: &Verdict, cands: &[Candidate], allow: Allow) -> Vec<u64> {
             ) && c.load.free() > 0
         })
         .collect();
-    // Emptiest first, so the work starts soonest. Ties on id, so two
-    // drivers deciding from the same state offer in the same order rather
-    // than crossing over.
-    able.sort_by_key(|c| (std::cmp::Reverse(c.load.free()), c.id));
+    // Warmest first, then emptiest so the work starts soonest. Ties on id,
+    // so two drivers deciding from the same state offer in the same order
+    // rather than crossing over.
+    able.sort_by_key(|c| {
+        (
+            std::cmp::Reverse(warm(c.id)),
+            std::cmp::Reverse(c.load.free()),
+            c.id,
+        )
+    });
     able.into_iter().map(|c| c.id).collect()
 }
 
@@ -661,9 +706,21 @@ pub struct Placement {
 }
 
 impl Placement {
+    #[allow(dead_code)] // as offer_order: the default order, pinned by tests
     pub fn new(v: &Verdict, cands: &[Candidate], allow: Allow) -> Self {
+        Placement::new_warm(v, cands, allow, &|_| 0)
+    }
+
+    /// [`Placement::new`], preferring peers that already hold the ancestry.
+    /// See [`offer_order_warm`].
+    pub fn new_warm(
+        v: &Verdict,
+        cands: &[Candidate],
+        allow: Allow,
+        warm: &dyn Fn(u64) -> u32,
+    ) -> Self {
         Placement {
-            order: offer_order(v, cands, allow),
+            order: offer_order_warm(v, cands, allow, warm),
             next: 0,
             outstanding: None,
         }
@@ -1875,6 +1932,75 @@ mod tests {
             def: encoded,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn work_goes_where_its_ancestry_already_is() {
+        // Least-loaded-first is load balancing, and load balancing is the
+        // WRONG default here: it spreads work that shares ancestry across
+        // machines, and every machine that touches a layer has to pull,
+        // decompress and unpack it into its own snapshotter. Measured on a
+        // full +test-no-qemu: `op duplication 2.3x built` - every op
+        // materialised on 2.3 machines on average, against an ideal of 1.
+        //
+        // So prefer a peer that already has the ancestry, and only among
+        // peers that could take the work anyway. Affinity subject to
+        // capacity, never instead of it.
+        let load = |slots, driver, peer| Load {
+            slots,
+            driver,
+            peer,
+        };
+        let cand = |id, l| Candidate {
+            id,
+            platform: "linux/arm64".to_owned(),
+            load: l,
+        };
+        let v = ok_verdict();
+        let cands = [
+            cand(1, load(4, 0, 0)),
+            cand(2, load(4, 0, 0)),
+            cand(3, load(4, 0, 0)),
+        ];
+
+        // All three idle: without affinity, id order. With it, the peer that
+        // already built some of this goes first.
+        assert_eq!(
+            offer_order(&v, &cands, Allow::default()),
+            vec![1, 2, 3],
+            "unchanged when nothing is warm"
+        );
+        let warm = |id: u64| if id == 3 { 7 } else { 0 };
+        assert_eq!(
+            offer_order_warm(&v, &cands, Allow::default(), &warm),
+            vec![3, 1, 2],
+            "the peer holding the ancestry is asked first"
+        );
+
+        // Capacity still wins over warmth when the warm peer is FULL: a peer
+        // that would decline is a wasted round trip however warm it is.
+        let full = [
+            cand(1, load(4, 0, 0)),
+            cand(2, load(4, 4, 0)), // saturated
+        ];
+        assert_eq!(
+            offer_order_warm(&v, &full, Allow::default(), &|id| if id == 2 {
+                99
+            } else {
+                0
+            }),
+            vec![1],
+            "a saturated peer is not offered to, warm or not"
+        );
+
+        // And among equally warm peers the emptiest still goes first, so
+        // affinity refines the old order rather than replacing it.
+        let mixed = [cand(1, load(4, 3, 0)), cand(2, load(4, 1, 0))];
+        assert_eq!(
+            offer_order_warm(&v, &mixed, Allow::default(), &|_| 5),
+            vec![2, 1],
+            "equal warmth falls back to emptiest first"
+        );
     }
 
     #[test]

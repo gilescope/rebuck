@@ -1517,13 +1517,37 @@ impl Driver {
                 .collect()
         };
 
-        let mut placement = crate::dispatch::Placement::new(
+        // How much of this subtree each candidate has already built. The
+        // pairs are already tracked for the duplication metric; this is the
+        // same fact read for a decision instead of a report.
+        let warm: std::collections::BTreeMap<u64, u32> = if crate::dispatch::affinity() {
+            use prost::Message;
+            let ops: Vec<String> =
+                bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice())
+                    .map(|d| d.def.iter().map(|b| crate::store::sha256_hex(b)).collect())
+                    .unwrap_or_default();
+            let pairs = self.op_by_worker.lock().await;
+            candidates
+                .iter()
+                .map(|c| {
+                    let n = ops
+                        .iter()
+                        .filter(|o| pairs.contains(&((*o).clone(), c.id)))
+                        .count();
+                    (c.id, n as u32)
+                })
+                .collect()
+        } else {
+            Default::default()
+        };
+        let mut placement = crate::dispatch::Placement::new_warm(
             &verdict,
             &candidates,
             // The SAME policy the gateway used to decide this was worth
             // offering. Two answers to one question is what left four idle
             // workers looking like the reason nothing moved.
             crate::dispatch::policy(),
+            &|id| warm.get(&id).copied().unwrap_or(0),
         );
         let Some(first) = placement.offer() else {
             drop(open);

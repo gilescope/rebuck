@@ -41,6 +41,10 @@ on:
       home_slots:
         description: "slots peer 0 keeps for itself - 0 forces dispatch"
         default: "0"
+      affinity:
+        description: prefer a peer that already holds the subtree's ancestry (1/0)
+        type: string
+        default: '0'
       fleet_cache:
         description: "off | read | readwrite. ALL THREE measured slower - see docs"
         default: "off"
@@ -116,6 +120,12 @@ env:
   # the Docker VM's disk and both legs fail for a reason that has nothing
   # to do with caching.
   REBUCK2_FLEET_CACHE: ${{ inputs.fleet_cache || 'off' }}
+  # Placement by ancestry rather than by load. Least-loaded-first is load
+  # BALANCING, which spreads work sharing a base across machines - and every
+  # machine that touches a layer pulls, decompresses and unpacks it into its
+  # own snapshotter. Measured at 2.2-2.3x built duplication against an ideal
+  # of 1. Off until it is measured, like the other three.
+  REBUCK2_AFFINITY: ${{ inputs.affinity || '0' }}
   # Cut the shared ancestry out as its own dispatch unit, publish it once,
   # and graft it into everything that follows.
   #
