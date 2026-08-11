@@ -1634,6 +1634,7 @@ impl Wire {
                 ("?affinity_imports", crate::dispatch::imports_affinity(),),
                 ("?prefetch_broadcast", crate::worker::prefetch_broadcast()),
                 ("?balance", crate::dispatch::balance_warmth()),
+                ("peer_cache_mounts", crate::dispatch::policy().caches,),
                 (
                     "prefetch",
                     std::env::var("REBUCK2_PREFETCH").as_deref() == Ok("1")
@@ -2921,6 +2922,25 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 // times on a target with 407 git-grounded solves. The graph
                 // is re-inspected strictly after the rewrite, below.
                 let allowed = verdict.dispatchable_once_mirrored(policy);
+                // The most load-bearing flag in the system, and until now the
+                // only one with no counter and no line in the report.
+                // REBUCK2_PEER_CACHE_MOUNTS=1 is set in every CI run, and 359
+                // of 414 leads in the last one named a cache mount - so this
+                // exception is what makes roughly seven dispatches in eight
+                // legal at all. It has never been reported either way.
+                //
+                // ONCE PER SOLVE, here, rather than inside `dispatchable_when`
+                // which the ordering code calls speculatively per candidate.
+                // An inflated count is a different lie, not a safer one.
+                if allowed
+                    && policy.caches
+                    && verdict
+                        .exclusions
+                        .iter()
+                        .any(|(_, e)| *e == crate::dispatch::Exclusion::CacheMount)
+                {
+                    crate::mech::applied("peer_cache_mounts");
+                }
                 if !allowed {
                     // Name the secret, not just its kind. A build that
                     // declares none can still be full of them: a frontend
