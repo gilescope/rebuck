@@ -46,6 +46,8 @@ on:
       - giles-dispatch-ci-seed
       - giles-dispatch-ci-lint-seed
       - giles-dispatch-ci-binaries-seed
+      - giles-dispatch-ci-ast
+      - giles-dispatch-ci-ast-seed
       - giles-dispatch-ci-lint-graft
       - giles-dispatch-ci-buildkitd-arm
   workflow_dispatch:
@@ -470,6 +472,14 @@ jobs:
             "") case "$workload" in
                   *-binaries) target=+all-binaries ;;
                   *-lint)     target=+lint-all ;;
+                  # THREE independent AST test groups, no docker, no
+                  # nested earthly - and, unlike +lint-all, nothing in it
+                  # fails on purpose. Every speed number so far has had a
+                  # deliberately-red target somewhere in it, which the
+                  # verdict fix made cheaper but did not remove: a failing
+                  # target still costs one peer attempt plus one build at
+                  # home. This is the clean measurement.
+                  *-ast)      target=+test-ast ;;
                   # Multi-arch buildkitd on its own. It is the only untested
                   # thing inside `+all`, and the only one that needs qemu -
                   # `+test-no-qemu` exists because that path is painful here
