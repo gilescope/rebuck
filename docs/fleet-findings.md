@@ -4614,3 +4614,50 @@ ambiguous.
 It goes next, on `+test-no-qemu`, alone. Ahead of `-bcast`: `-bcast` shaves
 a term that is 55% spread over 400 leads, and this one addresses five leads
 holding perhaps 40% of the critical path on the target that matters.
+
+## `-imports` fails, in exactly the way it was predicted to
+
+| | `-balance` | `+ -imports` |
+| -------------------- | ------------------- | ------------------- |
+| **fleet leg** | **1050s** | **1475s** |
+| amplification | 38.9x | 48.7x |
+| total lead time | 8,239s | 10,769s |
+| `waiting` | 3,670s (45%) | **6,519s (61%)** |
+| `building` | 4,521s (55%) | 4,249s (39%) |
+| **placement spread** | 37/38/58/68/77/140 | **44/51/54/83/182, 1 idle** |
+| built duplication | 1.7x | 2.1x |
+| `affinity_imports` | - | **1724** |
+
+The prediction, written before the run:
+
+> `building` could fall while `waiting` rises by more. Sending a lead to the
+> machine holding its parent means sending it to a machine that has been
+> doing related work - which is a machine with a queue.
+
+**That is what happened, to the number.** `building` fell 272s, which is the
+term `-imports` aims at and it did move it. `waiting` rose 2,849s, which is
+ten times as much, and one machine went idle again. The whole `-balance`
+gain was given back and then some.
+
+`affinity_imports` fired **1,724 times** against `balance`'s 361. The
+imports term did not tip a few close decisions - it fired roughly five times
+for every time the queue penalty reordered anything, which means it was not
+being traded against the brake, it was overwhelming it. Principle 27 named
+this shape and I built the counterweight at one warm item per queued lead;
+adding a second 64-point term to warmth doubled the thing being braked
+without touching the brake.
+
+**The fix is arithmetic, not conceptual.** Both terms are worth 64 and a
+queued lead cancels 64, so a candidate holding a parent AND a warm mount now
+needs three leads queued before an idle machine wins. Either the imports
+term is worth less than a mount, or a queued lead is worth more than one
+item - and the two runs give a ratio to pick from rather than a guess:
+`waiting` rose 78% when `affinity_imports` fired 4.8x per `balance`
+application.
+
+Not tuning it now. `-imports` goes off, `-balance` alone is the shipped
+configuration at 1050s, and the coverage run - which is what the mandate is
+actually about - goes next on six machines. Tuning a weight against
+`+test-ast`, whose ceiling is 2.97x and where two machines are idle for
+structural reasons, is exactly the mistake the ordering argument warned
+about two sections up.
