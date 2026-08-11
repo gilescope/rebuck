@@ -58,6 +58,7 @@ on:
       # the Earthfile survives the fleet - which is the one `+all` is for.
       - giles-dispatch-ci-all-nobase
       - giles-dispatch-ci-ast-imports
+      - giles-dispatch-ci-tests-nobase
       - giles-dispatch-ci-ast-minops-nobase
       - giles-dispatch-ci-ast-seed
       - giles-dispatch-ci-lint-graft
@@ -529,6 +530,14 @@ jobs:
                   # - so it is worth finding out cheaply rather than ninety
                   # minutes into the big target.
                   *-buildkitd) target=+all-buildkitd ;;
+                  # The WIDEST target in the Earthfile: +test-no-qemu is
+                  # +test-misc, twelve independent groups and +test-no-qemu-
+                  # slow. Fourteen siblings with no dependency between them,
+                  # which is the shape a fleet exists for - against +all,
+                  # whose four children each hide a chain. Only group2 has
+                  # ever been run, and one group of fourteen is not a
+                  # measurement of what distribution is worth here.
+                  *-tests)    target=+test-no-qemu ;;
                   *-all)      target=+all ;;
                   *)          target=+test-no-qemu-group2 ;;
                 esac ;;

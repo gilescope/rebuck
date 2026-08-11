@@ -3973,3 +3973,38 @@ it is cheap.
 `scratchpad/read-run.sh` now pulls a run's logs and prints exactly the lines
 that decide something. Written mid-run because the last four analyses were
 ad-hoc greps and two of them read a counter as the wrong quantity.
+
+## How much of the Earthfile has actually been through the fleet
+
+Read from earthbuild's own `Earthfile` rather than assumed, because the
+coverage half of this exercise had drifted into a performance investigation
+and the ladder turned out not to be the one I had in my head.
+
+| target | children | run through the fleet |
+| ------------------ | ------------------------------------ | --------------------- |
+| `+lint-all` | 3 | yes, many times |
+| `+all-binaries` | 5 cross-compiles | yes |
+| `+all-buildkitd` | multi-arch, qemu | yes, at parity |
+| `+test-ast` | 3 AST groups | yes |
+| `+test-no-qemu-group2` | 1 of 14 | yes, the default |
+| **`+all`** | `+all-buildkitd`, `+all-binaries`, `+earthly-docker`, `+prerelease` | **never** |
+| **`+test-no-qemu`** | `+test-misc`, twelve groups, `+test-no-qemu-slow` | **never** |
+
+Two things this corrects.
+
+`+all` is **not** the test surface. It is the release chain -
+buildkitd, binaries, the docker image and the prerelease bundle. Three of
+its four children have been through the fleet individually, so it is less of
+a coverage step than its name suggests.
+
+`+test-no-qemu` is the widest target in the file: **fourteen siblings with
+no dependency between them.** That is exactly the shape a fleet exists for,
+and precisely one of the fourteen has ever been run. Every speed number in
+this document comes from targets with 3 to 5 branches, on a fleet of 6 or 7
+machines - which is a fleet that cannot be busy, whatever the scheduler
+does. The Amdahl ceilings recorded here (3.11x, 3.50x, 5.99x) are the
+workload's, not the system's, and principle 19 says so; the fourteen-way
+target is the first chance to test that claim.
+
+So the coverage ladder is `+test-no-qemu` first and `+all` second, which is
+the reverse of the order I had been assuming. `-tests` selects it.
