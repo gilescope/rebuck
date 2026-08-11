@@ -910,6 +910,17 @@ fn fetch_summary() {
         return;
     }
     let mib = bytes as f64 / 1048576.0;
+    // LOCAL against REMOTE. This registry binds 0.0.0.0, so its clients are
+    // the buildkitd beside it and any peer wanting a result - one number for
+    // two very different costs. Asserting the total was loopback, on the
+    // strength of the registry having no UPSTREAM, was wrong twice over: that
+    // field says where it fetches, not who it serves.
+    let local = crate::registry::SERVED_LOCAL_BYTES.load(Relaxed);
+    println!(
+        "[worker] of that, {} MiB went to a client on this box and {} MiB left it",
+        local / 1_048_576,
+        bytes.saturating_sub(local) / 1_048_576,
+    );
     println!(
         "[worker] served {mib:.0} MiB in {ms}ms ({:.1} MB/s from this registry - \
          the REST of a lead's time is unpack)",

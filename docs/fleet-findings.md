@@ -3631,13 +3631,23 @@ it would not have stopped any of this.
 Written the same day as the section above, after taking the per-lead lines
 apart. The 73x is real; the explanation I attached to it is not.
 
-`SERVED_BYTES` counts HTTP responses out of a worker's **own** registry.
-The worker starts that registry with `serve_with_upstream(addr, reg, None)` -
-no upstream - and its only client is the buildkitd on the same box. So
-"24.7 GiB fetched" is 24.7 GiB served over loopback, mostly off local disk.
-The network share is separately counted, and it is small: `[cas] fetches:
-local=2 peer=37 driver=82` is the high-water mark on any worker, a few
-hundred fetches across the whole run, most of them frontier blobs.
+`SERVED_BYTES` counts HTTP responses out of a worker's **own** registry -
+bytes it handed to a client, which is a different thing from bytes it
+fetched to serve them. What the worker *fetches* is counted separately and
+is small: `[cas] fetches: local=2 peer=37 driver=82` is the high-water mark
+on any worker, a few hundred fetches across the whole run, most of them
+frontier blobs. So "24.7 GiB fetched" is wrong on its face.
+
+> **And the first replacement was wrong too.** I wrote that the 24.7 GiB
+> was therefore loopback, reasoning from `serve_with_upstream(addr, reg,
+> None)`. That argument does not hold: `upstream` says where the registry
+> FETCHES when it misses, not who it SERVES. A worker binds
+> `--registry-bind 0.0.0.0:15000`, so its clients are the buildkitd beside
+> it **and any peer pulling a result**. Nothing in the run separates them.
+> `SERVED_LOCAL_BYTES` now does, splitting on whether the client's socket is
+> loopback, with unknown counted as remote so the unproven case cannot land
+> on the flattering side. Until a run reports it, the local/remote split of
+> that 24.7 GiB is **unknown**.
 
 The registry file already carried the warning, ten lines above the counter:
 

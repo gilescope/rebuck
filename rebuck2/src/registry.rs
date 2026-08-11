@@ -1268,6 +1268,12 @@ pub fn router_with_upstream<S: RegistryStore>(
         .layer(axum::middleware::from_fn(
             |req: axum::extract::Request, next: axum::middleware::Next| async move {
                 let path = req.uri().path().to_owned();
+                // Absent unless the server was built with connect info, and
+                // absent in every router test. Treated as remote either way.
+                let peer = req
+                    .extensions()
+                    .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                    .map(|c| c.0);
                 let t = std::time::Instant::now();
                 let res = next.run(req).await;
                 SERVED_MS.fetch_add(
@@ -1281,6 +1287,9 @@ pub fn router_with_upstream<S: RegistryStore>(
                     .and_then(|v| v.parse::<u64>().ok())
                 {
                     SERVED_BYTES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                    if served_locally(peer) {
+                        SERVED_LOCAL_BYTES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                    }
                     // PER BLOB, because a total cannot answer "how big are
                     // the layers". 433 MiB over 304 requests could be three
                     // hundred small ones or two enormous ones, and which it
@@ -1330,6 +1339,24 @@ pub async fn serve<S: RegistryStore>(addr: SocketAddr, store: Arc<S>) -> Result<
 /// A worker reads its inputs from a registry where home reads its own content
 /// store, so this is the size of the difference.
 pub static SERVED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Of those bytes, the ones that went to a client on this machine.
+///
+/// `SERVED_BYTES` alone cannot answer "did the fleet move this", and I
+/// asserted it could - reading `upstream: None` (where this registry FETCHES)
+/// as proof that everything it SERVED was loopback. A worker binds
+/// `0.0.0.0:15000`; its clients are its own buildkitd and any peer wanting a
+/// result. `SERVED_BYTES - SERVED_LOCAL_BYTES` is what actually left the box.
+pub static SERVED_LOCAL_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Did this response go to something on this machine?
+///
+/// `None` - no `ConnectInfo`, so the server was built without it - counts as
+/// REMOTE. The unproven case must not land on the flattering side of a split
+/// that exists because a flattering reading was already wrong once.
+pub fn served_locally(peer: Option<std::net::SocketAddr>) -> bool {
+    peer.is_some_and(|a| a.ip().is_loopback())
+}
 
 /// Milliseconds this registry spent serving those bytes.
 ///
@@ -1430,53 +1457,82 @@ pub async fn serve_with_upstream<S: RegistryStore>(
     //
     // Stopping the SERVER is this function's business. Ending the PROCESS
     // belongs to whoever owns it.
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            if let Some(m) = TRAFFIC.held().as_ref() {
-                let total: u64 = m.values().sum();
-                // KiB, because the first run of this reported "0 MiB"
-                // against 89 blob GETs and that reads like a broken counter
-                // rather than a coordinator that genuinely served under a
-                // megabyte. It was the truncation.
-                let kib = SERVED_BYTES.load(std::sync::atomic::Ordering::Relaxed) / 1024;
-                println!("[registry] served {total} requests, {kib} KiB: {m:?}");
-                let big = BIG_BLOBS.lock().expect("blob sizes");
-                // By BYTES SERVED - size times count - not by size. The
-                // biggest single layer is rarely the biggest cost; a 26 MiB
-                // one served 76 times beats a 190 MiB one served once.
-                let mut v: Vec<(&String, &(u64, u64))> = big.iter().collect();
-                v.sort_by_key(|(_, (n, c))| std::cmp::Reverse(n * c));
-                let distinct: u64 = v.iter().map(|(_, (n, _))| *n).sum();
-                let served: u64 = v.iter().map(|(_, (n, c))| n * c).sum();
-                println!(
-                    "[registry] {} blobs over 1MiB: {} MiB distinct, {} MiB served \
+    // WITH CONNECT INFO, or `served_locally` sees `None` for every request
+    // and the split it exists to make reads 100% remote - the same shape of
+    // bug as a mechanism that is on and never applied.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+        if let Some(m) = TRAFFIC.held().as_ref() {
+            let total: u64 = m.values().sum();
+            // KiB, because the first run of this reported "0 MiB"
+            // against 89 blob GETs and that reads like a broken counter
+            // rather than a coordinator that genuinely served under a
+            // megabyte. It was the truncation.
+            let kib = SERVED_BYTES.load(std::sync::atomic::Ordering::Relaxed) / 1024;
+            println!("[registry] served {total} requests, {kib} KiB: {m:?}");
+            let big = BIG_BLOBS.lock().expect("blob sizes");
+            // By BYTES SERVED - size times count - not by size. The
+            // biggest single layer is rarely the biggest cost; a 26 MiB
+            // one served 76 times beats a 190 MiB one served once.
+            let mut v: Vec<(&String, &(u64, u64))> = big.iter().collect();
+            v.sort_by_key(|(_, (n, c))| std::cmp::Reverse(n * c));
+            let distinct: u64 = v.iter().map(|(_, (n, _))| *n).sum();
+            let served: u64 = v.iter().map(|(_, (n, c))| n * c).sum();
+            println!(
+                "[registry] {} blobs over 1MiB: {} MiB distinct, {} MiB served \
                      ({:.1}x re-served); largest by served:",
-                    v.len(),
-                    distinct / 1_048_576,
-                    served / 1_048_576,
-                    if distinct > 0 {
-                        served as f64 / distinct as f64
-                    } else {
-                        0.0
-                    }
-                );
-                for (d, (n, c)) in v.into_iter().take(8) {
-                    println!(
-                        "[registry]   {:>7} MiB x{:<4} {}",
-                        n / 1_048_576,
-                        c,
-                        &d[..24.min(d.len())]
-                    );
+                v.len(),
+                distinct / 1_048_576,
+                served / 1_048_576,
+                if distinct > 0 {
+                    served as f64 / distinct as f64
+                } else {
+                    0.0
                 }
+            );
+            for (d, (n, c)) in v.into_iter().take(8) {
+                println!(
+                    "[registry]   {:>7} MiB x{:<4} {}",
+                    n / 1_048_576,
+                    c,
+                    &d[..24.min(d.len())]
+                );
             }
-        })
-        .await?;
+        }
+    })
+    .await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    /// Which side of the wire did these bytes go?
+    ///
+    /// `SERVED_BYTES` is one number for two things: a worker's registry is
+    /// bound to `0.0.0.0:15000`, so its clients are the buildkitd on the same
+    /// box AND any peer that wants a result. I asserted the whole 24.7 GiB
+    /// was loopback on the strength of `upstream: None` - which says where
+    /// this registry FETCHES from, not who it SERVES. Unproven either way
+    /// until the two are counted apart.
+    #[test]
+    fn served_bytes_split_by_who_asked() {
+        use std::net::SocketAddr;
+        let local: SocketAddr = "127.0.0.1:41234".parse().unwrap();
+        let v6: SocketAddr = "[::1]:41234".parse().unwrap();
+        let peer: SocketAddr = "10.1.0.7:41234".parse().unwrap();
+        assert!(super::served_locally(Some(local)));
+        assert!(super::served_locally(Some(v6)), "v6 loopback is loopback");
+        assert!(!super::served_locally(Some(peer)));
+        // Unknown counts as REMOTE. The whole point is to stop over-claiming
+        // loopback, so the unproven case must not land on the flattering
+        // side of the split.
+        assert!(!super::served_locally(None));
+    }
+
     /// A blob served twice is two facts, not one.
     ///
     /// `BIG_BLOBS` kept digest -> size and OVERWROTE on the second serve, so
