@@ -729,6 +729,17 @@ jobs:
     # A measurement that cannot finish is not a slow measurement, it is no
     # measurement.
     timeout-minutes: 150
+    env:
+      # READ BY THE WORKER, not the coordinator. `my_share` calls
+      # prefetch_broadcast(), so setting this in the coordinator job - where
+      # every other new flag correctly lives, because the driver reads them -
+      # would leave `-bcast` switched on in the branch name and off in the
+      # process that acts on it.
+      #
+      # Caught by asking which JOB reads each variable rather than which job
+      # sets it. That is the sixth mechanism-that-cannot-fire in this session
+      # and the second I wrote myself.
+      REBUCK2_PREFETCH_ALL: ${{ needs.plan.outputs.bcast }}
     permissions:
       contents: read
     steps:
@@ -1022,7 +1033,6 @@ jobs:
       REBUCK2_COMPRESSION: ${{ needs.plan.outputs.compression }}
       REBUCK2_MIN_OPS: ${{ needs.plan.outputs.minops }}
       REBUCK2_AFFINITY_IMPORTS: ${{ needs.plan.outputs.imports }}
-      REBUCK2_PREFETCH_ALL: ${{ needs.plan.outputs.bcast }}
       REBUCK2_BALANCE: ${{ needs.plan.outputs.balance }}
       REBUCK2_SKIP_BASELINE: ${{ needs.plan.outputs.nobase }}
       # ONE path for the binary in this job. It was written out twice and
