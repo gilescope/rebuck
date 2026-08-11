@@ -1234,6 +1234,21 @@ jobs:
           # first colon and rejected `id == path`, which is every mount
           # buildkit keys on its destination. It now lives in Rust with a
           # test per shape.
+          # CAN this daemon be seeded at all? Thirty seconds, before the
+          # twenty-five minutes that would otherwise be needed to find out.
+          # It writes a marker into one cache mount, harvests it, and reads
+          # it back out of a DIFFERENT one seeded from that harvest - so a
+          # pass means the mechanism works here and a failure names which
+          # half is broken.
+          #
+          # Advisory: a failure warns and the harvest is still attempted,
+          # because the check uses its own cache ids and could conceivably
+          # fail where the real ones succeed. It is here to make a null
+          # result legible, not to gate one.
+          "$RB" check-seeding --bk "$LAN:28372" --registry "172.17.0.1:15000" \
+            --base "172.17.0.1:15000/library/busybox:1" \
+            || echo "::warning::seeding does not work on this daemon - see above"
+
           # The base comes from OUR registry, not Docker Hub. `build_subtree`
           # solves without a session, and a sessionless solve cannot reach
           # Hub - buildkit asks the session for credentials even anonymously
