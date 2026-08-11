@@ -1054,7 +1054,7 @@ jobs:
             echo "(no lead timings - nothing was dispatched)"
           fi
           echo "=== the coordinator's registry"
-          grep -E '^\[registry\] served' proxy.log || true
+          grep -E '^\[registry\] (served|  *[0-9]+ MiB|[0-9]+ blobs)' proxy.log || true
           echo "   uploads far below blobs served means results were fetched"
           echo "   from the runners that built them, which is the whole point."
           echo "=== wall"

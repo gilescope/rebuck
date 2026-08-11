@@ -1267,6 +1267,7 @@ pub fn router_with_upstream<S: RegistryStore>(
         // A metric applied at the edge is a metric no test can see.
         .layer(axum::middleware::from_fn(
             |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                let path = req.uri().path().to_owned();
                 let res = next.run(req).await;
                 if let Some(n) = res
                     .headers()
@@ -1275,6 +1276,20 @@ pub fn router_with_upstream<S: RegistryStore>(
                     .and_then(|v| v.parse::<u64>().ok())
                 {
                     SERVED_BYTES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                    // PER BLOB, because a total cannot answer "how big are
+                    // the layers". 433 MiB over 304 requests could be three
+                    // hundred small ones or two enormous ones, and which it
+                    // is decides whether splitting the seed across workers
+                    // helps or whether one layer dominates and has to be
+                    // shipped whole regardless.
+                    if n > 1_000_000 {
+                        if let Some(d) = path.rsplit('/').next() {
+                            BIG_BLOBS
+                                .lock()
+                                .expect("blob sizes")
+                                .insert(d.to_owned(), n);
+                        }
+                    }
                 }
                 res
             },
@@ -1305,6 +1320,13 @@ pub async fn serve<S: RegistryStore>(addr: SocketAddr, store: Arc<S>) -> Result<
 /// A worker reads its inputs from a registry where home reads its own content
 /// store, so this is the size of the difference.
 pub static SERVED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Blobs over a megabyte, by digest. A total says how much moved; this says
+/// whether it moved as a few large layers or many small ones, which is the
+/// difference between "split the seed" and "one layer dominates".
+pub static BIG_BLOBS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, u64>>,
+> = std::sync::LazyLock::new(Default::default);
 
 pub static TRAFFIC: std::sync::Mutex<Option<std::collections::BTreeMap<String, u64>>> =
     std::sync::Mutex::new(None);
@@ -1392,6 +1414,22 @@ pub async fn serve_with_upstream<S: RegistryStore>(
                 // megabyte. It was the truncation.
                 let kib = SERVED_BYTES.load(std::sync::atomic::Ordering::Relaxed) / 1024;
                 println!("[registry] served {total} requests, {kib} KiB: {m:?}");
+                let big = BIG_BLOBS.lock().expect("blob sizes");
+                let mut v: Vec<(&String, &u64)> = big.iter().collect();
+                v.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+                let sum: u64 = v.iter().map(|(_, n)| **n).sum();
+                println!(
+                    "[registry] {} blobs over 1MiB, {} MiB of the total; largest:",
+                    v.len(),
+                    sum / 1_048_576
+                );
+                for (d, n) in v.into_iter().take(8) {
+                    println!(
+                        "[registry]   {:>7} MiB  {}",
+                        n / 1_048_576,
+                        &d[..24.min(d.len())]
+                    );
+                }
             }
         })
         .await?;

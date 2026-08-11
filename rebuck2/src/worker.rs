@@ -515,6 +515,36 @@ async fn serve_get(
 /// Split out of the control loop so the decision chain is readable in one
 /// place: the checks run in the order `dispatch::consider` defines, and the
 /// build only happens after all of them pass.
+/// Which peer is responsible for pulling this blob from the driver first.
+///
+/// The seed is one machine wide today: the first worker to want the base
+/// finds nothing on any peer and pulls all of it from the coordinator - 75
+/// blobs against 3 from peers, measured - while the others wait. The cascade
+/// behind that works (the next worker got 26 of 36 from peers); it is the
+/// SEED that does not spread.
+///
+/// So each blob is assigned an owner by its own hash. Six workers then take
+/// six different sixths off the coordinator at once and exchange the rest.
+/// No coordination: every worker computes the same answer from the same
+/// inputs, which is the only reason two of them do not fetch the same blob.
+///
+/// Sorted first, so the answer cannot depend on the order a peer map happens
+/// to iterate in - that would defeat the agreement it exists to provide.
+fn seeder_for(hash: &str, peers: &[String]) -> Option<String> {
+    if peers.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<&String> = peers.iter().collect();
+    sorted.sort();
+    // The digest's TRAILING hex digits, in order. The first version reversed
+    // them, which puts the least-variable digits in the low bits - over 1200
+    // synthetic hashes that sent almost everything to one worker, and the
+    // spread test caught it.
+    let tail = &hash[hash.len().saturating_sub(8)..];
+    let n = u64::from_str_radix(tail, 16).unwrap_or(0);
+    Some(sorted[(n % sorted.len() as u64) as usize].clone())
+}
+
 /// How a nested build should reach the daemon on THIS machine, if it should.
 ///
 /// `None` leaves the graph alone, which means a nested earthly keeps dialling
@@ -1281,6 +1311,54 @@ async fn sync_shard(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn every_blob_has_one_agreed_seeder_and_the_load_spreads() {
+        use super::seeder_for;
+
+        // The seed is serial today: worker 1 arrives first, finds nothing on
+        // any peer, and pulls the whole base off the coordinator - measured
+        // at 75 blobs from the driver and 3 from peers - while five workers
+        // wait for it. The cascade behind it works (worker 2 then got 26 of
+        // 36 from peers); it is the seed that is one machine wide.
+        //
+        // So each blob gets a designated seeder, chosen from its own hash.
+        // Six workers then pull six different sixths of the base off the
+        // coordinator at once and exchange the rest.
+        let peers: Vec<String> = (1..=6).map(|n| format!("w{n}")).collect();
+
+        // AGREED, without anyone coordinating: every worker computes the
+        // same seeder for the same blob, or two of them fetch it and the
+        // split has bought nothing.
+        let h = "abc123";
+        let a = seeder_for(h, &peers);
+        assert!(a.is_some());
+        assert_eq!(a, seeder_for(h, &peers), "same answer twice");
+        let shuffled: Vec<String> = peers.iter().rev().cloned().collect();
+        assert_eq!(
+            a,
+            seeder_for(h, &shuffled),
+            "order of the peer list must not matter"
+        );
+
+        // SPREAD. A thousand blobs over six workers should not pile up: the
+        // point is six seeds at once, so no worker may take a large share.
+        let mut hits = std::collections::BTreeMap::new();
+        for n in 0..1200 {
+            let who = seeder_for(&format!("{:064x}", n), &peers).expect("a seeder");
+            *hits.entry(who).or_insert(0u32) += 1;
+        }
+        assert_eq!(hits.len(), 6, "every worker seeds something");
+        let (lo, hi) = (
+            *hits.values().min().expect("min"),
+            *hits.values().max().expect("max"),
+        );
+        assert!(hi < lo * 2, "lopsided: {hits:?}");
+
+        // Degenerate cases are not panics.
+        assert_eq!(seeder_for("abc", &[]), None);
+        assert_eq!(seeder_for("", &peers), seeder_for("", &peers));
+    }
 
     #[test]
     fn a_nested_host_is_never_loopback_and_never_a_surprise() {
