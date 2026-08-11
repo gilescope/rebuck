@@ -14,10 +14,14 @@ on:
     paths: ['.github/workflows/otel-reach.yml']
   workflow_dispatch:
     inputs:
-      endpoint:
-        description: host:port of the collector
+      host:
+        description: public address to probe
         type: string
-        default: 81.2.89.216:4318
+        default: 81.2.89.216
+      ports:
+        description: space-separated ports to try
+        type: string
+        default: 4317 4318 443 80 5090 5091 5092
 
 permissions:
   contents: read
@@ -27,20 +31,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: can we reach it
+      - name: which ports reach the box
         env:
           TOKEN: ${{ secrets.OTLP_TOKEN }}
-          EP: ${{ inputs.endpoint }}
+          HOST: ${{ inputs.host || '81.2.89.216' }}
+          PORTS: ${{ inputs.ports || '4317 4318 443 80 5090 5091 5092' }}
         run: |
           set -uo pipefail
-          echo "tcp connect:"
-          timeout 10 bash -c "cat < /dev/null > /dev/tcp/${EP%%:*}/${EP##*:}" \
-            && echo "  open" || echo "  refused or filtered"
-          echo "otlp POST (200 = accepted, 401 = reachable but token wrong):"
-          code=$(curl -sk -o /dev/null -m 15 -w '%{http_code}' \
-            -X POST "https://$EP/v1/traces" \
-            -H "Authorization: Bearer $TOKEN" \
-            -H 'Content-Type: application/json' \
-            -d '{"resourceSpans":[]}' || true)
-          echo "  http_code=$code"
-          [ "$code" = "200" ] && echo "REACHABLE" || echo "NOT REACHABLE from a GitHub runner"
+          # A TCP connect says the router forwards the port. The OTLP POST
+          # then says whether what answers is our collector: 200 accepted,
+          # 401 reachable but the token is wrong, anything else is some other
+          # service on a port that happens to be open.
+          for p in $PORTS; do
+            if timeout 8 bash -c "cat < /dev/null > /dev/tcp/$HOST/$p" 2>/dev/null; then
+              code=$(curl -sk -o /dev/null -m 12 -w '%{http_code}' \
+                -X POST "https://$HOST:$p/v1/traces" \
+                -H "Authorization: Bearer $TOKEN" \
+                -H 'Content-Type: application/json' \
+                -d '{"resourceSpans":[]}' || true)
+              echo "port $p: OPEN, otlp says $code"
+            else
+              echo "port $p: closed"
+            fi
+          done
