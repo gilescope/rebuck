@@ -355,6 +355,22 @@ pub struct Driver {
     /// appear eighteen times each, which says nothing about whether either
     /// costs a minute or a second.
     cache_cost: tokio::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
+    /// Lead durations split by whether the mounts they named were seeded.
+    ///
+    /// A WITHIN-RUN comparison, which is the only kind this rig can make
+    /// honestly: baseline variance here runs about 30%, so a 10% effect
+    /// between two runs is unreadable. Seed a SUBSET of the cache ids and
+    /// the same run contains both arms - leads that met a filled mount and
+    /// leads that met an empty one.
+    ///
+    /// It also separates what the per-id cost table cannot. That table
+    /// charges a lead to every id it names, so `go-mod`, `go-build` and the
+    /// rest all score nearly the same seconds and none of them can be told
+    /// apart. Seeding one and not the others makes the difference show up
+    /// as duration.
+    seeded_leads: tokio::sync::Mutex<Vec<u64>>,
+    cold_leads: tokio::sync::Mutex<Vec<u64>>,
+
     /// The same milliseconds, counted ONCE per lead.
     ///
     /// The map above adds a lead's whole duration to every cache id it
@@ -516,6 +532,8 @@ impl Driver {
             leases: crate::lease::Leases::default(),
             subtrees: Mutex::new(std::collections::HashMap::new()),
             cache_cost: Default::default(),
+            seeded_leads: Default::default(),
+            cold_leads: Default::default(),
             cache_lead_ms: Default::default(),
             cache_leads: Default::default(),
             peak_inflight: Default::default(),
@@ -858,6 +876,18 @@ impl Driver {
                                 let mut cw = self.cache_by_worker.lock().await;
                                 for id in &caches {
                                     cw.insert((id.clone(), worker_id));
+                                }
+                            }
+                            // Which arm this lead is in. `any`, not `all`:
+                            // one filled mount is enough to change what the
+                            // build does, and a lead naming a seeded id
+                            // alongside an unseeded one is not a control.
+                            if !caches.is_empty() {
+                                let seeds = crate::dispatch::cache_seeds();
+                                if caches.iter().any(|id| seeds.contains_key(id)) {
+                                    self.seeded_leads.lock().await.push(ms);
+                                } else {
+                                    self.cold_leads.lock().await.push(ms);
                                 }
                             }
                             let mut c = self.cache_cost.lock().await;
@@ -2082,6 +2112,24 @@ impl Driver {
     /// The most subtrees in flight at once, over the whole run.
     pub fn peak_inflight(&self) -> usize {
         self.peak_inflight.load(Ordering::Relaxed)
+    }
+
+    /// `(median of seeded leads, n, median of cold leads, n)`.
+    ///
+    /// Medians, not means: one 148-second lead in a set of forty drags a
+    /// mean somewhere no lead ever was, and this report has been misread
+    /// that way before.
+    pub async fn seeded_split(&self) -> (u64, usize, u64, usize) {
+        let median = |v: &mut Vec<u64>| -> u64 {
+            if v.is_empty() {
+                return 0;
+            }
+            v.sort_unstable();
+            v[v.len() / 2]
+        };
+        let mut a = self.seeded_leads.lock().await.clone();
+        let mut b = self.cold_leads.lock().await.clone();
+        (median(&mut a), a.len(), median(&mut b), b.len())
     }
 
     /// Lead time spent in leads that named ANY cache mount, and how many.

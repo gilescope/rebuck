@@ -2254,15 +2254,29 @@ pub async fn serve(
         // fleet as busier or idler than it was.
         let (peak_solves, occupancy, ceiling) = wire.held().report();
         let finite = ceiling_with(ceiling, machines);
-        let solo = solo.held();
-        let medians: std::collections::BTreeMap<usize, u64> = solo
-            .iter()
-            .map(|(p, v)| {
-                let mut v = v.clone();
-                v.sort_unstable();
-                (*p, v[v.len() / 2])
-            })
-            .collect();
+        // SCOPED, and that brace is load-bearing. `solo.held()` is a std
+        // Mutex guard, which is not Send, so anything awaited while it is
+        // alive makes this whole task non-Send - and the error blames the
+        // spawn a hundred lines up, not the await. That has now happened
+        // three times to three different additions, each innocent-looking.
+        // Everything the guard is needed for is two collects, so it lives
+        // for two collects.
+        let (medians, solo_counts): (
+            std::collections::BTreeMap<usize, u64>,
+            std::collections::BTreeMap<usize, usize>,
+        ) = {
+            let solo = solo.held();
+            (
+                solo.iter()
+                    .map(|(p, v)| {
+                        let mut v = v.clone();
+                        v.sort_unstable();
+                        (*p, v[v.len() / 2])
+                    })
+                    .collect(),
+                solo.iter().map(|(p, v)| (*p, v.len())).collect(),
+            )
+        };
         // The ceiling on what ANY fleet could do for this build. One means
         // the graph is a chain and more machines cannot help; the useful
         // comparison is against the number of workers, not against the
@@ -2287,6 +2301,7 @@ pub async fn serve(
             );
         }
         let (lead_total_ms, lead_total_n) = driver_for_report.cache_lead_total();
+        let (seeded_ms, seeded_n, cold_ms, cold_n) = driver_for_report.seeded_split().await;
         {
             let w = wire.held();
             // ONE LINE with the numbers a run is compared on, because the ledger
@@ -2323,6 +2338,20 @@ pub async fn serve(
                 lead_total_n,
             );
         }
+        // The within-run arm comparison. Only says anything when a SUBSET
+        // of the cache ids is seeded - with all or none, one arm is empty
+        // and the line says so rather than implying a result.
+        if seeded_n + cold_n > 0 {
+            println!(
+                "[wire] mount arms     : seeded p50 {seeded_ms}ms (n={seeded_n}), \
+                 cold p50 {cold_ms}ms (n={cold_n}){}",
+                if seeded_n == 0 || cold_n == 0 {
+                    " - one arm empty, so this compares nothing yet"
+                } else {
+                    ""
+                }
+            );
+        }
         if !costs.is_empty() {
             // NOT the sum of the rows. Each lead is added to every cache id
             // it names, so the rows overlap and their total exceeded the
@@ -2338,12 +2367,7 @@ pub async fn serve(
                 println!("[wire]   {ms:>8}ms  {n:>4} leads  {id}");
             }
         }
-        println!(
-            "[wire] peer solo ms   : {medians:?} (uncontended, n={:?})",
-            solo.iter()
-                .map(|(p, v)| (*p, v.len()))
-                .collect::<std::collections::BTreeMap<_, _>>()
-        );
+        println!("[wire] peer solo ms   : {medians:?} (uncontended, n={solo_counts:?})");
         std::process::exit(0);
     });
     // A FALLBACK that relays methods we do not implement.
