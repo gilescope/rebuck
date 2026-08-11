@@ -3484,3 +3484,28 @@ The last is the one with evidence behind it. 7.2 MB/s is decompression on
 two cores, zstd is several times quicker at similar size, and every layer
 the fleet moves is one this project exported - so it is a setting rather
 than a redesign.
+
+## zstd export: confirmed applied, before spending a run on it
+
+`REBUCK2_COMPRESSION=zstd`, harvested locally, manifest read back:
+
+```text
+mediaType: application/vnd.docker.distribution.manifest.v2+json
+  layer application/vnd.docker.image.rootfs.diff.tar.zstd  20972615 bytes
+```
+
+The layer really is zstd, so `force-compression` is doing its job - without
+it buildkit reuses whatever a layer already carried and the setting reads as
+having done nothing, which is the single most common failure mode in this
+document.
+
+Twenty megabytes of `/dev/urandom` compresses to twenty megabytes, so this
+says nothing about size. It was never meant to: the question was whether the
+attr reaches the exporter, and it does. Real cache contents - Go modules,
+compiled objects - compress well and decompress several times faster than
+gzip, which is the whole point at 7.2 MB/s.
+
+Worth noting what it cost to establish: one minute with the local rig,
+against a twenty-five minute fleet run that would have answered the same
+question with more noise. Principle 23, applied on purpose this time rather
+than after three runs.
