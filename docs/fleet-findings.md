@@ -5253,3 +5253,28 @@ and the fix belongs with the worker's exit handling rather than in the
 middle of a measurement sequence. Recorded because "the run went red" is
 about to stop meaning "the experiment failed", and that is worth knowing
 before the next one.
+
+### A reference band, not a reference point
+
+Two `-balance -sandbox` runs on `+test-no-qemu`:
+
+| run | fleet leg | solves | routed | home |
+| ---- | --------- | ------ | ------ | ---- |
+| first | **520s** | 150 | 127 | 20 |
+| second | **517s** | 184 | 147 | 35 |
+
+Three seconds apart, on a target whose solve count moved by 34 and whose
+home builds moved by 15 between them. The leg is reproducible to 0.6% while
+its own workload varies by a fifth - which says the leg is bound by
+something other than how many solves there are, consistent with `building`
+at 69-73% and a fixed serial fraction behind the host binds.
+
+Every comparison earlier in this document rests on a single reference and a
+shrug about pool variance. This one has two runs agreeing to within noise,
+so **anything outside roughly 505-535s is a real change** and does not need
+a repeat to believe.
+
+Worth having by accident: the second reference is the run that reported
+`completed/failure` because one worker exited non-zero. Its coordinator was
+green and its numbers are sound, which is exactly what the red-run signature
+two sections up exists to let a reader conclude.
