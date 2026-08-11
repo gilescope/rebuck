@@ -4869,3 +4869,42 @@ the workload. This moves the limit.
 Whether to do it is a judgement about how much `WITH DOCKER` matters to the
 builds someone actually wants distributed. What is no longer in doubt is
 that no amount of scheduling reaches past it.
+
+### One host bind blocks a whole solve, and the cut already exists
+
+`dispatchable_when` is a single `any`:
+
+```rust
+let blocked = self.exclusions.iter().any(|(_, e)| !lifted_by(e, allow));
+```
+
+So one op with a host bind keeps the ENTIRE graph at home, including every
+op in it that has no host bind. On a `WITH DOCKER` target that is the dind
+setup poisoning the test that follows it, and it is most of the 670 seconds.
+
+Two things make this look tractable rather than fundamental.
+
+**The position is already recorded.** Exclusions are `(usize, Exclusion)` -
+the index of the offending op, kept and never used for anything but the
+diagnostic message. Everything needed to say *where* the graph stops being
+dispatchable is in hand.
+
+**The cut already exists.** `cut_prefix` publishes a prefix of a graph as a
+separate image so peers can start from it - the same OnceCell as contexts
+and base images, `[proxy] publishing a N-op prefix before an M-op graph`. It
+fires twice a run and it cuts on a different criterion; nothing about the
+mechanism cares why the cut is there.
+
+So the shape of a fix is: cut at the last excluded op, build the poisoned
+prefix at home, dispatch the clean suffix. That is not a new subsystem, it
+is an existing one pointed at the index the verdict already carries.
+
+**Not attempting it now, and the reason is not caution.** It is unmeasured
+whether the clean suffix of a `WITH DOCKER` target is worth anything - the
+dind setup may BE the expensive part, in which case cutting it out
+dispatches a rounding error and the ceiling barely moves. That is one
+instrumented run to find out: attribute the 670 seconds to ops before and
+after the excluded index, which the verdict already knows.
+
+Measure which half the time is in before building anything. This document
+contains five mechanisms built before that question was asked.
