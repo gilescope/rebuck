@@ -1,22 +1,43 @@
 # Fleet findings
 
-Everything below was measured, mostly by `rebuck2/scripts/fleet.sh`, and much
-of it overturned something the previous section believed. It reads
-newest-first: each investigation was written at the top as it finished, so the
-early sections are conclusions and the late ones are how the mechanism came to
-exist at all.
+Everything below was measured, and much of it overturned something an earlier
+section believed.
+
+**Order.** This began newest-first and is now oldest-first: the early
+sections are how the mechanism came to exist, and everything from *"How much
+of the Earthfile has actually been through this"* onward was appended at the
+end as it happened. The header claimed the opposite for about thirty entries.
+
+**Where the numbers come from.** The early ones are
+`rebuck2/scripts/fleet.sh` on one machine. Everything current is
+`.github/workflows/earthfile-fleet-multi.yml` - six separate runners, a
+baseline and a fleet leg in the same run - and `rebuck2/scripts/seed-check.sh`
+for anything that only needs one daemon.
+
+**If you read four things**, read these:
+
+| entry                                                        | why                                              |
+| ------------------------------------------------------------ | ------------------------------------------------ |
+| *The workload sets the ceiling* (principle 19)               | most "the fleet is slow" numbers are Amdahl      |
+| *Count the WORK before blaming the scheduler* (principle 21) | the fleet does ~9x the work; that is the problem |
+| *Every number here is a cold-start number*                   | what a hosted runner can and cannot measure      |
+| *`+all-buildkitd`: parity in time, and it says why*          | the one result that points somewhere             |
 
 It lived in `src/proxy.rs` as a module comment until it reached 1342 lines --
 a third of the file, and a chronological log rather than documentation. The
 code kept the invariants a maintainer needs; the reasoning and the numbers are
 here.
 
-Most of these claims are now mechanically checked. `rebuck2/scripts/fleet-check.sh`
-runs the structural ones - where work was placed, whether the bytes match,
-whether a build survived something being destroyed - and asserts them. It
-deliberately does not assert wall clock: those numbers move for reasons that
-have nothing to do with this code, and a suite that fails on a busy laptop
-gets switched off.
+Many of these claims are mechanically checked. `rebuck2/scripts/fleet-check.sh`
+asserts the structural ones - where work was placed, whether the bytes match,
+whether a build survived something being destroyed. It deliberately does not
+assert wall clock: those numbers move for reasons that have nothing to do
+with this code, and a suite that fails on a busy laptop gets switched off.
+
+**It has also never passed in CI**: 96 failures and no successes in the last
+hundred `fleet.yml` runs, and the run log does not contain the step's output,
+so nobody has read a failure. Filed in `~/git/gilescope/rebuck-nits.md`. Treat
+the script as documentation of intent until that is fixed.
 
 ## Both lifts work across a real network
 
