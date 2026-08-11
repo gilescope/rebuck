@@ -80,6 +80,8 @@ confident version first - which has happened to me, in this file, twice.
 | `-bcast` breaks the build on `+test-ast` | parity failed, one target unreached, media type unexplained |
 | **The leg is lead time over concurrency** | 8,239s / 7.85 = 1049 against a measured 1050s |
 | `+test-ast` is 15x off its own ceiling | 2.97x at seven machines means a 71s best leg against 1050s |
+| The prefetch counting gate is dead | 0 acceptances, 14 refusals, 292 prefetches bypassing it |
+| The worker vertex tap costs 15% and is confounded | 1050s -> 1207s; 4,964s of vertex time in a 1,207s leg |
 
 **Open.** Believed for a reason, not measured.
 
