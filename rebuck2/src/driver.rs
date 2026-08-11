@@ -1654,6 +1654,23 @@ impl Driver {
 
     /// Send one frame to one worker, if it is still connected. A worker
     /// that has gone costs us the offer, not the build.
+    /// How many distinct workers have been sent an op - the consumer count.
+    ///
+    /// `op_by_worker` was built to report duplicate materialisation and is
+    /// exactly the oracle a prefetch needs: an op paired with two worker ids
+    /// has been demanded by two machines, which is the definition of worth
+    /// pushing. One pairing means one consumer, and pre-positioning that is
+    /// bandwidth spent making five machines hold something none will read.
+    async fn consumers_of(self: &Arc<Self>, op: &str) -> usize {
+        let pairs = self.op_by_worker.lock().await;
+        pairs
+            .iter()
+            .filter(|(o, _)| o == op)
+            .map(|(_, w)| *w)
+            .collect::<std::collections::BTreeSet<u64>>()
+            .len()
+    }
+
     /// Pre-position an image that MANY machines will want.
     ///
     /// The caller decides that, and the distinction is the whole mechanism:
@@ -1665,8 +1682,30 @@ impl Driver {
     /// base image, a prefix cut extracted because several graphs share it -
     /// not for whatever happened to finish.
     pub async fn prefetch_image(self: &Arc<Self>, image_ref: &str) {
+        self.prefetch_image_for(image_ref, None).await
+    }
+
+    /// As [`Driver::prefetch_image`], but only if `op` has more than one
+    /// consumer.
+    ///
+    /// `None` means the caller already knows the content is shared - a
+    /// mirrored base image is needed by every graph that names it, and no
+    /// count is required to establish that.
+    pub async fn prefetch_image_for(self: &Arc<Self>, image_ref: &str, op: Option<&str>) {
         if !prefetch_ahead() {
             return;
+        }
+        if let Some(op) = op {
+            let n = self.consumers_of(op).await;
+            if n < 2 {
+                // ONE consumer is not shared content. Pushing it spends
+                // bandwidth to make five machines hold what none will read,
+                // and it competes with the transfer that is on the critical
+                // path.
+                println!("[driver] not prefetching {image_ref}: {n} consumer(s)");
+                return;
+            }
+            println!("[driver] prefetching {image_ref}: {n} consumers");
         }
         let this = self.clone();
         let r = image_ref.to_owned();

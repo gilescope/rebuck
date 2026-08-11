@@ -283,7 +283,20 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                         return;
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                // 30s WHEN IDLE, but woken the moment holdings change.
+                //
+                // The interval alone made the seed split fictional: a worker
+                // fetches its share, and for up to thirty seconds no peer can
+                // see it - which is longer than the whole fan-out window. So
+                // every worker fell back to the driver anyway, and the split
+                // cost N speculative fetches on top of the N-1 lazy ones it
+                // was meant to replace. Strictly worse than not splitting.
+                //
+                // A share that nobody can see has not been shared.
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    _ = HOLDINGS_CHANGED.notified() => {}
+                }
             }
         });
     }
@@ -349,6 +362,13 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                         }
                     }
                     println!("[worker] prefetched {got}/{share} of my share ({n} announced)");
+                    // TELL THE FLEET NOW. The whole point of taking a share
+                    // is that the others can take theirs from here; waiting
+                    // for the next tick to say so is the difference between
+                    // a cascade and six machines each fetching everything.
+                    if got > 0 {
+                        HOLDINGS_CHANGED.notify_waiters();
+                    }
                 });
                 continue;
             }
@@ -547,6 +567,13 @@ async fn serve_get(
 /// Split out of the control loop so the decision chain is readable in one
 /// place: the checks run in the order `dispatch::consider` defines, and the
 /// build only happens after all of them pass.
+/// Woken when this worker gains blobs worth telling the fleet about.
+///
+/// Gossip is otherwise a 30s tick, which is longer than the window in which
+/// a prefetched share would be useful to anybody.
+static HOLDINGS_CHANGED: std::sync::LazyLock<tokio::sync::Notify> =
+    std::sync::LazyLock::new(tokio::sync::Notify::new);
+
 /// Which peer is responsible for pulling this blob from the driver first.
 ///
 /// The seed is one machine wide today: the first worker to want the base
