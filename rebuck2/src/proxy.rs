@@ -2374,7 +2374,25 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
         // Always peer 0: it holds the client's job, and after adoption the
         // graph is a fetch rather than a build.
         let t_answer = std::time::Instant::now();
-        let out = self.gw().solve(Request::from_parts(meta, ext, req)).await?;
+        let out = self
+            .gw()
+            .solve(Request::from_parts(meta, ext, req))
+            .await
+            .inspect_err(|e| {
+                // WHOSE connection broke. `h2 protocol error: error reading a
+                // body from connection` reaches the user as earthly's exit
+                // error, and earthly is Go - that phrasing is hyper's, so the
+                // failure is a call WE made and relayed, not one we served.
+                // Server-side reset limits were raised, then removed
+                // entirely, and it made no difference; the server's own
+                // connection log stayed silent throughout. Both are explained
+                // if the connection that dies is the proxy's upstream one.
+                println!(
+                    "[proxy] upstream solve failed: {} {}",
+                    e.code(),
+                    e.message()
+                );
+            })?;
         let answer = t_answer.elapsed().as_millis() as u64;
         self.wire.held().spans.push(Span {
             total: t_solve.elapsed().as_millis() as u64,
