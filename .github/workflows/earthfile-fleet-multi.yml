@@ -41,6 +41,10 @@ on:
       home_slots:
         description: "slots peer 0 keeps for itself - 0 forces dispatch"
         default: "0"
+      min_siblings:
+        description: keep a solve home unless this many are already in flight
+        type: string
+        default: '0'
       warm:
         description: workers build the base chain while the baseline runs (1/0)
         type: string
@@ -160,6 +164,11 @@ env:
   # which is the one place the answer is known.
   REBUCK2_LOCAL_NESTED: ${{ inputs.local_nested || '0' }}
   REBUCK2_WARM: ${{ inputs.warm || '0' }}
+  # Do not dispatch work that has nothing to overlap with. The traces put 192
+  # of the baseline's 271 seconds in a base chain three targets deep, one at
+  # a time - dispatching it cost +90s and could gain nothing, because there
+  # is no second piece of work to run beside it.
+  REBUCK2_MIN_SIBLINGS: ${{ inputs.min_siblings || '0' }}
   REBUCK2_WARM_TARGET: ${{ inputs.warm_target || './t/integration-base+test-base' }}
   # Pinned by digest like everything else here: a collector that changes
   # under us changes the data.

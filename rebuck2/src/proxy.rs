@@ -1576,6 +1576,33 @@ fn report_gateway(wire: &std::sync::Mutex<Wire>, req: &gw::SolveRequest) -> bool
     resend
 }
 
+/// Is there anything for this solve to overlap with if we send it away?
+///
+/// `inflight` counts solves in progress including this one. A solve with no
+/// concurrent siblings cannot use a second machine - there is no second
+/// piece of work to run beside it - so dispatching it buys nothing and pays
+/// the whole handover.
+///
+/// Straight out of the traces: a full `+test-no-qemu` spends 192 of its 271
+/// baseline seconds in a base chain three targets deep, one target at a
+/// time, and dispatching that chain cost +90s for nothing it could
+/// possibly gain. The parallel phase either side of it is 79s and costs the
+/// same in both legs.
+///
+/// A threshold of 0 disables the rule, so the A/B against the old behaviour
+/// is one environment variable.
+fn worth_dispatching_now(inflight: usize, min_siblings: usize) -> bool {
+    min_siblings == 0 || inflight > min_siblings
+}
+
+/// How crowded it has to be before dispatch is worth the handover.
+fn min_siblings() -> usize {
+    std::env::var("REBUCK2_MIN_SIBLINGS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 /// Is this failure the connection's fault rather than the build's?
 ///
 /// `Unavailable` is tonic's code for "the transport did not work" - a
@@ -2054,7 +2081,15 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                     );
                     w.slots = slots;
                 }
-                if allowed && worth && !saturated {
+                // Nothing to overlap with? Keep it. See
+                // `worth_dispatching_now` - the serial base chain is 71% of
+                // this workload and gains nothing from a second machine.
+                let crowded = worth_dispatching_now(
+                    self.home_inflight
+                        .load(std::sync::atomic::Ordering::Relaxed),
+                    min_siblings(),
+                );
+                if allowed && worth && !saturated && crowded {
                     *self
                         .wire
                         .held()
@@ -2707,6 +2742,35 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn work_with_no_siblings_stays_home() {
+        use super::worth_dispatching_now;
+
+        // Straight out of the traces. A full +test-no-qemu spends 192 of its
+        // 271 baseline seconds in a base chain three targets deep -
+        // +earthly-docker, then a FROM it, then a FROM that - and nothing
+        // else can start until it ends. Dispatching that chain cost +90s and
+        // could not have gained anything: it is ONE target at a time, so
+        // there is no second machine for it to use.
+        //
+        // The rule that follows: a solve with no concurrent siblings gains
+        // nothing from moving and pays the whole handover. Keep it home.
+        assert!(
+            !worth_dispatching_now(1, 2),
+            "alone: nothing to overlap with"
+        );
+        assert!(!worth_dispatching_now(2, 2), "at the threshold, still home");
+        assert!(
+            worth_dispatching_now(3, 2),
+            "a crowd can use another machine"
+        );
+
+        // Threshold 0 disables it, so the old behaviour is one env var away
+        // and the A/B is honest.
+        assert!(worth_dispatching_now(1, 0));
+        assert!(worth_dispatching_now(0, 0));
+    }
+
     #[test]
     fn only_a_broken_connection_is_worth_retrying() {
         use tonic::{Code, Status};
