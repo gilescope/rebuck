@@ -57,6 +57,7 @@ on:
       # target time this still answers the coverage question - how much of
       # the Earthfile survives the fleet - which is the one `+all` is for.
       - giles-dispatch-ci-all-nobase
+      - giles-dispatch-ci-ast-imports
       - giles-dispatch-ci-ast-minops-nobase
       - giles-dispatch-ci-ast-seed
       - giles-dispatch-ci-lint-graft
@@ -450,6 +451,7 @@ jobs:
       fleet: ${{ steps.n.outputs.fleet }}
       compression: ${{ steps.n.outputs.compression }}
       minops: ${{ steps.n.outputs.minops }}
+      imports: ${{ steps.n.outputs.imports }}
       nobase: ${{ steps.n.outputs.nobase }}
     steps:
       - id: n
@@ -500,7 +502,7 @@ jobs:
           workload=$REF
           while :; do
             before=$workload
-            for suffix in -seed -graft -arm -zstd -minops -nobase; do
+            for suffix in -seed -graft -arm -zstd -minops -imports -nobase; do
               # QUOTED: unquoted, `$suffix` is taken as a glob pattern
               # rather than a literal, which shellcheck SC2295 catches and
               # which would misbehave the moment a suffix contained a `?`
@@ -579,6 +581,19 @@ jobs:
           case "$REF" in *-minops*) minops=20 ;; *) minops=0 ;; esac
           echo "min ops: ${minops:-off}"
           echo "minops=$minops" >> "$GITHUB_OUTPUT"
+
+          # `-imports`: score a candidate on the parent IMAGES it holds, not
+          # just ops and cache mounts. A cut subtree names its parent by
+          # digest instead of carrying its ops, so op overlap is blind to the
+          # one expensive thing - and the local rig shows a daemon serving
+          # zero bytes for a parent it built itself, chained or not.
+          #
+          # Separate from the prefetch fix on purpose. Both aim at the same
+          # 93x re-serve ratio, and two mechanisms in one run measures
+          # neither.
+          case "$REF" in *-imports*) imports=1 ;; *) imports=0 ;; esac
+          echo "affinity imports: $imports"
+          echo "imports=$imports" >> "$GITHUB_OUTPUT"
 
           # `-nobase`: skip the baseline leg. For comparing a MECHANISM
           # against itself, where the control is another fleet leg and the
@@ -923,6 +938,7 @@ jobs:
       REBUCK2_GRAFT: ${{ needs.plan.outputs.graft }}
       REBUCK2_COMPRESSION: ${{ needs.plan.outputs.compression }}
       REBUCK2_MIN_OPS: ${{ needs.plan.outputs.minops }}
+      REBUCK2_AFFINITY_IMPORTS: ${{ needs.plan.outputs.imports }}
       REBUCK2_SKIP_BASELINE: ${{ needs.plan.outputs.nobase }}
       # ONE path for the binary in this job. It was written out twice and
       # the copies disagreed: the proxy step had `./rebuck2-repo/...` and

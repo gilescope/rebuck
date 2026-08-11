@@ -1677,6 +1677,18 @@ pub fn affinity() -> bool {
     std::env::var("REBUCK2_AFFINITY").as_deref() == Ok("1")
 }
 
+/// Score a candidate on the parent IMAGES it already holds, not just ops and
+/// cache mounts.
+///
+/// Separately switchable from `affinity` itself, and OFF by default, because
+/// the run it would first appear in also carries the prefetch fix - and two
+/// mechanisms changed at once is a measurement of neither. The evidence for
+/// it is in `fleet-findings.md`; the point of the flag is to spend one run
+/// on one variable.
+pub fn imports_affinity() -> bool {
+    std::env::var("REBUCK2_AFFINITY_IMPORTS").as_deref() == Ok("1")
+}
+
 /// Images to start named cache mounts from, as `id=ref,id=ref`.
 ///
 /// NAMED, never discovered, and that is principle 20 rather than a stage

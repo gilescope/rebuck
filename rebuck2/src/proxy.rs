@@ -1579,6 +1579,7 @@ impl Wire {
                 ("trust_verdict", crate::dispatch::trust_peer_verdicts()),
                 ("min_siblings", min_siblings() > 0),
                 ("min_ops", crate::dispatch::min_ops() > 0),
+                ("?affinity_imports", crate::dispatch::imports_affinity(),),
                 (
                     "prefetch",
                     std::env::var("REBUCK2_PREFETCH").as_deref() == Ok("1")

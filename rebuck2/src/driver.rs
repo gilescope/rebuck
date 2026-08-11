@@ -1788,6 +1788,11 @@ impl Driver {
                     // rather than winning one it should not.
                     let i = imports
                         .iter()
+                        // Gated separately from affinity: see
+                        // `imports_affinity`. An empty count leaves `warmth`
+                        // exactly as it was, so OFF is the old behaviour and
+                        // not a different code path.
+                        .filter(|_| crate::dispatch::imports_affinity())
                         .filter(|h| {
                             // EXACT first. `holder_of` is written the moment a
                             // worker reports a result; the bloom is gossiped
@@ -1808,6 +1813,14 @@ impl Driver {
                                 .is_some_and(|b| b.contains(h))
                         })
                         .count();
+                    // COUNTED where it is non-zero, not where the flag is
+                    // read. "A candidate already holds a parent" is the whole
+                    // claim, and a run where that never happens is a run
+                    // where this changed nothing - the distinction mech.rs
+                    // exists to make, and three mechanisms have needed it.
+                    if i > 0 {
+                        crate::mech::applied("affinity_imports");
+                    }
                     (c.id, crate::dispatch::warmth(n as u32, m as u32, i as u32))
                 })
                 .collect()
