@@ -564,6 +564,84 @@ pub fn image_identifier(name: &str) -> String {
     format!("docker-image://{full}")
 }
 
+/// A one-command graph with a writable cache mount, for checking seeding.
+///
+/// Both halves of a round trip are this shape. Write a marker into cache A,
+/// harvest A, then read the marker back out of cache **B** seeded from that
+/// harvest - and B has to be a different id, or the read passes by meeting
+/// A's own warm mount and proves nothing at all.
+///
+/// The command decides success: a non-zero exit fails the solve, so
+/// `test -f /c/marker` IS the assertion and no output has to be inspected.
+///
+/// No scratch output, unlike [`harvest_graph`]: that one exports a layer,
+/// this one only has to succeed or fail, and an output mount nothing writes
+/// to would export an empty layer on every check.
+pub fn cache_probe_graph(base: &str, cache_id: &str, dest: &str, cmd: &str) -> pb::Definition {
+    let src = pb::Op {
+        op: Some(pb::op::Op::Source(pb::SourceOp {
+            identifier: image_identifier(base),
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let src_bytes = src.encode_to_vec();
+    let src_digest = format!("sha256:{}", crate::store::sha256_hex(&src_bytes));
+
+    let exec = pb::Op {
+        inputs: vec![pb::Input {
+            digest: src_digest,
+            index: 0,
+        }],
+        op: Some(pb::op::Op::Exec(pb::ExecOp {
+            meta: Some(pb::Meta {
+                args: vec!["/bin/sh".into(), "-c".into(), cmd.to_owned()],
+                cwd: "/".into(),
+                ..Default::default()
+            }),
+            mounts: vec![
+                pb::Mount {
+                    input: 0,
+                    dest: "/".into(),
+                    output: -1,
+                    ..Default::default()
+                },
+                pb::Mount {
+                    input: -1,
+                    dest: dest.to_owned(),
+                    output: -1,
+                    mount_type: pb::MountType::Cache as i32,
+                    cache_opt: Some(pb::CacheOpt {
+                        id: cache_id.to_owned(),
+                        sharing: pb::CacheSharingOpt::Shared as i32,
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        })),
+        ..Default::default()
+    };
+    let exec_bytes = exec.encode_to_vec();
+    let exec_digest = format!("sha256:{}", crate::store::sha256_hex(&exec_bytes));
+
+    pb::Definition {
+        def: vec![
+            src_bytes,
+            exec_bytes,
+            pb::Op {
+                inputs: vec![pb::Input {
+                    digest: exec_digest,
+                    index: 0,
+                }],
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ],
+        ..Default::default()
+    }
+}
+
 /// Take a warm cache mount OUT of a daemon, as a layer.
 ///
 /// The other half of [`seed_cache_mounts`]. Seeding needs an image whose
@@ -2151,6 +2229,53 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// One graph shape for both halves of a seeding round trip.
+    #[test]
+    fn a_cache_probe_writes_or_reads_and_says_which() {
+        use bollard_buildkit_proto::pb;
+        use prost::Message;
+
+        let g = super::cache_probe_graph("alpine:3", "probe", "/c", "touch /c/marker");
+        let ops: Vec<pb::Op> = g
+            .def
+            .iter()
+            .map(|b| pb::Op::decode(b.as_slice()).unwrap())
+            .collect();
+        assert_eq!(ops.len(), 3, "source, exec, terminal");
+        assert!(ops[2].op.is_none(), "and the terminal is last");
+
+        let Some(pb::op::Op::Exec(e)) = &ops[1].op else {
+            panic!("the middle op runs the command")
+        };
+        let cache = e
+            .mounts
+            .iter()
+            .find(|m| m.mount_type == pb::MountType::Cache as i32)
+            .expect("a cache is mounted");
+        assert_eq!(cache.cache_opt.as_ref().unwrap().id, "probe");
+        assert_eq!(cache.dest, "/c");
+        // WRITABLE, unlike the harvest's. A probe that writes needs to.
+        assert!(!cache.readonly);
+        // And it must be seedable: no input, so `seed_cache_mounts` has
+        // somewhere to attach one.
+        assert_eq!(cache.input, -1);
+        assert!(e
+            .meta
+            .as_ref()
+            .unwrap()
+            .args
+            .join(" ")
+            .contains("touch /c/marker"));
+
+        // NO scratch output. The harvest needs one because it exports a
+        // layer; a probe only needs to succeed or fail, and an output mount
+        // it never writes to would export an empty layer on every check.
+        assert!(
+            e.mounts.iter().all(|m| m.output < 0 || m.dest == "/"),
+            "a probe exports nothing"
+        );
+    }
+
     /// `id:path` pairs, and the shape that broke the shell version.
     #[test]
     fn seed_pairs_accept_an_id_that_is_a_path() {

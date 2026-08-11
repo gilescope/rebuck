@@ -138,6 +138,22 @@ jobs:
             REBUCK2_CACHE_SEEDS=smoke-cache=172.17.0.1:15000/rebuck2/subtree@sha256:*) ;;
             *) echo "::error::not a pullable reference: $line"; exit 1 ;;
           esac
+      # And the MECHANISM, not just the path. The step above proves a
+      # harvest can be taken; this proves a cold mount can be started from
+      # one - write a marker into cache A, harvest A, read the marker back
+      # out of cache B seeded from that harvest. B is a different id on
+      # purpose: read it back out of A and it passes by meeting A's own warm
+      # mount.
+      #
+      # Thirty seconds, against the twenty-five minute fleet run that is the
+      # only other way to ask.
+      - name: can a cold cache mount be seeded at all
+        run: |
+          set -euo pipefail
+          ./rebuck2/target/release/rebuck2 check-seeding \
+            --bk 172.17.0.1:28372 --registry 172.17.0.1:15000 \
+            --base 172.17.0.1:15000/library/busybox:1
+
       - name: what it left behind
         if: always()
         run: |

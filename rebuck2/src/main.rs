@@ -287,6 +287,88 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
+        "check-seeding" => {
+            // `rebuck2 check-seeding --bk <addr> --registry <host:port>
+            //  [--base <image>]`
+            //
+            // Can this daemon be handed a filled cache mount? Writes a
+            // marker into cache A, harvests A, then reads the marker back
+            // out of cache B seeded from that harvest.
+            //
+            // B is a DIFFERENT id, and that is the whole design: read it
+            // back out of A and the probe passes by meeting A's own warm
+            // mount, proving nothing. The ids carry the process id so a
+            // second check on the same daemon does not inherit the first
+            // one's mounts.
+            //
+            // Exists because eight separate faults stopped a seeding run,
+            // none of them the mechanism, and each cost a twenty-five
+            // minute fleet build to find. This answers "does seeding work
+            // here" in about thirty seconds, and it is a fair question for
+            // an operator to ask before a run depends on the answer.
+            let bk = args.opt("--bk").unwrap_or_else(|| "127.0.0.1:8372".into());
+            let registry = args
+                .opt("--registry")
+                .ok_or_else(|| anyhow::anyhow!("check-seeding: --registry <host:port>"))?;
+            let base = args
+                .opt("--base")
+                .unwrap_or_else(|| format!("{registry}/library/busybox:1"));
+            let n = std::process::id();
+            let (src, dst) = (format!("seedcheck-src-{n}"), format!("seedcheck-dst-{n}"));
+            let marker = "rebuck2-seed-marker";
+
+            println!("[check] writing {marker} into cache {src}");
+            solve::build_subtree(
+                &bk,
+                &registry,
+                0,
+                dispatch::cache_probe_graph(&base, &src, "/c", &format!("touch /c/{marker}")),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("could not write to a cache mount: {e:#}"))?;
+
+            println!("[check] harvesting {src}");
+            let digest = solve::build_subtree(
+                &bk,
+                &registry,
+                0,
+                dispatch::harvest_graph(&base, &src, "/c"),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("could not harvest a cache mount: {e:#}"))?;
+            let reference = solve::pullable(&registry, &digest);
+            println!("[check] harvested {src} -> {reference}");
+
+            // The graph the fleet would dispatch: an unseeded probe, put
+            // through the same rewrite `make_portable` applies.
+            let probe =
+                dispatch::cache_probe_graph(&base, &dst, "/c", &format!("test -f /c/{marker}"));
+            let seeds = std::collections::BTreeMap::from([(dst.clone(), reference.clone())]);
+            let seeded = dispatch::seed_cache_mounts(&probe, &seeds);
+            if seeded.def == probe.def {
+                anyhow::bail!(
+                    "seed_cache_mounts changed nothing - the mount was not seeded, so the \
+                     read below would only prove that an empty cache is empty"
+                );
+            }
+
+            println!("[check] reading {marker} back out of {dst}, seeded from {reference}");
+            match solve::build_subtree(&bk, &registry, 0, seeded).await {
+                Ok(_) => {
+                    println!("[check] SEEDING WORKS: a cold {dst} started from {src}'s contents");
+                    Ok(())
+                }
+                // The probe's own `test -f` failing is the interesting
+                // answer and not an error in the rig, so say which.
+                Err(e) if dispatch::is_build_verdict(&format!("{e:#}")) => Err(anyhow::anyhow!(
+                    "the marker was NOT there: buildkit accepted the graph and the seeded \
+                     mount came up empty. {e:#}"
+                )),
+                Err(e) => Err(anyhow::anyhow!(
+                    "the seeded probe could not run at all: {e:#}"
+                )),
+            }
+        }
         "registry" => {
             let store_root: std::path::PathBuf = args
                 .opt("--store")
