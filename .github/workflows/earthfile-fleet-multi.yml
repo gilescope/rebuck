@@ -141,6 +141,12 @@ env:
   REBUCK2_H2_RESETS: ${{ inputs.h2_resets || '' }}
   REBUCK2_CONSOLIDATE: ${{ inputs.consolidate || '1' }}
   REBUCK2_SANDBOX_HOST: ${{ inputs.sandbox_host || '0' }}
+  # Pinned by digest like everything else here: a collector that changes
+  # under us changes the data.
+  OTEL_IMAGE: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.145.0
+  OTEL_TRACES_EXPORTER: otlp
+  OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://127.0.0.1:4317
   # Cut the shared ancestry out as its own dispatch unit, publish it once,
   # and graft it into everything that follows.
   #
@@ -579,6 +585,57 @@ jobs:
             "$(awk '/MemTotal/{printf "%.1fGB", $2/1024/1024}' /proc/meminfo)" \
             "$(uname -m)"
           df -h / | awk 'NR==2{print "disk: " $4 " free of " $2}'
+
+      # Traces, because earthly already emits them and we have been throwing
+      # them away. Every run so far has logged
+      #
+      #   traces export: exporter export timeout: rpc error: code = Unavailable
+      #
+      # which is earthly trying to export OTLP spans to a collector that is
+      # not there. Its spans carry per-target timing directly, which is the
+      # data that has so far been reconstructed by hand out of base64
+      # `llb.customname` strings and a sort.
+      #
+      # ON THE COORDINATOR ONLY. Workers are separate GitHub runners with no
+      # inbound route - they reach this machine through the iroh mesh, not
+      # TCP - so a collector here cannot receive from them. Same reason a
+      # collector on a LAN box cannot receive from any of them.
+      - name: a collector for the traces earthly already sends
+        env:
+          OTLP_FORWARD: ${{ secrets.OTLP_FORWARD }}
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/otel"; mkdir -p "$d"; chmod 777 "$d"
+          # Composed in shell rather than templated: the forward exporter is
+          # conditional, and a heredoc that has to be conditionally rewritten
+          # afterwards is how a config ends up half-indented and silently
+          # rejected.
+          {
+            printf 'receivers:\n  otlp:\n    protocols:\n'
+            printf '      grpc: { endpoint: 0.0.0.0:4317 }\n'
+            printf '      http: { endpoint: 0.0.0.0:4318 }\n'
+            printf 'exporters:\n  file:\n    path: /out/traces.jsonl\n'
+            if [ -n "${OTLP_FORWARD:-}" ]; then
+              printf '  otlp/forward:\n    endpoint: %s\n    tls: { insecure: true }\n' "$OTLP_FORWARD"
+            fi
+            printf 'service:\n  telemetry:\n    logs: { level: warn }\n  pipelines:\n    traces:\n'
+            printf '      receivers: [otlp]\n'
+            if [ -n "${OTLP_FORWARD:-}" ]; then
+              printf '      exporters: [file, otlp/forward]\n'
+            else
+              printf '      exporters: [file]\n'
+            fi
+          } > "$d/config.yaml"
+          docker run -d --name otelcol -p 4317:4317 -p 4318:4318 \
+            -v "$d:/etc/otel" -v "$d:/out" "$OTEL_IMAGE" --config /etc/otel/config.yaml
+          for _ in $(seq 1 30); do
+            (echo > /dev/tcp/127.0.0.1/4317) >/dev/null 2>&1 && break
+            sleep 1
+          done
+          (echo > /dev/tcp/127.0.0.1/4317) 2>/dev/null || {
+            echo "::warning::the collector never came up; traces will be dropped as before"
+            docker logs otelcol 2>&1 | tail -20 || true
+          }
 
       - name: coordinator - gateway, driver and registry
         env:

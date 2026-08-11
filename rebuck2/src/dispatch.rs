@@ -1310,6 +1310,108 @@ pub fn describe_root(def: &pb::Definition) -> Option<String> {
     describe(def, at)
 }
 
+/// Apply an in-place edit to every op, cascading the digests it changes.
+///
+/// The shared spine of every graph rewrite here, and it exists because each
+/// one that grew its own copy grew its own bug: an op re-encoded when it did
+/// not change loses the fields earthly's fork added to the proto; a changed
+/// op whose consumers are not updated dangles; a rewrite that reorders stops
+/// the terminal being last and buildkit resolves it as a vertex.
+///
+/// `edit` returns whether it changed anything. Returning false must mean the
+/// bytes are untouched, because that is what lets them travel verbatim.
+fn rewrite_ops(def: &pb::Definition, edit: &dyn Fn(&mut pb::Op) -> bool) -> pb::Definition {
+    let digest = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
+    let mut remap: BTreeMap<String, String> = BTreeMap::new();
+    let mut metadata = def.metadata.clone();
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(def.def.len());
+
+    // In order, so the terminal stays last. LLB is topological, so an op's
+    // inputs are always already remapped by the time it is reached.
+    for bytes in &def.def {
+        let before = digest(bytes);
+        let Ok(mut op) = pb::Op::decode(bytes.as_slice()) else {
+            out.push(bytes.clone());
+            continue;
+        };
+        let touched_inputs = op.inputs.iter().any(|i| remap.contains_key(&i.digest));
+        let edited = edit(&mut op);
+        if !touched_inputs && !edited {
+            debug_assert_lossless!(bytes, "rewrite_ops");
+            out.push(bytes.clone());
+            continue;
+        }
+        for input in &mut op.inputs {
+            if let Some(new) = remap.get(&input.digest) {
+                input.digest = new.clone();
+            }
+        }
+        let nb = op.encode_to_vec();
+        let after = digest(&nb);
+        if after != before {
+            remap.insert(before.clone(), after.clone());
+            if let Some(m) = metadata.remove(&before) {
+                metadata.insert(after, m);
+            }
+        }
+        out.push(nb);
+    }
+
+    prune(pb::Definition {
+        def: out,
+        metadata,
+        ..def.clone()
+    })
+}
+
+/// Point every nested build at the daemon that is about to run it.
+///
+/// earthly forwards its own `BUILDKIT_HOST` into every `RUN`, so a nested
+/// earthly shares the outer daemon instead of standing one up. On a single
+/// machine that daemon is local and the forwarding halves the build. In a
+/// fleet it is the COORDINATOR, so every nested build on every worker dials
+/// one machine: the five leads that own a full `+test-no-qemu` critical path
+/// are all nested builds at 231-258s, each longer than the entire
+/// single-machine build.
+///
+/// The address cannot be chosen where the graph is built - the converter
+/// runs before placement and does not know which worker will execute the op.
+/// earthly's own attempt at a machine-independent constant,
+/// `tcp://buildkitsandbox:8372`, resolves locally for most execs and NOT for
+/// `--privileged --entrypoint` ones, where the nested earthly reports
+/// `could not connect to buildkit: timeout 1m0s`.
+///
+/// So the worker substitutes its own address when the subtree arrives, which
+/// is the one place the answer is known. An EMPTY value is left alone: that
+/// is `force_internal_buildkit` deliberately unsetting it so the nested build
+/// stands up its own daemon, and filling it in would silently undo the
+/// exemption.
+///
+/// Ops that do not carry the variable travel byte for byte - re-encoding
+/// through our types drops whatever earthly's fork added to the proto.
+pub fn retarget_buildkit_host(def: &pb::Definition, addr: &str) -> pb::Definition {
+    let rewrite = |op: &mut pb::Op| -> bool {
+        let Some(pb::op::Op::Exec(e)) = op.op.as_mut() else {
+            return false;
+        };
+        let Some(meta) = e.meta.as_mut() else {
+            return false;
+        };
+        let mut hit = false;
+        for entry in &mut meta.env {
+            let Some((k, v)) = entry.split_once('=') else {
+                continue;
+            };
+            if k.ends_with("BUILDKIT_HOST") && !v.is_empty() && v != addr {
+                *entry = format!("{k}={addr}");
+                hit = true;
+            }
+        }
+        hit
+    };
+    rewrite_ops(def, &rewrite)
+}
+
 /// Drop everything the terminal cannot reach.
 ///
 /// Grafting orphans by construction: replacing a subtree root with the image
@@ -2046,6 +2148,244 @@ mod tests {
             offer_order_warm(&v, &mixed, Allow::default(), &|_| 5),
             vec![2, 1],
             "equal warmth falls back to emptiest first"
+        );
+    }
+
+    /// What must be true of ANY graph this code hands to buildkit.
+    ///
+    /// Written after the fourth structural bug, because all four broke the
+    /// same handful of rules and each was caught by a different accident:
+    ///
+    ///   - the terminal stopped being last, so buildkit resolved an op with
+    ///     no union and said `no support for <nil>`
+    ///   - a graft left orphans, which inflated `def.len()` and let a
+    ///     terminal-rooted cut through the cut-prefix picker
+    ///   - a re-encode of an UNCHANGED op dropped fields earthly's fork adds
+    ///     to the proto
+    ///   - metadata kept keys for ops that no longer existed
+    ///
+    /// Each rewrite is checked against all of them rather than against the
+    /// one that broke it.
+    fn assert_well_formed(before: &pb::Definition, after: &pb::Definition, what: &str) {
+        let dig = |b: &[u8]| format!("sha256:{}", crate::store::sha256_hex(b));
+        let ops: Vec<pb::Op> = after
+            .def
+            .iter()
+            .map(|b| pb::Op::decode(b.as_slice()).unwrap_or_else(|e| panic!("{what}: {e}")))
+            .collect();
+        assert!(!ops.is_empty(), "{what}: empty definition");
+
+        // ONE terminal, and it is last.
+        let (last, rest) = ops.split_last().expect("non-empty");
+        assert!(last.op.is_none(), "{what}: last op is not a terminal");
+        assert!(
+            rest.iter().all(|o| o.op.is_some()),
+            "{what}: a second op has no union - buildkit resolves it as a vertex"
+        );
+
+        // Every input resolves, and nothing is unreachable.
+        let by_digest: std::collections::BTreeSet<String> =
+            after.def.iter().map(|b| dig(b)).collect();
+        for (i, op) in ops.iter().enumerate() {
+            for input in &op.inputs {
+                assert!(
+                    by_digest.contains(&input.digest),
+                    "{what}: op {i} points at a digest that is not in the graph"
+                );
+            }
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        let mut stack = vec![after.def.len() - 1];
+        while let Some(i) = stack.pop() {
+            if !seen.insert(i) {
+                continue;
+            }
+            for input in &ops[i].inputs {
+                if let Some(j) = after.def.iter().position(|b| dig(b) == input.digest) {
+                    stack.push(j);
+                }
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            after.def.len(),
+            "{what}: {} orphan(s) the terminal cannot reach",
+            after.def.len() - seen.len()
+        );
+
+        // Metadata describes ops that exist.
+        for k in after.metadata.keys() {
+            assert!(by_digest.contains(k), "{what}: metadata for a pruned op {k}");
+        }
+
+        // Anything carried over unchanged is carried over BYTE for byte.
+        let kept: Vec<&Vec<u8>> = after.def.iter().filter(|b| before.def.contains(b)).collect();
+        for b in kept {
+            assert!(
+                before.def.contains(b),
+                "{what}: an op claims to be unchanged but is not"
+            );
+        }
+    }
+
+    #[test]
+    fn every_rewrite_leaves_a_graph_buildkit_can_load() {
+        let exec = |env: Vec<&str>| pb::Op {
+            op: Some(OpKind::Exec(pb::ExecOp {
+                meta: Some(pb::Meta {
+                    args: vec!["/bin/sh".into()],
+                    env: env.into_iter().map(String::from).collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let d = chain(vec![
+            (src("docker-image://docker.io/library/alpine:3.20"), vec![]),
+            (src("git://github.com/example/repo.git#main"), vec![]),
+            (exec(vec!["EARTHLY_BUILDKIT_HOST=tcp://10.0.0.1:1234"]), vec![0, 1]),
+            (plain(), vec![2]),
+            (pb::Op::default(), vec![3]),
+        ]);
+        let mid = format!("sha256:{}", crate::store::sha256_hex(&d.def[2]));
+
+        // Each rewrite in turn, and then the compositions that actually run
+        // in the proxy - the terminal-as-vertex bug only appeared when
+        // grafting and cutting were both on.
+        assert_well_formed(&d, &retarget_buildkit_host(&d, "tcp://10.0.0.9:8372"), "retarget");
+        assert_well_formed(&d, &rewrite_git_sources(&d, &|_| None), "git (no-op)");
+        assert_well_formed(
+            &d,
+            &rewrite_git_sources(&d, &|_| Some("docker-image://reg/m@sha256:aa".into())),
+            "git (mirrored)",
+        );
+        let grafted = graft_built(&d, &|dg| {
+            (dg == mid).then(|| "docker-image://reg/x@sha256:beef".to_owned())
+        });
+        assert_well_formed(&d, &grafted, "graft");
+        assert_well_formed(
+            &grafted,
+            &retarget_buildkit_host(&grafted, "tcp://10.0.0.9:8372"),
+            "graft then retarget",
+        );
+        if let Some(cut) = subgraph(&d, 3) {
+            assert_well_formed(&d, &cut, "subgraph");
+        }
+
+        // A rewrite with nothing to do must be byte-identical, or every
+        // solve it touches becomes a whole-build cache miss.
+        assert_eq!(
+            retarget_buildkit_host(&d, "tcp://10.0.0.1:1234").def,
+            d.def,
+            "already pointing there: no change"
+        );
+        assert_eq!(graft_built(&d, &|_| None).def, d.def, "nothing built: no change");
+    }
+
+    #[test]
+    fn a_nested_build_is_pointed_at_the_daemon_running_it() {
+        // The funnel: earthly forwards its own BUILDKIT_HOST into every RUN,
+        // so a nested earthly on ANY worker dials the coordinator. The five
+        // leads owning a full +test-no-qemu critical path are nested builds
+        // at 231-258s, each longer than the whole single-machine build.
+        //
+        // A constant cannot fix it. `tcp://buildkitsandbox:8372` resolves
+        // locally for most execs and NOT for `--privileged --entrypoint`
+        // ones, where the nested earthly reports
+        // `could not connect to buildkit: timeout 1m0s` and the test dies.
+        //
+        // But the address does not have to be chosen where the graph is
+        // built. The WORKER knows how its own daemon is reached, and it can
+        // substitute that when the subtree arrives.
+        let exec = |env: Vec<&str>| pb::Op {
+            op: Some(OpKind::Exec(pb::ExecOp {
+                meta: Some(pb::Meta {
+                    args: vec!["/bin/sh".into()],
+                    env: env.into_iter().map(String::from).collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let d = chain(vec![
+            (src("docker-image://alpine:3.20"), vec![]),
+            (exec(vec!["PATH=/bin", "EARTHLY_BUILDKIT_HOST=tcp://10.0.0.1:1234"]), vec![0]),
+            (exec(vec!["PATH=/bin"]), vec![1]),
+            (pb::Op::default(), vec![2]),
+        ]);
+
+        let out = retarget_buildkit_host(&d, "tcp://10.0.0.9:8372");
+        let ops: Vec<pb::Op> = out
+            .def
+            .iter()
+            .map(|b| pb::Op::decode(b.as_slice()).expect("decodes"))
+            .collect();
+        let env_of = |i: usize| match &ops[i].op {
+            Some(OpKind::Exec(e)) => e.meta.as_ref().expect("meta").env.clone(),
+            _ => vec![],
+        };
+        assert_eq!(
+            env_of(1),
+            vec!["PATH=/bin", "EARTHLY_BUILDKIT_HOST=tcp://10.0.0.9:8372"],
+            "the forwarded address becomes this machine's daemon"
+        );
+        assert_eq!(env_of(2), vec!["PATH=/bin"], "and nothing else is touched");
+
+        // The op that changed has a new digest, so its consumer must follow
+        // it - a graph that dangles here is a build that cannot load.
+        let new1 = format!("sha256:{}", crate::store::sha256_hex(&out.def[1]));
+        assert_eq!(ops[2].inputs[0].digest, new1, "the consumer follows");
+        assert!(ops.last().expect("non-empty").op.is_none(), "terminal last");
+
+        // An UNCHANGED op must travel byte for byte. Re-encoding through our
+        // types drops whatever earthly's fork added to the proto, and that
+        // has already cost two days once.
+        assert_eq!(out.def[0], d.def[0], "untouched ops are verbatim");
+
+        // Nothing to do is nothing done - a graph with no forwarded host
+        // must come back byte-identical, or every solve becomes a cache miss.
+        let plain_d = chain(vec![
+            (src("docker-image://alpine:3.20"), vec![]),
+            (exec(vec!["PATH=/bin"]), vec![0]),
+            (pb::Op::default(), vec![1]),
+        ]);
+        assert_eq!(
+            retarget_buildkit_host(&plain_d, "tcp://10.0.0.9:8372").def,
+            plain_d.def,
+            "no forwarded host, no rewrite"
+        );
+
+        // Both spellings: earthly reads EARTH_ first and falls back to the
+        // deprecated EARTHLY_, and the entrypoint reads bare BUILDKIT_HOST.
+        for name in ["BUILDKIT_HOST", "EARTH_BUILDKIT_HOST"] {
+            let d = chain(vec![
+                (src("docker-image://alpine:3.20"), vec![]),
+                (exec(vec![&format!("{name}=tcp://10.0.0.1:1234")]), vec![0]),
+                (pb::Op::default(), vec![1]),
+            ]);
+            let out = retarget_buildkit_host(&d, "tcp://10.0.0.9:8372");
+            let got = pb::Op::decode(out.def[1].as_slice()).expect("decodes");
+            let env = match got.op {
+                Some(OpKind::Exec(e)) => e.meta.expect("meta").env,
+                _ => vec![],
+            };
+            assert_eq!(env, vec![format!("{name}=tcp://10.0.0.9:8372")], "{name}");
+        }
+
+        // An EMPTY value is a deliberate opt-out - `force_internal_buildkit`
+        // unsets these so the nested build stands up its own daemon, and
+        // filling it back in would silently undo that.
+        let optout = chain(vec![
+            (src("docker-image://alpine:3.20"), vec![]),
+            (exec(vec!["BUILDKIT_HOST="]), vec![0]),
+            (pb::Op::default(), vec![1]),
+        ]);
+        assert_eq!(
+            retarget_buildkit_host(&optout, "tcp://10.0.0.9:8372").def,
+            optout.def,
+            "an emptied host stays empty"
         );
     }
 

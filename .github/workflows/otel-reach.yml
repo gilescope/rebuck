@@ -1,0 +1,40 @@
+# Can a GitHub runner reach the collector at all?
+#
+# Asked because the box's public address is the ROUTER's: the machine itself
+# only holds 192.168.1.137, so anything from outside needs a forward that a
+# NixOS firewall rule cannot supply. Testing from a LAN machine proves
+# nothing either way - most routers do not hairpin - so ask a runner.
+name: otel reachability
+on:
+  workflow_dispatch:
+    inputs:
+      endpoint:
+        description: host:port of the collector
+        type: string
+        default: 81.2.89.216:4318
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: can we reach it
+        env:
+          TOKEN: ${{ secrets.OTLP_TOKEN }}
+          EP: ${{ inputs.endpoint }}
+        run: |
+          set -uo pipefail
+          echo "tcp connect:"
+          timeout 10 bash -c "cat < /dev/null > /dev/tcp/${EP%%:*}/${EP##*:}" \
+            && echo "  open" || echo "  refused or filtered"
+          echo "otlp POST (200 = accepted, 401 = reachable but token wrong):"
+          code=$(curl -sk -o /dev/null -m 15 -w '%{http_code}' \
+            -X POST "https://$EP/v1/traces" \
+            -H "Authorization: Bearer $TOKEN" \
+            -H 'Content-Type: application/json' \
+            -d '{"resourceSpans":[]}' || true)
+          echo "  http_code=$code"
+          [ "$code" = "200" ] && echo "REACHABLE" || echo "NOT REACHABLE from a GitHub runner"
