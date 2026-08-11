@@ -13,6 +13,17 @@ gh api "repos/gilescope/rebuck/actions/runs/$run/logs" > "$dir.zip" 2>/dev/null 
 unzip -oq "$dir.zip" -d "$dir"
 strip() { sed 's/^[^ ]* //'; }
 
+# STEP LOGS ONLY. The coordinator also uploads proxy.log as an artifact, and
+# twenty-one [wire] lines are printed into it that the summary step never
+# greps - arrivals, contexts published, op duplication, peer solo ms and the
+# rest. They are not lost, they are in the artifact, and nothing here reads
+# artifacts. If a line you expect is missing, that is where it is:
+#
+#   gh run download <run-id> -n <artifact> && grep '\[wire\]' proxy.log
+#
+# Said here rather than discovered again: I spent part of a session assuming
+# a line had not printed when it had, in a file I was not reading.
+
 echo "── verdict ─────────────────────────────────"
 grep -rah "wire\] verdict\|^amplification\|^baseline:\|^one machine\|^PARITY" "$dir" | strip | sort -u
 

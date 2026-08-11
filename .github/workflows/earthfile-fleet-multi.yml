@@ -1872,7 +1872,7 @@ jobs:
           # nothing said what the rest was, and a 50-minute leg could not be
           # told apart from an expensive tap without running it twice.
           echo "=== where the time went, and what measuring it cost"
-          grep -E '^\[wire\] (lead phases|status tap|home vertices|service ms|grafted)' \
+          grep -E '^\[wire\] (lead phases|status tap|home vertices|service ms|grafted|trapped ops|WARNING)' \
             proxy.log || true
           # WORK AMPLIFICATION, which is the number that reframes all of
           # these. The fleet's lead time against the whole baseline wall: if
