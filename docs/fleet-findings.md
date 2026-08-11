@@ -70,6 +70,11 @@ confident version first - which has happened to me, in this file, twice.
 | Placing a lead near its parent does not pay as weighted | `-imports`: 1050s -> 1475s, `waiting` +2849s, a machine idle again |
 | A brake sized for one preference does not hold two | the imports term fired 1724x against 361 reorders |
 | The instruments are not the problem | the status tap: 1ms across 3004 frames |
+| **The whole of `+test-no-qemu` runs through the fleet** | 520s, fourteen groups, one failed target matching the reference |
+| The h2 collapse is cured by `REBUCK2_SANDBOX_HOST` | it died at 39 targets without it, completed with it |
+| A fix is worth what its target's bottleneck is worth | prefetch and `-balance`: 41% on `+test-ast`, 0% here |
+| `WITH DOCKER` cannot be dispatched | mount type 100 is `HOST_BIND` in earthly's fork |
+| That ceiling is 2.32x on six machines | 670s of 2,120s serial by construction |
 
 **Open.** Believed for a reason, not measured.
 
@@ -78,7 +83,7 @@ confident version first - which has happened to me, in this file, twice.
 | How much of the fleet's traffic crosses a wire | `SERVED_BYTES` mixes loopback with peer serving; `SERVED_LOCAL_BYTES` exists and has never reported |
 | Whether the fleet repeats itself, and by how much | the coordinator reports 1.1x; the per-worker figure has never printed |
 | What made the reference run take 50 minutes | not the tap, which costs 1ms. Still unexplained |
-| What a 14-way target does with the fixes | it ran at 186s/525s BEFORE them - see the correction |
+| Whether the `WITH DOCKER` cut is worth building | `trapped ops` in flight; a large suffix means yes |
 
 **Retracted.** Written here confidently and wrong. Left in place with the
 correction attached, because a deleted mistake gets made again.
