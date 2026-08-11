@@ -1027,7 +1027,19 @@ jobs:
           # address is !isLocal and earthly simply connects.
           LAN=$(hostname -I | awk '{print $1}')
           echo "LAN=$LAN" >> "$GITHUB_ENV"
-          REBUCK2_MIRROR=172.17.0.1:15000 \
+          # PULL-THROUGH, for the harvest's base image and nothing else.
+          #
+          # `build_subtree` solves without a session and a sessionless solve
+          # cannot reach Docker Hub - buildkit asks the session for
+          # credentials even for an anonymous pull. Our registry does the
+          # token dance itself over plain HTTP, so a reference AT OUR
+          # ADDRESS resolves where a Hub one cannot.
+          #
+          # No confound: this only adds the ability to serve
+          # `172.17.0.1:15000/library/...`. A graph naming `docker.io/...`
+          # does not come through us and is unaffected, so nothing that was
+          # undispatchable becomes dispatchable.
+          REBUCK2_MIRROR=172.17.0.1:15000 REBUCK_UPSTREAM_REGISTRY=1 \
             "$RB" buildkit-proxy \
               --listen 0.0.0.0:1234 \
               --upstream "http://$BK_ADDR" \
@@ -1208,7 +1220,14 @@ jobs:
           # first colon and rejected `id == path`, which is every mount
           # buildkit keys on its destination. It now lives in Rust with a
           # test per shape.
+          # The base comes from OUR registry, not Docker Hub. `build_subtree`
+          # solves without a session, and a sessionless solve cannot reach
+          # Hub - buildkit asks the session for credentials even anonymously
+          # and answers `failed to load cache key: no active sessions`. That
+          # finding is already in fleet-findings under "a sessionless peer
+          # cannot reach Docker Hub"; the harvest rediscovered it.
           "$RB" harvest-cache --bk "$LAN:28372" --registry "172.17.0.1:15000" \
+            --base "172.17.0.1:15000/library/busybox:1" \
             --pairs "$REBUCK2_SEED_IDS" 2>&1 | tee harvest.out || \
             echo "::warning::no cache mount could be harvested"
           grep -oE '^REBUCK2_CACHE_SEEDS=.*' harvest.out \

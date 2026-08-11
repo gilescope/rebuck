@@ -86,6 +86,14 @@ jobs:
           docker run -d --name smoke-bk --privileged -p 28372:8372 \
             -e BUILDKIT_TCP_TRANSPORT_ENABLED=true -e BUILDKIT_TLS_ENABLED=false \
             earthbuild/buildkitd:v0.8.17 >/dev/null
+          # PULL-THROUGH ON. A sessionless solve cannot reach Docker Hub -
+          # buildkit asks the session for credentials even for an anonymous
+          # pull and answers `failed to load cache key: no active sessions` -
+          # and this project already has that finding written down under "a
+          # sessionless peer cannot reach Docker Hub". Our own registry does
+          # the token dance itself, over plain HTTP the daemon needs no
+          # session for.
+          REBUCK_UPSTREAM_REGISTRY=1 \
           ./rebuck2/target/release/rebuck2 registry --bind 0.0.0.0:15000 \
             > registry.log 2>&1 &
           for _ in $(seq 1 90); do
@@ -103,6 +111,7 @@ jobs:
           # rather than the one in use.
           ./rebuck2/target/release/rebuck2 harvest-cache \
             --bk 172.17.0.1:28372 --registry 172.17.0.1:15000 \
+            --base 172.17.0.1:15000/library/busybox:1 \
             --id smoke-cache --dest /smoke/cache | tee harvest.out
           line=$(grep -oE '^REBUCK2_CACHE_SEEDS=.*' harvest.out)
           echo "harvested: $line"
