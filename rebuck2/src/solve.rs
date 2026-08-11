@@ -330,10 +330,35 @@ pub fn solve_request(
 ///
 /// `addr` is a gRPC endpoint (`http://127.0.0.1:1234`). Earthly runs a
 /// buildkitd per container, so on a worker this is loopback.
+/// A daemon address as tonic needs it.
+///
+/// Every caller in this crate has to know that a buildkit address is a URL
+/// to tonic and a `host:port` to everyone else - the workflow, buildctl,
+/// earthly's own `--buildkit-host`, and every log line that ever printed
+/// one. `harvest-cache` did not know, and died on
+///
+///     transport error
+///     caused by: invalid URL, scheme is missing
+///
+/// which is tonic's wording and names no argument. That is the fourth
+/// distinct fault to stop a seeding run, and the sign that the convention
+/// should never have been the caller's to keep.
+///
+/// `tcp://` is translated rather than passed through: it is what earthly
+/// writes and what tonic cannot dial, so leaving it would move the same
+/// error later.
+pub fn daemon_url(addr: &str) -> String {
+    match addr.split_once("://") {
+        Some(("tcp", rest)) => format!("http://{rest}"),
+        Some(_) => addr.to_owned(),
+        None => format!("http://{addr}"),
+    }
+}
+
 pub async fn connect(
     addr: &str,
 ) -> anyhow::Result<control::control_client::ControlClient<tonic::transport::Channel>> {
-    Ok(control::control_client::ControlClient::connect(addr.to_owned()).await?)
+    Ok(control::control_client::ControlClient::connect(daemon_url(addr)).await?)
 }
 
 /// The one-source-and-a-terminal graph that pulls a context out of a client.
@@ -820,6 +845,33 @@ mod tests {
             f("git://example.com/r.git#main"),
             "git://example.com/r.git#main"
         );
+    }
+
+    /// A daemon address is a URL to tonic and a host:port to everyone else.
+    ///
+    /// Fourth distinct fault to stop a seeding run. `harvest-cache --bk
+    /// 10.1.0.5:28372` died on `transport error / invalid URL, scheme is
+    /// missing` - tonic's wording, and one that says nothing about which
+    /// argument it means. The proxy is started with `--upstream
+    /// http://$BK_ADDR` and never hit it; the new caller had no reason to
+    /// know the convention, which is a sign the convention should not have
+    /// been the caller's to keep.
+    #[test]
+    fn a_daemon_address_is_a_url_whether_or_not_it_was_written_as_one() {
+        let d = super::daemon_url;
+        assert_eq!(d("10.1.0.5:28372"), "http://10.1.0.5:28372");
+        assert_eq!(d("127.0.0.1:8372"), "http://127.0.0.1:8372");
+        // Already a URL: untouched, including the schemes buildkit itself
+        // uses for a TLS daemon or a unix socket.
+        assert_eq!(d("http://127.0.0.1:8372"), "http://127.0.0.1:8372");
+        assert_eq!(d("https://bk.example:443"), "https://bk.example:443");
+        assert_eq!(
+            d("unix:///run/buildkit/buildkitd.sock"),
+            "unix:///run/buildkit/buildkitd.sock"
+        );
+        // tcp:// is what earthly writes and what tonic cannot dial, so it
+        // becomes http:// rather than being passed through to fail later.
+        assert_eq!(d("tcp://host:8372"), "http://host:8372");
     }
 
     #[test]
