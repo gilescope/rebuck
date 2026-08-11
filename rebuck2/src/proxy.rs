@@ -1554,21 +1554,11 @@ impl Wire {
             .map(|p| crate::dispatch::expand_home(&p))
         {
             if !self.cache_inputs.is_empty() {
-                let body: Vec<String> = self
-                    .cache_inputs
-                    .iter()
-                    .map(|(id, (op, sel))| {
-                        use base64::Engine;
-                        format!(
-                            "{id}\t{sel}\t{}",
-                            base64::engine::general_purpose::STANDARD.encode(op)
-                        )
-                    })
-                    .collect();
+                let body = crate::dispatch::encode_cache_inputs(&self.cache_inputs);
                 if let Some(dir) = std::path::Path::new(&path).parent() {
                     let _ = std::fs::create_dir_all(dir);
                 }
-                match std::fs::write(&path, body.join("\n")) {
+                match std::fs::write(&path, &body) {
                     Ok(()) => println!(
                         "[wire] cache inputs  : {} written to {path}",
                         self.cache_inputs.len()

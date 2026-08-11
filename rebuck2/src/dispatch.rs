@@ -396,6 +396,50 @@ fn hazards(op: &pb::Op) -> Vec<Exclusion> {
 /// Naming them is the first step to deciding which are worth seeding: the
 /// answer is not "all of them", and it cannot be guessed from the Earthfile
 /// because frequency in the source says nothing about time spent.
+/// Observed cache-mount inputs, as a file the next run can read.
+///
+/// `id \t selector \t base64(op bytes)` per line. Base64 because op bytes
+/// are arbitrary protobuf - NUL, tab and newline all occur in them - and a
+/// raw write would corrupt on the first op containing a tab, leaving the
+/// reader silently one field short.
+///
+/// Written by the proxy at the end of a run and read by `harvest-cache`,
+/// usually a run later, carried between them by the bank. Two processes and
+/// two runs apart is exactly the kind of seam that has cost this project
+/// thirteen faults, so both directions live here and are tested together.
+pub fn encode_cache_inputs(m: &BTreeMap<String, (Vec<u8>, String)>) -> String {
+    use base64::Engine;
+    m.iter()
+        .map(|(id, (op, sel))| {
+            format!(
+                "{id}\t{sel}\t{}",
+                base64::engine::general_purpose::STANDARD.encode(op)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The reverse of [`encode_cache_inputs`]. A malformed line is dropped.
+///
+/// Dropped rather than repaired: the file rides between runs in a cache and
+/// can arrive truncated, and a half-read op would produce a seed pointing at
+/// the wrong directory - which reads as an empty cache and not as an error.
+pub fn decode_cache_inputs(text: &str) -> BTreeMap<String, (Vec<u8>, String)> {
+    use base64::Engine;
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.splitn(3, '\t');
+            let id = f.next()?;
+            let sel = f.next()?;
+            let op = base64::engine::general_purpose::STANDARD
+                .decode(f.next()?)
+                .ok()?;
+            (!id.is_empty()).then(|| (id.to_owned(), (op, sel.to_owned())))
+        })
+        .collect()
+}
+
 /// `~/x` as a real path.
 ///
 /// A workflow's `env:` value has `${{ }}` expressions evaluated and nothing
@@ -2606,6 +2650,36 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 
 #[cfg(test)]
 mod tests {
+    /// The proxy writes these and the harvest reads them, in two processes
+    /// and often two runs apart. One function each way, tested together.
+    #[test]
+    fn observed_cache_inputs_survive_the_round_trip() {
+        let mut m = std::collections::BTreeMap::new();
+        // Op bytes are arbitrary protobuf: NUL, newline and tab all occur,
+        // which is why they are base64 and not written raw. A raw write
+        // would corrupt on the first op containing a tab and the harvest
+        // would silently read one field short.
+        m.insert(
+            "go-mod".to_owned(),
+            (vec![0u8, 10, 9, 255, 128, 1], "/cache".to_owned()),
+        );
+        m.insert(
+            "/run/cache/abc123/root/.cache/golangci_lint".to_owned(),
+            (vec![1u8, 2, 3], String::new()),
+        );
+
+        let text = super::encode_cache_inputs(&m);
+        assert_eq!(text.lines().count(), 2);
+        let back = super::decode_cache_inputs(&text);
+        assert_eq!(back, m, "byte for byte, including an empty selector");
+
+        // A truncated or foreign line is dropped, not guessed at. This file
+        // rides between runs in a cache, so it can arrive half-written.
+        let back = super::decode_cache_inputs("go-mod\t/cache\nnot-a-line\n\n");
+        assert!(back.is_empty(), "a line missing its payload is not a seed");
+        assert!(super::decode_cache_inputs("").is_empty());
+    }
+
     #[test]
     fn a_leading_tilde_is_expanded_because_a_workflow_env_does_not() {
         // GitHub evaluates `${{ }}` in an `env:` value and nothing else, so

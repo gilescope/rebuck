@@ -381,20 +381,7 @@ async fn main() -> Result<()> {
                 .ok()
                 .map(|p| dispatch::expand_home(&p))
                 .and_then(|p| std::fs::read_to_string(p).ok())
-                .map(|t| {
-                    use base64::Engine;
-                    t.lines()
-                        .filter_map(|l| {
-                            let mut f = l.splitn(3, '\t');
-                            let id = f.next()?.to_owned();
-                            let sel = f.next()?.to_owned();
-                            let op = base64::engine::general_purpose::STANDARD
-                                .decode(f.next()?)
-                                .ok()?;
-                            Some((id, (op, sel)))
-                        })
-                        .collect::<std::collections::BTreeMap<_, _>>()
-                })
+                .map(|t| dispatch::decode_cache_inputs(&t))
                 .unwrap_or_default();
             if inputs.is_empty() {
                 println!(
