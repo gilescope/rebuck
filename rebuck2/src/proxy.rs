@@ -2093,12 +2093,15 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 // Nothing to overlap with? Keep it. See
                 // `worth_dispatching_now` - the serial base chain is 71% of
                 // this workload and gains nothing from a second machine.
+                //
+                // Read BEFORE the claim is handed back, so it reflects what
+                // else is actually in flight rather than this solve alone.
                 let crowded = worth_dispatching_now(
                     self.home_inflight
                         .load(std::sync::atomic::Ordering::Relaxed),
                     min_siblings(),
                 );
-                if allowed && worth && !saturated && crowded {
+                if allowed && worth && !saturated {
                     *self
                         .wire
                         .held()
@@ -2116,7 +2119,20 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 // it does it without any layer crossing the coordinator,
                 // which is principle 6 and the thing the shared mirror could
                 // never satisfy.
-                let offer = allowed && worth && saturated;
+                // `crowded` belongs HERE, on the decision, not on the
+                // diagnostic tally above - which is where it was first
+                // written, making REBUCK2_MIN_SIBLINGS change a counter and
+                // nothing else. The A/B would have read "no effect" and the
+                // idea would have been discarded without ever being enabled.
+                let offer = allowed && worth && saturated && crowded;
+                if allowed && worth && saturated && !crowded {
+                    *self
+                        .wire
+                        .held()
+                        .rejected
+                        .entry("nothing to overlap with".to_owned())
+                        .or_default() += 1;
+                }
                 // The slot was claimed above. Hand it back if the work is
                 // leaving after all.
                 if offer && claimed {
