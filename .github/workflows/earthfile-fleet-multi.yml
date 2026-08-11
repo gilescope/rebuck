@@ -41,6 +41,10 @@ on:
       home_slots:
         description: "slots peer 0 keeps for itself - 0 forces dispatch"
         default: "0"
+      keepalive_s:
+        description: upstream http2 keepalive interval in seconds; 0 disables it
+        type: string
+        default: ''
       conns:
         description: upstream connections; 1 shares Control and gateway as before the split
         type: string
@@ -198,6 +202,7 @@ env:
   REBUCK2_PREFETCH: ${{ inputs.prefetch || '0' }}
   REBUCK2_FRESH_FLEET: ${{ inputs.fresh_fleet || '1' }}
   REBUCK2_CONNS: ${{ inputs.conns || '' }}
+  REBUCK2_KEEPALIVE_S: ${{ inputs.keepalive_s || '' }}
   REBUCK2_WARM_TARGET: ${{ inputs.warm_target || './tests/integration-base+test-base' }}
   # Pinned by digest like everything else here: a collector that changes
   # under us changes the data.

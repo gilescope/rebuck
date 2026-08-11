@@ -221,11 +221,29 @@ impl Proxy {
         // Keepalive on both: a Session can sit idle while a nested build
         // runs, and an intermediary that reaps idle connections takes the
         // build with it.
-        let endpoint = |u: String| -> anyhow::Result<tonic::transport::Endpoint> {
-            Ok(tonic::transport::Endpoint::new(u)?
-                .http2_keep_alive_interval(std::time::Duration::from_secs(20))
-                .keep_alive_timeout(std::time::Duration::from_secs(60))
-                .keep_alive_while_idle(true))
+        // KEEPALIVE, and whether it is the thing killing long solves.
+        //
+        // Added in the same commit as the connection split, and the failure
+        // lands immediately after a 59.6s lead against a 60s keep-alive
+        // timeout. A Control.Solve waits for the fleet to build a subtree -
+        // 59s here, 142s for the next one - and carries no traffic while it
+        // waits, which is exactly when a keepalive decides a connection is
+        // dead.
+        //
+        // 0 disables it, which is what every run before the split used.
+        let ka: u64 = std::env::var("REBUCK2_KEEPALIVE_S")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        let endpoint = move |u: String| -> anyhow::Result<tonic::transport::Endpoint> {
+            let e = tonic::transport::Endpoint::new(u)?;
+            Ok(if ka == 0 {
+                e
+            } else {
+                e.http2_keep_alive_interval(std::time::Duration::from_secs(ka))
+                    .keep_alive_timeout(std::time::Duration::from_secs(ka * 3))
+                    .keep_alive_while_idle(true)
+            })
         };
         let upstream_kept = upstream.clone();
         // HOW MANY connections, and whether Control shares one.
