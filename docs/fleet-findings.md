@@ -3009,3 +3009,57 @@ reports that it ran, the effect is absent, and the instrument cannot
 separate "did nothing" from "did nothing useful". `mech::applied` was built
 for the first version of this, the blob count for the second, and the byte
 count for the third.
+
+## The caches were empty, and a seeded mount is a DIFFERENT mount
+
+Attempt seven, with the byte counter in place:
+
+```text
+[harvest] go-mod at /go/pkg/mod -> ...@sha256:001f3d..., 2 blob(s), 0.0 MiB
+[harvest] WARNING: go-mod harvested under 64 KiB - that cache was
+  effectively empty, so seeding it changes nothing.
+```
+
+All four ids, all 0.0 MiB. So the previous run's null result was never
+"seeding does not pay" - nothing was shipped. The instrument that could tell
+those apart was added one run earlier and answered on its first use.
+
+Note the two `go-mod` and `/go/pkg/mod` harvests returned the SAME digest.
+Two ids, one empty layer, identical content - which is what identical
+nothing looks like.
+
+**Why the caches are empty is not yet known.** The baseline runs `+lint-all`
+on `base-bk`, that build fills `go-mod` through `+deps`, and the harvest
+runs against the same daemon minutes later. One of those three statements is
+false and the run does not say which, so `buildctl du -v` now runs against
+`base-bk` before the harvest. It names each cache mount the way `mount.go`
+builds the name - `cached mount <dest> from <manager> with id "<id>"` - so
+it answers all three at once: do the mounts exist, how big are they, and
+under which id.
+
+**And a semantic worth knowing before the answer arrives.** From
+`getRefCacheDir`:
+
+```go
+key := id
+if ref != nil {
+    key += ":" + ref.ID()
+}
+```
+
+A cache mount with an INPUT is keyed on the id *and the input's ref*. So a
+seeded mount is not the warmed version of the unseeded one - it is a
+**separate cache directory**, initialised from the seed and never shared
+with the plain `go-mod` dir beside it.
+
+That is correct, and it has a consequence this project has to decide about:
+a worker that has built five leads and has a genuinely warm `go-mod` will,
+on being handed a seeded graph, start from the SEED instead. If the seed is
+older or thinner than what that worker already had, seeding makes it slower.
+
+Which puts seeding and affinity back in tension, in a new way. Affinity
+exists to keep a worker meeting its own warm mount; seeding hands every
+worker the same one and, by keying, replaces rather than augments. The
+resolution is probably to seed only where a worker has no warm mount of that
+id already - `cache_by_worker` already tracks exactly that, for affinity -
+but nothing measured yet says how big the effect is in either direction.

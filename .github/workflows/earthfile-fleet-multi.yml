@@ -1318,6 +1318,18 @@ jobs:
           docker tag busybox:1 127.0.0.1:15000/library/busybox:1
           docker push -q 127.0.0.1:15000/library/busybox:1
 
+          # WHAT base-bk ACTUALLY HOLDS, from buildkit's own accounting.
+          #
+          # Every harvest came back at 0.0 MiB, so the caches the baseline
+          # was supposed to have filled were empty when the harvest looked.
+          # `buildctl du` names each cache mount the way mount.go builds it
+          # - `cached mount <dest> from <manager> with id "<id>"` - so this
+          # says whether the mounts exist, how big they are, and under
+          # which id. All three are guesses otherwise.
+          echo "=== cache mounts base-bk holds"
+          docker exec base-bk buildctl --addr tcp://127.0.0.1:8372 du -v 2>/dev/null \
+            | grep -iE "cached mount|Total" | head -20 || echo "(du unavailable)"
+
           # CAN this daemon be seeded at all? Thirty seconds, before the
           # twenty-five minutes that would otherwise be needed to find out.
           # It writes a marker into one cache mount, harvests it, and reads
