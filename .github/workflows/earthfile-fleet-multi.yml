@@ -562,7 +562,9 @@ jobs:
           # runs it is a different proposition entirely: the bank restores
           # the coordinator's store, so last run's subtrees are already
           # there and grafting costs a pull rather than a build. Nothing has
-          # tested that, and `[wire] grafted` has read 0 in every run.
+          # tested that. `[wire] grafted` read 0 in every run and I took it
+          # for evidence - but the flag was UNSET in every one of those runs,
+          # so the zero said nothing at all. It now prints OFF instead.
           case "${GRAFT:-}" in
             "") case "$REF" in *-graft*) graft=1 ;; *) graft=0 ;; esac ;;
             *)  graft="$GRAFT" ;;

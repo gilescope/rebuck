@@ -2527,10 +2527,19 @@ pub async fn serve(
         // comparison is against the number of workers, not against the
         // number of solves.
         println!("[wire] peak in flight : {peak} subtree(s) at once");
-        println!(
-            "[wire] grafted        : {} subtree(s) started from a built ancestor",
-            wire.held().grafted
-        );
+        // OFF is not ZERO. This printed `grafted: 0` in every run, including
+        // every run where REBUCK2_GRAFT was not set - and I read that as
+        // "grafting never fires", wrote it into the workflow as a comment,
+        // and used it to rank grafting below other work. A mechanism that is
+        // switched off has not been tested; saying 0 claims it has.
+        if std::env::var("REBUCK2_GRAFT").as_deref() == Ok("1") {
+            println!(
+                "[wire] grafted        : {} subtree(s) started from a built ancestor",
+                wire.held().grafted
+            );
+        } else {
+            println!("[wire] grafted        : OFF (REBUCK2_GRAFT unset) - not a zero");
+        }
         if uniq > 0 {
             // 1.0x means the subtrees are disjoint and a fleet divides the
             // work. Higher means every machine is rebuilding the same
