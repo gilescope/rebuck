@@ -3625,3 +3625,67 @@ is known too, because we mirrored it.
 
 `min_siblings` exists, is off, and gates on queue depth rather than size -
 it would not have stopped any of this.
+
+### Correction: the 24.7 GiB never crossed the network
+
+Written the same day as the section above, after taking the per-lead lines
+apart. The 73x is real; the explanation I attached to it is not.
+
+`SERVED_BYTES` counts HTTP responses out of a worker's **own** registry.
+The worker starts that registry with `serve_with_upstream(addr, reg, None)` -
+no upstream - and its only client is the buildkitd on the same box. So
+"24.7 GiB fetched" is 24.7 GiB served over loopback, mostly off local disk.
+The network share is separately counted, and it is small: `[cas] fetches:
+local=2 peer=37 driver=82` is the high-water mark on any worker, a few
+hundred fetches across the whole run, most of them frontier blobs.
+
+The registry file already carried the warning, ten lines above the counter:
+
+> two runs reported "0 KiB" across 160 blob GETs, and I read that as an
+> architectural finding about who serves a worker's inputs.
+
+Same counter, opposite direction, same mistake.
+
+What the per-lead numbers actually say, on 414 distinct leads:
+
+| relationship | pearson r |
+| ---------------- | --------- |
+| ops ~ KiB served | 0.32 |
+| ops ~ ms | 0.27 |
+| **KiB served ~ ms** | **0.06** |
+
+Bytes served do not predict how long a lead takes. Nor does op count
+predict bytes. And the served volume is a handful of fixed artifacts
+repeated: worker 2 served an identical 26,726 KiB blob **76 times**, worker
+4 served an identical 188,827 KiB blob 14 times. Three buckets of the ops
+histogram have medians of 26,726 / 26,729 / 26,726 KiB - that is one
+artifact, re-served per lead, not a size distribution.
+
+So three claims retract:
+
+- **"A lead costs what it fetches"** - unsupported per-lead (r = 0.06).
+  It survives only as an aggregate intuition, which is not a mechanism.
+- **"24.7 GiB moved"** - it was served, over loopback. Say served.
+- **The op floor's justification.** ops~KiB at 0.32 makes op count a weak
+  proxy for bytes, and bytes are not the cost anyway.
+
+What survives, and it is still the finding: **204s against 1773s, 412
+solves all routed, and a per-lead cost of ~2.5s that barely varies with
+what is in the lead.** The cost of a lead is close to CONSTANT. That is a
+much stronger reason to refuse small work than any byte argument - a fixed
+toll is paid in full by the smallest job - and it points somewhere the byte
+story did not: at the ~26 MiB re-materialised per lead on a machine that
+already had it.
+
+The floor ships anyway, and `-ast-minops` was already running when this
+came out. It is now a calibration, not a fix: the counterfactual on the
+recorded distribution says a floor of 20 refuses 63 of 414 leads, so if the
+20-op run moves the wall clock much at all, the constant is not as constant
+as this section claims.
+
+| floor | leads refused | of 414 |
+| ----- | ------------- | ------ |
+| 5 | 10 | 2% |
+| 20 | 63 | 15% |
+| 40 | 221 | 53% |
+| 100 | 315 | 76% |

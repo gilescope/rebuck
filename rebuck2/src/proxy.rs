@@ -2809,13 +2809,15 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
                 // written, making REBUCK2_MIN_SIBLINGS change a counter and
                 // nothing else. The A/B would have read "no effect" and the
                 // idea would have been discarded without ever being enabled.
-                // Is there enough WORK here to pay for the bytes?
+                // Is there enough WORK here to pay the placement toll?
                 //
-                // `+test-ast` dispatched 412 solves and moved 24.7 GiB to run
-                // a 204-second build - 73x. The median lead ran 2.6 seconds
-                // and fetched 26 MiB to do a `jq` and a `diff`. A lead costs
-                // what it fetches, so a graph smaller than its own base image
-                // is a straight loss however idle the fleet is.
+                // `+test-ast` dispatched 412 solves to run a 204-second build
+                // and took 1773s - 73x. The median lead ran 2.6 seconds to do
+                // a `jq` and a `diff`, and duration barely varies with what is
+                // in the lead: placing work costs a near-constant amount, so a
+                // job smaller than the toll is a straight loss however idle
+                // the fleet is. (Stated as a byte argument first; that version
+                // rested on loopback traffic and was withdrawn - principle 25.)
                 //
                 // A different question from `crowded`, which asks whether
                 // anything else is in flight. That one is about whether

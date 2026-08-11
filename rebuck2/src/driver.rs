@@ -1607,7 +1607,7 @@ impl Driver {
         // The SECOND dispatch site, and it needs the same floor as the
         // first. A worker handing a five-op branch to a peer makes that peer
         // materialise a base image to run it, exactly as the proxy did 412
-        // times on `+test-ast` for 24.7 GiB and 73x. Principle 25.
+        // times on `+test-ast` for 73x. Principle 25.
         //
         // Refusing here is not a failure: the requester builds it itself,
         // which is the outcome the rule wants. For a verbatim client graph

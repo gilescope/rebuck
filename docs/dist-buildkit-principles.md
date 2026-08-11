@@ -856,17 +856,23 @@ Two corollaries worth having:
   paid never fills. The cheap target could not answer the question, and
   nothing about the mechanism was wrong.
 
-## 25. A lead costs what it fetches, so measure the work against the bytes
+## 25. A lead has a fixed toll, so the smallest job pays the most
 
-Ask of every solve, before dispatching it: is there more work here than
-there are bytes to move? If not, keep it home. Idle machines are not a
+Ask of every solve, before dispatching it: is there more work here than it
+costs to place work at all? If not, keep it home. Idle machines are not a
 reason to send it - they are a reason to send something else.
 
+> **Corrected the same day.** This principle first read "a lead costs what
+> it fetches", and the byte number behind it was loopback traffic, not
+> network - see the correction in `fleet-findings.md`. Across 414 leads,
+> bytes served correlate with lead duration at r = 0.06. The toll is real
+> and near-constant; it is just not made of bytes on a wire.
+
 `+test-ast` is the case. 412 solves, every one routed, none kept home; 204
-seconds baseline against 1773 in the fleet; 24.7 GiB moved. The median lead
-ran 2.6 seconds and fetched 26 MiB, to run a `jq` and a `diff`. Fifty-four
-leads carried twenty ops or fewer, cost 232 seconds between them, and
-dragged 1.2 GiB.
+seconds baseline against 1773 in the fleet. The median lead ran 2.6 seconds
+to do a `jq` and a `diff`, and re-materialised ~26 MiB the machine already
+had in order to do it. Lead duration barely varies with what is in the
+lead: that is the toll.
 
 **73x.** Not 73% slower - 73 times the work, to produce the same artifacts.
 
@@ -880,7 +886,10 @@ scheduling bug.
 The proxy cannot know a graph's runtime, and does not need to. Op count is
 a crude proxy, known before dispatch, needing no history - principle 13.
 The asymmetry is what licenses the crudeness: being wrong costs one solve
-built at home; being absent cost 73x.
+built at home; being absent cost 73x. Crude is not the same as arbitrary,
+though, and op count is weaker than it looked: against bytes served it
+correlates at 0.32. It is a proxy for the SIZE OF THE JOB, which is the
+thing that has to beat the toll - not for anything about transport.
 
 Distinguish this from a cap on WORKERS, which I wrote, tested, and removed
 in the same hour because it rested on reading 162 machine-seconds as wall
@@ -894,3 +903,9 @@ The general form, for any system that moves work to where the capacity is:
 the unit of dispatch has a floor price, and it is set by the context the
 work needs, not by the work. Below that floor, the fastest scheduler in the
 world loses to doing nothing.
+
+And the corollary the correction taught: **when you find a large number,
+find out what it is a number OF before you build on it.** The 24.7 GiB was
+a real counter, correctly incremented, measuring loopback. The 73x needed
+no explaining to be true - I explained it anyway, and the explanation was
+the part that was wrong.

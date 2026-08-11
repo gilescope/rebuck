@@ -1549,11 +1549,16 @@ pub fn worth_offering(
 /// that is an argument, and arguments have lost to measurements every time.
 /// Is this graph too small to be worth sending anywhere?
 ///
-/// A lead costs what it fetches. `+test-ast` dispatched 412 solves and moved
-/// 24.7 GiB to run a 204-second build: median lead 2.6s and 26 MiB, to run a
-/// `jq` and a `diff`. Fifty-four of those leads carried twenty ops or fewer,
-/// cost 232 seconds between them, and dragged 1.2 GiB to do work a single
-/// machine does in the noise.
+/// Placing a lead has a near-constant toll, so the smallest job pays the
+/// most. `+test-ast` dispatched 412 solves to run a 204-second build and took
+/// 1773s: the median lead ran 2.6 seconds to do a `jq` and a `diff`, and lead
+/// duration barely varies with what is in the lead.
+///
+/// The first version of this said "a lead costs what it fetches", on a byte
+/// count that turned out to be loopback - across 414 leads, bytes served
+/// correlate with duration at r = 0.06. Op count is a proxy for the SIZE OF
+/// THE JOB, which is what has to beat the toll; it is not a proxy for
+/// transport, and against bytes it correlates at only 0.32.
 ///
 /// Op count is a crude proxy for how much work a graph is, and deliberately
 /// so - principle 13. It is known before dispatch, it needs no history, and
@@ -2689,10 +2694,10 @@ pub fn import_graph(reference: &str) -> pb::Definition {
 mod tests {
     /// A graph too small to be worth the bytes it drags across.
     ///
-    /// `+test-ast` dispatched 412 solves and moved 24.7 GiB to run a
-    /// 204-second build. Median lead: 2.6s, 26 MiB fetched, for a `jq` and
-    /// a `diff`. A lead costs what it fetches, so a lead that fetches a base
-    /// image to run milliseconds of work is pure loss.
+    /// `+test-ast` dispatched 412 solves to run a 204-second build and took
+    /// 1773s. Median lead: 2.6s, for a `jq` and a `diff`. Duration barely
+    /// varies with what is in the lead, so a lead carrying milliseconds of
+    /// work is pure loss - it pays the same toll as a real one.
     #[test]
     fn a_graph_can_be_too_small_to_send() {
         let keep = super::too_small_to_send;

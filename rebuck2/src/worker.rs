@@ -834,11 +834,15 @@ async fn lead_reply(
     let moved =
         crate::registry::SERVED_BYTES.load(std::sync::atomic::Ordering::Relaxed) - bytes_before;
     // SERVING ms beside the bytes, because the two together split a number
-    // that was doing two jobs. A lead costs what it fetches, at 7.2 MB/s -
-    // and that rate is GETTING the bytes plus UNPACKING them. This registry
-    // is on one side of the line: what it spent is fetch, and the rest of
-    // the lead is unpack. A faster mesh and a cheaper codec fix different
-    // halves and nothing so far says which half is bigger.
+    // that was doing two jobs.
+    //
+    // READ IT RIGHT. This registry is started with no upstream and its only
+    // client is the buildkitd on this box, so `moved` is LOOPBACK: bytes out
+    // of this worker's own store, not bytes off the network. Over 414 leads
+    // it correlates with lead duration at r = 0.06 - it is a measure of how
+    // much buildkit re-materialised, which is worth knowing and is not a
+    // transport cost. What crosses the wire is `[cas] fetches: peer/driver`,
+    // and that ran to a few hundred fetches for the whole run.
     let served_ms =
         crate::registry::SERVED_MS.load(std::sync::atomic::Ordering::Relaxed) - serve_ms_before;
     println!(
@@ -889,10 +893,11 @@ async fn lead_reply(
 /// `std::env::consts::ARCH` in the spelling buildkit platforms use.
 /// One line saying where this worker's time went.
 ///
-/// A lead costs what it fetches - 87% of lead time in a measured run was in
-/// the seventeen leads that moved more than a MiB, at 7.2 MB/s. That rate
-/// is two things at once: GETTING the bytes, which this worker's registry
-/// does and times, and UNPACKING them, which buildkit does and does not.
+/// Bytes SERVED, which on this worker means loopback: the registry has no
+/// upstream and its only client is the buildkitd beside it. The rate is
+/// still worth having - it is what re-materialising costs - but it is not
+/// what the fleet moved, and reading it as transport is the mistake that
+/// produced a retracted principle. See the correction in fleet-findings.
 ///
 /// The per-lead line carries both, but forty of those need adding up before
 /// they say anything. This is the total, once, where a reader will find it.
