@@ -100,6 +100,51 @@ type Published = std::sync::Arc<
     >,
 >;
 
+/// Note every vertex a status frame carries, keyed by digest.
+///
+/// Buildkit re-sends a vertex as it progresses: once with `completed` unset,
+/// then again once it finishes. Overwriting by digest keeps the last word and
+/// makes repeats free, which matters because this runs on every frame of a
+/// stream the client is waiting on.
+///
+/// A vertex with no `started` has not begun and is skipped entirely - it is
+/// not a zero, it is an absence.
+pub fn note_vertices(
+    seen: &mut std::collections::BTreeMap<String, (u64, bool)>,
+    vertexes: &[bollard_buildkit_proto::moby::buildkit::v1::Vertex],
+) {
+    for v in vertexes {
+        let Some(from) = v.started.as_ref() else {
+            continue;
+        };
+        let ms = match v.completed.as_ref() {
+            Some(to) => {
+                let a = from.seconds * 1000 + i64::from(from.nanos) / 1_000_000;
+                let b = to.seconds * 1000 + i64::from(to.nanos) / 1_000_000;
+                u64::try_from(b - a).unwrap_or(0)
+            }
+            // Started and still going. Recorded so the digest is known, and
+            // replaced by the real figure when the finished frame arrives.
+            None => 0,
+        };
+        seen.insert(v.digest.clone(), (ms, v.cached));
+    }
+}
+
+/// `(vertices that ran, their total ms, how many were cache hits)`.
+///
+/// A cache hit is excluded from the count of work but kept in its own tally:
+/// a home that did nothing because it was lucky and a home that did nothing
+/// because it was idle are the same zero and opposite situations.
+pub fn home_work(seen: &std::collections::BTreeMap<String, (u64, bool)>) -> (usize, u64, usize) {
+    let ran = seen.values().filter(|(_, c)| !c);
+    (
+        ran.clone().count(),
+        ran.map(|(ms, _)| ms).sum(),
+        seen.values().filter(|(_, c)| *c).count(),
+    )
+}
+
 /// build id -> (where it went, graph key, whether it held a home slot).
 type Went = std::sync::Arc<
     std::sync::Mutex<std::collections::HashMap<String, (Option<usize>, String, bool)>>,
@@ -612,6 +657,16 @@ impl control::control_server::Control for Proxy {
     type StatusStream =
         Pin<Box<dyn futures::Stream<Item = Result<control::StatusResponse, Status>> + Send>>;
 
+    /// Home work, timed by the daemon that did it.
+    ///
+    /// One row per vertex digest, `(ms, cached)`. Buildkit re-sends a vertex
+    /// as it progresses - once with no `completed`, then again with one - so
+    /// a running vertex is recorded at zero and overwritten when it finishes,
+    /// and a repeat of the finished form changes nothing.
+    ///
+    /// A CACHED vertex is kept with `ms = 0` rather than dropped: "nothing
+    /// ran" and "ran instantly" are the same number and different facts, and
+    /// the count of each is what says whether home was busy or lucky.
     async fn status(
         &self,
         request: Request<control::StatusRequest>,
@@ -621,7 +676,20 @@ impl control::control_server::Control for Proxy {
             .client()
             .status(Request::from_parts(meta, ext, req))
             .await?;
-        Ok(Response::new(Box::pin(s.into_inner())))
+        // TAPPED, not consumed. Every byte still reaches the client - this
+        // stream is earthly's progress display - and the vertices are noted
+        // on the way past. Nothing here may fail or block: a status relay
+        // that stalls stalls the build it is describing.
+        let wire = self.wire.clone();
+        let tapped = s.into_inner().map(move |item| {
+            if let Ok(resp) = &item {
+                if let Ok(mut w) = wire.lock() {
+                    note_vertices(&mut w.home_vertices, &resp.vertexes);
+                }
+            }
+            item
+        });
+        Ok(Response::new(Box::pin(tapped)))
     }
 
     type ListenBuildHistoryStream =
@@ -1275,6 +1343,8 @@ pub struct Wire {
     /// The sweep says the best split is 2:1 toward home, and a weight can
     /// only be derived from measurement if the ratio the sweep implies is
     /// actually observable. These two are what would have to predict it.
+    /// Home vertex digest -> (ms, cached). See `note_vertices`.
+    pub home_vertices: std::collections::BTreeMap<String, (u64, bool)>,
     pub home_ms: Vec<u64>,
     pub away_ms: Vec<u64>,
     /// How long each `Control.Solve` took - the call the CLIENT blocks on,
@@ -1696,6 +1766,15 @@ impl Wire {
         // build time either, so there is no home-side equivalent of the
         // driver's lead timings, and that gap is exactly what stopped the
         // min_ops run from being diagnosable.
+        // What home ACTUALLY spent, from the status stream, which is the
+        // replacement for the pair below rather than a companion to it. This
+        // daemon builds only home work, so every vertex it reports is home
+        // work, timed by the thing that ran it.
+        let (ran, home_ms, cached) = home_work(&self.home_vertices);
+        println!(
+            "[wire] home vertices  : {ran} ran in {home_ms}ms, {cached} cache hit(s) \
+             - the only measure of what did NOT leave"
+        );
         if self.home_ms.is_empty() && self.away_ms.is_empty() {
             println!(
                 "[wire] service ms     : NOT MEASURED - every solve is an inner gateway \
@@ -3628,6 +3707,58 @@ impl gw::llb_bridge_server::LlbBridge for Proxy {
 
 #[cfg(test)]
 mod tests {
+    /// What the home machine actually spent, which nothing measured.
+    ///
+    /// `service ms` printed `home 0 (0) away 0 (0)` for two runs: it keys off
+    /// the outer `Control.Solve` ref, and under earthly there is one of those
+    /// for the whole build while every placement happens on an inner gateway
+    /// solve. So a run that kept seventeen graphs home could not say what
+    /// they cost, and the `-ast-minops` result had to be inferred.
+    ///
+    /// The status stream already carries it. This daemon builds ONLY home
+    /// work - dispatched subtrees run on workers - so every vertex it reports
+    /// with a start and a finish is home work, timed by buildkit itself.
+    #[test]
+    fn home_vertices_are_timed_from_the_status_stream() {
+        use bollard_buildkit_proto::google::protobuf::Timestamp;
+        let v = |d: &str, cached: bool, from: i64, to: Option<i64>| {
+            bollard_buildkit_proto::moby::buildkit::v1::Vertex {
+                digest: d.to_owned(),
+                cached,
+                started: Some(Timestamp {
+                    seconds: from,
+                    nanos: 0,
+                }),
+                completed: to.map(|t| Timestamp {
+                    seconds: t,
+                    nanos: 0,
+                }),
+                ..Default::default()
+            }
+        };
+        let mut seen = std::collections::BTreeMap::new();
+        // Buildkit re-sends a vertex as it progresses: once unfinished, then
+        // again complete. Both arrive; only the complete one is a duration,
+        // and it must not be counted twice.
+        super::note_vertices(&mut seen, &[v("a", false, 100, None)]);
+        super::note_vertices(&mut seen, &[v("a", false, 100, Some(107))]);
+        super::note_vertices(&mut seen, &[v("a", false, 100, Some(107))]);
+        super::note_vertices(&mut seen, &[v("b", true, 200, Some(200))]);
+        super::note_vertices(&mut seen, &[v("c", false, 300, Some(302))]);
+
+        assert_eq!(seen.len(), 3, "one row per digest: {seen:?}");
+        assert_eq!(seen["a"], (7000, false));
+        assert_eq!(seen["b"], (0, true), "a cache hit is work nobody did");
+        assert_eq!(seen["c"], (2000, false));
+
+        let (n, ms, cached) = super::home_work(&seen);
+        assert_eq!(
+            (n, ms, cached),
+            (2, 9000, 1),
+            "two vertices ran, nine seconds between them, one was cached"
+        );
+    }
+
     /// The keepalive rule is arithmetic, so it belongs in one place.
     ///
     /// grpc-go, vendored into the buildkitd we talk to: `maxPingStrikes = 2`
