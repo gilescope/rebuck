@@ -5278,3 +5278,45 @@ Worth having by accident: the second reference is the run that reported
 `completed/failure` because one worker exited non-zero. Its coordinator was
 green and its numbers are sound, which is exactly what the red-run signature
 two sections up exists to let a reader conclude.
+
+## `-bcast`: halves `waiting`, moves the clock by nothing
+
+Confirmed fired, from the worker logs rather than the wire report - the
+counter lives in the worker's process:
+
+```text
+251 x "8 of 8"   80 x "5 of 5"   71 x "2 of 2"   66 x "4 of 4"   35 x "44 of 44"
+```
+
+N equals M everywhere: every worker took every announced blob, which is
+exactly what broadcast means and what the split never did.
+
+| | `-balance -sandbox` | `+ -bcast` |
+| ---------- | ------------------- | ---------- |
+| fleet leg | 517s, 520s | **517s** |
+| `waiting` | 443s (27%), 453s (31%) | **245s (19%)** |
+| `building` | 1,196s, 1,021s | 1,017s |
+| occupancy | 3.35, 3.00 | 2.61 |
+
+**`waiting` fell by 45% and the clock did not move at all.**
+
+That is the mechanism working and not mattering, and the phase split is what
+makes the difference legible. Pre-positioning layers on every worker instead
+of one does remove queue time - 200 seconds of it - but this target's leg is
+not set by queue time. It is set by 771 seconds of home vertex work behind
+the host binds, which no amount of prefetching touches.
+
+Two things follow.
+
+**`-bcast` is a real improvement with no current value.** On a workload whose
+serial fraction dominates, shaving the parallel part changes the shape and
+not the clock - the same sentence written for `-sandbox` cutting the
+critical leads by a third. Two mechanisms now, both working, both invisible
+in the wall clock for the same structural reason.
+
+**It would matter on a target without host binds.** `+test-ast` has none,
+and its `waiting` was 45% after `-balance`. That is where `-bcast` should
+pay - and it is the target I moved it AWAY from three hours ago, on the
+argument that `building` was the bigger bucket there. The bucket was bigger;
+the bucket was not the constraint. Choosing by bucket size was the right
+correction to "choose by which target is cheapest" and still not right.
