@@ -136,6 +136,9 @@ pub struct Proxy {
     session_channel: Chan,
     /// Kept so each Session can dial a connection of its own.
     upstream: String,
+    /// Connections the gateway's calls are spread over. See [`Proxy::gw`].
+    gw_pool: Vec<Chan>,
+    next_gw: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// One dispatch at a time until something has been BUILT.
     ///
     /// The barrier that grafting needs and did not have. On a cold fleet the
@@ -227,12 +230,22 @@ impl Proxy {
         };
         let upstream_kept = upstream.clone();
         let channel = endpoint(upstream.clone())?.connect().await?;
-        let session_channel = endpoint(upstream)?.connect().await?;
+        let session_channel = endpoint(upstream.clone())?.connect().await?;
+        // FOUR, which is a guess bounded on both sides: one connection
+        // admits 250 concurrent streams and a run peaks well under 1000, so
+        // four is enough; and each is an idle TCP connection to localhost
+        // when unused, so being wrong upwards costs nothing measurable.
+        let mut gw_pool = vec![channel.clone()];
+        for _ in 0..3 {
+            gw_pool.push(endpoint(upstream.clone())?.connect().await?);
+        }
         Ok(Proxy {
             client: control::control_client::ControlClient::new(channel.clone()),
             channel,
             session_channel,
             upstream: upstream_kept,
+            gw_pool,
+            next_gw: Default::default(),
             warmup: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             driver,
             wire: Default::default(),
@@ -295,8 +308,29 @@ impl Proxy {
     }
 
     /// The gateway rides the same channel, because the client's does.
+    /// A gateway client, spread across the connection POOL.
+    ///
+    /// Not one connection. The gateway carries the bulk of the traffic - one
+    /// run logged 200 calls across solve, read_file, read_dir, ping and
+    /// return - and Go's http2 server admits 250 concurrent streams per
+    /// connection by default. Past that a stream is refused and the h2 error
+    /// surfaces as several independent targets failing in the same instant:
+    ///
+    ///     apply IF: read exit code: transport error
+    ///
+    /// on `+cache-mount-arg` and `+cache-test` together, followed by the
+    /// build dying. Simultaneous failure of unrelated calls is what a shared
+    /// connection looks like when it breaks.
+    ///
+    /// Round-robin rather than least-loaded: the counter is one atomic add,
+    /// and picking the emptiest would need per-connection stream accounting
+    /// that tonic does not expose.
     fn gw(&self) -> GwClient {
-        gw::llb_bridge_client::LlbBridgeClient::new(self.channel.clone())
+        let n = self
+            .next_gw
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ch = &self.gw_pool[n % self.gw_pool.len()];
+        gw::llb_bridge_client::LlbBridgeClient::new(ch.clone())
     }
 }
 
