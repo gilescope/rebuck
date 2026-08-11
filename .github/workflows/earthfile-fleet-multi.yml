@@ -663,6 +663,7 @@ jobs:
       - name: a collector for the traces earthly already sends
         env:
           OTLP_FORWARD: ${{ secrets.OTLP_FORWARD }}
+          OTLP_TOKEN: ${{ secrets.OTLP_TOKEN }}
         run: |
           set -euo pipefail
           d="$RUNNER_TEMP/otel"; mkdir -p "$d"; chmod 777 "$d"
@@ -676,7 +677,17 @@ jobs:
             printf '      http: { endpoint: 0.0.0.0:4318 }\n'
             printf 'exporters:\n  file:\n    path: /out/traces.jsonl\n'
             if [ -n "${OTLP_FORWARD:-}" ]; then
-              printf '  otlp/forward:\n    endpoint: %s\n    tls: { insecure: true }\n' "$OTLP_FORWARD"
+              # insecure_skip_verify, NOT insecure. `insecure: true` means
+              # PLAINTEXT, so it would dial a TLS listener without TLS and
+              # every export would fail - the collector is TLS with a
+              # self-signed cert, which needs verification skipped, not
+              # encryption dropped.
+              printf '  otlp/forward:\n    endpoint: %s\n' "$OTLP_FORWARD"
+              printf '    tls: { insecure_skip_verify: true }\n'
+              # And the token, or the far end 401s every batch.
+              if [ -n "${OTLP_TOKEN:-}" ]; then
+                printf '    headers: { Authorization: "Bearer %s" }\n' "$OTLP_TOKEN"
+              fi
             fi
             printf 'service:\n  telemetry:\n    logs: { level: warn }\n  pipelines:\n    traces:\n'
             printf '      receivers: [otlp]\n'

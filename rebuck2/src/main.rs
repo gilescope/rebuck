@@ -9,7 +9,6 @@
 //! `--session` (default $GITHUB_RUN_ID), see mesh.rs.
 
 mod bank;
-mod traces;
 mod bench;
 mod dispatch;
 mod driver;
@@ -24,6 +23,7 @@ mod registry;
 mod rpc;
 mod solve;
 mod store;
+mod traces;
 mod worker;
 
 use std::sync::Arc;
@@ -192,10 +192,7 @@ async fn main() -> Result<()> {
             let path = args
                 .opt("--file")
                 .ok_or_else(|| anyhow::anyhow!("traces: --file <traces.jsonl>"))?;
-            let top: usize = args
-                .opt("--top")
-                .and_then(|t| t.parse().ok())
-                .unwrap_or(12);
+            let top: usize = args.opt("--top").and_then(|t| t.parse().ok()).unwrap_or(12);
             let text = std::fs::read_to_string(&path)?;
             let legs = traces::parse(&text);
             if legs.is_empty() {

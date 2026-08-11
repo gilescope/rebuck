@@ -56,21 +56,26 @@ pub fn parse(jsonl: &str) -> Vec<Leg> {
                 .map(str::to_owned);
             for ss in rs["scopeSpans"].as_array().into_iter().flatten() {
                 for sp in ss["spans"].as_array().into_iter().flatten() {
-                    let (Some(tid), Some(name)) =
-                        (sp["traceId"].as_str(), sp["name"].as_str())
+                    let (Some(tid), Some(name)) = (sp["traceId"].as_str(), sp["name"].as_str())
                     else {
                         continue;
                     };
                     let ms = match (
-                        sp["startTimeUnixNano"].as_str().and_then(|s| s.parse::<u128>().ok()),
-                        sp["endTimeUnixNano"].as_str().and_then(|s| s.parse::<u128>().ok()),
+                        sp["startTimeUnixNano"]
+                            .as_str()
+                            .and_then(|s| s.parse::<u128>().ok()),
+                        sp["endTimeUnixNano"]
+                            .as_str()
+                            .and_then(|s| s.parse::<u128>().ok()),
                     ) {
                         (Some(a), Some(b)) if b >= a => (b - a) as f64 / 1e6,
                         _ => continue,
                     };
                     let leg = legs.entry(tid.to_owned()).or_default();
                     if leg.label.is_empty() {
-                        leg.label = tag.clone().unwrap_or_else(|| tid[..12.min(tid.len())].to_owned());
+                        leg.label = tag
+                            .clone()
+                            .unwrap_or_else(|| tid[..12.min(tid.len())].to_owned());
                     }
                     if name == "main" {
                         leg.wall_ms = leg.wall_ms.max(ms);
@@ -105,7 +110,10 @@ pub fn report(legs: &[Leg], top: usize) {
         );
         let mut rows: Vec<(&String, &Tally)> = leg.targets.iter().collect();
         rows.sort_by(|a, b| b.1.total_ms.total_cmp(&a.1.total_ms));
-        println!("{:44} {:>5} {:>9} {:>8}", "target", "n", "total s", "mean s");
+        println!(
+            "{:44} {:>5} {:>9} {:>8}",
+            "target", "n", "total s", "mean s"
+        );
         for (name, t) in rows.into_iter().take(top) {
             println!(
                 "{:44} {:5} {:9.1} {:8.1}",
@@ -119,14 +127,17 @@ pub fn report(legs: &[Leg], top: usize) {
     // The comparison the split exists for: same target, two legs.
     if legs.len() == 2 {
         println!("\n== the same target in both legs (mean seconds)");
-        println!("{:44} {:>10} {:>10} {:>7}", "target", &legs[0].label, &legs[1].label, "ratio");
+        println!(
+            "{:44} {:>10} {:>10} {:>7}",
+            "target", &legs[0].label, &legs[1].label, "ratio"
+        );
         let mut names: Vec<&String> = legs[0].targets.keys().collect();
-        names.sort_by_key(|n| {
-            -(legs[0].targets[*n].total_ms as i64)
-        });
+        names.sort_by_key(|n| -(legs[0].targets[*n].total_ms as i64));
         for n in names.into_iter().take(top) {
             let a = &legs[0].targets[n];
-            let Some(b) = legs[1].targets.get(n) else { continue };
+            let Some(b) = legs[1].targets.get(n) else {
+                continue;
+            };
             let (ma, mb) = (a.total_ms / a.count as f64, b.total_ms / b.count as f64);
             println!(
                 "{:44} {:10.1} {:10.1} {:7.1}x",
@@ -174,16 +185,21 @@ mod tests {
         // is the opposite conclusion and the correct one.
         let ms = 1_000_000u128;
         let jsonl = [
-            line("aaaa000000000000", Some("baseline"), &[
-                ("main", 0, 275_000 * ms),
-                ("+base", 0, 3_000 * ms),
-                ("+base", 0, 3_000 * ms),
-                ("+base", 0, 3_000 * ms),
-            ]),
-            line("bbbb000000000000", Some("fleet"), &[
-                ("main", 0, 365_000 * ms),
-                ("+base", 0, 20_000 * ms),
-            ]),
+            line(
+                "aaaa000000000000",
+                Some("baseline"),
+                &[
+                    ("main", 0, 275_000 * ms),
+                    ("+base", 0, 3_000 * ms),
+                    ("+base", 0, 3_000 * ms),
+                    ("+base", 0, 3_000 * ms),
+                ],
+            ),
+            line(
+                "bbbb000000000000",
+                Some("fleet"),
+                &[("main", 0, 365_000 * ms), ("+base", 0, 20_000 * ms)],
+            ),
         ]
         .join("\n");
 
@@ -208,11 +224,15 @@ mod tests {
         // time counts everything twice and the total exceeds the wall clock
         // by a factor nobody notices.
         let ms = 1_000_000u128;
-        let jsonl = line("cccc000000000000", Some("fleet"), &[
-            ("main", 0, 400_000 * ms),
-            ("+test-no-qemu", 0, 390_000 * ms), // umbrella
-            ("+real-work", 0, 9_000 * ms),
-        ]);
+        let jsonl = line(
+            "cccc000000000000",
+            Some("fleet"),
+            &[
+                ("main", 0, 400_000 * ms),
+                ("+test-no-qemu", 0, 390_000 * ms), // umbrella
+                ("+real-work", 0, 9_000 * ms),
+            ],
+        );
         let legs = parse(&jsonl);
         assert_eq!(legs[0].targets.len(), 1, "only the real target counts");
         assert_eq!(legs[0].targets["+real-work"].count, 1);
@@ -225,10 +245,14 @@ mod tests {
         let jsonl = [
             "not json at all".to_owned(),
             "{}".to_owned(),
-            line("dddd000000000000", None, &[
-                ("moby.buildkit.v1.Control/Solve", 0, 5_000 * ms),
-                ("+thing", 0, 5_000 * ms),
-            ]),
+            line(
+                "dddd000000000000",
+                None,
+                &[
+                    ("moby.buildkit.v1.Control/Solve", 0, 5_000 * ms),
+                    ("+thing", 0, 5_000 * ms),
+                ],
+            ),
         ]
         .join("\n");
         let legs = parse(&jsonl);
