@@ -952,6 +952,21 @@ jobs:
           # moved runner to runner instead of through the coordinator.
           grep -E "hits|fetch|leading subtree|declined" "worker-${WORKER_N}.log" | tail -30 || true
 
+          # DISTINCT against SERVED, and how much left this box. Reported as
+          # 93x once, from fleet-wide served over the COORDINATOR's distinct -
+          # two different registries, and not a ratio at all. The per-worker
+          # figures are the comparable ones and have never printed: the run
+          # carrying them died before its workers could.
+          #
+          # HERE, on the worker, because that is where worker-N.log lives.
+          # The first version of this grepped worker-*.log from the
+          # coordinator step, which has no such file and would have matched
+          # nothing forever - the same shape of dead mechanism this session
+          # has now found five times.
+          echo "=== repetition, and which side of the wire"
+          grep -E '^\[worker\] ([0-9]+ blobs over|of that,|served [0-9]+ MiB)' \
+            "worker-${WORKER_N}.log" || echo "  (worker printed no serve summary)"
+
   coordinator:
     needs: plan
     runs-on: ubuntu-latest
@@ -1821,14 +1836,6 @@ jobs:
           echo "=== the coordinator's registry"
           grep -E '^\[registry\] (served|  *[0-9]+ MiB|[0-9]+ blobs)' proxy.log || true
 
-          # DISTINCT against SERVED, and how much left the box. The ratio was
-          # reported as 93x from fleet-served over coordinator-distinct -
-          # two different registries - and the per-worker figure is the
-          # comparable one. It has never printed: the run carrying it died
-          # before its workers could.
-          echo "=== repetition, and which side of the wire"
-          grep -hE '^\[worker\] ([0-9]+ blobs over|of that,|served [0-9]+ MiB)' \
-            worker-*.log 2>/dev/null || true
           echo "   uploads far below blobs served means results were fetched"
           echo "   from the runners that built them, which is the whole point."
           echo "=== wall"
