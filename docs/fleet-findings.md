@@ -1623,3 +1623,34 @@ end, and it points somewhere specific: the distribution unit should be
 the TARGET, not the LLB subtree. That is also the unit earthbuild's own
 CI already uses - twelve `+test-no-qemu-groupN` jobs on twelve runners -
 and it is why that arrangement beats this one.
+
+### Scaling is flat, and that settles which number to attack
+
+Same target, same commit, only the machine count moved:
+
+| machines | fleet wall | routed | peak in flight | mean lead |
+| -------- | ---------- | ------ | -------------- | --------- |
+| 1        | 213s       | -      | -              | -         |
+| 2        | 568s       | 50     | 8              | 19.3s     |
+| 6        | 504s       | 44     | 8              | 18.6s     |
+
+Tripling the fleet bought 11%. Peak concurrency was 8 either way, and the
+mean lead did not move. So the fleet is not machine-limited: four idle
+runners were available the whole time and the build could not use them.
+Every remaining question is about the tax per lead and the concurrency
+the client offers, not about how many machines are in the room.
+
+### Resends are already cheap, so memoising them is not the lever
+
+`[wire] resend cost: 28 resends 2235ms mean, 63 first-sightings 19797ms
+mean`.
+
+28 of 91 solves being byte-identical repeats looked like a third of the
+build available for free. They are answered ~9x faster than a first
+sighting - buildkit's own cache already has them - so the whole
+opportunity is worth at most ~60s of a 504s run, and realistically far
+less because those seconds overlap other work.
+
+Worth recording as a hypothesis KILLED rather than a fix shipped. It cost
+one instrumented run to close, which is the point of paying for the
+instrument: the count alone had pointed the opposite way.
