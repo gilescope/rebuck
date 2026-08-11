@@ -98,7 +98,7 @@ on:
       affinity:
         description: prefer a peer that already holds the subtree's ancestry (1/0)
         type: string
-        default: '0'
+        default: '1'
       fleet_cache:
         description: "off | read | readwrite. ALL THREE measured slower - see docs"
         default: "off"
@@ -184,7 +184,19 @@ env:
   # machine that touches a layer pulls, decompresses and unpacks it into its
   # own snapshotter. Measured at 2.2-2.3x built duplication against an ideal
   # of 1. Off until it is measured, like the other three.
-  REBUCK2_AFFINITY: ${{ inputs.affinity || '0' }}
+  # ON, on evidence that arrived late. Affinity was measured on op
+  # duplication - 2.2x to 1.0x - and left off because the gain looked
+  # marginal. The run that turned prefetch on reported something else
+  # entirely: 2.9x built duplication with affinity OFF, and 1,524,789ms of
+  # lead time across 64 leads that named the `go-mod` cache mount, ~24s
+  # each.
+  #
+  # That is the real cost of lifting cache mounts. Lifting one does not make
+  # it free, it makes every worker pay for a COLD one - and affinity is
+  # exactly worker stickiness, so the same op keeps meeting the same warm
+  # cache. Nobody had measured affinity against cache cost; the two
+  # mechanisms are in agreement, not tension.
+  REBUCK2_AFFINITY: ${{ inputs.affinity || '1' }}
   REBUCK2_H2_RESETS: ${{ inputs.h2_resets || '' }}
   REBUCK2_CONSOLIDATE: ${{ inputs.consolidate || '1' }}
   REBUCK2_SANDBOX_HOST: ${{ inputs.sandbox_host || '0' }}

@@ -328,6 +328,16 @@ pub struct Driver {
     /// appear eighteen times each, which says nothing about whether either
     /// costs a minute or a second.
     cache_cost: tokio::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
+    /// The same milliseconds, counted ONCE per lead.
+    ///
+    /// The map above adds a lead's whole duration to every cache id it
+    /// names, which is right for ranking ids and wrong for a total: a lead
+    /// naming `go-mod`, `go-build`, `/go/pkg/mod` and `/root/.cache` is in
+    /// there four times. Summing the map gave "5,841,146ms of cache cost" in
+    /// a run whose entire fleet leg was 789 seconds, which is a number that
+    /// cannot be true and was very nearly quoted.
+    cache_lead_ms: std::sync::atomic::AtomicU64,
+    cache_leads: std::sync::atomic::AtomicU64,
     /// The most subtrees ever in flight at once.
     ///
     /// The question that outranks every transfer optimisation: can this
@@ -472,6 +482,8 @@ impl Driver {
             leases: crate::lease::Leases::default(),
             subtrees: Mutex::new(std::collections::HashMap::new()),
             cache_cost: Default::default(),
+            cache_lead_ms: Default::default(),
+            cache_leads: Default::default(),
             peak_inflight: Default::default(),
             dispatched_ops: Default::default(),
             built: Default::default(),
@@ -803,6 +815,10 @@ impl Driver {
                         // ranks what seeding a warm cache would actually
                         // buy, and cannot be derived from the Earthfile.
                         {
+                            if !caches.is_empty() {
+                                self.cache_lead_ms.fetch_add(ms, Ordering::Relaxed);
+                                self.cache_leads.fetch_add(1, Ordering::Relaxed);
+                            }
                             let mut c = self.cache_cost.lock().await;
                             for id in &caches {
                                 let e = c.entry(id.clone()).or_insert((0u64, 0u64));
@@ -1942,6 +1958,14 @@ impl Driver {
     /// The most subtrees in flight at once, over the whole run.
     pub fn peak_inflight(&self) -> usize {
         self.peak_inflight.load(Ordering::Relaxed)
+    }
+
+    /// Lead time spent in leads that named ANY cache mount, and how many.
+    pub fn cache_lead_total(&self) -> (u64, u64) {
+        (
+            self.cache_lead_ms.load(Ordering::Relaxed),
+            self.cache_leads.load(Ordering::Relaxed),
+        )
     }
 
     pub async fn cache_costs(&self) -> Vec<(String, u64, u64)> {

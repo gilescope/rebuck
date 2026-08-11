@@ -2315,3 +2315,59 @@ Still untried, in rough order of how much they would add:
 | `+all`      | `+all-binaries` plus two multi-arch images | wants `+all-binaries` to pass first |
 | `+lint-all` | three independent, cheap, no docker        | small, but a good smoke target      |
 | `+test`     | `+test-no-qemu` plus the qemu legs         | qemu on a runner is its own fight   |
+
+## Lifting a cache mount does not make it free. Measured
+
+`+test-no-qemu-group2`, six machines, prefetch on, affinity **off**:
+
+|                |                                                            |
+| -------------- | ---------------------------------------------------------- |
+| baseline       | 259s, 0 failed                                             |
+| fleet          | 789s, 1 failed (`copy-test-verbose-output`, the known one) |
+| solves         | 157 seen, 130 routed, 13 kept home (`Insecure`)            |
+| peak in flight | 22 subtrees at once                                        |
+| leads          | 142; p50 8.6s, p90 19.5s, max **148.8s**                   |
+| op duplication | 6863 sent / 389 distinct, **2.9x built**                   |
+| registry       | 448 MiB served, 22 blobs over 1 MiB                        |
+
+Dispatch is not the problem. Twenty-two subtrees in flight at once is a
+fleet working; 3x slower than one machine while doing that is something
+else, and two rows say what.
+
+**2.9x built.** Nearly three machines executed each distinct op. Affinity
+takes that to 1.0x and had been left off because the gain looked marginal
+against op counts.
+
+**The cache mounts.** Lead time attributed to each cache id the lead named:
+
+| cache id       | lead time   | leads |
+| -------------- | ----------- | ----- |
+| `go-mod`       | 1,524,789ms | 64    |
+| `/go/pkg/mod`  | 1,443,534ms | 58    |
+| `/root/.cache` | 1,443,534ms | 58    |
+| `go-build`     | 1,429,289ms | 59    |
+
+These rows OVERLAP - a lead naming all four appears in all four - so they do
+not sum, and the first read of this table produced "5,841,146ms of cache
+cost" for a fleet leg of 789 seconds. The report now says so, and prints the
+once-per-lead total beside it.
+
+Read correctly it is still the headline: ~64 leads, ~24s each, all of them
+behind a Go cache mount. `REBUCK2_PEER_CACHE_MOUNTS=1` is what makes those
+subtrees dispatchable at all - a cache mount otherwise grounds a subtree to
+the machine holding it. But lifting the hazard does not lift the cost. It
+moves it: the worker builds against its OWN cache mount, which is cold, so
+`go mod download` and `go build` redo work the coordinator had already
+cached.
+
+That reframes affinity entirely. It was measured against duplication and
+filed as marginal. Its real value is that a cache mount is **per-worker
+state**, and affinity is **worker stickiness** - the same op keeps meeting
+the same warm cache. The two mechanisms are in agreement, and nobody had
+measured the pair.
+
+So affinity is on by default from here, and the next run is the A/B. If it
+does not move the 24s leads, the conclusion is that lifted cache mounts are
+too expensive to dispatch behind and the policy should be to keep
+cache-mounted subtrees at home - which is the opposite of what
+`REBUCK2_PEER_CACHE_MOUNTS` was built to allow, and would be worth knowing.

@@ -2103,8 +2103,16 @@ pub async fn serve(
             );
         }
         if !costs.is_empty() {
-            let total: u64 = costs.iter().map(|(_, ms, _)| ms).sum();
-            println!("[wire] cache cost ms  : {total} total, worst first:");
+            // NOT the sum of the rows. Each lead is added to every cache id
+            // it names, so the rows overlap and their total exceeded the
+            // whole fleet leg by a factor of seven the first time it was
+            // read out.
+            let (lead_ms, leads) = driver_for_report.cache_lead_total();
+            println!(
+                "[wire] cache cost ms  : {lead_ms} in {leads} lead(s) that named any cache \
+                 mount; per-id below, and a lead counts under EVERY id it names, so these \
+                 rows overlap and do not sum:"
+            );
             for (id, ms, n) in costs.iter().take(6) {
                 println!("[wire]   {ms:>8}ms  {n:>4} leads  {id}");
             }
