@@ -79,6 +79,7 @@ on:
       # -balance, so this is the target where removing queue time can
       # actually show.
       - giles-dispatch-ci-ast-balance-bcast
+      - giles-dispatch-ci-ast-balance-vtx
       - giles-dispatch-ci-tests-nobase
       # The coverage run, with whatever placement is known best at the time.
       # A coverage run's deliverable is the failed-target list, not a clock,
@@ -499,6 +500,7 @@ jobs:
       balance: ${{ steps.n.outputs.balance }}
       nested: ${{ steps.n.outputs.nested }}
       sandbox: ${{ steps.n.outputs.sandbox }}
+      vtx: ${{ steps.n.outputs.vtx }}
       nobase: ${{ steps.n.outputs.nobase }}
     steps:
       - id: n
@@ -574,7 +576,7 @@ jobs:
             # leaves a stray `1` on the workload.
             workload=${workload%-w[0-9]}
             workload=${workload%-w[0-9][0-9]}
-            for suffix in -seed -graft -arm -zstd -minops -imports -bcast -balance -nested -sandbox -nobase; do
+            for suffix in -seed -graft -arm -zstd -minops -imports -bcast -balance -nested -sandbox -vtx -nobase; do
               # QUOTED: unquoted, `$suffix` is taken as a glob pattern
               # rather than a literal, which shellcheck SC2295 catches and
               # which would misbehave the moment a suffix contained a `?`
@@ -739,6 +741,15 @@ jobs:
           echo "sandbox host: $sandbox"
           echo "sandbox=$sandbox" >> "$GITHUB_OUTPUT"
 
+          # `-vtx`: workers record their own per-vertex times, for the join
+          # against the baseline's. Costs about 15% - the collection sits
+          # inside the interval build_ms covers - so the leg from a -vtx run
+          # is NOT comparable to the reference band. Its output is per-vertex
+          # ratios, which is what the 12.5x needs and what no leg time says.
+          case "$REF" in *-vtx*) vtx=1 ;; *) vtx=0 ;; esac
+          echo "worker vertices: $vtx"
+          echo "vtx=$vtx" >> "$GITHUB_OUTPUT"
+
           case "${NESTED:-}" in
             "") case "$REF" in *-nested*) nested=1 ;; *) nested=0 ;; esac ;;
             *)  nested="$NESTED" ;;
@@ -836,6 +847,7 @@ jobs:
       # Also worker-side: worker.rs reads it to retarget a nested build's
       # BUILDKIT_HOST before handing the graph to its own daemon.
       REBUCK2_LOCAL_NESTED: ${{ needs.plan.outputs.nested }}
+      REBUCK2_WORKER_VERTICES: ${{ needs.plan.outputs.vtx }}
     permissions:
       contents: read
     steps:
