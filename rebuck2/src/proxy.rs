@@ -1650,8 +1650,22 @@ impl Wire {
                 ("min_siblings", min_siblings() > 0),
                 ("min_ops", crate::dispatch::min_ops() > 0),
                 ("?affinity_imports", crate::dispatch::imports_affinity(),),
-                ("?prefetch_broadcast", crate::worker::prefetch_broadcast()),
                 ("?balance", crate::dispatch::balance_warmth()),
+                // NOT prefetch_broadcast. It is counted in the WORKER's
+                // process - `my_share` calls it - and `mech::APPLIED` is a
+                // per-process map, so this report can never see it however
+                // often it fires. Listing it here would print
+                // `prefetch_broadcast=0 (never needed)` on every run of a
+                // mechanism working perfectly.
+                //
+                // The source-consistency test cannot catch this: it checks
+                // that a listed name has an applied() call SOMEWHERE in
+                // src/, and worker.rs has one. Process boundaries are
+                // invisible to it.
+                //
+                // The evidence lives in the worker logs, where
+                // `[worker] prefetched N/N of my share (M announced)` has
+                // N == M under broadcast and N < M under the split.
                 ("peer_cache_mounts", crate::dispatch::policy().caches,),
                 ("?serve_secrets", serving_secrets()),
                 ("?forward_agent", forwarding_agent()),
