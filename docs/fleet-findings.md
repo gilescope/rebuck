@@ -3940,3 +3940,36 @@ Weight: the same 64 as a cache mount. A warm mount saves ~24s of `go mod
 download`; a parent already local saves a 188 MiB transfer, which at this
 fleet's ~7 MB/s is the same order. Two constants would imply a precision
 that comes from nowhere.
+
+## Building is a quarter of lead time; the rest is unattributed
+
+From the ungated `+test-ast` run, two totals over the same 414 leads:
+
+| | seconds |
+| ---------------------------------------- | ------- |
+| worker-side, summed `took Nms` | **4,407** |
+| driver-side, summed `lead_ms` | **14,812** |
+
+A lead spends **3.4x longer in the driver's books than the worker spends
+building it.** Median: 16.5s round trip against 2.6s of build.
+
+`lead_ms` runs from the subtree record being opened to the worker reporting
+`Led`, so it contains the offer round trips, any declines and re-offers, the
+time the lead sits queued on a busy worker, and the build. The worker's own
+figure contains the build and its fetches, and nothing else.
+
+**Not all of that gap is waste.** Peak in flight was 11 across 6 workers, so
+some of it is a lead legitimately waiting its turn - that is a fleet being
+used, not a fleet being slow. But nothing splits the two, and the quantity
+is larger than everything else measured put together: 10,400 seconds
+against 4,407 of building and against a 204-second baseline.
+
+Every remedy so far - seeding, compression, the op floor, prefetch,
+affinity - aims at the 4,407. The instrument that would price the other
+10,400 is three timestamps on the subtree record: offered, accepted,
+started. That is the next thing to build after the two fixes in flight, and
+it is cheap.
+
+`scratchpad/read-run.sh` now pulls a run's logs and prints exactly the lines
+that decide something. Written mid-run because the last four analyses were
+ad-hoc greps and two of them read a counter as the wrong quantity.
