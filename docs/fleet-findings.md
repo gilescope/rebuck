@@ -2806,3 +2806,61 @@ Two consequences worth keeping:
   helps a first build by adding per-build work - re-shipping a cache every
   run, say - is a loss on every build after it, and this rig would report it
   as a win.
+
+## Cache-mount seeding works, and what buildkit's mounts actually do
+
+Proven, against a real daemon, by `scripts/seed-check.sh`:
+
+```text
+[check] writing rebuck2-seed-marker into cache seedcheck-src
+[check] harvesting seedcheck-src
+[check] reading the marker back out of seedcheck-dst, seeded from it
+[check] SEEDING WORKS: a cold seedcheck-dst started from src's contents
+```
+
+Thirteen faults stood between writing the transform and seeing it work and
+none of them was the mechanism. Two are worth keeping, because they are
+properties of buildkit that the documentation does not mention and the
+source states backwards.
+
+**`readonly: true` on the root mount is what gets it a MUTABLE ref.** From
+`PrepareMounts`:
+
+```go
+// if dest is root we need mutable ref even if there is no output
+if m.Dest == opspb.RootMount {
+    p.ReadonlyRootFS = m.Readonly
+    if m.Output == int64(opspb.SkipOutput) && p.ReadonlyRootFS {
+        active, err := makeMutable(m, ref)
+```
+
+The comment says a root needs a mutable ref "even if there is no output".
+The code supplies one only when `Readonly` is *set*. So a hand-built exec
+with `readonly: false` and no output gets the immutable ref as its root, and
+the container fails with `exit code: 1` before running a line - which is
+indistinguishable from the command failing, and cost three attempts blaming
+an innocent `cp`.
+
+**Results are numbered by ORDER OF APPEARANCE, not by the `output` value.**
+`p.OutputRefs` is appended in mount order. Putting the root at `output: 1`
+and the payload at `output: 0` does not make the payload result 0: the root
+appears first among mounts with an output, so the root is result 0. The
+symptom was a harvested "cache" image containing 1.9 MB of `/bin` and a
+97-byte layer holding `proc/` and `sys/` - read out of the registry with
+curl and `tar tzf`, which is what turned a mystery into a five-minute fix.
+
+So the working shape for an exec that exports one thing that is not its
+rootfs:
+
+| mount     | input    | output | readonly | why                                                                          |
+| --------- | -------- | ------ | -------- | ---------------------------------------------------------------------------- |
+| `/`       | the base | -1     | **true** | readonly is what makes it mutable, and no output keeps it out of the results |
+| the cache | -1       | -1     | true     | a cache mount is never exportable                                            |
+| `/.seed`  | -1       | **0**  | false    | scratch, and the only output, so it is result 0                              |
+
+The general lesson is priced rather than argued. Faults 1-4 cost a
+twenty-five minute CI run each. A five-minute smoke job took the next
+several. A local rig - buildkitd in docker, our registry beside it - took
+the last two in four minutes, and one of those had already consumed three CI
+runs on its own. **Build the cheapest instrument first**; `scripts/seed-check.sh`
+is that instrument and it should have existed on day one.
