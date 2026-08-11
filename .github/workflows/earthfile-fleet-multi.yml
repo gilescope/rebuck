@@ -47,6 +47,7 @@ on:
       - giles-dispatch-ci-lint-seed
       - giles-dispatch-ci-binaries-seed
       - giles-dispatch-ci-ast
+      - giles-dispatch-ci-ast-zstd
       - giles-dispatch-ci-ast-seed
       - giles-dispatch-ci-lint-graft
       - giles-dispatch-ci-buildkitd-arm
@@ -307,6 +308,15 @@ env:
   # A FILE, not a variable. The seeds are harvested after the proxy is
   # already running, so a variable set at that point would never reach it;
   # `cache_seeds()` reads this lazily on the first dispatch.
+  # UNPACK is the bottleneck, measured: 87% of lead time in one run sat in
+  # the seventeen leads that fetched over a MiB, at 7.2 MB/s on a gigabit
+  # runner. That is gzip plus overlayfs on two cores, not the wire - and
+  # every layer this fleet moves is one we exported.
+  #
+  # Empty by default: gzip is what every number in fleet-findings was
+  # measured against. `-zstd` on a branch turns it on.
+  # Resolved in `plan`, like the target and the seeding switch: a
+  # workflow-level env cannot see `needs`, and one place has to state it.
   REBUCK2_CACHE_SEEDS_FILE: /tmp/cache-seeds.txt
   # THE BYTES, not a reconstruction of them. Earthly's cache mounts carry an
   # input and `getRefCacheDir` keys the directory on that input's ref, so a
@@ -428,6 +438,7 @@ jobs:
       seed: ${{ steps.n.outputs.seed }}
       graft: ${{ steps.n.outputs.graft }}
       fleet: ${{ steps.n.outputs.fleet }}
+      compression: ${{ steps.n.outputs.compression }}
     steps:
       - id: n
         env:
@@ -468,6 +479,7 @@ jobs:
           workload=${REF%-seed}
           workload=${workload%-graft}
           workload=${workload%-arm}
+          workload=${workload%-zstd}
           case "${T:-}" in
             "") case "$workload" in
                   *-binaries) target=+all-binaries ;;
@@ -515,6 +527,19 @@ jobs:
           esac
           echo "graft: $graft"
           echo "graft=$graft" >> "$GITHUB_OUTPUT"
+
+          # `-zstd`: how our own layers are compressed. Unpack is the
+          # measured bottleneck at ~7 MB/s, zstd decompresses several times
+          # faster than gzip at similar size, and every layer the fleet
+          # moves is one we exported.
+          # BRANCH ONLY, no input. workflow_dispatch takes at most 25
+          # inputs and this file is at the ceiling - which matters less than
+          # it sounds, because dispatch is unreachable for a workflow that
+          # lives off the default branch. The suffix has been the real
+          # interface since `-binaries`; from here it is the only one.
+          case "$REF" in *-zstd) comp=zstd ;; *) comp="" ;; esac
+          echo "compression: ${comp:-buildkit default}"
+          echo "compression=$comp" >> "$GITHUB_OUTPUT"
 
           # WHICH ARCHITECTURE each worker runs on.
           #
@@ -835,6 +860,7 @@ jobs:
       # it - a target name is an earthly concept and the proxy sees LLB.
       REBUCK2_TARGET: ${{ needs.plan.outputs.target }}
       REBUCK2_GRAFT: ${{ needs.plan.outputs.graft }}
+      REBUCK2_COMPRESSION: ${{ needs.plan.outputs.compression }}
       # ONE path for the binary in this job. It was written out twice and
       # the copies disagreed: the proxy step had `./rebuck2-repo/...` and
       # the harvest step `./rebuck2/...`, which is the WORKER job's layout.

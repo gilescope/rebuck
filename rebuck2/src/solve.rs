@@ -108,6 +108,40 @@ pub fn pullable(registry: &str, reference: &str) -> String {
 /// explicit that it does NOT change what a client gets: output digests were
 /// identical across all three variants above. The mirror is a transport for
 /// a result the client computes for itself.
+/// How to compress the layers this fleet exports.
+///
+/// Unpack is the bottleneck, measured: 87% of lead time in one run was in
+/// the seventeen leads that fetched over a MiB, at 7.2 MB/s on a gigabit
+/// runner. That rate is gzip decompression plus overlayfs writes on two
+/// cores, and every layer the fleet moves is one we exported, so this is
+/// ours to set.
+///
+/// `zstd` decompresses several times faster than gzip at a similar size.
+/// `uncompressed` skips decompression entirely, paying bytes for CPU, which
+/// on a local mesh with slow cores can win outright.
+///
+/// OFF by default. gzip is what buildkit does and what every number in
+/// `docs/fleet-findings.md` was measured against; changing it silently
+/// would reprice the whole document.
+///
+/// `force-compression` is not optional when this is set. Without it buildkit
+/// reuses whatever compression a layer already carries, so a re-exported
+/// base image stays gzip and the setting reads as having done nothing -
+/// which is the failure mode this project has spent the most time on.
+fn compression_attrs(want: Option<&str>) -> HashMap<String, String> {
+    let Some(v) = want.map(str::trim).filter(|v| !v.is_empty()) else {
+        return HashMap::new();
+    };
+    if !matches!(v, "gzip" | "zstd" | "uncompressed" | "estargz") {
+        println!("[solve] REBUCK2_COMPRESSION={v:?} is not one of gzip|zstd|uncompressed|estargz");
+        return HashMap::new();
+    }
+    HashMap::from([
+        ("compression".to_owned(), v.to_owned()),
+        ("force-compression".to_owned(), "true".to_owned()),
+    ])
+}
+
 fn publish_attrs(name: String) -> HashMap<String, String> {
     HashMap::from([
         ("name".to_owned(), name),
@@ -121,6 +155,11 @@ fn publish_attrs(name: String) -> HashMap<String, String> {
         ("source-date-epoch".to_owned(), "0".to_owned()),
         ("rewrite-timestamp".to_owned(), "true".to_owned()),
     ])
+    .into_iter()
+    .chain(compression_attrs(
+        std::env::var("REBUCK2_COMPRESSION").ok().as_deref(),
+    ))
+    .collect()
 }
 
 /// `host:port/repo:tag` + digest -> `host:port/repo@sha256:...`
@@ -937,6 +976,47 @@ pub fn published_reference(
 
 #[cfg(test)]
 mod tests {
+    /// How our own layers are compressed, because unpack is the bottleneck.
+    ///
+    /// 87% of lead time in a measured run was in the seventeen leads that
+    /// fetched more than a MiB, at 7.2 MB/s on a gigabit runner. That rate
+    /// is gzip decompression plus overlayfs writes on two cores, not the
+    /// wire - and every layer this fleet moves is one WE exported, so the
+    /// compression is ours to choose.
+    #[test]
+    fn the_export_compression_is_ours_to_choose() {
+        let a = |v: Option<&str>| {
+            let m = super::compression_attrs(v);
+            (
+                m.get("compression").cloned(),
+                m.get("force-compression").cloned(),
+            )
+        };
+        // Default OFF: gzip is what buildkit does and what every number in
+        // the findings was measured against. Changing it silently would
+        // reprice the whole document.
+        assert_eq!(a(None), (None, None));
+        assert_eq!(a(Some("")), (None, None));
+        // zstd decompresses several times faster than gzip at similar size.
+        assert_eq!(
+            a(Some("zstd")),
+            (Some("zstd".to_owned()), Some("true".to_owned()))
+        );
+        // And the extreme: no decompression at all, paying bytes for CPU.
+        // On a fast local mesh with slow cores that can win outright.
+        assert_eq!(
+            a(Some("uncompressed")),
+            (Some("uncompressed".to_owned()), Some("true".to_owned()))
+        );
+        // `force-compression` matters: without it buildkit reuses whatever
+        // compression a layer already had, so a re-exported base image stays
+        // gzip and the setting reads as having done nothing.
+        assert!(a(Some("gzip")).1.is_some());
+        // Anything unrecognised is refused rather than passed through to a
+        // daemon that answers with a less obvious error.
+        assert_eq!(a(Some("brotli")), (None, None));
+    }
+
     #[test]
     fn cache_ids_come_out_of_buildkits_own_descriptions() {
         let held = vec![
