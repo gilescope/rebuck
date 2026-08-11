@@ -2604,7 +2604,7 @@ pub async fn serve(
                 "[wire] verdict        : target={} solves={} routed={} home={} peak_solves={peak_solves} \
                  inflight={peak} \
                  occupancy={occupancy:.2} ceiling={ceiling:.2} ceiling_{machines}m={finite:.2} \
-                 dup={:.1} seeds={}/{} leads={all_leads} lead_ms={all_lead_ms} \
+                 dup={:.1} seeds={} leads={all_leads} lead_ms={all_lead_ms} \
                  mounts_ms={} \
                  mount_leads={}",
                 std::env::var("REBUCK2_TARGET").unwrap_or_else(|_| "?".into()),
@@ -2621,8 +2621,17 @@ pub async fn serve(
                 // reasons, and each time the question "did it even run" cost
                 // a log dig. `0/3` says it in the line the ledger is built
                 // from.
-                crate::dispatch::seeds_resolved(),
-                crate::dispatch::cache_seeds().len(),
+                // `off` rather than `0/0`. A run with no seeds configured and
+                // a run whose seeds all failed to resolve printed the same
+                // pair, and the ledger is assembled from these fields by
+                // grep - so a column that cannot tell "not asked for" from
+                // "asked for and got nothing" puts both in the same row.
+                // The same confusion cost the grafted line a whole ranking
+                // decision.
+                match crate::dispatch::cache_seeds().len() {
+                    0 => "off".to_owned(),
+                    n => format!("{}/{n}", crate::dispatch::seeds_resolved()),
+                },
                 lead_total_ms,
                 lead_total_n,
             );
