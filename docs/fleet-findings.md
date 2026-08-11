@@ -16,13 +16,17 @@ for anything that only needs one daemon.
 
 **If you read five things**, read these:
 
-| entry                                                        | why                                              |
-| ------------------------------------------------------------ | ------------------------------------------------ |
-| *The workload sets the ceiling* (principle 19)               | most "the fleet is slow" numbers are Amdahl      |
-| *Count the WORK before blaming the scheduler* (principle 21) | the fleet does ~9x the work; that is the problem |
-| *Every number here is a cold-start number*                   | what a hosted runner can and cannot measure      |
-| *`+all-buildkitd`: parity in time, and it says why*          | the one result that points somewhere             |
-| *How cache-mount seeding works, end to end*                  | the mechanism, without the nine-run chronology   |
+| entry | why |
+| ----- | --- |
+| *Current state of belief* | what is established, open and retracted, in three tables |
+| *Prefetch, once it worked: 1773s to 1240s* | the first change to move the headline by more than noise |
+| *`-balance`: 1240s to 1050s* | and no machine idle; the fault was a preference with no brake |
+| *Building is a quarter of lead time* | and the split that made every mechanism rankable |
+| *The workload sets the ceiling* (principle 19) | most "the fleet is slow" numbers are Amdahl |
+
+**Read `docs/how-this-lies.md` too**, if you are going to trust any number
+here. Seventeen ways this system has produced a confident wrong answer, four
+of them found in a single day.
 
 It lived in `src/proxy.rs` as a module comment until it reached 1342 lines --
 a third of the file, and a chronological log rather than documentation. The
