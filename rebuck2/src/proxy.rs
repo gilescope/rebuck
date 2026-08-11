@@ -152,15 +152,17 @@ pub struct Proxy {
     /// is the same sequence with this step already paid for by a previous
     /// generation, which is why 0 beats 1.
     warmup: std::sync::Arc<tokio::sync::Semaphore>,
-    /// Have the cache seeds been announced to the fleet yet?
+    /// The seeds that actually resolve, computed once.
     ///
-    /// Once per process. A seed is named by every graph carrying that cache
-    /// id, so without this it would be announced on every dispatch.
-    /// Arc, not a bare AtomicBool: `Proxy` is Clone and is cloned per call,
-    /// so an unshared flag would be "once per clone", which is once per
-    /// dispatch - exactly the thing it exists to prevent. The compiler
-    /// caught this one; the semantics would not have shown up in a log.
-    seeds_announced: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Principle 20's corollary is that a failed seed degrades to a cold
+    /// mount and never to a broken build - and as first written it did not.
+    /// A seed becomes an INPUT to the exec that carries the mount, so a ref
+    /// no worker can pull does not make that subtree slower, it makes it
+    /// fail. Advisory in intent, load-bearing in fact.
+    ///
+    /// So every ref is resolved against the registry before any graph is
+    /// allowed to name it, and one that does not resolve is dropped.
+    seeds_ok: std::sync::Arc<tokio::sync::OnceCell<std::collections::BTreeMap<String, String>>>,
     /// Who places dispatched work. The gateway holds the client's Solve; the
     /// driver decides which machine builds it, using the arbitration workers
     /// already get. Not a peer list of our own - see M4.5.
@@ -311,7 +313,7 @@ impl Proxy {
             gw_pool,
             next_gw: Default::default(),
             warmup: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
-            seeds_announced: Default::default(),
+            seeds_ok: Default::default(),
             driver,
             wire: Default::default(),
             mirror: None,
@@ -1680,6 +1682,49 @@ impl Proxy {
 
     /// Swap `local://` sources for the contexts we published, so the graph
     /// depends on content rather than on one machine's disk.
+    /// The configured seeds, minus any that cannot be resolved, announced
+    /// to the fleet the first time anybody asks.
+    ///
+    /// Two jobs in one pass because both must happen exactly once, and the
+    /// first is the one that matters. A seed is an INPUT to the exec that
+    /// carries the mount, so a ref no worker can pull turns a "faster if it
+    /// works" mechanism into a hard dependency - principle 20 promises the
+    /// opposite in its own last paragraph. Resolving the manifest here is
+    /// the cheapest thing that keeps the promise: `image_blobs` returns
+    /// `None` for a ref the registry cannot answer for, and that seed is
+    /// dropped before any graph is allowed to name it.
+    ///
+    /// The announcement rides along because seeding is applied after every
+    /// source rewrite - deliberately, so the seed is not copied through peer
+    /// 0 - which also means it misses the prefetch the base-image path does,
+    /// and a seed is the best thing in a build to pre-position: every graph
+    /// naming that cache id wants it, on every machine, and it is large by
+    /// construction.
+    async fn usable_seeds(&self) -> &std::collections::BTreeMap<String, String> {
+        self.seeds_ok
+            .get_or_init(|| async {
+                let mut ok = std::collections::BTreeMap::new();
+                for (id, reference) in crate::dispatch::cache_seeds() {
+                    match crate::solve::image_blobs(reference).await {
+                        Some(b) if !b.is_empty() => {
+                            println!(
+                                "[proxy] seed {id} = {reference}, {} blob(s) - pre-positioning",
+                                b.len()
+                            );
+                            self.driver.prefetch_image(reference).await;
+                            ok.insert(id.clone(), reference.clone());
+                        }
+                        _ => println!(
+                            "[proxy] seed {id} = {reference} does not resolve - dropping it. \
+                             That mount starts cold, which is what it did before seeding existed."
+                        ),
+                    }
+                }
+                ok
+            })
+            .await
+    }
+
     async fn make_portable(
         &self,
         def: &bollard_buildkit_proto::pb::Definition,
@@ -1854,16 +1899,7 @@ impl Proxy {
         // build to pre-position: every graph naming that cache id wants it,
         // on every machine, and it is large by construction. So announce it
         // here, once.
-        let seeds = crate::dispatch::cache_seeds();
-        if !seeds.is_empty()
-            && !self
-                .seeds_announced
-                .swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            for reference in seeds.values() {
-                self.driver.prefetch_image(reference).await;
-            }
-        }
+        let seeds = self.usable_seeds().await;
         crate::dispatch::seed_cache_mounts(&out, seeds)
     }
 
