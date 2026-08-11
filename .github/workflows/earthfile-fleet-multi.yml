@@ -84,6 +84,11 @@ on:
       - giles-dispatch-ci-tests-balance-imports-w12-nobase
       - giles-dispatch-ci-tests-balance-nested-w12-nobase
       - giles-dispatch-ci-tests-balance-sandbox-nobase
+      # -bcast on the WIDE target, not the narrow one. Its whole effect
+      # lands in `building`, which is 72% here against 55% on +test-ast, and
+      # the lane risk agrees rather than conflicting: 128 leads here against
+      # 414 there, so one prefetch lane carries far fewer announcements.
+      - giles-dispatch-ci-tests-balance-sandbox-bcast-nobase
       - giles-dispatch-ci-ast-minops-nobase
       - giles-dispatch-ci-ast-seed
       - giles-dispatch-ci-lint-graft
