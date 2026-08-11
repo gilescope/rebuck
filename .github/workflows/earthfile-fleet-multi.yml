@@ -78,6 +78,7 @@ on:
       # than one added later, because a branch that is pushed and does not
       # trigger looks exactly like a run that failed to start.
       - giles-dispatch-ci-tests-balance-imports-w12-nobase
+      - giles-dispatch-ci-tests-balance-nested-w12-nobase
       - giles-dispatch-ci-ast-minops-nobase
       - giles-dispatch-ci-ast-seed
       - giles-dispatch-ci-lint-graft
@@ -474,6 +475,7 @@ jobs:
       imports: ${{ steps.n.outputs.imports }}
       bcast: ${{ steps.n.outputs.bcast }}
       balance: ${{ steps.n.outputs.balance }}
+      nested: ${{ steps.n.outputs.nested }}
       nobase: ${{ steps.n.outputs.nobase }}
     steps:
       - id: n
@@ -548,7 +550,7 @@ jobs:
             # leaves a stray `1` on the workload.
             workload=${workload%-w[0-9]}
             workload=${workload%-w[0-9][0-9]}
-            for suffix in -seed -graft -arm -zstd -minops -imports -bcast -balance -nobase; do
+            for suffix in -seed -graft -arm -zstd -minops -imports -bcast -balance -nested -nobase; do
               # QUOTED: unquoted, `$suffix` is taken as a glob pattern
               # rather than a literal, which shellcheck SC2295 catches and
               # which would misbehave the moment a suffix contained a `?`
@@ -686,6 +688,19 @@ jobs:
           echo "balance warmth: $balance"
           echo "balance=$balance" >> "$GITHUB_OUTPUT"
 
+          # `-nested`: point a nested earthly at the daemon on ITS OWN
+          # machine. earthly forwards its BUILDKIT_HOST into every exec, and
+          # in a fleet that address is the coordinator's - so the five leads
+          # that own a full +test-no-qemu critical path, 231-258s each, are
+          # nested builds dialling back across the network into one funnel.
+          #
+          # Carries a hazard: nested builds under `--privileged
+          # --entrypoint` have died on `could not connect to buildkit:
+          # timeout 1m0s` when retargeted. That is why it is a switch.
+          case "$REF" in *-nested*) nested=1 ;; *) nested=0 ;; esac
+          echo "local nested: $nested"
+          echo "nested=$nested" >> "$GITHUB_OUTPUT"
+
           # `-nobase`: skip the baseline leg. For comparing a MECHANISM
           # against itself, where the control is another fleet leg and the
           # baseline is dead weight.
@@ -773,6 +788,9 @@ jobs:
       # sets it. That is the sixth mechanism-that-cannot-fire in this session
       # and the second I wrote myself.
       REBUCK2_PREFETCH_ALL: ${{ needs.plan.outputs.bcast }}
+      # Also worker-side: worker.rs reads it to retarget a nested build's
+      # BUILDKIT_HOST before handing the graph to its own daemon.
+      REBUCK2_LOCAL_NESTED: ${{ needs.plan.outputs.nested }}
     permissions:
       contents: read
     steps:
