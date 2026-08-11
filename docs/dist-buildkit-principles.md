@@ -963,3 +963,40 @@ when a probe fails, does not just fail to inform - it produces a confident
 wrong answer. `check-reserve` reported a flat zero across six solves because
 every stats request had failed; the flat line looked exactly like the result
 it was supposed to prove.
+
+## 27. A preference that feeds itself needs a brake
+
+Affinity prefers the machine that already holds what a job needs. Every job
+it wins makes it hold more, so it wins the next one too. Left as the first
+sort key it is not a preference, it is a ratchet: across three runs with six
+machines available, placements went 223/125/63/3, 46/37/10 and
+153/142/81/3 - two or three machines never took a single job.
+
+The brake is not to remove the preference. Warmth is real and measured: a
+cold cache mount costs ~24s, a parent image transfer is the same order, and
+`-imports` exists because op overlap cannot even see the parent. The brake
+is that a self-reinforcing preference has to be **traded** against something
+that grows with it, not ranked above it.
+
+Queue depth is that something, and it is free - the scheduler already knows
+it.
+
+    // before: warmth wins outright, and winning makes it warmer
+    sort_by_key(|c| (Reverse(warm(c)), Reverse(free(c)), id))
+    // after:  one queued job cancels one warm item
+    sort_by_key(|c| (Reverse(warm(c) - queued(c) * 64), Reverse(free(c)), id))
+
+Measured: 1240s to 1050s, all six machines working, `waiting` down 2,913
+seconds. And it cost what it should - `building` rose 1,004s because a cold
+machine pays for the parent it does not have, and duplication went 1.4x to
+1.7x for the same reason. A trade that costs nothing was not a trade.
+
+The general shape, for anything that routes work by past behaviour - cache
+affinity, sticky sessions, locality-aware schedulers, consistent hashing
+with load: **if winning makes you more likely to win, the tie-break is doing
+the load balancing, and a tie-break only runs when everything above it is
+equal.** Put the counterweight in the same term as the preference.
+
+The tell that this is happening is not slowness. It is an idle worker in a
+system reporting high occupancy - the busy machines are genuinely busy, so
+every average looks healthy. Count the machines that did nothing.

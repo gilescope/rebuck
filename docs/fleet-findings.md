@@ -60,7 +60,9 @@ confident version first - which has happened to me, in this file, twice.
 | A cap inside a cap turns slow into failed | worker `timeout 3000` under a 150-minute job |
 | Fixing prefetch took 30% off the fleet leg | 1773s -> 1240s, same target, same 412 solves |
 | Choosing a worker costs nothing | `placing 0s (0%)` - no offer was ever refused |
-| **Queueing is the largest cost in the system** | `waiting 6583s (65%)` against `building 3517s (35%)` |
+| Queueing WAS the largest cost | `waiting 6583s (65%)`; trading warmth against queue depth cut it to 3670s (45%) |
+| Spreading beats concentrating, and costs what it should | 1240s -> 1050s, no idle machine, `building` up 1004s against `waiting` down 2913s |
+| **Building is now the majority term** | 4521s (55%) - what `-imports` and `-bcast` aim at |
 | The instruments are not the problem | the status tap: 1ms across 3004 frames |
 
 **Open.** Believed for a reason, not measured.
@@ -69,7 +71,7 @@ confident version first - which has happened to me, in this file, twice.
 | -------- | -------------- |
 | How much of the fleet's traffic crosses a wire | `SERVED_BYTES` mixes loopback with peer serving; `SERVED_LOCAL_BYTES` exists and has never reported |
 | Whether the fleet repeats itself, and by how much | the coordinator reports 1.1x; the per-worker figure has never printed |
-| Why 65% of lead time is queueing when machines sit idle | measured; `-balance` is in flight against it |
+| Whether placing a lead near its parent pays | `-balance-imports` in flight; it had to follow `-balance`, not precede it |
 | What made the reference run take 50 minutes | not the tap, which costs 1ms. Still unexplained |
 | What a 14-way target does | `+test-no-qemu` has never run |
 
