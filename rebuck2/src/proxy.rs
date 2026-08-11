@@ -683,8 +683,16 @@ impl control::control_server::Control for Proxy {
         let wire = self.wire.clone();
         let tapped = s.into_inner().map(move |item| {
             if let Ok(resp) = &item {
-                if let Ok(mut w) = wire.lock() {
-                    note_vertices(&mut w.home_vertices, &resp.vertexes);
+                // NOTHING TO SAY, NOTHING TO LOCK. Most frames on this stream
+                // are log lines and byte counters with no vertex at all, and
+                // `wire` is the same mutex the placement path takes - taking
+                // it once per frame of earthly's progress display would put
+                // the instrument on the critical path of the thing it is
+                // measuring, which is the one thing an instrument may not do.
+                if !resp.vertexes.is_empty() {
+                    if let Ok(mut w) = wire.lock() {
+                        note_vertices(&mut w.home_vertices, &resp.vertexes);
+                    }
                 }
             }
             item
