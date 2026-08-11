@@ -1905,10 +1905,17 @@ impl Driver {
             let Some(st) = self.subtrees.lock().await.remove(&job) else {
                 return;
             };
-            // May we hand this straight to the client, or must it be rebuilt
-            // at home to be sure? See `trust_verdict`: only a graph that
-            // went out untouched, with no cache mount travelling, and only
-            // when asked for.
+            // May we hand this straight to the client, or must it be
+            // rebuilt at home? See `trust_verdict` for the conditions.
+            //
+            // Worth being clear about what the home rebuild IS, because
+            // "to be sure" undersells it: today's behaviour is already a
+            // two-opinion protocol, and the second opinion is the client's
+            // own daemon with its own caches - the most authoritative
+            // machine in the fleet. Confirming on a second PEER instead
+            // would cost the same and be weaker evidence. So the only
+            // saving on offer is trusting one peer alone, which is exactly
+            // what the flag buys and exactly why it is a flag.
             let trusted = crate::dispatch::trust_verdict(
                 crate::dispatch::trust_peer_verdicts(),
                 st.verbatim,

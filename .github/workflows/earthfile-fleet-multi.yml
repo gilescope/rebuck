@@ -44,6 +44,8 @@ on:
       - giles-dispatch-ci-buildkitd
       - giles-dispatch-ci-all
       - giles-dispatch-ci-seed
+      - giles-dispatch-ci-lint-seed
+      - giles-dispatch-ci-binaries-seed
   workflow_dispatch:
     inputs:
       peer_cache_mounts:
@@ -413,12 +415,19 @@ jobs:
           # bank key is the one that hurts when they disagree: a run would
           # restore the test groups' bank, build something else, and save it
           # back under the same name.
-          # One branch per experiment, and the suffix picks the target.
-          # `-seed` is not in here on purpose: it selects a MECHANISM, not a
-          # workload, so it keeps the default target and the seeded and
-          # unseeded runs are comparable.
+          # Suffixes COMPOSE. A workload suffix picks the target, and
+          # `-seed` is a mechanism rather than a workload, so it is stripped
+          # first and whatever remains still names a target. That is what
+          # makes `-lint-seed` possible, and it matters: seeding was going to
+          # be measured against +test-no-qemu-group2 at forty minutes a run
+          # when +lint-all answers the same question in fifteen.
+          #
+          # Stripping and re-matching, rather than enumerating the
+          # combinations, because the combinations multiply and the table
+          # would go stale the first time a target was added.
+          workload=${REF%-seed}
           case "${T:-}" in
-            "") case "$REF" in
+            "") case "$workload" in
                   *-binaries) target=+all-binaries ;;
                   *-lint)     target=+lint-all ;;
                   # Multi-arch buildkitd on its own. It is the only untested
