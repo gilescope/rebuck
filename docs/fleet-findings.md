@@ -5320,3 +5320,39 @@ pay - and it is the target I moved it AWAY from three hours ago, on the
 argument that `building` was the bigger bucket there. The bucket was bigger;
 the bucket was not the constraint. Choosing by bucket size was the right
 correction to "choose by which target is cheapest" and still not right.
+
+### The leg is lead time over concurrency, to within a second
+
+`+test-ast` with `-balance`: leg **1050s**, total lead time **8,239s**,
+occupancy **7.94**.
+
+```text
+8239 / 7.85 = 1049
+```
+
+The identity holds exactly, and it is worth more than any single
+measurement here because it says what a mechanism has to do to matter.
+There are two levers and only two: **cut total lead time, or raise achieved
+concurrency.** Anything that does neither cannot move the clock, whatever
+else it improves.
+
+That is principle 28 in one line, and it retroactively explains both
+mechanisms that worked without paying. `-sandbox` cut the critical leads by
+a third on a target whose leg was already set by serial home work -
+concurrency could not rise because the work could not leave. `-bcast` cut
+queueing 45% on the same target - lead time fell, and the leg did not,
+because that leg was not lead-bound.
+
+It also sharpens the prediction for `-bcast` on `+test-ast`, which is
+lead-bound: if `waiting` falls 45% again, 3,670s becomes ~2,020s, total lead
+time becomes ~6,589s, and at unchanged concurrency the leg lands near
+**840s**. Two ways to be wrong, both named in advance - concurrency drops
+because a single prefetch lane serialises six workers, or `waiting` does not
+fall because a 2.6-second lead cannot wait for a prefetch that has not
+arrived.
+
+And one number that frames the whole exercise: `+test-ast`'s graph ceiling
+is 2.97x at seven machines, so its best possible leg against a 212s baseline
+is about **71 seconds**. At 1050s the fleet is fifteen times off the ceiling
+its own workload permits. Whatever binds here is not Amdahl, which makes it
+the honest place to keep measuring.
