@@ -243,6 +243,28 @@ leave the machine at all.
 counted under its lowercased name or exempted in a list that carries a
 reason. It found five the moment it ran.
 
+## 18. A counter in the wrong process
+
+**Instance:** `prefetch_broadcast` is incremented by `my_share`, which runs
+on the WORKER, and was listed in the coordinator's `[wire] mechanisms` line.
+`mech::APPLIED` is a per-process map, so the coordinator's report could
+never see it however often the mechanism fired - and would have printed
+`prefetch_broadcast=0 (never needed)` on every run of a mechanism working
+perfectly.
+
+The source-consistency guard cannot catch this. It asserts that every
+reported name has an `applied("name")` call somewhere in `src/`, and
+`worker.rs` has one. **Process boundaries are invisible to a grep over a
+source tree**, and this is a distributed system whose two halves are
+compiled from the same crate.
+
+**Countermeasure:** removed from the coordinator's list, with the real
+evidence named at the removal site - the worker's own
+`prefetched N/N of my share (M announced)` line, where N equals M under
+broadcast. No general fix: the honest rule is that a counter belongs to the
+process that increments it, and a report may only list what its own process
+counts.
+
 ## The common thread
 
 Twelve of these thirteen produced a GREEN result. Not one announced itself.
