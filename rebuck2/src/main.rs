@@ -8,6 +8,14 @@
 //! Rendezvous needs no service: both sides derive the driver's iroh key from
 //! `--session` (default $GITHUB_RUN_ID), see mesh.rs.
 
+// A std guard held across an await is a deadlock waiting for a scheduler.
+// Clippy cannot see the tokio equivalent - holding one is legal and often
+// intended - and that is the one that bit: `job_terminal` held across an
+// await by an `if let` scrutinee temporary cut routing from 94 solves to 8.
+// This catches the half a machine can catch.
+#![warn(clippy::await_holding_lock)]
+#![warn(clippy::await_holding_refcell_ref)]
+
 mod bank;
 mod bench;
 mod dispatch;
