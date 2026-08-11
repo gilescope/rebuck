@@ -4,7 +4,7 @@
 # only holds 192.168.1.137, so anything from outside needs a forward that a
 # NixOS firewall rule cannot supply. Testing from a LAN machine proves
 # nothing either way - most routers do not hairpin - so ask a runner.
-name: otel reachability  # probe: firewall opened
+name: otel reachability  # probe: rule activated
 on:
   # A push trigger as well as dispatch: workflow_dispatch only lists
   # workflows present on the DEFAULT branch, and this one lives on a

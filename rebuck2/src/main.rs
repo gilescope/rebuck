@@ -9,6 +9,7 @@
 //! `--session` (default $GITHUB_RUN_ID), see mesh.rs.
 
 mod bank;
+mod traces;
 mod bench;
 mod dispatch;
 mod driver;
@@ -183,6 +184,26 @@ async fn main() -> Result<()> {
         // The peer-to-peer OCI mirror on its own, for a worker that lends a
         // buildkitd but runs no driver. Principle 6's mechanism needs
         // somewhere to publish to and pull from.
+        "traces" => {
+            // `rebuck2 traces <file.jsonl> [top]` - read what a run's spans
+            // say, per leg. Committed rather than retyped: the analysis that
+            // overturned the `+base` finding was a heredoc, and a heredoc is
+            // not something the next run can be compared against.
+            let path = args
+                .opt("--file")
+                .ok_or_else(|| anyhow::anyhow!("traces: --file <traces.jsonl>"))?;
+            let top: usize = args
+                .opt("--top")
+                .and_then(|t| t.parse().ok())
+                .unwrap_or(12);
+            let text = std::fs::read_to_string(&path)?;
+            let legs = traces::parse(&text);
+            if legs.is_empty() {
+                anyhow::bail!("no spans in {path} - did the collector receive anything?");
+            }
+            traces::report(&legs, top);
+            Ok(())
+        }
         "registry" => {
             let store_root: std::path::PathBuf = args
                 .opt("--store")
