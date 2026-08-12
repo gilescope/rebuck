@@ -2117,10 +2117,35 @@ impl Driver {
                     // `host/repo@sha256:...` it returns the whole reference
                     // and the size lookup silently misses - which is how a
                     // "free to be right" size ends up always zero.
+                    // ONLY IF WE HOLD IT, and `size_of` is that test - not
+                    // a nicety about getting the size right.
+                    //
+                    // The first version passed `unwrap_or(0)` and announced
+                    // the digest anyway. Every worker then asked the fleet
+                    // for a manifest the coordinator did not have, and run
+                    // 31559656955 is full of the result:
+                    //
+                    //   prefetch MISS f3f3190a (0 bytes):
+                    //     driver CAS missing blob f3f3190a.../0
+                    //
+                    // A manifest reaches the CAS when a client PUTs it here;
+                    // one resolved upstream, or held only as a tag, never
+                    // does. Announcing what we cannot serve turns a
+                    // pre-position into a guaranteed round trip and a failed
+                    // fetch, which is worse than not announcing at all.
                     if let Some(m) = crate::solve::manifest_dig(&r, 0) {
-                        let size = this.store.size_of(&m.hash).await.unwrap_or(0) as i64;
-                        if !d.iter().any(|x| x.hash == m.hash) {
-                            d.push(crate::mesh::Dig { size, ..m });
+                        match this.store.size_of(&m.hash).await {
+                            Some(size) if !d.iter().any(|x| x.hash == m.hash) => {
+                                d.push(crate::mesh::Dig {
+                                    size: size as i64,
+                                    ..m
+                                });
+                            }
+                            Some(_) => {}
+                            None => println!(
+                                "[driver] prefetch: not announcing manifest {} for {r} -                                  this CAS does not hold it",
+                                m.hash
+                            ),
                         }
                     }
                     Some(d)
