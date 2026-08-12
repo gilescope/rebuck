@@ -7184,3 +7184,47 @@ to say so.
 
 Not changed tonight: it is a third variable, run D is in flight, and the
 diagnostic that distinguishes it from the other two lands in ten minutes.
+
+### 87 of the 91 home builds are ONE blob
+
+`read-run.sh`, once it read artifacts, printed the `not routed` map whole:
+
+```text
+"not routed": {"considered": 412,
+  "...could not fetch content descriptor sha256:ef2f6c8d...: not found": 87,
+  "...sha256:311a81dd...": 1, "...sha256:430ab33d...": 1,
+  "...sha256:af33e497...": 1, "...sha256:c4db4dc1...": 1}
+```
+
+Run C fell back to home 91 times, and **87 of those are the same digest**.
+Four other blobs failed once each.
+
+This is not diffuse contention. It is one object that eighty-seven separate
+leads needed and none could obtain, and the four singletons are noise beside
+it.
+
+**And it is a CONFIG blob**, of media type
+`application/vnd.docker.container.image.v1+json`, which is a couple of
+kilobytes. So the size theory does not survive it:
+whatever stops this blob arriving, it is not that 456 MiB is hard to move
+across a shared network in five seconds.
+
+That reframes the whole delivery investigation. The question is no longer
+"why is the mesh slow under broadcast" but **"why is this one small object
+unreachable"**, which is a much more tractable thing to ask - and the
+`prefetch MISS` line, if that blob was announced, will answer it in run D
+with the error the mesh actually returned.
+
+Two candidates worth holding, neither yet tested:
+
+- it was never announced. `manifest_blobs` returns config and layers for a
+  reference the driver can resolve; a subtree RESULT reaches the announce
+  path only through `prefetch_results`, which is off by default because I
+  gated it earlier tonight.
+- it was announced and the fetch genuinely fails, in which case run D names
+  the error.
+
+Found by running the tool I had just changed, against a run I had already
+downloaded and grepped by hand twice. The map was in the step log the whole
+time; I had been reading `declined` lines and never the `not routed` field
+that aggregates them by cause.
