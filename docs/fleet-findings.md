@@ -8183,9 +8183,28 @@ would remove the portability term, make warming possible for the first
 time, and let the baseline and fleet legs share content instead of building
 parallel universes of the same target.
 
-**Unverified, and it is a design note rather than a finding.** The rewrite
-may serve purposes the comment does not list - the mirror is filled by
-`mirror_image` through a peer WITH a session, and a mirror stanza changes
-who fetches from where at exactly the moment credentials matter. That is
-precisely the area where this project has produced `no active sessions`
-twice. It wants reading before it wants doing.
+**And it has a hard prerequisite, found while checking it.** A registry
+acting as a mirror for `docker.io` must serve MANIFESTS for tags it has
+never seen. Ours cannot:
+
+```rust
+Ok(None) => err(StatusCode::NOT_FOUND, "MANIFEST_UNKNOWN", &key),
+```
+
+There is no upstream consulted on the manifest path, and the workflow says
+so in two places already - "the registry's pull-through is BLOB-only: a
+manifest tag it does not hold is a 404, with no upstream consulted". That is
+coherent for a mesh mirror filled deliberately by `mirror_image`, and
+disqualifying for a `docker.io` mirror, which is asked for tags by
+definition.
+
+So the order is: **manifest pull-through first, mirror stanza second, and
+only then does the graph stop being rewritten.** Each is small; together
+they are a project, and the first one changes a component this file has
+already recorded three faults in.
+
+**A design note rather than a finding**, and doubly so now. The rewrite may
+serve purposes its comment does not list, and a mirror stanza changes who
+fetches from where at exactly the moment credentials matter - the area where
+this project has produced `no active sessions` twice. It wants reading
+before it wants doing.
