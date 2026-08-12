@@ -1095,3 +1095,54 @@ reached, which is shape 23 and is why this took a run to notice. And a bound
 written for a dead peer (five seconds to answer) becomes a bound on a BUSY
 peer once the herd exists, so the stampede does not merely cost bandwidth,
 it makes healthy machines look dead.
+
+## 30. A fleet pays ancestry times machines, and wins only above it
+
+Measured on `+test-ast`: each of six workers ends up holding the same ~705
+MiB of distinct content, the coordinator serves one set, and 32 GiB moves
+across the mesh to put a copy on every machine. Whatever a subtree's
+ancestry is, **every machine that runs any lead needs it, and pays for it
+once.**
+
+That gives the shape of every result in this project:
+
+    fleet cost  ~  N x ancestry  +  work  +  leads x per-lead-toll
+    one machine ~      ancestry  +  work
+
+The fleet wins when the work it parallelises exceeds the ancestry it
+replicates. Which is exactly what the target table says:
+
+| target | leads | work per lead | outcome |
+| ---------------- | ----- | ------------- | ------------- |
+| `+all-binaries` | 5 | minutes | **2.7x faster** |
+| `+all-buildkitd` | few | minutes | level |
+| `+lint-all` | 3 | seconds | 2.9x slower |
+| `+test-ast` | 412 | 2-6s median | 7-8x slower |
+
+Not "small leads are bad" - `+all-binaries` has only five and wins. The
+quantity is **work per machine against ancestry per machine**, and lead
+count enters only because it is usually how the work is divided.
+
+### The uncomfortable corollary
+
+For a target whose leads all share one ancestry, **no scheduler can fix
+this.** Affinity, balance, prefetch, seeding and broadcast all decide WHERE
+work goes and HOW content arrives; none of them can make a machine run a
+lead without the lead's ancestry. If every lead needs the same 700 MiB, then
+every machine that gets any lead needs 700 MiB, and the only variable left
+is how many machines get one.
+
+That reframes several of this project's mechanisms as fighting the wrong
+war, and it explains why five of them measured as no better than nothing.
+
+### What it says to do
+
+- **Decide the machine count per target, from the ratio.** Dispatching to
+  six machines a target whose total parallel work is smaller than six copies
+  of its ancestry is a guaranteed loss, computable before the run.
+- **Prefer fewer, larger leads** - not because small leads are expensive in
+  themselves, but because they divide the work more finely without dividing
+  the ancestry at all.
+- **Stop optimising distribution.** 81% of fetches are already local and the
+  coordinator serves one set; the bytes are not the problem, the number of
+  machines that need them is.
