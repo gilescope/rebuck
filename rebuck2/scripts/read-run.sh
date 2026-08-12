@@ -47,6 +47,26 @@ grep -rah "prefetched [0-9]*/[0-9]* of my share" "$dir" | strip \
   | sed -E 's/.*prefetched ([0-9]+)\/([0-9]+) of my share \(([0-9]+) announced\)/\1 of \3/' \
   | sort | uniq -c | sort -rn | head -6
 
+echo; echo "── seeding ─────────────────────────────────"
+# THE ONLY HONEST READ, and it needs its own block rather than a line inside
+# `mechanisms`. A seeded mount reports 0.0 MiB in the harvest table - its
+# size is the copy-on-write diff over the seed, not the total - so "how big
+# is the cache" says the same thing after a perfect seed as after a total
+# failure. The arms comparison is what distinguishes them.
+grep -rah "\[harvest\]" "$dir" | strip \
+  | sed -E 's,[^ ]*sha256:[0-9a-f]{8}[0-9a-f]*,<ref>,g' | sort -u | head -12
+arms=$(grep -rah "wire\] mount arms" "$dir" | strip | sort -u | tail -1)
+echo "${arms:-  (no mount arms line - the run printed none)}"
+# n=0 on the seeded arm has been the outcome of EVERY run so far, for four
+# different reasons. Saying so here stops the next reader concluding that
+# seeding was measured and did not pay.
+case "$arms" in
+  *"seeded p50 0ms (n=0)"*)
+    echo "  ^ SEEDED ARM EMPTY: nothing was seeded. This is not a result about"
+    echo "    seeding - it is the mechanism not firing. Check the harvest lines"
+    echo "    above and REBUCK2_CACHE_SEEDS in the fleet step." ;;
+esac
+
 echo; echo "── affinity and mechanisms ─────────────────"
 grep -rah "wire\] mechanisms\|op duplication\|mount arms" "$dir" | strip | sort -u
 
