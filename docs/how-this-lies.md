@@ -460,6 +460,22 @@ claim became `broadcast_takes_everything_but_its_own_share_first`, which
 fails if the ordering is ever removed. A comment that can be executed stops
 being a comment.
 
+**Audited the rest of the strong claims** - every `so nothing`, `cannot
+happen`, `never fires`, `guarantees`, `is impossible` in `src/` - and found
+no further instance. One is worth a footnote rather than a correction:
+
+> A bloom lies only in the safe direction, so a false positive here
+> misplaces one subtree and a false negative is impossible.
+
+True of the data structure and not quite true of the system: a worker that
+has just fetched a blob is a false negative to every peer until its bloom is
+gossiped. The codebase already knows - `note_gained` makes the filter
+additive precisely so gossip can be prompt, because "30 seconds is longer
+than the window in which a freshly-fetched share is worth anything to
+anyone". So the window is bounded by design rather than absent, which is a
+different sentence from the one in the comment and matters exactly when a
+seed is being raced to six machines.
+
 ## The common thread
 
 Twenty-two of these twenty-three produced a GREEN result. Not one announced itself.
