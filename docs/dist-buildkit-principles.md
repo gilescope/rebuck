@@ -1114,14 +1114,22 @@ replicates. Which is exactly what the target table says:
 
 | target | leads | work per lead | outcome |
 | ---------------- | ----- | ------------- | ------------- |
-| `+all-binaries` | 5 | minutes | **2.7x faster** |
 | `+all-buildkitd` | few | minutes | level |
+| `+all-binaries` | 5 | minutes | 2.7x slower |
 | `+lint-all` | 3 | seconds | 2.9x slower |
 | `+test-ast` | 412 | 2-6s median | 7-8x slower |
 
-Not "small leads are bad" - `+all-binaries` has only five and wins. The
-quantity is **work per machine against ancestry per machine**, and lead
-count enters only because it is usually how the work is divided.
+**No target here wins**, which is a stronger statement of the same
+principle rather than a refutation of it: on every one of them the work per
+machine is smaller than the ancestry per machine. `+all-binaries` comes
+closest and still loses, and the run that measured it said why in terms
+that are principle 30 exactly - "one machine cross-compiling five platforms
+downloads the module graph ONCE into one `/go/pkg/mod`; six machines each
+pay for their own".
+
+Not "small leads are bad": `+all-binaries` has five leads of minutes and
+loses anyway. The quantity is **work per machine against ancestry per
+machine**, and five leaves sharing one 700 MiB stem does not clear it.
 
 ### The uncomfortable corollary
 

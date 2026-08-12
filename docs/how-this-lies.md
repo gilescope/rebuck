@@ -514,9 +514,39 @@ than an assumption. Anything that moves work between machines, or between
 now and later, is trading latency against throughput and needs both numbers
 or neither.
 
+## 25. The same misreading, twice, forty minutes apart
+
+**Instance:** the coverage ledger writes results as `A vs B` without saying
+which is which. I read `+lint-all`'s "88s vs 252s" as fleet-then-baseline,
+called it the one target the fleet wins, then found the detail table saying
+baseline 88s and fleet 252s - **2.9x slower** - and fixed it, with a note
+about how easily a transposition survives because "the premise looked like
+data".
+
+Forty minutes later I read `+all-binaries`'s "262s vs 712s" the same way,
+concluded the fleet wins 2.7x there, and built the evidence table for
+principle 30 on it. The detail table for that run says `wall | baseline
+262s | fleet 712s`.
+
+**Having just written the countermeasure did not stop me applying the
+misreading to the next row.** The fix I made was local - I corrected one
+row and moved on - when the defect was in the FORMAT, which produces the
+error afresh on every row a reader meets.
+
+Worse, the second misreading was load-bearing in a way the first was not. It
+became the positive example in a principle, the "proof" that large leads can
+win, and the thing that made "the fleet is not slow, its leads are too
+small" sound established rather than speculative.
+
+**Countermeasure, and this time to the format rather than the instance:**
+the ledger now writes "fleet 712s against a 262s baseline" - naming both
+sides in every cell. A cell that cannot be read backwards cannot be
+misread backwards. Correcting one row taught me nothing; the row after it
+proved that within the hour.
+
 ## The common thread
 
-Twenty-three of these twenty-four produced a GREEN result. Not one announced itself.
+Twenty-four of these twenty-five produced a GREEN result. Not one announced itself.
 
 The discipline that caught them is the same every time: **find the
 observation that differs between the world where it works and the world where
