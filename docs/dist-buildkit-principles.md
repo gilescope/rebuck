@@ -1051,3 +1051,47 @@ round trips halve, duplication falls, queueing drops - and the only number
 anybody cares about does not move. **An improvement that does not reach the
 binding term is indistinguishable from no improvement, and it costs a run
 either way.**
+
+## 29. Wanted by everyone is not the same as fetched by everyone at once
+
+A cache seed is the clearest case of content every machine needs: every
+graph naming that cache id wants it, on every worker, at the start of its
+first lead. So the prefetch was made to broadcast - all workers take all
+blobs instead of a one-in-N share.
+
+It worked, and it cost. Run `31557310760` moved roughly **24 GiB** across
+the mesh in one leg: 590 MiB of distinct content re-served **seven times**
+off a single worker, none of it to a local client. Six machines asked six
+times for the same 456 MiB layer, at the same instant, from a driver that
+was the only holder.
+
+**The two questions are separate, and conflating them is the mistake:**
+
+| question | answer for a seed |
+| ------------------------------- | ------------------------------ |
+| WHO needs this content? | everyone |
+| WHO should fetch it FROM SOURCE? | one machine |
+
+A split answers the second well and the first badly - one machine gets it
+and five fetch it lazily on the critical path. A naive broadcast answers the
+first well and the second badly - everyone gets it and the source is
+stampeded. Both are wrong, and the correct answer needs no new mechanism:
+**broadcast the SET and stagger the SOURCE.** Each worker fetches the blobs
+it is the designated seeder for first, then the rest; by the time it asks
+for the rest, the machines that owned those have them, and the bloom says
+so. Same total set on every machine, one puller per blob from the origin.
+
+The generalisation, which is not about caches:
+
+> When N consumers need the same object, the fan-out and the fetch pattern
+> are different decisions. Deciding one and letting the other follow gives
+> you either a cold majority or a stampede, and the fix is an ORDERING
+> rather than a policy.
+
+Two details earned the hard way. The comment in `share_of` claimed the
+staggering already happened - `seeder_for` spreads the source per blob
+"either way" - while the broadcast branch returned before `seeder_for` was
+reached, which is shape 23 and is why this took a run to notice. And a bound
+written for a dead peer (five seconds to answer) becomes a bound on a BUSY
+peer once the herd exists, so the stampede does not merely cost bandwidth,
+it makes healthy machines look dead.
