@@ -6255,3 +6255,64 @@ Two details worth writing down:
 So the remaining risk in the seeding prediction is not aim. It is whether
 the harvest can present the right input - which is the bank question, now
 that the truncating write is gone.
+
+## Where the 9,033 seconds go, and why it points at mounts
+
+The checkpoint run's phase split, which had never been read against the
+amplification figure:
+
+```text
+[wire] lead phases : placing 0s (0%) waiting 4115s (46%) building 4917s (54%)
+```
+
+| quantity | value |
+| ------------------------------- | ------------------ |
+| lead time total | 9,033s |
+| of which placing | 0s (0%) |
+| of which waiting (worker busy) | 4,115s (46%) |
+| of which building | 4,917s (54%) |
+| baseline, whole target | 201s |
+| leg | 1,113s |
+| workers | 6 |
+
+Three things follow, and the third is the useful one.
+
+**Placing is free.** Zero seconds across 414 leads. Whatever is wrong, it is
+not the dispatcher deciding.
+
+**Waiting is not waste, but it bounds the machine count.** 4,115s of leads
+sitting behind other leads on a busy worker. The line's own caveat is right
+that this is a worker being busy rather than a fleet failing - but it also
+says six machines is fewer than this workload wants, and that is a knob.
+
+**The amplification lives entirely in `building`.** 4,917s of building
+against a 201s baseline is **24.5x the build work one machine does for the
+same target**. `dup=1.8` accounts for 1.8x of that. The remaining **~13.6x
+is the same work costing more per unit on a worker than on the baseline
+daemon** - not more work, more expensive work.
+
+Machine utilisation, for completeness: 4,917s of building across 6 workers
+for 1,113s is 74% of the available machine-seconds. So the fleet is not
+idle. It is busy doing work that costs it fourteen times what it costs one
+machine.
+
+### Why this points at cache mounts
+
+A cold cache mount is precisely a mechanism that makes identical work cost
+more on a worker: the baseline fills `/go/pkg/mod` once and reuses it across
+every target, while each worker starts empty and runs `go mod download`
+again. It inflates `building` and nothing else - not placing, not transfer,
+not the queue.
+
+And the population split is consistent: leads with a cache mount average
+23.7s, leads without average 9.2s.
+
+This is a converging argument, not a proof. Cache-touching leads are also
+the substantial ones, so the 2.6x could run the other way, and 13.6x is a
+lot to hang on one mechanism. But every phase that is NOT building has now
+been eliminated by measurement, and the one remaining candidate is the one
+the seeding work already targets.
+
+**If seeding works and `building` does not move, the 13.6x is something
+else and this whole line of attack is wrong.** That is the falsifiable form,
+and the arms line plus the phase split will answer it in one run.
