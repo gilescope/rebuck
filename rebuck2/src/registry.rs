@@ -284,7 +284,7 @@ impl<S: RegistryStore> RegistryStore for MeshBacked<S> {
         // fleet ends up building against a cache nobody else can see.
         let found = self.fleet.tag(key).await;
         if found.is_some() {
-            println!("[registry] tag {key} resolved from the fleet");
+            println!("[registry] tag {} resolved from the fleet", loggable(key));
         }
         found
     }
@@ -590,6 +590,23 @@ fn media_type_of(bytes: &[u8]) -> String {
         OCI_INDEX.to_string()
     } else {
         OCI_MANIFEST.to_string()
+    }
+}
+
+/// A request-controlled string, made safe to put in a log line.
+///
+/// Everything this module reports on - a reference, a repo, a tag key -
+/// comes out of a URL path supplied by whoever dialled us. Printed raw, a
+/// newline ends the line and the next one reads as the registry's own
+/// output. Debug-formatting escapes control characters and quotes the value
+/// so its extent is unambiguous; the truncation bounds a log line an
+/// attacker would otherwise choose the length of.
+fn loggable(s: &str) -> String {
+    const MAX_CHARS: usize = 128;
+    match s.char_indices().nth(MAX_CHARS) {
+        // Split on a char boundary, never a byte one.
+        Some((i, _)) => format!("{:?}...", &s[..i]),
+        None => format!("{s:?}"),
     }
 }
 
@@ -981,7 +998,10 @@ async fn handle<S: RegistryStore>(
                 // origin; failing that, report the miss we would have reported
                 // before any of this existed and let the caller fetch it.
                 Err(e) => {
-                    eprintln!("[registry] local lookup for {reference} failed: {e}");
+                    eprintln!(
+                        "[registry] local lookup for {} failed: {e}",
+                        loggable(reference)
+                    );
                     if ensure_present(&reg, _repo, reference, hex).await {
                         match reg.store.blob_stream(hex).await {
                             Some((len, body)) => {
@@ -1195,14 +1215,18 @@ async fn fetch_once<S: RegistryStore>(
         Ok(Some(s)) => s,
         Ok(None) => return false,
         Err(e) => {
-            eprintln!("[registry] upstream {repo} {reference}: {e}");
+            eprintln!(
+                "[registry] upstream {} {}: {e}",
+                loggable(repo),
+                loggable(reference)
+            );
             return false;
         }
     };
     let mut upload = match reg.store.upload_begin().await {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("[registry] cannot stage {reference}: {e}");
+            eprintln!("[registry] cannot stage {}: {e}", loggable(reference));
             return false;
         }
     };
@@ -1211,19 +1235,27 @@ async fn fetch_once<S: RegistryStore>(
         let chunk = match chunk {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("[registry] upstream {repo} {reference} broke off: {e}");
+                eprintln!(
+                    "[registry] upstream {} {} broke off: {e}",
+                    loggable(repo),
+                    loggable(reference)
+                );
                 return false;
             }
         };
         n += chunk.len() as u64;
         if let Err(e) = upload.write(&chunk).await {
-            eprintln!("[registry] cannot stage {reference}: {e}");
+            eprintln!("[registry] cannot stage {}: {e}", loggable(reference));
             return false;
         }
     }
     // A mismatch lands here, as an Err, and nothing reaches the CAS.
     if let Err(e) = reg.store.upload_finish(upload, Some(hex)).await {
-        eprintln!("[registry] refusing {reference} from {repo}: {e}");
+        eprintln!(
+            "[registry] refusing {} from {}: {e}",
+            loggable(reference),
+            loggable(repo)
+        );
         return false;
     }
     reg.bw.upstream_fetches.fetch_add(1, Ordering::Relaxed);
@@ -2420,6 +2452,36 @@ mod tests {
             media_type_of(docker_list),
             "application/vnd.docker.distribution.manifest.list.v2+json"
         );
+    }
+
+    /// A log line must not be forgeable by the thing it describes.
+    ///
+    /// Every string in this module's diagnostics - `reference`, `repo`, a
+    /// tag key - arrives in a URL path from whoever dialled the registry.
+    /// Printed raw, a `\n` in one of them ends the line and starts a new
+    /// one the reader will attribute to the registry itself, which is how a
+    /// log becomes evidence for something that never happened.
+    #[test]
+    fn a_logged_reference_cannot_forge_a_line() {
+        let forged = super::loggable("sha256:aa\n[registry] all clear, nothing to see");
+        assert!(
+            !forged.contains('\n'),
+            "a newline survived into a log line: {forged}"
+        );
+        assert!(forged.contains("\\n"), "it should be visible, not dropped");
+
+        // Carriage returns rewrite a terminal line rather than adding one.
+        assert!(!super::loggable("a\rb").contains('\r'));
+
+        // An ordinary digest stays readable, or nobody will keep the helper.
+        assert!(super::loggable("sha256:abc123").contains("sha256:abc123"));
+
+        // Bounded, because an attacker-supplied path can be enormous and a
+        // log that scrolls a screen per request is its own denial of
+        // service. Truncation must not split a UTF-8 character.
+        let long = "é".repeat(4096);
+        let out = super::loggable(&long);
+        assert!(out.len() < 600, "unbounded: {} bytes", out.len());
     }
 
     /// A repo name is a path segment too. Hashing the tag key makes traversal

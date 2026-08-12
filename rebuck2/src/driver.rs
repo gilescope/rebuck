@@ -2667,16 +2667,29 @@ impl Driver {
     }
 
     /// Ask one worker for a blob by hash.
+    /// Two bounds, not one: see [`PEER_BLOB_TIMEOUT`] and
+    /// [`PEER_BLOB_BULK_TIMEOUT`]. The handshake catches a corpse; the bulk
+    /// read must be allowed to take as long as the bytes take.
     async fn fetch_by_hash_from(&self, endpoint: &str, hash: &str) -> Result<Vec<u8>> {
-        let conn = self.peer_conn(endpoint).await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        mesh::send_frame(&mut send, &BlobReq::GetByHash(hash.to_owned())).await?;
-        send.finish()?;
-        match mesh::recv_frame::<BlobResp>(&mut recv)
-            .await?
-            .context("worker closed blob stream")?
-        {
-            BlobResp::Found { size } => Ok(mesh::recv_raw(&mut recv, size).await?),
+        let (mut recv, resp) = tokio::time::timeout(PEER_BLOB_TIMEOUT, async {
+            let conn = self.peer_conn(endpoint).await?;
+            let (mut send, mut recv) = conn.open_bi().await?;
+            mesh::send_frame(&mut send, &BlobReq::GetByHash(hash.to_owned())).await?;
+            send.finish()?;
+            let resp = mesh::recv_frame::<BlobResp>(&mut recv)
+                .await?
+                .context("worker closed blob stream")?;
+            Ok::<_, anyhow::Error>((recv, resp))
+        })
+        .await
+        .with_context(|| format!("worker {endpoint} did not answer for {hash} in time"))??;
+        match resp {
+            BlobResp::Found { size } => Ok(tokio::time::timeout(
+                PEER_BLOB_BULK_TIMEOUT,
+                mesh::recv_raw(&mut recv, size),
+            )
+            .await
+            .with_context(|| format!("worker {endpoint} stalled sending {hash}"))??),
             other => anyhow::bail!("worker {endpoint} for {hash}: {other:?}"),
         }
     }
@@ -3746,7 +3759,20 @@ async fn serve_blob_stream(
 /// between a fast 404 that it retries or routes around, and a hang that ends
 /// the build. Six unanswering peers at this budget still comes in under any
 /// client timeout worth the name.
+/// How long a peer gets to ANSWER - dial, take the request, send the first
+/// frame back. Short on purpose: a dead runner does not refuse, it hangs.
 const PEER_BLOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the bytes themselves get, once a peer has answered.
+///
+/// Separate from [`PEER_BLOB_TIMEOUT`] because they bound different
+/// failures, and using one number for both made every large blob
+/// unfetchable: a cache seed is hundreds of megabytes (`go-mod` was 456 MiB
+/// in run 31552464169) and cannot cross a shared CI network in five
+/// seconds. A peer that has already answered is demonstrably alive, so the
+/// hang this guards against is a different and rarer one - a stall
+/// mid-stream - and it can afford a generous bound.
+const PEER_BLOB_BULK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The fleet, as the COORDINATOR's registry sees it.
 ///
@@ -3783,15 +3809,51 @@ impl crate::registry::FleetBlobs for Driver {
         // buildkit gave up with `timeout awaiting response headers` and
         // failed the build. A miss must 404 quickly; it is a perfectly
         // ordinary answer and buildkit knows what to do with it.
+        // BOUNDED INSIDE the fetch now, in two places rather than one
+        // around the whole call - a single outer bound caps the transfer as
+        // well as the handshake, which made every large blob unfetchable.
         for who in claimants.iter().chain(others.iter()) {
-            match tokio::time::timeout(PEER_BLOB_TIMEOUT, self.fetch_by_hash_from(who, hash)).await
-            {
-                Ok(Ok(bytes)) => return Some(bytes),
-                Ok(Err(_)) => {}
-                Err(_) => println!("[driver] {who} did not answer for {hash} in time"),
+            match self.fetch_by_hash_from(who, hash).await {
+                Ok(bytes) => return Some(bytes),
+                Err(e) => println!("[driver] {who} could not supply {hash}: {e:#}"),
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod peer_fetch_bounds {
+    /// The two bounds are for two different failures and must not be one
+    /// number.
+    ///
+    /// `PEER_BLOB_TIMEOUT` exists because a dead runner does not refuse, it
+    /// hangs - six workers killed by their own cap once left the walk
+    /// sitting on each corpse until buildkit gave up. That is a HANDSHAKE
+    /// problem: dial, ask, hear the first frame back.
+    ///
+    /// Bounding the whole fetch with it makes any blob that takes longer
+    /// than five seconds to move unfetchable by construction, and a cache
+    /// seed is hundreds of megabytes. `go-mod` alone was 456 MiB in run
+    /// 31552464169.
+    #[test]
+    fn the_bulk_bound_fits_a_real_seed_and_the_handshake_bound_does_not() {
+        const SEED_BYTES: u64 = 456 * 1024 * 1024;
+        // Deliberately pessimistic: inter-runner throughput on shared CI is
+        // not a link speed, and a bound that only works on a good day is a
+        // bound that fails under exactly the load it exists for.
+        const SLOW_MIB_PER_S: u64 = 10;
+        let needed = std::time::Duration::from_secs(SEED_BYTES / (SLOW_MIB_PER_S * 1024 * 1024));
+
+        assert!(
+            super::PEER_BLOB_TIMEOUT < needed,
+            "if the handshake bound alone were enough for a seed there would be              nothing to fix and this test should be deleted"
+        );
+        assert!(
+            super::PEER_BLOB_BULK_TIMEOUT >= needed,
+            "a {SEED_BYTES}-byte seed at {SLOW_MIB_PER_S} MiB/s needs {needed:?},              but the bulk bound is {:?}",
+            super::PEER_BLOB_BULK_TIMEOUT
+        );
     }
 }
 
