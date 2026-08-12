@@ -99,6 +99,11 @@ echo; echo "── CPU, the only like-for-like comparison ──"
 # keeps timestamps out of the arithmetic, which the first version summed
 # into a 45-million-second total across 96 imaginary workers.
 grep -rahoE "baseline cpu: [0-9]+s against [0-9]+s wall" "$dir" | sort -u | sed 's/^/  /' | head -2
+# The coordinator's own daemon. On a run where `home` is non-zero this is
+# part of the fleet's cost and was missing from every total before it
+# existed - run 31564650459 built 372 of 412 solves here and reported none
+# of the CPU.
+grep -rahoE "coordinator cpu: [0-9]+s" "$dir" | sort -u | sed 's/^/  /' | head -1
 wcpu=$(grep -rahoE "worker cpu: [0-9]+s" "$dir" | grep -oE "[0-9]+" | sort -u | paste -sd, -)
 if [ -n "${wcpu:-}" ]; then
   echo "  worker cpu: $wcpu"

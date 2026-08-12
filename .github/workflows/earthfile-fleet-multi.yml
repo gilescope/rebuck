@@ -1976,6 +1976,22 @@ jobs:
           # rounds of connection isolation have not stopped it, which is
           # evidence against every theory that assumes the daemon is fine.
           echo "own-bk: $(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} restarts={{.RestartCount}}' own-bk 2>&1)"
+          # THE COORDINATOR'S OWN CPU, which no run has ever recorded and
+          # which run 31564650459 needed: with one worker, 372 of 412 solves
+          # were built HERE, so the fleet's CPU total excluded nine tenths of
+          # its own work and the run could not be interpreted at all.
+          #
+          # Same cgroup read the baseline step does against base-bk, so the
+          # two are directly comparable - and on a run where `home` is zero
+          # this reports what an idle daemon costs, which is worth having as
+          # the floor.
+          ccpu=$(docker exec own-bk sh -c \
+                   'awk "/^usage_usec/{print \$2}" /sys/fs/cgroup/cpu.stat' 2>/dev/null || true)
+          if [ -n "${ccpu:-}" ]; then
+            echo "coordinator cpu: $((ccpu / 1000000))s"
+          else
+            echo "coordinator cpu: unavailable (no cgroup v2 reading from own-bk)"
+          fi
           # THE PANIC LINE, not the last 25 frames of the stack under it.
           #
           # `--tail 25` caught the bottom of a goroutine dump ending in
