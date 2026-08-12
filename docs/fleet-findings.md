@@ -6017,3 +6017,51 @@ aimed at it has never been switched on.
 
 **Order of work:** let the selftest answer "does seeding work at all" in
 thirty seconds. Only if it does is a `-seed` fleet run worth half an hour.
+
+## Seeding works. Measured, twice, before spending a fleet run
+
+The selftest fix let `check-seeding` run for the first time. It passed on
+x86 Linux CI, and the same rig passed locally on arm64. Write a marker into
+cache A, harvest A, seed a cold cache B from that harvest, read the marker
+back out of B - different ids, so it cannot pass by meeting A's own warm
+mount.
+
+Local rig, `scripts/seed-check.sh`, both fills:
+
+| phase | 0 MiB | 200 MiB | who pays |
+| --------- | ----- | ------- | ------------------------- |
+| write | 334ms | 872ms | once, setup only |
+| harvest | 369ms | 8921ms | ONCE, on one machine |
+| seed+read | 248ms | **794ms** | EVERY worker, every mount |
+
+The asymmetry is the finding. Harvest scales with the cache - 8.9s for 200
+MiB, and the fleet's daemon has been observed holding 1.71 GB under these
+ids, so a full harvest is plausibly a minute or more. But it is paid once,
+serially, before the leg. **Seeding is 794ms for 200 MiB** and is what every
+worker pays.
+
+### The prediction, written before the run
+
+From the checkpoint: `cold p50 5677ms` across 359 mount arms, 9,033s of lead
+time, occupancy 8.19, a 1113s leg.
+
+If a seeded arm lands near 1s where a cold arm takes 5.7s, that is ~4.7s off
+each of 359 leads - about 1,690s of lead time, 19% of the total. At 8.19
+concurrency that is roughly **200s off the leg: 1113s -> ~910s**.
+
+Three ways this fails, all worth naming now so the result cannot be
+retrofitted:
+
+- **The harvest is serial and uncounted.** A 1.7 GB harvest at the local
+  rate is ~75s added to the coordinator before the leg starts. If the leg
+  only drops 200s, a third of the win is eaten at the front.
+- **`cold p50 5677ms` may not be arming.** It is the same family of metric
+  as `mounts_ms`, which lied this evening. If it is really "time in leads
+  that armed a mount", the 4.7s saving is imaginary.
+- **A seeded mount reads 0.0 MiB in the harvest table** - its size is the
+  copy-on-write diff over the seed, already documented in `harvest-cache`.
+  So the obvious "did it work" check reports the same thing as total
+  failure, and the arms line is the only honest read.
+
+The measurement to trust is `mount arms : seeded p50 ... (n=N)` with **both
+arms non-empty**. Every run so far has printed `n=0` on the seeded side.
