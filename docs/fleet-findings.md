@@ -7523,3 +7523,35 @@ Recorded because the previous entry called this "the one real unknown" and
 it took four minutes to answer. The answer makes the experiment bigger than
 it looked, which is exactly what wanted knowing before someone started it at
 the end of a long night.
+
+#### Measured: the abbreviation is not lossy on this repo
+
+The entry above says display-name-to-target-ref "cannot be done by string
+manipulation, because `./t/` could have been `./tests/` or `./tools/`". That
+was reasoning, and it is wrong. Measured against the actual Earthfiles:
+
+| | |
+| ------------------------------- | ---------- |
+| Earthfiles | 192 |
+| targets | 961 |
+| target directories | 191 |
+| **ambiguous abbreviations** | **0** |
+
+Earthly abbreviates only the FIRST path component - `./tests/integration-base`
+becomes `./t/integration-base`, not `./t/i-b` - which the recorded example
+shows and my first model did not. Expanding it back is a lookup against the
+enumerated directories, and on this repo it is exact.
+
+The top-level directories holding Earthfiles are `buildkitd examples
+inputgraph internal release scripts tests util`, and only `i` is shared -
+by `inputgraph` and `internal`. Even those do not collide, because no
+subpath exists under both. So the fragility is real and one shared
+subdirectory away, which a lookup that fails closed handles for free: no
+match, no estimate, dispatch as today.
+
+**So the join holds after all**, and `worth_offering` is a wiring job of the
+size it first appeared to be. Option 1 is not a compromise, it is exact.
+
+Two models, both guesses, before one measurement settled it - first that all
+components are abbreviated (37 ambiguous), then that the first one is (0
+ambiguous). The repo was on disk the whole time.
