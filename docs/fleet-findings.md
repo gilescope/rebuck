@@ -6884,3 +6884,47 @@ all.
 
 `mount arms: seeded p50 6037ms (n=213), cold p50 8040ms (n=1)` - one cold
 sample again, so the per-arm comparison still has nothing to say.
+
+### Broadcast works, and one blob in three does not arrive
+
+Run C's worker logs settle what the seed announcement actually did.
+
+The driver announced **3 blobs** per seed - two blobs plus the manifest, so
+`manifest_dig` is working - and twelve worker lines report a share of three,
+which is exactly two seeds times six workers. **That is the broadcast
+signature**: under the split, six workers divide three blobs and most get
+zero or one.
+
+But of those twelve:
+
+```text
+  2 prefetched 3/3 of my share (3 announced)
+ 10 prefetched 2/3 of my share (3 announced)
+```
+
+**Ten of twelve fetched two of their three blobs.** The prefetch reached
+every worker, every worker tried to take the whole seed, and one blob in
+three did not arrive - after which 733 leads failed on content this prefetch
+was supposed to have placed. That is up from 192 in run B, which fits: more
+workers now attempt the fetch, so more of them can fail it.
+
+**And nothing said which blob, or why.** The loop was
+
+```rust
+if exec::Blobs::get(&*blobs, &d).await.is_ok() { got += 1; }
+```
+
+with the comment "Failures are dropped - a blob that does not arrive now
+arrives lazily later", which was true when a prefetch was advisory and is
+not true for a seed: a seed that does not arrive fails the build that needed
+it.
+
+The `[registry] MISS` line added earlier tonight cannot cover this either -
+prefetch takes the mesh path directly and never enters the HTTP handler,
+which is why `MISS: 0` appeared in every log while 733 leads were failing.
+Two diagnostics, one blind spot between them, and the blind spot is exactly
+where the mechanism lives.
+
+Now named: `[worker] prefetch MISS <hash> (<size> bytes): <error>`. The next
+run says which blob and what the mesh answered, which is the one fact this
+investigation has never had.

@@ -433,8 +433,22 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                         // driver - the same path a lazy fetch takes, so a
                         // prefetch warms exactly what a build would have
                         // pulled and nothing else.
-                        if exec::Blobs::get(&*blobs, &d).await.is_ok() {
-                            got += 1;
+                        match exec::Blobs::get(&*blobs, &d).await {
+                            Ok(_) => got += 1,
+                            // NAMED, not counted. `prefetched 2/3` says one
+                            // blob did not arrive and nothing said which or
+                            // why - and run 31557310760 reported exactly
+                            // that on ten of the twelve seed announcements,
+                            // with 733 leads then failing to fetch content
+                            // this prefetch was supposed to have placed.
+                            //
+                            // The registry's own MISS line cannot cover
+                            // this: prefetch takes the mesh path directly
+                            // and never goes through the HTTP handler.
+                            Err(e) => println!(
+                                "[worker] prefetch MISS {} ({} bytes): {e:#}",
+                                d.hash, d.size
+                            ),
                         }
                     }
                     println!("[worker] prefetched {got}/{share} of my share ({n} announced)");
