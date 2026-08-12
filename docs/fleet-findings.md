@@ -121,6 +121,26 @@ correction attached, because a deleted mistake gets made again.
 | "seeding costs 1872s rewriting every graph" | wrong mechanism - that 1872s is decline-and-re-offer round trips |
 | "the seed address is unreachable from a worker" | `172.17.0.1:15000` correctly names each worker's own mesh-backed registry; the bytes were not there yet |
 
+**Superseded figures.** This file keeps its mistakes in place, so a number
+you meet in the middle of it may be one. These are the ones that recur, and
+what each became:
+
+| you will read | it is now | why |
+| ------------- | --------------------------- | ------------------------------- |
+| `12.5x` | see below | earliest form of the same figure |
+| `21.3x` | see below | fleet work over baseline wall |
+| `24.5x` | **17.9x**, then unsettled | lead-seconds divided by a wall clock |
+| `13.6x` | **~10x**, then unsettled | same, after duplication |
+| `74%` utilisation | **54%** | overlap not divided out |
+| `94%` cache mounts | not a duration at all | `mounts_ms` was a filter |
+| `mounts_ms` | `lead_ms_with_cache` | the name stated a filter as a total |
+
+The per-unit cost currently has no settled value: somewhere between about 6x
+and 18x depending on which units, and the CPU counters added on 2026-08-12
+are the first instrument that can narrow it honestly. Use
+`scripts/leg-arithmetic.sh` rather than dividing by hand - it exists because
+dividing by hand is what produced four of the seven rows above.
+
 The pattern in every retraction is one shape: **a real counter, correctly
 incremented, answering a question I was not asking.** Before building on a
 number, establish what it is a number OF.
