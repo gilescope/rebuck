@@ -1945,7 +1945,13 @@ jobs:
           # nothing said what the rest was, and a 50-minute leg could not be
           # told apart from an expensive tap without running it twice.
           echo "=== where the time went, and what measuring it cost"
-          grep -E '^\[wire\] (lead phases|status tap|home vertices|service ms|grafted|trapped ops|refused time|WARNING)' \
+          # `cache inputs` decides the NEXT run, not this one. The harvest
+          # can only read the directory earthly wrote if it presents the same
+          # mount input, and the only source of those is this line - written
+          # at the end of the leg, banked, and read by the next run's
+          # harvest. It printed into the artifact and nothing surfaced it, so
+          # "did the bank get anything" cost an artifact download every time.
+          grep -E '^\[wire\] (lead phases|status tap|home vertices|service ms|grafted|trapped ops|refused time|cache inputs|WARNING)' \
             proxy.log || true
           # WORK AMPLIFICATION, which is the number that reframes all of
           # these. The fleet's lead time against the whole baseline wall: if
