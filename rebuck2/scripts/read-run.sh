@@ -53,9 +53,15 @@ echo; echo "── fetches that found nothing anywhere ─────"
 # caller that was resolving an image fails its build on it - which arrives
 # as `worker declined ... could not fetch content descriptor`, 274 times in
 # one run, with nothing on our side saying which digest or who was asked.
-grep -rah "\[registry\] MISS" "$dir" | strip \
-  | sed -E 's/sha256:[0-9a-f]{8}[0-9a-f]*/<digest>/g' \
-  | sort | uniq -c | sort -rn | head -8
+# TWO strings, in two files, for two paths. The registry's MISS is the end
+# of the HTTP lookup chain; the worker's is the end of the MESH one, which
+# prefetch takes directly and never enters the handler. Run 31557310760
+# printed `MISS: 0` in every log while 733 leads failed on content a
+# prefetch had silently not fetched - one diagnostic covering one path, and
+# the mechanism living in the gap between them.
+grep -rah "\[registry\] MISS\|\[worker\] prefetch MISS" "$dir" | strip \
+  | sed -E 's/sha256:[0-9a-f]{8}[0-9a-f]*/<digest>/g; s/[0-9a-f]{40,}/<digest>/g' \
+  | sort | uniq -c | sort -rn | head -10
 echo "  (none is the good answer)"
 
 echo; echo "── why a lead was declined ─────────────────"
