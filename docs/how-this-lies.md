@@ -391,9 +391,43 @@ caught it: when a number moves a lot, re-read the definition of the field
 before explaining the movement. Both readings were of a real number
 correctly computed.
 
+## 22. A sum over concurrent things, divided by a wall clock
+
+**Instance:** `building` is 4,917 seconds. The baseline builds the same
+target in 201. I wrote "24.5x the build work one machine does", subtracted
+the measured 1.8x duplication, and reported a 13.6x per-unit cost as the
+project's largest open question.
+
+`lead_ms` and its phase shares are summed over leads that RUN AT THE SAME
+TIME - across six workers, and more than one per worker. This file already
+depends on that fact: the leg identity is `lead_ms / occupancy = leg`, and
+it checks out to 1%. I used the identity in one paragraph and contradicted
+it in the next.
+
+At the measured occupancy the same 4,917 lead-seconds are 3,602
+worker-wall-seconds, so the ratio is 17.9x, and after duplication ~10x
+rather than 13.6x. The same slip inflated a utilisation figure from 54% to
+74%.
+
+And 17.9x is still not a like-for-like comparison, because the baseline's
+201 seconds is one wall clock over work buildkit parallelises across the
+runner's cores. Both sides have to be in wall time or both in CPU time, and
+nothing here measures the baseline's CPU time.
+
+**What makes this shape dangerous is that it survives sanity checks.** Every
+input was real, the division was arithmetically correct, and the result was
+plausible - large enough to be interesting, not so large as to look absurd.
+It sat at the top of the open-questions table.
+
+**Countermeasure:** a summed duration is not a duration. Before dividing one
+by anything, state what it is a sum over and whether those things overlap -
+and if the denominator is a wall clock, the numerator has to be one too. The
+tell here was free and ignored: an identity three paragraphs earlier already
+said how much the leads overlap.
+
 ## The common thread
 
-Twenty of these twenty-one produced a GREEN result. Not one announced itself.
+Twenty-one of these twenty-two produced a GREEN result. Not one announced itself.
 
 The discipline that caught them is the same every time: **find the
 observation that differs between the world where it works and the world where

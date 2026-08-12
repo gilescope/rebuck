@@ -85,7 +85,7 @@ confident version first - which has happened to me, in this file, twice.
 | The prefetch counting gate is dead | 0 acceptances, 14 refusals, 292 prefetches bypassing it |
 | The worker vertex tap costs 15% and is confounded | 1050s -> 1207s; 4,964s of vertex time in a 1,207s leg |
 | **The apparatus still works after ~640 commits** | checkpoint run: parity green, 1113s leg, 201s baseline, 412/412 routed |
-| The amplification is entirely inside `building` | placing 0s, waiting 4115s, building 4917s against a 201s baseline = 24.5x |
+| The amplification is inside `building` | placing 0s, waiting 4115s, building 4917s - the RATIO to the baseline is unsettled, see the correction |
 | More machines cannot fix it | building alone needs 25 machines to reach the baseline; Amdahl caps at 5.67x |
 | Cache-mount seeding has never once run | four mechanical reasons, plus a fifth that defeats even a warm bank |
 | The seeding mechanism itself works | `check-seeding` green on x86 CI and arm64 local: write, harvest, seed a COLD mount, read back |
@@ -103,7 +103,7 @@ confident version first - which has happened to me, in this file, twice.
 | How much of the fleet's traffic crosses a wire | `SERVED_BYTES` mixes loopback with peer serving; `SERVED_LOCAL_BYTES` exists and has never reported |
 | Whether the fleet repeats itself, and by how much | the coordinator reports 1.1x; the per-worker figure has never printed |
 | What made the reference run take 50 minutes | not the tap, which costs 1ms. Still unexplained |
-| **What the 13.6x is** | inside `building`. Export bounded at 5-10%, duplication measured at 1.8x, cold mounts an order of magnitude too small once per-daemon reuse is counted. No candidate currently fits |
+| **What the per-unit cost is** | inside `building`, and between ~6x and ~18x depending on units - `lead_ms` sums concurrent leads and the baseline's CPU time has never been measured. Export bounded at 5-10%, duplication 1.8x, cold mounts too small. No candidate fits, and the range itself is not tight |
 | Why `-bcast` breaks `+test-ast` | three hypotheses refuted; two families eliminated by tracing the error to containerd `images.Manifest()` |
 | Whether seeding pays once it can be delivered | never yet measured - every run so far failed before the question could be asked |
 
@@ -6317,16 +6317,38 @@ while each unit of work costs fourteen times what it costs there.
 So `-w12` stays cancelled, now for a second and better reason than the
 ceiling arithmetic that cancelled it the first time.
 
-**The amplification lives entirely in `building`.** 4,917s of building
-against a 201s baseline is **24.5x the build work one machine does for the
-same target**. `dup=1.8` accounts for 1.8x of that. The remaining **~13.6x
-is the same work costing more per unit on a worker than on the baseline
-daemon** - not more work, more expensive work.
+**The amplification lives in `building`** - but the size of it was
+overstated, twice, and the arithmetic is worth doing properly.
 
-Machine utilisation, for completeness: 4,917s of building across 6 workers
-for 1,113s is 74% of the available machine-seconds. So the fleet is not
-idle. It is busy doing work that costs it fourteen times what it costs one
-machine.
+`lead_ms` and its `building` share are a SUM OVER LEADS THAT RUN
+CONCURRENTLY, both across the six workers and within each one. The whole
+leg identity in this file depends on that (`lead_ms / occupancy = leg`, 9033
+/ 8.19 = 1103s against a measured 1113s). So dividing 4,917 lead-seconds by
+a 201-second wall clock is not a work ratio, and the 24.5x it produces is
+not a quantity.
+
+Converting to worker-wall-seconds at the measured occupancy:
+
+| quantity | value |
+| ------------------------------ | ------- |
+| building, summed over leads | 4,917s |
+| leads in flight per worker | 1.36 |
+| building as worker-wall-seconds | 3,602s |
+| per worker, in a 1,113s leg | 600s = **54% busy** |
+| against a 201s baseline wall | **17.9x** |
+
+Two corrections fall out. The utilisation figure I gave as 74% is **54%** -
+I divided lead-seconds by machine-seconds without dividing out the overlap.
+And the amplification is 17.9x rather than 24.5x, which after `dup=1.8`
+leaves **~10x** rather than 13.6x.
+
+Even 17.9x is not yet apples to apples: the baseline's 201s is one wall
+clock over work buildkit parallelises internally across the runner's cores,
+while a dispatched subtree is small and parallelises less. A defensible
+comparison needs both sides in the same units - wall or CPU - and this file
+does not currently have the baseline's CPU time. So **the honest figure is
+"between about 6x and 18x, and the instrument to narrow it does not exist
+yet"**, which is a good deal less than the number this section opened with.
 
 ### Why this points at cache mounts
 
