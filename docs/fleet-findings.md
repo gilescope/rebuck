@@ -8443,3 +8443,45 @@ The only levers principle 30 leaves are therefore the two it named: **fewer
 machines**, or **more work per machine to amortise it**. Both are workload
 decisions, not scheduler ones - and `-w1` is the first measurement of what
 the lever is worth.
+
+### The unpack is not irreducible after all: buildkit can mount instead
+
+I wrote two entries ago that each machine "must UNPACK those 690 MiB into
+snapshots" and called it irreducible. That is only true of the format the
+images are in.
+
+The buildkitd this project runs has the stargz snapshotter compiled in -
+`cmd/buildkitd/main_oci_worker.go` imports `stargz-snapshotter/fs` - and the
+fork ships `docs/stargz-estargz.md` describing it:
+
+> if the image is formatted as stargz/eStargz, buildkit with the
+> configuration described here can skip pull of that image even when it's
+> needed (e.g. on `RUN` and `COPY`). Instead, it *mounts* that image from
+> the registry to the node and *lazily* fetches necessary files (or chunks
+> for big files) contained in that image on demand.
+
+**That is precisely the shape of this project's largest cost.** A 690 MiB
+ancestry unpacked on six machines, where each lead reads some fraction of
+it, becomes six lazy mounts and only the chunks actually touched.
+
+**The prerequisite, and it is a real one.** Lazy pulling requires the images
+to BE in estargz format:
+
+- **subtree results** - ours, produced by buildkit's exporter, which can
+  emit estargz as an exporter attr. `publish_attrs` is one place and this
+  file already notes the codec as "a one-line setting" in another context.
+- **base images** - not ours. Docker Hub does not serve estargz, so the
+  mirror would have to convert on the way through, which is a real feature
+  and not a flag.
+
+So the reachable half is the fleet's own results, and the 171 MiB blob that
+dominates the table is more likely a base layer than a subtree result -
+which would put the biggest single item on the wrong side of the
+prerequisite. Checking which it is costs one manifest lookup and has not
+been done.
+
+**Recorded as the only idea found tonight that attacks the unpack rather
+than the transfer**, with its prerequisite named and its likely limitation
+named too. The measurement that would justify pursuing it is the same one
+everything else waits on: how much of the 6-9x is unpack, which `-w1`
+answers.
