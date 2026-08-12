@@ -119,30 +119,65 @@ one worker, so correctness does not depend on it. `publish_attrs`' own
 comment already records that client-visible output digests were identical
 with and without it.
 
-### The digest already does the job `rewrite-timestamp` is paid for
+### Why `rewrite-timestamp` is on, and why that reason does not survive here
 
-Everything this fleet moves is referenced by digest. A layer pulled by
-digest is verified by the pull: if the bytes hash to the name you asked
-for, they are the bytes. **Integrity is free and already paid.**
+It is not an oversight. `81a0ce7` put it there deliberately, with a
+measurement: buildkit stamps wall clock into the config and real mtimes into
+the layer tar, so **republishing an unchanged graph produced fresh bytes,
+moved the tag, and orphaned everything the tag used to name.** Over 24
+adoptions of 4 distinct graphs into one persistent store:
 
-So what does making the bytes *deterministic* buy on top of that? Exactly
-one thing — that two machines independently building the same subtree
-produce the same blob, and the second one dedups against the first. In this
-fleet that case is close to empty: each subtree result is pushed by exactly
-one worker, and `dup 1.9x` is duplicate *materialisation* of an existing
-blob, which digests already collapse. `publish_attrs`' own comment records
-that client-visible output digests were identical with and without it.
+| attrs | blobs | orphaned |
+| ------------------------ | ----- | -------- |
+| neither | 75 | 60 |
+| `source-date-epoch` only | 75 | 60 |
+| both | **15** | **0** |
 
-`rewrite-timestamp` is therefore paying a whole-ancestry re-tar, per solve,
-for a property that content addressing supplies for nothing. That is not a
-trade-off to weigh — it is a cost with no matching benefit, which is the
-rarest and best kind of thing to find in a system this heavily measured.
+An earlier draft of this section called it "a cost with no matching
+benefit". That was wrong — the benefit is real and measured. What is wrong
+with it is narrower, and there are three things:
 
-Same argument retires `force-compression` as a default: it exists to
-normalise a layer's *encoding*, and the digest does not care what encoding
-a blob has, only that it is the blob. Keep both behind a flag for anyone
-who genuinely wants bit-reproducible published images; do not pay for them
-on every dispatch.
+**1. The benefit is sized in blob COUNT, and this repo has already
+discredited that unit — with these exact numbers.** `how-this-lies.md`
+shape 6:
+
+> counting orphaned BLOBS to size the mirror's garbage. 60 of 75 were
+> unreachable, which reads as 80% waste and an obvious case for a gc. **By
+> bytes it was 0.6%**: the base image is one shared 4MB object and the
+> orphans are kilobytes of metadata. The stand-in argued for the opposite
+> conclusion.
+
+Same 75, same 60. `56af5eb` wrote that down at 21:07. `81a0ce7` used the
+same count as its justification at **21:44 — thirty-seven minutes later.**
+So the honest size of the win is **0.6% of the store by bytes**, and it is
+being bought with a whole-ancestry re-tar on every solve.
+
+That is shape 25 — the same misreading twice inside the hour — in a second
+instance the file does not record.
+
+**2. The rig is not the fleet's regime.** 24 adoptions of 4 graphs into
+**one persistent store** is six republishes per graph, deliberately
+constructed so repeats dominate. The fleet runs on ephemeral runners with a
+fresh mirror per run, and each subtree result has exactly one producer that
+pushes it exactly once. The repeat the attr exists to make cheap barely
+happens where the attr is being paid for.
+
+**3. The cost was never on the other side of the scale.** `81a0ce7`
+measured the benefit carefully and priced nothing. That is shape 24 — a
+trade-off judged on one side of the trade — which this file already invokes
+against cache-mount seeding.
+
+**What this does not change:** integrity. Everything here is fetched by
+digest, so a client that asks for a digest and gets bytes hashing to it has
+the right bytes, whatever their mtimes. Determinism is about *cheap
+republish*, not correctness, and `publish_attrs`' own comment confirms
+client-visible output digests were identical with and without it.
+
+**So the fix is conditional, not a deletion.** Keep both attrs for the
+persistent-mirror case they were measured on; drop them for per-solve
+dispatch, where the repeat does not occur and the price is the largest term
+in the build. Same argument for `force-compression`, which normalises a
+layer's encoding — something a digest-addressed transport never needs.
 
 ### The `-nocomp` arm as committed is confounded
 
