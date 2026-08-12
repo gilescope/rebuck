@@ -2434,7 +2434,7 @@ The standing goal is larger and larger parts of it, so here is the ledger.
 | `+test-no-qemu-group10`  | the same, one group                    | where graft and cut-prefix were measured                  |
 | `+test-no-qemu` (all 14) | 14 groups on one 192s base chain       | completes, parity, 508s vs 285s                           |
 | `+all-binaries`          | 5 cross-compiles off one `+code` stem  | **green both legs**, 262s vs 712s, 2.3x ceiling           |
-| `+lint-all`              | 3 independent lint targets, no docker  | parity, 88s vs 252s after the retry fix (was 628s)        |
+| `+lint-all`              | 3 independent lint targets, no docker  | parity - fleet 252s against an 88s baseline (was 628s)    |
 | `+all-buildkitd`         | multi-arch buildkitd, needs qemu       | **parity**, 1161s vs 1188s - arm64 half is undispatchable |
 | `+test-ast`              | 412 solves, the densest fan-out here   | **parity** - the target every mechanism is measured on    |
 | `+all`                   | the whole Earthfile                    | **parity**, 2724s, zero failed - a chain, not a fan-out   |
@@ -7350,3 +7350,47 @@ honestly be split between the mounts it holds.
 Recorded so the next person does not spend a run on `REBUCK2_SEED_IDS` with
 one id in it, which is the obvious next move and would produce the same
 `n=1` for a third reason.
+
+### There is no target where the fleet wins
+
+The coverage ledger read `+lint-all` as "88s vs 252s", which parses as
+fleet-then-baseline and makes it the one target the fleet beats. The detail
+table further down the same file has it the other way:
+
+```text
+| baseline | 92s  | 88s  |
+| fleet    | 628s | 252s |
+```
+
+Baseline **88s**, fleet **252s**. The row was transposed, and it turned the
+fleet's second-worst ratio into its only win.
+
+Caught while about to ask "what is different about `+lint-all` that lets the
+fleet win there?" - a line of inquiry entirely built on a number written
+backwards, and one that would have taken a while to bottom out because the
+premise looked like data.
+
+Consolidating what the targets actually say, on wall clock:
+
+| target | baseline | fleet | ratio |
+| ---------------- | -------- | ------ | ----------- |
+| `+lint-all` | 88s | 252s | 2.9x slower |
+| `+test-ast` | ~210s | ~1400-1800s | 7-8x slower |
+| `+all-binaries` | 712s | 262s | **2.7x faster** |
+| `+all-buildkitd` | 1188s | 1161s | level |
+
+So there IS a target the fleet wins on, and it is not the one the ledger
+claimed: **`+all-binaries`**, five genuinely independent cross-compiles off
+one shared stem. That is the shape a build farm is for, and it is the only
+entry here with that shape.
+
+The pattern across the four is not about cache mounts or docker. It is
+whether the target has independent work of real size. `+all-binaries` has
+five minutes-long leaves; `+lint-all` has three cheap ones where per-lead
+overhead dominates; `+test-ast` has 412 small solves where it dominates
+utterly; `+all-buildkitd` is half undispatchable.
+
+Which sharpens the open question. The per-unit cost of 6-9x is not a tax the
+fleet pays everywhere - `+all-binaries` pays it too and still wins, because
+its leads are large enough to absorb it. **The fleet is not slow. Its leads
+are too small**, and every target where that is false is a target it beats.
