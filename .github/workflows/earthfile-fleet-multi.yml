@@ -104,10 +104,11 @@ on:
       # measurement.
       # The export-cost test - see the `-nocomp` case in the plan job.
       - giles-dispatch-ci-ast-balance-nocomp
+      # Lazy mounts. Measured locally at 5/1000 of a layer fetched before
+      # it was given a branch - see scripts/stargz-check.sh.
+      - giles-dispatch-ci-ast-balance-estargz
       - giles-dispatch-ci-ast-balance-w1
       - giles-dispatch-ci-ast-balance-w3
-      # The export-cost test - see the `-nocomp` case in the plan job.
-      - giles-dispatch-ci-ast-balance-nocomp
       - giles-dispatch-ci-ast-balance-w12
       # Seeding ON TOP of balance, not instead of it. `-ast-seed` already
       # existed and would answer a different question: the 1113s reference
@@ -610,7 +611,7 @@ jobs:
             # leaves a stray `1` on the workload.
             workload=${workload%-w[0-9]}
             workload=${workload%-w[0-9][0-9]}
-            for suffix in -seed -graft -arm -nocomp -zstd -minops -imports -bcast -balance -nested -sandbox -vtx -nobase; do
+            for suffix in -seed -graft -arm -estargz -nocomp -zstd -minops -imports -bcast -balance -nested -sandbox -vtx -nobase; do
               # QUOTED: unquoted, `$suffix` is taken as a glob pattern
               # rather than a literal, which shellcheck SC2295 catches and
               # which would misbehave the moment a suffix contained a `?`
@@ -716,10 +717,18 @@ jobs:
           # `uncompressed` removes the compress half entirely. If worker CPU
           # collapses, export is the answer; if it barely moves, export is
           # exonerated and the portable rewrite is what remains.
+          #
+          # `-estargz`: the only arm aimed at the unpack term rather than at
+          # transfer or placement. It is NOT a compression choice - an
+          # estargz blob is BIGGER than gzip - it is what makes a layer
+          # lazily mountable, so the worker fetches the chunks it reads and
+          # unpacks nothing. The consuming half lives in the daemon step,
+          # and the arm fails loudly there if the snapshotter did not load.
           case "$REF" in
-            *-nocomp*) comp=uncompressed ;;
-            *-zstd*)   comp=zstd ;;
-            *)         comp="" ;;
+            *-estargz*) comp=estargz ;;
+            *-nocomp*)  comp=uncompressed ;;
+            *-zstd*)    comp=zstd ;;
+            *)          comp="" ;;
           esac
           echo "compression: ${comp:-buildkit default}"
           echo "compression=$comp" >> "$GITHUB_OUTPUT"
@@ -896,6 +905,22 @@ jobs:
       # sets it. That is the sixth mechanism-that-cannot-fire in this session
       # and the second I wrote myself.
       REBUCK2_PREFETCH_ALL: ${{ needs.plan.outputs.bcast }}
+      # THE SEVENTH, and the comment above is what found it. The chain is
+      # worker.rs:919 -> solve::build_subtree -> solve_request ->
+      # publish_attrs -> compression_attrs(env "REBUCK2_COMPRESSION"), so
+      # the process that exports every DISPATCHED result is this one. The
+      # variable was set in the coordinator job and nowhere else.
+      #
+      # So every dispatched export in every run so far used buildkit's
+      # default codec, and `-zstd` and `-nocomp` configured the coordinator
+      # alone - which exports far less. Both arms measured a fraction of
+      # what their names claim, and `-nocomp` is in flight right now.
+      #
+      # `mech.rs` cannot catch this and says so: it asserts every reported
+      # mechanism has an `applied()` somewhere in `src/`, and process
+      # boundaries are invisible to a grep over a source tree. That is
+      # shape 18, and this is its second instance.
+      REBUCK2_COMPRESSION: ${{ needs.plan.outputs.compression }}
       # Also worker-side: worker.rs reads it to retarget a nested build's
       # BUILDKIT_HOST before handing the graph to its own daemon.
       REBUCK2_LOCAL_NESTED: ${{ needs.plan.outputs.nested }}
@@ -1022,13 +1047,44 @@ jobs:
           BK_IMAGE=${BK_IMAGE:-earthbuild/buildkitd:v0.8.17}
           docker pull "$BK_IMAGE"
           docker rm -f own-bk base-bk >/dev/null 2>&1 || true
-          docker run -d --name own-bk --privileged -p 18372:8372 \
-            -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
-            -e BUILDKIT_TLS_ENABLED=false \
+          # estargz is TWO halves and only one of them is a codec.
+          # REBUCK2_COMPRESSION is the EXPORT side; the consuming side is
+          # this daemon MOUNTING a layer instead of unpacking it, which
+          # needs the stargz snapshotter and /dev/fuse.
+          #
+          # Shipping only the export half measures a REGRESSION: an estargz
+          # blob is bigger than gzip (TOC, footer, per-file gzip members)
+          # and nothing is skipped without the mount. That is shape 13 - a
+          # knob wired, documented and inert - and it would read as
+          # "estargz is worse" rather than as "half of it was missing".
+          #
+          # Measured locally first, `scripts/stargz-check.sh`: 1,143,096
+          # bytes fetched from a 201,392,438-byte layer, 9 of 12 blob GETs
+          # answered 206.
+          BK_ARGS=(-d --name own-bk --privileged -p 18372:8372
+            -e BUILDKIT_TCP_TRANSPORT_ENABLED=true
+            -e BUILDKIT_TLS_ENABLED=false
             -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG='[registry."172.17.0.1:15000"]
             http = true
-            insecure = true' \
-            "$BK_IMAGE" >/dev/null
+            insecure = true')
+          BK_TAIL=()
+          if [ "${REBUCK2_COMPRESSION:-}" = "estargz" ]; then
+            # The snapshotter CANNOT be appended through
+            # EARTHLY_ADDITIONAL_BUILDKIT_CONFIG. The image's template
+            # already carries
+            #
+            #   [worker.oci]
+            #     snapshotter = "auto"
+            #
+            # and TOML forbids a duplicate table, so a second [worker.oci]
+            # is a parse error rather than an override. Edit the template
+            # before the entrypoint renders it - and do NOT replace the
+            # entrypoint, because the entrypoint is what renders it at all
+            # and appends the registry stanza above.
+            BK_ARGS+=(--device /dev/fuse --entrypoint sh)
+            BK_TAIL=(-c 'sed -i "s|snapshotter = \"auto\"|snapshotter = \"stargz\"|" /etc/buildkitd.toml.template && exec /usr/bin/entrypoint.sh buildkitd --config=/etc/buildkitd.toml')
+          fi
+          docker run "${BK_ARGS[@]}" "$BK_IMAGE" "${BK_TAIL[@]}" >/dev/null
           for _ in $(seq 1 120); do
             docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers \
               >/dev/null 2>&1 && break
@@ -1036,6 +1092,20 @@ jobs:
           done
           docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 || {
             echo "our buildkitd never became ready:"; docker logs --tail 20 own-bk; exit 1; }
+          # Ask the daemon what it LOADED. A template edit that missed, or a
+          # kernel with no /dev/fuse, both leave a daemon that starts
+          # perfectly and unpacks everything - the green-but-inert outcome.
+          if [ "${REBUCK2_COMPRESSION:-}" = "estargz" ]; then
+            docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers \
+              --format '{{range .}}{{.Labels}}{{end}}' 2>/dev/null \
+              | grep -q 'snapshotter:stargz' || {
+                echo "estargz export is ON and this daemon is NOT running the stargz"
+                echo "snapshotter. The arm would ship bigger blobs and mount none of"
+                echo "them, and the run would read as 'estargz is worse'."
+                docker exec own-bk cat /etc/buildkitd.toml | grep -n snapshotter || true
+                exit 1; }
+            echo "[estargz] snapshotter=stargz confirmed on own-bk"
+          fi
           # Shell variable AND $GITHUB_ENV: the latter only reaches LATER
           # steps, and this one uses it below. See the single-runner
           # workflow, where writing only the env file left `set -u` to kill
@@ -1493,13 +1563,44 @@ jobs:
           BK_IMAGE=${BK_IMAGE:-earthbuild/buildkitd:v0.8.17}
           docker pull "$BK_IMAGE"
           docker rm -f own-bk base-bk >/dev/null 2>&1 || true
-          docker run -d --name own-bk --privileged -p 18372:8372 \
-            -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
-            -e BUILDKIT_TLS_ENABLED=false \
+          # estargz is TWO halves and only one of them is a codec.
+          # REBUCK2_COMPRESSION is the EXPORT side; the consuming side is
+          # this daemon MOUNTING a layer instead of unpacking it, which
+          # needs the stargz snapshotter and /dev/fuse.
+          #
+          # Shipping only the export half measures a REGRESSION: an estargz
+          # blob is bigger than gzip (TOC, footer, per-file gzip members)
+          # and nothing is skipped without the mount. That is shape 13 - a
+          # knob wired, documented and inert - and it would read as
+          # "estargz is worse" rather than as "half of it was missing".
+          #
+          # Measured locally first, `scripts/stargz-check.sh`: 1,143,096
+          # bytes fetched from a 201,392,438-byte layer, 9 of 12 blob GETs
+          # answered 206.
+          BK_ARGS=(-d --name own-bk --privileged -p 18372:8372
+            -e BUILDKIT_TCP_TRANSPORT_ENABLED=true
+            -e BUILDKIT_TLS_ENABLED=false
             -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG='[registry."172.17.0.1:15000"]
             http = true
-            insecure = true' \
-            "$BK_IMAGE" >/dev/null
+            insecure = true')
+          BK_TAIL=()
+          if [ "${REBUCK2_COMPRESSION:-}" = "estargz" ]; then
+            # The snapshotter CANNOT be appended through
+            # EARTHLY_ADDITIONAL_BUILDKIT_CONFIG. The image's template
+            # already carries
+            #
+            #   [worker.oci]
+            #     snapshotter = "auto"
+            #
+            # and TOML forbids a duplicate table, so a second [worker.oci]
+            # is a parse error rather than an override. Edit the template
+            # before the entrypoint renders it - and do NOT replace the
+            # entrypoint, because the entrypoint is what renders it at all
+            # and appends the registry stanza above.
+            BK_ARGS+=(--device /dev/fuse --entrypoint sh)
+            BK_TAIL=(-c 'sed -i "s|snapshotter = \"auto\"|snapshotter = \"stargz\"|" /etc/buildkitd.toml.template && exec /usr/bin/entrypoint.sh buildkitd --config=/etc/buildkitd.toml')
+          fi
+          docker run "${BK_ARGS[@]}" "$BK_IMAGE" "${BK_TAIL[@]}" >/dev/null
           for _ in $(seq 1 120); do
             docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers \
               >/dev/null 2>&1 && break
@@ -1507,6 +1608,20 @@ jobs:
           done
           docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 || {
             echo "our buildkitd never became ready:"; docker logs --tail 20 own-bk; exit 1; }
+          # Ask the daemon what it LOADED. A template edit that missed, or a
+          # kernel with no /dev/fuse, both leave a daemon that starts
+          # perfectly and unpacks everything - the green-but-inert outcome.
+          if [ "${REBUCK2_COMPRESSION:-}" = "estargz" ]; then
+            docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers \
+              --format '{{range .}}{{.Labels}}{{end}}' 2>/dev/null \
+              | grep -q 'snapshotter:stargz' || {
+                echo "estargz export is ON and this daemon is NOT running the stargz"
+                echo "snapshotter. The arm would ship bigger blobs and mount none of"
+                echo "them, and the run would read as 'estargz is worse'."
+                docker exec own-bk cat /etc/buildkitd.toml | grep -n snapshotter || true
+                exit 1; }
+            echo "[estargz] snapshotter=stargz confirmed on own-bk"
+          fi
           # Shell variable AND $GITHUB_ENV: the latter only reaches LATER
           # steps, and this one uses it below. See the single-runner
           # workflow, where writing only the env file left `set -u` to kill
