@@ -7696,3 +7696,50 @@ and building; on these leads `building` will be nearly all of it, and
 `building` includes the worker's own fetch, unpack, export and push. That
 decomposition does not exist yet and is the one that would say which of the
 four to attack.
+
+### What a 173-second `diff` is actually doing
+
+`lead_split` puts run D at placing 443s (4%), waiting 3,802s (38%), building
+5,812s (58%). So a 173-second `diff` spends roughly a minute queued and two
+minutes in `building` - and `building` is one `solve()` call, which is:
+
+1. buildkit materialises the graph's INPUTS on that worker,
+2. runs the command,
+3. exports the result,
+4. pushes it to the mesh registry.
+
+Step 2 is the `diff`. Steps 1, 3 and 4 are the toll, and step 1 is the one
+that scales with the target rather than with the lead: **a `diff` whose
+ancestry is a 600 MiB image costs whatever it costs to pull and unpack 600
+MiB**, however small the diff.
+
+On one machine that ancestry is already present - the previous target built
+it - and costs nothing. In the fleet each worker materialises it again.
+
+**This is the first hypothesis that fits everything measured tonight:**
+
+| observation | explained |
+| ------------------------------------------ | ---------------------------- |
+| 6-9x CPU against one machine | ancestry materialised per worker, not once |
+| a `diff` at 173s, a `jq` at 197s | their ancestry, not their command |
+| `dup` only 1.4-1.8 | dup counts ops SENT, not ancestry unpacked |
+| cold cache mounts eliminated | it was never the mounts, it is the layers |
+| `+all-binaries` wins with five leads | five ancestries, amortised over minutes of real compute each |
+| `+test-ast` loses with 519 | the same ancestry paid hundreds of times |
+| a lead's cost barely depends on its content | principle 25, and this is why |
+
+It also explains why every delivery fix tonight moved nothing: prefetch,
+seeding and broadcast all pre-position CONTENT, and the cost is not fetching
+the bytes, it is unpacking them into a snapshot on every machine that runs a
+lead. The worker's own line says so plainly and has all along:
+
+> served 4005 MiB in 104435ms (38.3 MB/s from this registry - **the REST of
+> a lead's time is unpack**)
+
+**Not proven.** It is a hypothesis that fits, assembled from figures already
+in this file, and the measurement that would settle it does not exist:
+`building` needs splitting into materialise / run / export, which buildkit's
+own status stream distinguishes and `lead_split` does not.
+
+That split is now the single most valuable instrument this project could
+add, and it is worth more than any further seeding or placement experiment.
