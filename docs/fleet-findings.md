@@ -6277,8 +6277,15 @@ amplification figure:
 
 Three things follow, and the third is the useful one.
 
-**Placing is free.** Zero seconds across 414 leads. Whatever is wrong, it is
-not the dispatcher deciding.
+**Placing is zero, but not for the reason it looks.** `placing_ms` is
+`offered_ms`, which starts at 0 and is stamped ONLY in the decline path
+(`driver.rs:2202`), on every re-offer, so what survives is the last one. A
+lead accepted by its first candidate keeps zero forever. So the field
+measures **re-offer round trips after a decline**, not the cost of
+deciding, and 0s across 414 leads means *no lead was ever declined* - a
+different and narrower statement. The conclusion "placement is not the
+problem" survives; the reason had to be corrected. See the correction under
+the `-seed` run below.
 
 **Waiting is not waste, and it is NOT an argument for more machines.**
 4,115s of leads sitting behind other leads on a busy worker. The obvious
@@ -6407,12 +6414,28 @@ them to 360 mounts.
 | dup | 1.8 | 1.5 | |
 | cut_prefix | 2 | 113 | |
 
-**`placing` is the surprise.** It was zero across 414 leads and is now 1,872
-seconds - 15% of all lead time - because seeding rewrites every graph before
-it is offered. That cost is paid whether or not the seed contains anything,
-and nothing in the design anticipated it. `cut_prefix` jumping 2 -> 113 is
-the same cause seen from another angle: rewritten graphs have different
-shapes, so the prefix finder sees many more distinct roots.
+**`placing` is the surprise, and my first reading of it was wrong.** I wrote
+that the 1,872s was the cost of rewriting every graph. It is not.
+`placing_ms` is only ever non-zero for a lead that was **declined and
+re-offered** - `offered_ms` is initialised to 0 and stamped nowhere but the
+decline path.
+
+So the real statement is sharper: **seeding made workers refuse leads.**
+1,872 seconds of decline-and-re-offer round trips, where the checkpoint had
+none at all. The same run corroborates it from two other directions -
+`home` went 0 -> 19 and `routed` 412 -> 393, which is exactly what refusals
+look like on the other side of the ledger.
+
+Why a seeded lead gets refused is now the open question, and it is a better
+one than "graph rewriting is slow". `cut_prefix` jumping 2 -> 113 is a
+separate consequence: rewritten graphs have different shapes, so the prefix
+finder sees many more distinct roots.
+
+**This is shape 6 in `how-this-lies.md`** - a plausible stand-in for the
+quantity you want. `placing` reads like "time spent placing" and is
+"time spent re-placing". It has been in the phase-split line since it was
+built, and both of tonight's readings of it were wrong until the definition
+was checked.
 
 So an empty seed is not neutral. It costs **+670s of wall clock**, split
 between rewriting graphs that gain nothing and pulling images that contain

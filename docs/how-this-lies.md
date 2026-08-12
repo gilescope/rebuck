@@ -351,9 +351,49 @@ production site does - `sha256_hex(bytes)` on the write, `format!("sha256:
 test fails loudly if someone later unifies them and makes it vacuous. The
 fix normalises both sides through `store::bare_digest`.
 
+## 21. A field whose name is the noun and whose value is the exception
+
+**Instance:** `placing` in the lead-phase split. It reads as "time spent
+placing this lead", sits beside `waiting` and `building`, and the three sum
+to the lead. Everything about the presentation says *this is the placement
+share of the work*.
+
+It is `offered_ms`, which is initialised to zero and stamped in exactly one
+place - the DECLINE path:
+
+```rust
+// driver.rs, in the "a worker said no" branch only
+st.offered_ms = st.started.elapsed().as_millis() as u64;
+```
+
+A lead accepted by its first candidate keeps zero for its whole life. So the
+field is not the cost of placing, it is the cost of **re**-placing, and it
+is silent for every lead that went smoothly.
+
+I read it wrongly twice in one evening, in opposite directions:
+
+- `placing 0s (0%)` became "placement is free, the dispatcher is not the
+  problem". The conclusion happened to hold, but only by luck - the field
+  cannot report placement cost, so a zero was never evidence about it.
+- `placing 1872s (15%)` became "seeding is expensive because it rewrites
+  every graph". Wrong mechanism entirely. The true reading is far more
+  interesting: **seeding made workers refuse leads**, and 1,872 seconds went
+  on decline-and-re-offer round trips.
+
+The second misreading is the dangerous one, because it is actionable. It
+points at optimising a graph rewrite that costs nothing, and away from
+asking why a seeded lead gets refused.
+
+**Countermeasure:** none general, and that is the honest answer - a summing
+triple whose members are named after phases will be read as phases. The
+specific fix is to say so in the line, and the discipline is the one that
+caught it: when a number moves a lot, re-read the definition of the field
+before explaining the movement. Both readings were of a real number
+correctly computed.
+
 ## The common thread
 
-Nineteen of these twenty produced a GREEN result. Not one announced itself.
+Twenty of these twenty-one produced a GREEN result. Not one announced itself.
 
 The discipline that caught them is the same every time: **find the
 observation that differs between the world where it works and the world where
