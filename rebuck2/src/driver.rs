@@ -3759,20 +3759,7 @@ async fn serve_blob_stream(
 /// between a fast 404 that it retries or routes around, and a hang that ends
 /// the build. Six unanswering peers at this budget still comes in under any
 /// client timeout worth the name.
-/// How long a peer gets to ANSWER - dial, take the request, send the first
-/// frame back. Short on purpose: a dead runner does not refuse, it hangs.
-const PEER_BLOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// How long the bytes themselves get, once a peer has answered.
-///
-/// Separate from [`PEER_BLOB_TIMEOUT`] because they bound different
-/// failures, and using one number for both made every large blob
-/// unfetchable: a cache seed is hundreds of megabytes (`go-mod` was 456 MiB
-/// in run 31552464169) and cannot cross a shared CI network in five
-/// seconds. A peer that has already answered is demonstrably alive, so the
-/// hang this guards against is a different and rarer one - a stall
-/// mid-stream - and it can afford a generous bound.
-const PEER_BLOB_BULK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+use crate::mesh::{PEER_BLOB_BULK_TIMEOUT, PEER_BLOB_TIMEOUT};
 
 /// The fleet, as the COORDINATOR's registry sees it.
 ///
@@ -3824,6 +3811,40 @@ impl crate::registry::FleetBlobs for Driver {
 
 #[cfg(test)]
 mod peer_fetch_bounds {
+    /// Both sides bound their peer fetch, and with the SHARED constants.
+    ///
+    /// There are two `fetch_by_hash_from` implementations - the driver's and
+    /// the worker's - and they had different bugs: the driver bounded the
+    /// whole fetch with the handshake constant, so no large blob could
+    /// arrive, and the worker bounded nothing, so a dead peer hung it
+    /// forever. Two wrong answers to one question, and nothing connected
+    /// them.
+    ///
+    /// A source scan rather than a behavioural test: exercising either
+    /// branch needs two live QUIC endpoints and a peer that deliberately
+    /// stalls, which is a harness worth more than it would prove here. This
+    /// at least fails if someone reintroduces an unbounded fetch.
+    #[test]
+    fn both_peer_fetches_are_bounded_by_the_shared_constants() {
+        for file in ["src/driver.rs", "src/worker.rs"] {
+            let text = std::fs::read_to_string(file).expect(file);
+            let at = text
+                .find("async fn fetch_by_hash_from")
+                .unwrap_or_else(|| panic!("{file} no longer has fetch_by_hash_from"));
+            // The body, generously bounded - long enough to contain both
+            // timeouts, short enough not to reach the next function's.
+            let body = &text[at..(at + 2200).min(text.len())];
+            for want in ["PEER_BLOB_TIMEOUT", "PEER_BLOB_BULK_TIMEOUT"] {
+                assert!(
+                    body.contains(want),
+                    "{file}: fetch_by_hash_from does not mention {want} - an \
+                     unbounded or single-bounded peer fetch is how a corpse hangs \
+                     the walk, and how a 456 MiB seed becomes unfetchable"
+                );
+            }
+        }
+    }
+
     /// The two bounds are for two different failures and must not be one
     /// number.
     ///

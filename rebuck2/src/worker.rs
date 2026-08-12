@@ -1173,19 +1173,38 @@ impl RemoteBlobs {
     }
 
     /// `BlobReq::GetByHash` against one peer, dialled directly.
+    /// BOUNDED, in two places - see [`mesh::PEER_BLOB_TIMEOUT`] and
+    /// [`mesh::PEER_BLOB_BULK_TIMEOUT`].
+    ///
+    /// This had no timeout at all while the driver's twin had one, which is
+    /// two different wrong answers to the same question: unbounded, a dead
+    /// peer hangs this worker's registry and therefore its daemon's blob
+    /// GET; bounded by a single short constant, no large blob can ever
+    /// arrive. Seeding makes both matter, because it is exactly the case
+    /// where workers fetch hundreds of megabytes from each other.
     async fn fetch_by_hash_from(&self, endpoint: &str, hash: &str) -> Result<Vec<u8>> {
         let id: iroh::EndpointId = endpoint
             .parse()
             .map_err(|_| anyhow::anyhow!("bad provider endpoint {endpoint:?} for {hash}"))?;
-        let conn = self.ep.connect(id, mesh::ALPN).await?;
-        let (mut send, mut recv) = conn.open_bi().await?;
-        mesh::send_frame(&mut send, &BlobReq::GetByHash(hash.to_owned())).await?;
-        send.finish()?;
-        match mesh::recv_frame::<BlobResp>(&mut recv)
-            .await?
-            .context("provider closed blob stream")?
-        {
-            BlobResp::Found { size } => Ok(mesh::recv_raw(&mut recv, size).await?),
+        let (mut recv, resp) = tokio::time::timeout(mesh::PEER_BLOB_TIMEOUT, async {
+            let conn = self.ep.connect(id, mesh::ALPN).await?;
+            let (mut send, mut recv) = conn.open_bi().await?;
+            mesh::send_frame(&mut send, &BlobReq::GetByHash(hash.to_owned())).await?;
+            send.finish()?;
+            let resp = mesh::recv_frame::<BlobResp>(&mut recv)
+                .await?
+                .context("provider closed blob stream")?;
+            Ok::<_, anyhow::Error>((recv, resp))
+        })
+        .await
+        .with_context(|| format!("provider {endpoint} did not answer for {hash} in time"))??;
+        match resp {
+            BlobResp::Found { size } => Ok(tokio::time::timeout(
+                mesh::PEER_BLOB_BULK_TIMEOUT,
+                mesh::recv_raw(&mut recv, size),
+            )
+            .await
+            .with_context(|| format!("provider {endpoint} stalled sending {hash}"))??),
             other => bail!("provider {endpoint} for {hash}: {other:?}"),
         }
     }

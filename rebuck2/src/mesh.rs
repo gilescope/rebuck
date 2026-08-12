@@ -173,6 +173,25 @@ pub enum W2D {
     },
 }
 
+/// How long a peer gets to ANSWER a blob request - dial, take the request,
+/// send the first frame back. Short on purpose: a dead runner does not
+/// refuse, it hangs, and a walk over six corpses once held a manifest HEAD
+/// until buildkit gave up and failed the build.
+pub const PEER_BLOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the BYTES get, once a peer has answered.
+///
+/// Separate from [`PEER_BLOB_TIMEOUT`] because they bound different
+/// failures. Using one number for both makes every large blob unfetchable
+/// by construction - a cache seed is hundreds of megabytes (`go-mod` was
+/// 456 MiB in run 31552464169) and does not cross a shared CI network in
+/// five seconds. A peer that has already answered is demonstrably alive, so
+/// what remains is a mid-stream stall rather than a corpse.
+///
+/// Shared by both sides deliberately: the driver had a bound and the worker
+/// had none, which is two different wrong answers to one question.
+pub const PEER_BLOB_BULK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Driver → worker, on the control stream.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum D2W {
