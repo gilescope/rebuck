@@ -7289,3 +7289,28 @@ it may be noise, and the entries claiming those should be read with that in
 mind rather than rewritten now on the strength of one more sample.
 
 The cheap remedy for anything that matters from here: run it twice.
+
+### The next two runs, and why they are the same run twice
+
+Fired `giles-dispatch-ci-ast-balance` on current HEAD - plain, unseeded, with
+the manifest regression fixed. It does three jobs at once:
+
+1. **re-establishes the unseeded band**, which `1,113s` no longer represents:
+   `manifest_dig` and the peer-timeout split both changed the default path.
+2. **measures the manifest fix**, since every prefetch in runs C and D was
+   announcing digests the coordinator did not hold.
+3. **starts the pair.** Run it again, unchanged, and the difference between
+   the two IS the noise band - the number every comparison in this file has
+   been missing.
+
+The third is the one that matters most and is the cheapest thing this
+project has never done. Two identical runs cost an hour and make every
+subsequent tens-of-percent claim interpretable; without them, a 14%
+improvement and a 34% regression are indistinguishable from what happened
+between runs C and D, which was nothing.
+
+Stated as a rule going in, so it is not negotiated afterwards: **a
+difference smaller than the spread between two identical runs is not a
+finding.** If the pair comes back 1,400s and 1,700s, then `-balance`'s
+1240-to-1050 and prefetch's 1773-to-1240 survive comfortably and most of
+tonight's seeded comparisons do not.
