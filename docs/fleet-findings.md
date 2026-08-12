@@ -7641,3 +7641,58 @@ the top of the open list twenty minutes ago:
 efficient. The question that survives is why `+test-ast`'s large ones are
 not - and that is a different question from lead size, asked of a population
 that a size filter would not touch.
+
+## The big leads are not big work. A `diff` took 173 seconds
+
+The leads that own run D's critical path, from the workflow's own ranking:
+
+```text
+302059ms  job 89   ./internal/earthfile/tests+base depends on +earthly
+197246ms  job 90   RUN jq -S . ./actual.json >./actual.pretty.json
+172685ms  job 176  RUN diff ./actual.pretty.json ./expected.pretty.json
+170874ms  job 125  COPY ./oom-adjust.sh.template /bin/oom-adjust.sh.template
+165048ms  job 186  RUN diff ./actual.pretty.json ./expected.pretty.json
+```
+
+A `jq` on one JSON file: **197 seconds**. A `diff` of two files: **173
+seconds**, twice. Copying one template into `/bin`: **171 seconds**. On one
+machine these are milliseconds.
+
+**So the previous entry's framing was wrong in an instructive way.** I split
+the leads into "small" and "big" by duration and concluded the amplification
+must live in the big ones because that is where the time is. It does - and
+the big ones are not big. They are trivial commands wearing minutes of
+overhead.
+
+This is principle 25 - "a lead's cost barely depends on what is in it" - at
+its limit, and it is the clearest statement of the fleet's problem yet:
+
+> The fleet's per-lead toll is not tens of seconds. On the leads that decide
+> the leg it is **one to five minutes**, for work worth milliseconds.
+
+### And it is a trap for the fix
+
+`worth_offering(est_p90, ...)` gates on **observed duration**. These leads
+have an observed p90 of hundreds of seconds, so it would dispatch them
+enthusiastically - they look like the biggest jobs in the build. The one
+mechanism aimed at "stop sending work that is not worth sending" would send
+these first.
+
+Worse, if the estimate is fed from the FLEET's own observations it is shape
+7, a feedback signal the controller moves: the fleet is slow on a lead, so
+the estimate rises, so the fleet keeps sending it. `bank::timings` is filled
+by `bank::logstream` from earthly's log, and **which leg's log it parses
+decides whether the mechanism works or chases itself.** It must be the
+baseline's.
+
+That is now the first question to answer before wiring anything, and it was
+invisible an hour ago when the wiring looked like a lookup.
+
+### What to measure next
+
+The overhead is per-lead and enormous, so the thing to price is a single
+lead's fixed cost, decomposed. `lead_split` already reports placing, waiting
+and building; on these leads `building` will be nearly all of it, and
+`building` includes the worker's own fetch, unpack, export and push. That
+decomposition does not exist yet and is the one that would say which of the
+four to attack.
