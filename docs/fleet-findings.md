@@ -6102,3 +6102,54 @@ during a pull.
 Still open, and deliberately not guessed at. But the search space is two
 families smaller, and the next person does not have to re-refute the
 registry.
+
+## The seeding chicken-and-egg, stated as a constraint
+
+Reading the code while the first `-seed` run was in flight, the ordering is
+the problem and it is structural rather than a bug.
+
+A harvest can only read the cache directory earthly actually wrote if it
+presents the same mount INPUT. From `harvest_graph_with`:
+
+> `getRefCacheDir` keys on the input's ref, so a digest that differs by a
+> platform field reads an empty directory and reports a cold cache.
+
+Reconstructing that input has been measured wrong. The correct inputs come
+from observing real graphs, which the proxy does and writes to
+`REBUCK2_CACHE_INPUTS_FILE`. The proxy's own comment says the rest:
+
+> The proxy sees graphs during the fleet leg, and the harvest currently runs
+> BEFORE it - so this file is for the NEXT run, carried by the bank.
+
+So on a run whose bank carries no inputs file:
+
+1. harvest runs, has no observed inputs, reconstructs them,
+2. reconstruction reads a directory nothing wrote,
+3. the harvest is empty and the fleet is seeded with nothing,
+4. the leg then runs and finally records the correct inputs - for next time.
+
+The baseline cannot break the cycle either. It was deliberately moved onto
+its own daemon (`base-bk`) so both legs start equally cold, which also means
+it does not pass through the proxy, so its graphs are never observed.
+
+### What the first run's timings already say
+
+Step 16 - docker pull, tag and push of busybox, a `buildctl du -v`, a full
+`check-seeding` round trip, and four harvests - completed in **8 seconds**.
+Locally, harvesting a single 200 MiB cache takes 8.9s on its own.
+
+That is not a cheap harvest. It is consistent with four harvests that found
+nothing, which is branch 1-3 above. The log will say which; recorded here
+because the prediction was written before the run and the arithmetic was
+available before the evidence.
+
+### Three ways out, none taken yet
+
+- **Harvest after the leg, seed on the next run.** Honest, needs two runs to
+  show anything, and is the warm-CI case rather than a simulation of it.
+- **Observe the baseline.** Requires it to pass through something that
+  records graphs without dispatching them.
+- **Read the inputs out of the baseline daemon's history.** The vertices are
+  there; `watch-vertices` already reads them. This is the only option that
+  costs one run, and it shares machinery with the `-vtx` step currently
+  gated off under suspicion.
