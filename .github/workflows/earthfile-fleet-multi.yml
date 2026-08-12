@@ -1143,6 +1143,15 @@ jobs:
       REBUCK2_MIN_OPS: ${{ needs.plan.outputs.minops }}
       REBUCK2_AFFINITY_IMPORTS: ${{ needs.plan.outputs.imports }}
       REBUCK2_SANDBOX_HOST: ${{ needs.plan.outputs.sandbox }}
+      # Also here, not only in the worker job. The worker reads it to record
+      # its own vertices; the COORDINATOR reads it to decide whether to run
+      # the baseline history step. Two processes, one switch, and the `if:`
+      # on that step is evaluated in this job - so setting it only worker-side
+      # would have made the step silently never run.
+      #
+      # Fourth cross-job flag mistake today, and the first caught by asking
+      # the question before pushing rather than after reading a zero.
+      REBUCK2_WORKER_VERTICES: ${{ needs.plan.outputs.vtx }}
       REBUCK2_BALANCE: ${{ needs.plan.outputs.balance }}
       REBUCK2_SKIP_BASELINE: ${{ needs.plan.outputs.nobase }}
       # ONE path for the binary in this job. It was written out twice and
@@ -1634,7 +1643,18 @@ jobs:
       # straight to its daemon and stays the clean single-machine number
       # every comparison in the findings rests on.
       - name: what the baseline's own daemon spent, per vertex
-        if: env.REBUCK2_SKIP_BASELINE != '1'
+        # BEHIND -vtx, with the worker half. The first run carrying this step
+        # failed parity with `could not fetch content descriptor` - a
+        # suspiciously fast 636s leg that had stopped early. The worker tap
+        # is exonerated (an earlier run carried it and passed), which leaves
+        # this read as the new element: it enumerates build history and opens
+        # a Status stream per record against the baseline's daemon, and
+        # buildkit's history subsystem holds references to build results.
+        #
+        # Unproven either way. Gated because if it IS harmful it is harmful
+        # to the reference band every comparison rests on, and a measurement
+        # that can damage the baseline must not ride along on every baseline.
+        if: env.REBUCK2_SKIP_BASELINE != '1' && env.REBUCK2_WORKER_VERTICES == '1'
         continue-on-error: true
         run: |
           set -uo pipefail
