@@ -8012,3 +8012,42 @@ comment has always claimed, and it is covered by a test that asserts the
 seeder share is a PREFIX rather than merely present. But a reader should
 know that between "committed" and "observed working" there is a gap here,
 and it is wider for this change than for anything else tonight.
+
+### 81% of a worker's fetches are already local, which is what the hypothesis needs
+
+Run D's per-worker `[cas] fetches` counters, at the end of the leg:
+
+| worker | local | peer | driver |
+| ------ | ----- | ---- | ------ |
+| 1 | 2,039 | 185 | 116 |
+| 2 | 980 | 179 | 117 |
+| 3 | 652 | 193 | 107 |
+| 4 | 1,936 | 184 | 226 |
+| 5 | 1,913 | 278 | 91 |
+| 6 | 1,054 | 220 | 128 |
+| **total** | **8,574 (81%)** | **1,239 (12%)** | **785 (7%)** |
+
+Two things follow, and the second is the useful one.
+
+**Transfer is not the cost.** Four fetches in five never leave the machine,
+and of the ones that do, more come from a peer than from the coordinator -
+so the mesh is working and is barely needed. That is the fourth independent
+line of evidence against the delivery story, after the 325-to-7 miss ratio,
+the elimination of cold mounts, and seeding costing 300s for nothing.
+
+**Within-worker caching works, so any duplication is strictly across
+machines.** An 81% local hit rate is what it looks like when a worker
+materialises something once and reuses it for its remaining leads. That is
+precisely the premise the ancestry hypothesis rests on - and it had been
+assumed rather than checked.
+
+So the shape is confirmed even though the magnitude is not: each machine
+pays a set-up cost once, and six machines pay it six times where one machine
+paid it once. What remains unmeasured is how big that cost is relative to
+the real work, which is exactly what `-w1` will say.
+
+Worth noting the spread too: 652 to 2,039 local fetches, a 3.1x range that
+tracks the 6.9x CPU spread. The busiest machine is not just doing more
+leads, it is touching more distinct content - which is what an
+ancestry-dominated cost looks like when placement is uneven, and another
+reason the `-balance` work should weigh content rather than counts.
