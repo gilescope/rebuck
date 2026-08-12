@@ -445,10 +445,15 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                             // The registry's own MISS line cannot cover
                             // this: prefetch takes the mesh path directly
                             // and never goes through the HTTP handler.
-                            Err(e) => println!(
-                                "[worker] prefetch MISS {} ({} bytes): {e:#}",
-                                d.hash, d.size
-                            ),
+                            Err(e) => {
+                                use std::sync::atomic::Ordering::Relaxed;
+                                PREFETCH_MISSES.fetch_add(1, Relaxed);
+                                PREFETCH_MISS_BYTES.fetch_add(d.size.max(0) as u64, Relaxed);
+                                println!(
+                                    "[worker] prefetch MISS {} ({} bytes): {e:#}",
+                                    d.hash, d.size
+                                );
+                            }
                         }
                     }
                     println!("[worker] prefetched {got}/{share} of my share ({n} announced)");
@@ -986,8 +991,30 @@ async fn lead_reply(
 ///
 /// The per-lead line carries both, but forty of those need adding up before
 /// they say anything. This is the total, once, where a reader will find it.
+/// Blobs a prefetch announced and failed to fetch, and how many bytes they
+/// were.
+///
+/// A COUNTER as well as the per-blob line, because the per-blob lines are
+/// printed early - prefetch runs at the front of a leg - and the workflow
+/// greps the worker log with `tail -30`. A diagnostic that scrolls off the
+/// end of the thing that reads it is a diagnostic nobody sees.
+pub static PREFETCH_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PREFETCH_MISS_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn fetch_summary() {
     use std::sync::atomic::Ordering::Relaxed;
+    // FIRST, because it is the one that fails a build. Everything below is
+    // accounting; this is a lead that could not start.
+    let missed = PREFETCH_MISSES.load(Relaxed);
+    if missed > 0 {
+        println!(
+            "[worker] prefetch missed {missed} blob(s), {} MiB - each one is content \
+             a lead may then fail to fetch on its own",
+            PREFETCH_MISS_BYTES.load(Relaxed) / 1_048_576
+        );
+    } else {
+        println!("[worker] prefetch missed nothing");
+    }
     let bytes = crate::registry::SERVED_BYTES.load(Relaxed);
     let ms = crate::registry::SERVED_MS.load(Relaxed);
     if bytes == 0 {
