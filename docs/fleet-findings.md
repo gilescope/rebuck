@@ -88,6 +88,10 @@ confident version first - which has happened to me, in this file, twice.
 | The amplification is inside `building` | placing 0s, waiting 4115s, building 4917s - the RATIO to the baseline is unsettled, see the correction |
 | More machines cannot fix it | building alone needs 25 machines to reach the baseline; Amdahl caps at 5.67x |
 | Cache-mount seeding has never once run | four mechanical reasons, plus a fifth that defeats even a warm bank |
+| Cold cache mounts are NOT the amplification | each worker ends with 2-4 mounts, so they are reused across its ~69 leads |
+| The fleet costs ~6.5x the CPU of one machine | 3900 worker CPU-s against 604 baseline CPU-s, the first like-for-like figure |
+| The baseline parallelises 2.73x internally | 604 CPU-s in 221s wall - which is why every wall-clock ratio overstated |
+| Worker load is 8.2x unequal | 160s to 1316s of CPU across six machines on one target |
 | The seeding mechanism itself works | `check-seeding` green on x86 CI and arm64 local: write, harvest, seed a COLD mount, read back |
 | A diagnostic deleted the data its consumer needed | `check-seeding` truncated the inputs file 3s before `harvest-cache` read it |
 | Merging instead of truncating fixed the harvest | run A harvest 8s (read nothing), run B 65s against 1.6 GB held |
@@ -103,7 +107,7 @@ confident version first - which has happened to me, in this file, twice.
 | How much of the fleet's traffic crosses a wire | `SERVED_BYTES` mixes loopback with peer serving; `SERVED_LOCAL_BYTES` exists and has never reported |
 | Whether the fleet repeats itself, and by how much | the coordinator reports 1.1x; the per-worker figure has never printed |
 | What made the reference run take 50 minutes | not the tap, which costs 1ms. Still unexplained |
-| **What the per-unit cost is** | inside `building`, and between ~6x and ~18x depending on units - `lead_ms` sums concurrent leads and the baseline's CPU time has never been measured. Export bounded at 5-10%, duplication 1.8x, cold mounts too small. No candidate fits, and the range itself is not tight |
+| **What the per-unit cost is** | MEASURED: 3900 worker CPU-seconds against 604 baseline CPU-seconds = 6.5x, ~4.6x after duplication. Cold mounts eliminated (2-4 mounts per worker = reuse works). Export bounded at 5-10%. Still no candidate for the remainder |
 | Whether seeding pays once it can be delivered | never yet measured - every run so far failed before the question could be asked |
 
 **Retracted.** Written here confidently and wrong. Left in place with the
@@ -6797,3 +6801,86 @@ worker is the counter that says so.
 
 The bulk bound has no such trade-off: it only ever permits transfers that
 were previously cut off.
+
+## Run C: the first like-for-like amplification, and cold mounts are dead
+
+`31557310760`. Parity green. Leg 1,625s against a 221s baseline.
+
+### Cold cache mounts are not the amplification
+
+Each worker's daemon, at teardown:
+
+```text
+cache mounts: 2  4  2  2  0  2
+```
+
+A handful, exactly as predicted before the run. **Mounts are reused across
+leads** - a worker fills `go-mod` once and keeps it for its other sixty-odd
+leads - so cold mounts cost about one fill per worker, not one per lead. The
+hypothesis that carried this investigation for a week is dead, and it was
+killed by a single `du -v` that took ten lines of YAML.
+
+The one worker at `0` took no cache-touching lead at all, which is its own
+small finding about spread.
+
+### The amplification, in CPU, at last
+
+| | CPU | wall | implied |
+| ------------------ | ------- | ---- | ------------------- |
+| baseline (`base-bk`) | **604s** | 221s | 2.73x internal parallelism |
+| six workers, summed | **3,900s** | - | 551 1316 160 821 591 461 |
+
+**3,900 / 604 = 6.5x**, and after `dup=1.4`, roughly **4.6x unexplained.**
+
+Every previous figure in this file was larger: 24.5x, then 17.9x, then
+13.6x. All of them divided a sum over concurrent leads by a single wall
+clock. The measured 2.73x internal parallelism is most of why: the baseline
+was never doing 221 seconds of work, it was doing 604 in 221.
+
+Two caveats, both making 6.5x an UNDER-estimate of the fleet's cost:
+
+- the coordinator's own daemon is not counted, and it built 91 solves at
+  home in this run;
+- `dup=1.4` is ops SENT to more than one worker, which is an upper bound on
+  ops rebuilt.
+
+So the honest headline is **the fleet spends somewhere around 6-7x the CPU
+one machine spends on the same target**, which is a real and serious cost -
+and a quarter of what this file claimed yesterday.
+
+### The load spread nobody had measured
+
+Worker CPU ran from **160s to 1,316s: an 8.2x spread** across six machines
+given the same fleet and the same target. `-balance` was built to even out
+lead COUNTS; it does not even out work. That is a new finding and probably
+the cheapest remaining win, because the busiest worker sets the leg.
+
+### The identity refused to be trusted, correctly
+
+`scripts/leg-arithmetic.sh` printed:
+
+```text
+identity check : lead/occupancy = 1017s against a measured 1625s leg  MISMATCH
+```
+
+Which is right: `home=91` this run, and work built at home is not a lead, so
+`lead_ms` no longer accounts for the leg. The script written two hours ago
+to stop me dividing badly caught the first case where the division would
+have been wrong for a completely different reason.
+
+### Seeding, still not paying
+
+| | checkpoint | A | B | **C** |
+| --------- | ---------- | ----- | ----- | --------- |
+| leg | 1,113s | 1,783s | 1,699s | **1,625s** |
+| lead time | 9,033s | 12,254s | 12,979s | **8,058s** |
+| building | 4,917s | 6,653s | 7,035s | **4,763s** |
+| routed/home | 412/0 | 393/19 | 403/9 | **321/91** |
+
+Lead time and building are both now BELOW the unseeded checkpoint - the
+delivery fixes worked, and the fleet is doing less work than it was. But 91
+solves fell back to home, and the leg is still 46% worse than not seeding at
+all.
+
+`mount arms: seeded p50 6037ms (n=213), cold p50 8040ms (n=1)` - one cold
+sample again, so the per-arm comparison still has nothing to say.
