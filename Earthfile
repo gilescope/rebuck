@@ -39,8 +39,19 @@ deps:
     # Installing it here rather than in +coverage keeps it out of the layer
     # that changes every commit.
     RUN rustup component add llvm-tools-preview
+    # zstd and sqlite3 are TEST dependencies, and nothing declares them.
+    # `bank::zstd` is `Command::new("zstd")` and `bank::dice` is
+    # `Command::new("sqlite3")` - so five `bank::pack` tests fail on any
+    # machine that happens not to have them, and pass on every machine that
+    # does. A laptop has them from nix or homebrew; a GitHub runner ships
+    # them; a clean bookworm-slim does not, which is how this surfaced.
+    #
+    # That is the argument for building tests in a container at all: the
+    # suite was green everywhere it had ever run and still had an undeclared
+    # dependency on the host.
     RUN apt-get update \
-     && apt-get install -y --no-install-recommends pkg-config libssl-dev protobuf-compiler \
+     && apt-get install -y --no-install-recommends \
+          pkg-config libssl-dev protobuf-compiler zstd sqlite3 \
      && rm -rf /var/lib/apt/lists/*
     RUN cargo install cargo-llvm-cov --version $LLVM_COV --locked
     WORKDIR /w

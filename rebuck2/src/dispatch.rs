@@ -524,6 +524,24 @@ pub fn held_for(mounts: &[(String, i64)], id: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// The `REBUCK2_CACHE_SEEDS=` line for a harvest, or why there is not one.
+///
+/// A VALUE, not a `println!` behind an early return. The floor was
+/// unit-tested from the day it was added and the emission was not, so the
+/// harvest went on shipping empty seeds - three lines of control flow that
+/// no test could reach. `Err` carries the reason so the caller prints one
+/// thing or the other and cannot print both, or neither.
+pub fn seed_line(id: &str, reference: &str, bytes: i64) -> Result<String, String> {
+    if !worth_seeding(bytes) {
+        return Err(format!(
+            "{id}: {bytes} bytes is under the {SEED_FLOOR_BYTES} byte floor. A seed this \
+             size costs every worker a pull and an unpack and returns nothing - which \
+             would read as seeding being slow rather than absent."
+        ));
+    }
+    Ok(format!("REBUCK2_CACHE_SEEDS={id}={reference}"))
+}
+
 /// Did the harvest read far less than the daemon says the mount holds?
 ///
 /// [`worth_seeding`] catches an empty harvest. It does not catch a partial
@@ -3349,6 +3367,42 @@ mod tests {
         assert_eq!(held_for(&mounts, "golangci_lint"), 0);
         // A partial id must not match a longer one.
         assert_eq!(held_for(&mounts, "go"), 0);
+    }
+
+    /// Whether a harvest becomes a seed, as a VALUE rather than a println.
+    ///
+    /// `harvest_one` printed `REBUCK2_CACHE_SEEDS=<id>=<ref>`
+    /// unconditionally, including on the branch whose own message said the
+    /// harvest names no blobs. The threshold was unit-tested; the EMISSION
+    /// was three lines of control flow around a `println!`, and that is
+    /// where the defect was.
+    ///
+    /// Same shape as `announce_set`: make the decision return something a
+    /// test can hold.
+    #[test]
+    fn only_a_seed_worth_having_gets_a_line() {
+        use super::seed_line;
+        let r = "127.0.0.1:5000/rebuck2/subtree@sha256:abc";
+
+        // Worth shipping: the line the workflow greps for.
+        assert_eq!(
+            seed_line("go-mod", r, 200 * 1024 * 1024),
+            Ok(format!("REBUCK2_CACHE_SEEDS=go-mod={r}"))
+        );
+
+        // Empty, and under the floor: no line, and a reason that says which
+        // finding this is - "the harvest found nothing", not "seeding is
+        // slow".
+        let why = seed_line("go-mod", r, 0).unwrap_err();
+        assert!(why.contains("go-mod"), "the reason must name the id: {why}");
+        assert!(why.contains('0'), "and the size: {why}");
+
+        // 491 bytes is the real case from run 31554856118.
+        assert!(seed_line("//go/pkg/mod", r, 491).is_err());
+
+        // Exactly at the floor is worth having - the boundary belongs to
+        // the seed, or a cache that just clears it is silently dropped.
+        assert!(seed_line("go-build", r, super::SEED_FLOOR_BYTES).is_ok());
     }
 
     /// A harvest that is not empty can still be wrong.
