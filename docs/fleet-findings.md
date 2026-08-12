@@ -6359,3 +6359,80 @@ and that is all this needs to decide.
 So export is named, bounded, and set aside. The per-unit cost is still
 unexplained, and cold cache mounts remain the only candidate on the table
 that is the right SIZE.
+
+## The first `-seed` run: every prediction confirmed, and a 60% tax measured
+
+Run `31552464169`, `+test-ast`, balanced, seeding on. It is a negative
+result and a good one: it confirms all five mechanical reasons in one pass
+and prices the failure mode.
+
+**The daemon had the caches.** 1.6 GB of them:
+
+```text
+[harvest]  586.3 MiB  cached mount /root/.cache ... with id "//root/.cache"
+[harvest]  554.9 MiB  cached mount /root/.cache/go-build ... with id "go-build"
+[harvest]  456.1 MiB  cached mount /go/pkg/mod ... with id "go-mod"
+```
+
+**And read none of them.**
+
+```text
+[harvest] 1 observed cache-mount input(s)
+[harvest] go-mod: RECONSTRUCTING earthly's input, which has been measured wrong
+[harvest] WARNING: go-mod harvested under 64 KiB
+REBUCK2_CACHE_SEEDS=go-mod=...@sha256:001f3dff...
+```
+
+`1 observed input` is the clobber, caught. The proxy's own line from the
+same run says `cache inputs : 2 written`, and the bank restored them - so
+the file held two real entries until `check-seeding` truncated it to its own
+probe, three seconds before `harvest-cache` read it.
+
+`go-mod` and `//go/pkg/mod` harvested to the **same digest**, `001f3dff...`,
+which is what two empty directories look like.
+
+All three empty harvests were emitted as seeds anyway, and the fleet applied
+them to 360 mounts.
+
+### What an empty seed costs
+
+| | checkpoint | `-seed` | change |
+| ------------- | ---------- | -------- | ------ |
+| leg | 1,113s | **1,783s** | +60% |
+| lead time | 9,033s | 12,254s | +36% |
+| placing | 0s (0%) | **1,872s (15%)** | from nothing |
+| waiting | 4,115s | 3,727s | -9% |
+| building | 4,917s | 6,653s | +35% |
+| routed / home | 412 / 0 | 393 / 19 | |
+| dup | 1.8 | 1.5 | |
+| cut_prefix | 2 | 113 | |
+
+**`placing` is the surprise.** It was zero across 414 leads and is now 1,872
+seconds - 15% of all lead time - because seeding rewrites every graph before
+it is offered. That cost is paid whether or not the seed contains anything,
+and nothing in the design anticipated it. `cut_prefix` jumping 2 -> 113 is
+the same cause seen from another angle: rewritten graphs have different
+shapes, so the prefix finder sees many more distinct roots.
+
+So an empty seed is not neutral. It costs **+670s of wall clock**, split
+between rewriting graphs that gain nothing and pulling images that contain
+nothing.
+
+### Both fixes were already in before the numbers landed
+
+`merge_cache_inputs` stops the clobber; `worth_seeding` stops an empty
+harvest becoming a seed. Either alone prevents this run. They were written
+from the code and the 8-second harvest timing, before the leg finished -
+which is the only reason the next run could be fired immediately.
+
+### The arms line still compares nothing
+
+```text
+[wire] mount arms : seeded p50 4448ms (n=289), cold p50 0ms (n=0)
+```
+
+Everything was seeded, so there is no cold arm - the mirror image of every
+previous run, where nothing was seeded and there was no seeded arm. **The
+within-run comparison needs a SUBSET seeded**, which is what the next run
+gets for free: the bank carries inputs for only some ids, and the empty ones
+are now skipped rather than emitted.
