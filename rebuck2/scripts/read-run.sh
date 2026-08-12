@@ -11,18 +11,31 @@ rm -rf "$dir" && mkdir -p "$dir"
 gh api "repos/gilescope/rebuck/actions/runs/$run/logs" > "$dir.zip" 2>/dev/null || {
   echo "no logs for $run (still running?)"; exit 1; }
 unzip -oq "$dir.zip" -d "$dir"
+
+# ARTIFACTS TOO. The header below used to say "nothing here reads
+# artifacts", and that was a real hole: `proxy.log` and every `worker-N.log`
+# are uploaded rather than printed, and they hold the decline reasons, the
+# per-worker fetch summaries and the prefetch MISS lines. Reading a run
+# without them found `MISS: 0` and 733 silent failures in the same log.
+#
+# Best effort - a run whose artifacts have expired, or one still going, is
+# still worth reading for its step logs.
+gh run download "$run" -R gilescope/rebuck -D "$dir/artifacts" 2>/dev/null \
+  && echo "(artifacts: $(find "$dir/artifacts" -type f | wc -l | tr -d ' ') file(s))" \
+  || echo "(no artifacts - expired, or the run is still going)"
+
 strip() { sed 's/^[^ ]* //'; }
 
-# STEP LOGS ONLY. The coordinator also uploads proxy.log as an artifact, and
+# STEP LOGS AND ARTIFACTS. The coordinator uploads proxy.log as an artifact and
 # twenty-one [wire] lines are printed into it that the summary step never
 # greps - arrivals, contexts published, op duplication, peer solo ms and the
-# rest. They are not lost, they are in the artifact, and nothing here reads
-# artifacts. If a line you expect is missing, that is where it is:
-#
-#   gh run download <run-id> -n <artifact> && grep '\[wire\]' proxy.log
+# rest. Those are now downloaded above and every grep below sees them, which
+# it did not for the first several analyses.
 #
 # Said here rather than discovered again: I spent part of a session assuming
-# a line had not printed when it had, in a file I was not reading.
+# a line had not printed when it had, in a file I was not reading - and then
+# a second session finding `MISS: 0` in step logs while the artifact held
+# 733 failures.
 
 echo "── verdict ─────────────────────────────────"
 grep -rah "wire\] verdict\|^amplification\|^baseline:\|^one machine\|^PARITY" "$dir" | strip | sort -u
