@@ -7980,3 +7980,35 @@ One caveat to record before the run rather than after: with a single worker
 the leg will be long and occupancy near 1, so **the leg from this run means
 nothing** and only the CPU figures should be read. A fleet of one is not a
 fleet; it is an instrument.
+
+### What tonight shipped that has never run
+
+Worth stating plainly, because "built and left unconnected" is a failure
+this file names four times and there is a fifth shape of it: built, wired,
+and never executed.
+
+| change | exercised by |
+| ----------------------------- | ------------------------------------ |
+| `merge_cache_inputs` | runs B, C, D - confirmed by its log line |
+| `worth_seeding` | run B - skipped a 491-byte harvest |
+| `manifest_dig` + the CAS check | run D found the bug, the FIX has not run |
+| two-phase peer timeouts | runs C, D, ref1 - and selftest |
+| **seeder-first ordering** | **its unit test, and nothing else** |
+| `prefetch MISS` + counters | run D printed the lines, the COUNTER has not |
+| `held_for`, `harvest_is_short` | neither has run |
+
+The seeder-first ordering is the one that matters. It only takes effect on
+the broadcast branch, only seeds broadcast, and every seeded run predates
+it - so its first execution will be whenever someone next runs `-seed`. And
+seeding has now been measured as costing 300 seconds and returning nothing,
+so that may not be soon.
+
+`check-seeding` does not cover it either: it runs against a single daemon
+with no fleet, so `share_of` sees `ids.len() <= 1` and returns before the
+broadcast branch is reached.
+
+That is not an argument for reverting it - it makes the code do what its own
+comment has always claimed, and it is covered by a test that asserts the
+seeder share is a PREFIX rather than merely present. But a reader should
+know that between "committed" and "observed working" there is a gap here,
+and it is wider for this change than for anything else tonight.
