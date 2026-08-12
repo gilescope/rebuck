@@ -8143,3 +8143,49 @@ The connection was available all along - the warming finding is 2,500 lines
 above tonight's measurements in the same file. It took measuring the
 ancestry to notice that a paragraph about warm workers was really about
 what a dispatched graph costs.
+
+### A registry mirror would remove half of `make_portable`
+
+If rewriting the graph is what breaks digest equality with the baseline,
+the question is whether the rewrite is necessary. Half of it may not be.
+
+`make_portable` does two things:
+
+1. **local contexts** become published images - unavoidable, a sessionless
+   peer genuinely cannot read the client's filesystem;
+2. **base images** are repointed at our mirror - `docker.io/library/x` to
+   `172.17.0.1:15000/library/x`.
+
+The second exists because a sessionless peer cannot authenticate to Docker
+Hub. But buildkit already solves that without touching the graph, and the
+fork we run documents it:
+
+```toml
+[registry."docker.io"]
+  mirrors = ["yourmirror.local:5000"]
+  http = true
+  insecure = true
+```
+
+The daemon then serves `docker.io/library/x` from our registry while the
+GRAPH still says `docker.io/library/x`. Same identifier, same op bytes,
+**same digest** - so a worker's cache and the baseline's would key-match for
+everything downstream of a base image, which today they never do.
+
+The workflow already writes a `[registry."172.17.0.1:15000"]` stanza into
+every daemon through `EARTHLY_ADDITIONAL_BUILDKIT_CONFIG`. Adding a
+`mirrors` line to a `[registry."docker.io"]` stanza is the same mechanism,
+one block further down.
+
+**What it would be worth, and what it would not.** It cannot remove the
+ancestry term - every machine still materialises what its leads need. It
+would remove the portability term, make warming possible for the first
+time, and let the baseline and fleet legs share content instead of building
+parallel universes of the same target.
+
+**Unverified, and it is a design note rather than a finding.** The rewrite
+may serve purposes the comment does not list - the mirror is filled by
+`mirror_image` through a peer WITH a session, and a mirror stanza changes
+who fetches from where at exactly the moment credentials matter. That is
+precisely the area where this project has produced `no active sessions`
+twice. It wants reading before it wants doing.
