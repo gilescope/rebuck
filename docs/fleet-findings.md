@@ -6770,3 +6770,30 @@ is worth having once there is a figure to explain, and not before.
 `REBUCK2_WORKER_VERTICES` and the `-vtx` baseline history step stay gated
 off. Both were suspects in two parity failures, and the checkpoint that
 cleared HEAD ran with them off.
+
+### What the timeout split changes, including the part that is worse
+
+Splitting `PEER_BLOB_TIMEOUT` into a handshake bound and a bulk bound fixes
+the case it was written for - a 456 MiB seed can now cross the mesh - but it
+also introduces a bound where the worker previously had none, and that is
+worth stating rather than discovering.
+
+**Before:** the worker's `fetch_by_hash_from` waited forever. A slow peer
+always eventually delivered; a dead one hung the worker's registry, and
+therefore its daemon's blob GET, until something further up gave up.
+
+**After:** a peer that cannot ANSWER within five seconds is abandoned and
+the walk moves on - to the next peer, then to the driver. So under heavy
+contention, where a busy worker might genuinely take longer than five
+seconds to reply to a blob request, more traffic lands on the coordinator
+than before.
+
+That is the right direction to fail: the driver is the backstop and holds
+everything the mirror has, so the fetch still succeeds, just less
+peer-to-peer than intended. It is a load shift, not a failure mode. But if a
+future run shows the coordinator serving more than it used to, this is the
+first thing to check, and `hits_local / hits_peer / hits_driver` on each
+worker is the counter that says so.
+
+The bulk bound has no such trade-off: it only ever permits transfers that
+were previously cut off.
