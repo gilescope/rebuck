@@ -8578,3 +8578,40 @@ graphs - rewritten sources, different digests - so its CPU is not the
 baseline's 598s and should not be assumed to be. That difference is the
 portability term, and this arrangement folds it into `W` rather than
 separating it. Two points cannot resolve three terms.
+
+## Coverage, and why the number to want is not the headline one
+
+`Earthfile` adds `+coverage`, `+coverage-gate` and `+check`, pinned to the
+same toolchain `selftest.yml` uses.
+
+The reason is narrower than "we should have coverage". Every fix in the last
+day came with a test, and **not one of those tests would have caught its own
+bug**:
+
+| bug | where it lived | what the test tested |
+| --------------------- | ----------------------------- | -------------------- |
+| the inputs clobber | a call site choosing `fs::write` | `merge_cache_inputs` |
+| empty seed shipped | an ungated `println!` | the 64 KiB threshold |
+| digest mismatch | one of four readers of a table | `consumers_of` |
+| one timeout, two bounds | a wrapper around the wrong span | the constants |
+| manifest not held | `unwrap_or(0)` at a call site | `manifest_dig` |
+
+Five defects, five call sites, five tests of the callee. That is shape 20 -
+a test that supplies both sides of a seam cannot see a mismatch in it - and
+a coverage percentage would not have caught it either, because **every one
+of those call sites was executed by the test suite**. Executed, and wrong.
+
+So the number this target exists for is not the total. It is the per-line
+report, answered against one question: *did the line I am about to change
+have any coverage before I touched it?* A line that is executed but whose
+behaviour nothing asserts is invisible to lcov too - but a line that is
+never executed at all is a line where a bug can live indefinitely, and this
+project has found ten of those.
+
+`FAIL_UNDER` is 0 until `+coverage` has run once. Setting a floor before
+measuring is how a threshold becomes a number people route around.
+
+Two errors in the Earthfile were found by running it rather than reading it:
+`ARG --global X := v` is not Earthly syntax, and the binary is now `earth`.
+A build file nobody has executed is a hypothesis - shape 10, and it applies
+to the thing measuring the tests as much as to the tests.
