@@ -489,6 +489,23 @@ pub fn encode_cache_inputs(m: &BTreeMap<String, (Vec<u8>, String)>) -> String {
         .join("\n")
 }
 
+/// Is a harvest of this many bytes worth handing to the fleet as a seed?
+///
+/// An empty harvest is not free to use. Every worker that seeds a mount from
+/// it pulls an image, unpacks it, and rewrites the mount - and on the target
+/// this was built for that is 359 mount arms paying for nothing. Emitting
+/// the seed anyway turns "the harvest found nothing" into "seeding measured
+/// slower", which are opposite findings and only one of them is true.
+///
+/// 64 KiB is the same threshold the harvest already warns at, kept as one
+/// number so the warning and the decision cannot drift apart.
+pub const SEED_FLOOR_BYTES: i64 = 64 * 1024;
+
+/// See [`SEED_FLOOR_BYTES`].
+pub fn worth_seeding(bytes: i64) -> bool {
+    bytes >= SEED_FLOOR_BYTES
+}
+
 /// Fold freshly observed cache-mount inputs into whatever a previous run
 /// left, WITHOUT losing the previous run's.
 ///
@@ -3252,6 +3269,26 @@ mod tests {
         let back = super::decode_cache_inputs("go-mod\t/cache\nnot-a-line\n\n");
         assert!(back.is_empty(), "a line missing its payload is not a seed");
         assert!(super::decode_cache_inputs("").is_empty());
+    }
+
+    /// An empty harvest must not be handed out as a seed.
+    ///
+    /// `harvest_one` printed `REBUCK2_CACHE_SEEDS=<id>=<ref>` unconditionally,
+    /// including on the branch whose own message says the harvest names no
+    /// blobs and so "will change nothing". It does not change nothing: every
+    /// worker still pulls the image, unpacks it and rewrites the mount. 359
+    /// mount arms paying for an empty layer turns a null result into a
+    /// negative one.
+    #[test]
+    fn an_empty_harvest_is_not_a_seed() {
+        assert!(!super::worth_seeding(0), "no blobs at all");
+        assert!(!super::worth_seeding(2_048), "config plus an empty layer");
+        assert!(
+            !super::worth_seeding(super::SEED_FLOOR_BYTES - 1),
+            "the floor is the same number the harvest warns at"
+        );
+        assert!(super::worth_seeding(super::SEED_FLOOR_BYTES));
+        assert!(super::worth_seeding(200 * 1024 * 1024), "a real go-mod");
     }
 
     /// `check-seeding` writes the SAME file the harvest then reads, and it

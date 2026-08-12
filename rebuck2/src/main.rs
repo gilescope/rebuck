@@ -170,7 +170,7 @@ async fn harvest_one(
     // first run that seeded successfully - config plus one layer - and two
     // is also what an EMPTY cache produces, so it could not tell a harvest
     // that worked from one that found nothing. The size can.
-    match solve::image_blobs(&reference).await {
+    let bytes: i64 = match solve::image_blobs(&reference).await {
         Some(b) if !b.is_empty() => {
             let bytes: i64 = b.iter().map(|d| d.size).sum();
             println!(
@@ -178,18 +178,34 @@ async fn harvest_one(
                 b.len(),
                 bytes as f64 / (1024.0 * 1024.0)
             );
-            if bytes < 64 * 1024 {
-                println!(
-                    "[harvest] WARNING: {id} harvested under 64 KiB - that cache was \
-                     effectively empty, so seeding it changes nothing. Which is a \
-                     different finding from seeding not paying."
-                );
-            }
+            bytes
         }
-        _ => println!(
-            "[harvest] {id} at {dest} -> {reference}, but it names NO blobs - that cache \
-             was empty, so seeding it will change nothing"
-        ),
+        _ => {
+            println!(
+                "[harvest] {id} at {dest} -> {reference}, but it names NO blobs - that \
+                 cache was empty"
+            );
+            0
+        }
+    };
+    // NOT EMITTED when the harvest came back empty, and the old comment here
+    // was wrong about why. It said seeding an empty cache "changes nothing".
+    // It does not change nothing: every worker still pulls the image,
+    // unpacks it and rewrites the mount, and on this project's own target
+    // that is 359 mount arms paying for an empty layer. Emitting it anyway
+    // converts "the harvest found nothing" into "seeding measured slower",
+    // which are opposite findings and only one of them is true.
+    //
+    // Omitting the line is enough: the workflow builds the seeds file by
+    // grepping for it, and warns when the file ends up empty.
+    if !dispatch::worth_seeding(bytes) {
+        println!(
+            "[harvest] NOT seeding {id}: {bytes} bytes is under the {} byte floor. \
+             A seed this size costs every worker a pull and an unpack and returns \
+             nothing - which would read as seeding being slow rather than absent.",
+            dispatch::SEED_FLOOR_BYTES
+        );
+        return Ok(());
     }
     println!("REBUCK2_CACHE_SEEDS={id}={reference}");
     Ok(())
