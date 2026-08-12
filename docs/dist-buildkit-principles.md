@@ -1143,6 +1143,18 @@ war, and it explains why five of them measured as no better than nothing.
 - **Prefer fewer, larger leads** - not because small leads are expensive in
   themselves, but because they divide the work more finely without dividing
   the ancestry at all.
-- **Stop optimising distribution.** 81% of fetches are already local and the
-  coordinator serves one set; the bytes are not the problem, the number of
-  machines that need them is.
+- **Stop trying to REDUCE the distribution, but keep improving its TIMING.**
+  This wants care, because it nearly dismissed a real win. Fixing prefetch
+  took the leg from 1773s to 1240s - 30%, the largest single improvement in
+  this file - and it did not move one byte less. It moved the same bytes
+  EARLIER, off the critical path and onto time the fleet was going to spend
+  anyway.
+
+  So the volume is set by `N x ancestry` and no distribution mechanism can
+  lower it; the leg, however, depends on when those bytes arrive relative to
+  the leads that need them, and that is very much improvable. `-balance`'s
+  1240s to 1050s is the same lesson from the scheduling side.
+
+  The mechanisms that measured as nothing - `-minops`, `-imports`, `-bcast`,
+  seeding - all tried to change WHICH bytes go WHERE. The two that paid
+  changed WHEN.
