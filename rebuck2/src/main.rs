@@ -142,6 +142,9 @@ async fn harvest_one(
     id: &str,
     dest: &str,
     input: Option<(Vec<u8>, String)>,
+    // What the daemon says this mount holds, for the shortfall check. 0
+    // means no signal - see `dispatch::harvest_is_short`.
+    held_bytes: i64,
 ) -> anyhow::Result<()> {
     // WHICH PATH, per id. The count alone cannot say that `go-mod` was
     // observed and `go-build` was not, and a partial file is the likely
@@ -188,6 +191,20 @@ async fn harvest_one(
             0
         }
     };
+    // NOT EMPTY IS NOT THE SAME AS COMPLETE. The floor below catches a
+    // harvest of 491 bytes; it does not catch 5 MiB read out of a mount the
+    // daemon says holds 456 MiB, which ships and is then reported as
+    // seeding failing to pay.
+    if dispatch::harvest_is_short(bytes, held_bytes) {
+        println!(
+            "[harvest] WARNING: {id} harvested {:.1} MiB but this daemon says the \
+             mount holds {:.1} MiB. Seeding from a fraction of a cache is not a \
+             measurement of seeding - check the input above says `observed from a \
+             real graph` and not `RECONSTRUCTING`.",
+            bytes as f64 / (1024.0 * 1024.0),
+            held_bytes as f64 / (1024.0 * 1024.0)
+        );
+    }
     // NOT EMITTED when the harvest came back empty, and the old comment here
     // was wrong about why. It said seeding an empty cache "changes nothing".
     // It does not change nothing: every worker still pulls the image,
@@ -434,7 +451,18 @@ async fn main() -> Result<()> {
                 };
                 let id = &id;
                 let input = inputs.get(id).cloned();
-                if let Err(e) = harvest_one(&bk, &registry, &base, id, dest, input).await {
+                // What the daemon said about THIS id, matched on the same
+                // name `cache_ids_held` extracted, so the two cannot drift.
+                let held_bytes = held
+                    .iter()
+                    .find(|(what, _)| {
+                        what.contains(&format!("with id {id:?}")) || what.contains(id)
+                    })
+                    .map(|(_, sz)| *sz)
+                    .unwrap_or(0);
+                if let Err(e) =
+                    harvest_one(&bk, &registry, &base, id, dest, input, held_bytes).await
+                {
                     println!("[harvest] {id} at {dest} failed: {e:#}");
                     failed += 1;
                 }

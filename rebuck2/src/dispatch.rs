@@ -501,6 +501,27 @@ pub fn encode_cache_inputs(m: &BTreeMap<String, (Vec<u8>, String)>) -> String {
 /// number so the warning and the decision cannot drift apart.
 pub const SEED_FLOOR_BYTES: i64 = 64 * 1024;
 
+/// Did the harvest read far less than the daemon says the mount holds?
+///
+/// [`worth_seeding`] catches an empty harvest. It does not catch a partial
+/// one - 5 MiB taken from a 456 MiB mount ships happily, seeds every worker
+/// with a twentieth of the cache, and is then reported as seeding failing to
+/// pay. Those are different findings and this separates them.
+///
+/// Loose on purpose. The harvested layer is compressed and the mount's own
+/// figure is buildkit's accounting, so the two are not comparable to better
+/// than a factor of a few; only an order-of-magnitude gap means anything.
+///
+/// `held == 0` is NO SIGNAL, never a complaint: a mount that was itself
+/// seeded reports zero however much it holds, because its size is the
+/// copy-on-write diff over the seed.
+pub fn harvest_is_short(harvested: i64, held: i64) -> bool {
+    if held < SEED_FLOOR_BYTES {
+        return false;
+    }
+    harvested < held / 10
+}
+
 /// See [`SEED_FLOOR_BYTES`].
 pub fn worth_seeding(bytes: i64) -> bool {
     bytes >= SEED_FLOOR_BYTES
@@ -3269,6 +3290,39 @@ mod tests {
         let back = super::decode_cache_inputs("go-mod\t/cache\nnot-a-line\n\n");
         assert!(back.is_empty(), "a line missing its payload is not a seed");
         assert!(super::decode_cache_inputs("").is_empty());
+    }
+
+    /// A harvest that is not empty can still be wrong.
+    ///
+    /// `worth_seeding` catches 491 bytes. It does not catch 5 MiB taken from
+    /// a mount the daemon says holds 456 MiB - which ships, seeds every
+    /// worker with a twentieth of the cache, and reads afterwards as
+    /// "seeding did not pay". That is the confusion this whole file exists
+    /// to prevent: a mechanism that half-ran, reported as a mechanism that
+    /// did not help.
+    #[test]
+    fn a_harvest_far_smaller_than_the_mount_is_suspicious() {
+        use super::harvest_is_short;
+        let mib = 1024 * 1024;
+
+        // The real case: go-mod, 456 MiB held, a fifth of a percent read.
+        assert!(harvest_is_short(mib, 456 * mib));
+        assert!(harvest_is_short(5 * mib, 456 * mib));
+
+        // A full harvest is not short, and neither is a nearly-full one -
+        // compression alone moves this, so the threshold has to be loose.
+        assert!(!harvest_is_short(456 * mib, 456 * mib));
+        assert!(!harvest_is_short(200 * mib, 456 * mib));
+
+        // NO SIGNAL is not a complaint. A mount that was itself seeded
+        // reports 0.0 MiB however much it holds - its size is the
+        // copy-on-write diff over the seed - so `held == 0` must never be
+        // read as "the harvest failed".
+        assert!(!harvest_is_short(0, 0));
+        assert!(!harvest_is_short(10 * mib, 0));
+
+        // And a genuinely tiny mount is not short just because it is tiny.
+        assert!(!harvest_is_short(1024, 2048));
     }
 
     /// An empty harvest must not be handed out as a seed.
