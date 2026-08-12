@@ -6928,3 +6928,40 @@ where the mechanism lives.
 Now named: `[worker] prefetch MISS <hash> (<size> bytes): <error>`. The next
 run says which blob and what the mesh answered, which is the one fact this
 investigation has never had.
+
+### `-balance` evens the counts, and the counts are not the work
+
+Run C, per worker:
+
+| | spread |
+| ----------- | ------------------------------- |
+| leads taken | 122 to 239 = **1.96x** |
+| CPU spent | 160s to 1,316s = **8.2x** |
+
+(The two lists cannot be paired - the CPU figures come out in job order and
+the lead counts by worker number - so this compares DISTRIBUTIONS, not
+per-worker ratios. The spreads stand without pairing.)
+
+`-balance` was built to stop affinity piling leads onto one machine, and by
+its own measure it works: a factor of two across six workers is a reasonable
+spread for a scheduler that cannot see the future. But **the work inside a
+lead varies four times more than the count of leads does**, so evening the
+counts leaves an 8x imbalance in the thing that matters.
+
+The busiest worker sets the leg. On this run one machine spent 1,316 CPU-
+seconds and another 160, which means five machines were waiting on one for
+much of the leg - and `waiting 1542s (19%)` is that, seen from the other
+side.
+
+This is the cheapest remaining structural win, and it needs no new
+mechanism: `offer_score` already exists and already takes a queue-depth
+term. What it lacks is any notion of how big a lead is. `analyse` computes
+the op count of every cut before the offer goes out, and the driver already
+carries `lead_ms` per worker from completed leads - either would be a better
+weight than a count.
+
+Worth naming the trap before anyone acts on it: op count is a measure of
+SIZE, and `-minops` already proved size is not cost - a 20-op dispatch floor
+made the fleet five times slower while improving every per-lead number.
+Observed `lead_ms` per worker is the honest signal, and it is already
+recorded.
