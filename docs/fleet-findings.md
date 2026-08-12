@@ -7743,3 +7743,48 @@ own status stream distinguishes and `lead_split` does not.
 
 That split is now the single most valuable instrument this project could
 add, and it is worth more than any further seeding or placement experiment.
+
+### The ancestry hypothesis predicts the amplification EQUALS the worker count
+
+buildkit caches a materialised snapshot by vertex digest, so a worker that
+has unpacked an ancestry once does not unpack it again for the next lead
+that needs it. The cost is therefore per (ancestry x worker), not per lead.
+
+Which gives a number rather than a story:
+
+> If materialising ancestry is the amplification, then the fleet's CPU cost
+> over the baseline's should be **approximately the number of workers that
+> touch a given ancestry** - because each of them does once what one machine
+> did once.
+
+Six workers. Measured amplification 6.5x and 8.7x. That is a closer
+agreement than this file has any right to expect from a hypothesis assembled
+after the fact, and it is exactly the kind of coincidence that has misled it
+before - so it wants a test, not a celebration.
+
+**The test is cheap and decisive: change the worker count.**
+
+| run | prediction if ancestry dominates | prediction if it does not |
+| --- | -------------------------------- | ------------------------- |
+| 3 workers | CPU amplification falls to ~3x | stays ~6-9x |
+| 6 workers | ~6x (measured: 6.5x, 8.7x) | - |
+| 12 workers | rises to ~12x | stays ~6-9x |
+
+Nothing else on the table predicts that shape. Per-lead overhead, export
+cost, cold mounts and delivery failure are all indifferent to how many
+machines are present; only a cost paid once per machine scales with the
+machine count.
+
+And it inverts the usual reading of a fleet result. If it holds, **adding
+machines makes the fleet cost more CPU while making the leg shorter** - the
+wall clock improves and the bill rises, which is a real trade and not a bug,
+but only if it is known.
+
+The machinery exists: the plan job already parses `-w<N>` anywhere in the
+branch name, and `giles-dispatch-ci-tests-balance-w12-nobase` proves the
+pattern works. It needs one branch added to the trigger list and two runs.
+
+Worth doing before anything else, including the `building` split - the split
+says WHERE the time goes, and this says whether the answer scales with
+machines, which is the difference between a tuning problem and a structural
+one.
