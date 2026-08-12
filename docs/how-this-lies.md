@@ -425,9 +425,44 @@ and if the denominator is a wall clock, the numerator has to be one too. The
 tell here was free and ignored: an identity three paragraphs earlier already
 said how much the leads overlap.
 
+## 23. A comment that asserts what the code does not do
+
+**Instances, all three found in one night:**
+
+| comment | what the code does |
+| ---------------------------------------------- | ------------------------------ |
+| `share_of`: "a broadcast pulls each blob from a different peer rather than stampeding one" | the broadcast branch returns before `seeder_for` is reached |
+| `usable_seeds`: "every graph naming that cache id wants it, on every machine" | hands it to `prefetch_image`, which the worker splits 1-in-N |
+| `harvest_one`: "that cache was empty, so seeding it changes nothing" | emits the seed anyway; every worker pulls and unpacks it |
+
+Each is a statement of intent that reads as a statement of fact. None is
+lazy or vague - they are the best-written comments in their files, which is
+exactly the problem. A vague comment gets checked; a precise, confident,
+mechanism-naming comment gets believed.
+
+**This is not shape 13.** There the knob is wired, documented and inert - the
+code is dead. Here the code is alive and doing something else, and the
+documentation is what is wrong. The failure is in the reader, and the reader
+is whoever trusts the file's own account of itself.
+
+It bit hardest where the codebase is strongest. This project records its
+reasoning in comments rather than in commit messages or a wiki, deliberately
+and to great effect - which means the comments are load-bearing, and
+**nothing checks them.** `cargo test` cannot fail on a sentence.
+
+**Countermeasure, and it is weak:** when a comment names a mechanism
+(`seeder_for`, `prefetch_image`, a specific function), read the three lines
+under it before believing it. That is a habit rather than a guard, and
+habits are what this file exists because of.
+
+The stronger form, where it is cheap: make the sentence a test. `share_of`'s
+claim became `broadcast_takes_everything_but_its_own_share_first`, which
+fails if the ordering is ever removed. A comment that can be executed stops
+being a comment.
+
 ## The common thread
 
-Twenty-one of these twenty-two produced a GREEN result. Not one announced itself.
+Twenty-two of these twenty-three produced a GREEN result. Not one announced itself.
 
 The discipline that caught them is the same every time: **find the
 observation that differs between the world where it works and the world where
