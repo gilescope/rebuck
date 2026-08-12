@@ -2111,14 +2111,16 @@ impl Driver {
             // `...subtree@sha256:...: not found`.
             let blobs = match blobs {
                 Some(mut d) => {
-                    let bare = crate::store::bare_digest(&r).to_owned();
-                    // Its real length if we hold it. A wrong size is not
-                    // fatal - the provider frames its own response - but it
-                    // is free to be right.
-                    let size = this.store.size_of(&bare).await.unwrap_or(0) as i64;
-                    if let Some(m) = crate::solve::manifest_dig(&r, size) {
+                    // The HASH comes from `manifest_dig`, not from
+                    // `bare_digest`. The latter strips a leading `sha256:`
+                    // and nothing else, so handed a full
+                    // `host/repo@sha256:...` it returns the whole reference
+                    // and the size lookup silently misses - which is how a
+                    // "free to be right" size ends up always zero.
+                    if let Some(m) = crate::solve::manifest_dig(&r, 0) {
+                        let size = this.store.size_of(&m.hash).await.unwrap_or(0) as i64;
                         if !d.iter().any(|x| x.hash == m.hash) {
-                            d.push(m);
+                            d.push(crate::mesh::Dig { size, ..m });
                         }
                     }
                     Some(d)

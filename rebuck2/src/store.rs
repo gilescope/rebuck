@@ -1001,6 +1001,31 @@ mod held_across_await {
 
 #[cfg(test)]
 mod tests {
+    /// What `bare_digest` does, and - the part that bit - what it does NOT.
+    ///
+    /// It strips an algorithm prefix. It is not a reference parser. Handed a
+    /// full `host/repo@sha256:...` it returns the whole string unchanged,
+    /// which looks like a hash to a caller that only ever tested it with
+    /// bare ones - and a store lookup then silently misses.
+    ///
+    /// That happened within an hour of the function being added, in the
+    /// prefetch path, to size a manifest. The size was not load-bearing so
+    /// nothing broke; the next misuse might be.
+    #[test]
+    fn bare_digest_strips_a_prefix_and_does_not_parse_a_reference() {
+        use super::bare_digest;
+        assert_eq!(bare_digest("sha256:abc"), "abc");
+        assert_eq!(bare_digest("abc"), "abc", "already bare is a no-op");
+
+        let full = "172.17.0.1:15000/rebuck2/subtree@sha256:abc";
+        assert_eq!(
+            bare_digest(full),
+            full,
+            "a reference comes back whole - use solve::manifest_dig to take \
+             the digest out of one"
+        );
+    }
+
     /// Case-collision / leftover tolerance: materializing onto an existing
     /// dest replaces it (last-wins - the semantics tar gave case-colliding
     /// trees when each OS unpacked its own copy). Run 29199153837: a
