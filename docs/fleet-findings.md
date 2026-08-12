@@ -8311,3 +8311,39 @@ decides who does the work, not how much there is.** Every mechanism that
 tried to reduce total work by placing differently was attempting something
 placement cannot do, and principle 30 says why - the ancestry is needed by
 whoever runs the lead, wherever that is.
+
+### The margin does not track any single variable, and I said it did
+
+Reading the five outcomes together, I wrote that "the margin scales with how
+finely the target is divided". Checked against the table, it does not.
+
+| target | baseline | fleet | ratio | leads | s / lead |
+| ---------------- | -------- | ----- | ----- | ----- | -------- |
+| `+all-buildkitd` | 1188s | 1161s | 1.0 | - | - |
+| `+test-no-qemu` | 285s | 508s | 1.8 | 14 | 20.4 |
+| `+all-binaries` | 262s | 712s | 2.7 | 34 | 7.7 |
+| `+lint-all` | 88s | 252s | 2.9 | 3 | 29.3 |
+| `+test-ast` | 215s | 1065s | 5.0 | 412 | 0.5 |
+
+- **against lead count**: `+lint-all` has three leads and loses 2.9x;
+  `+test-no-qemu` has fourteen and loses 1.8x. Backwards.
+- **against baseline size**: `+test-ast` at 215s loses 5x, `+all-binaries`
+  at 262s loses 2.7x. Not it either.
+- **against seconds per lead**: `+lint-all` has the most work per lead of
+  any loser and the second-worst ratio.
+
+`+test-ast` is the extreme on every axis and the worst outcome, which is
+what made the story feel true. Four points do not make a trend, and the
+three in the middle disagree with each of the three orderings.
+
+**What the model actually predicts is a ratio of two things this table does
+not contain.** Principle 30 says the fleet loses when `N x ancestry` is
+large against the work; nothing here measures ancestry per target. 705 MiB
+is `+test-ast`'s figure and no other target has one. `+lint-all` losing 2.9x
+on an 88-second baseline is entirely consistent with a small ancestry that
+is nonetheless most of an 88-second build.
+
+So the table supports "every target loses" and supports the mechanism, and
+does NOT support any ordering claim. **Measuring per-worker distinct content
+on the other four targets is what would** - and it is one grep of a run that
+has already happened for three of them.
