@@ -6519,3 +6519,30 @@ spared this run. It does nothing about the address. So:
 
 Written before it lands. Either outcome is informative, and neither is the
 seeding measurement - that needs the address fixed first.
+
+## Run B: the harvest finally read something
+
+`31554856118`, same target and branch, first run with `merge_cache_inputs`.
+
+| step | run A | run B |
+| ----------------- | ----- | --------- |
+| baseline | 212s | 216s |
+| harvest (step 16) | **8s** | **65s** |
+
+Run A's eight seconds covered a docker pull, a `du -v`, a full
+`check-seeding` round trip and four harvests - which is only possible if
+every harvest read an empty directory. Run B spends 57 seconds more on the
+same steps, and the local rig puts a 200 MiB harvest at 8.9s, so ~65s is the
+right order for the 1.6 GB the daemon holds.
+
+**So the clobber was the whole of it.** The bank had been carrying the right
+bytes; `check-seeding` truncated the file three seconds before
+`harvest-cache` read it, and merging instead of overwriting was sufficient
+to make a harvest that had never worked start working.
+
+Whether the resulting seeds can be USED is a separate question, and this run
+predates the broadcast fix, so the prediction filed earlier still stands:
+real seeds carry the same delivery problem as empty ones, and 1-in-N
+splitting of a blob every worker needs immediately is what produced 274
+`could not fetch content descriptor` failures. Large seeds should make that
+worse, not better.
