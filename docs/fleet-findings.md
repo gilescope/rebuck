@@ -7314,3 +7314,39 @@ difference smaller than the spread between two identical runs is not a
 finding.** If the pair comes back 1,400s and 1,700s, then `-balance`'s
 1240-to-1050 and prefetch's 1773-to-1240 survive comfortably and most of
 tonight's seeded comparisons do not.
+
+### Why the cold arm is always `n=1`, and why subset-seeding will not fix it
+
+The within-run arm comparison is the right instrument for a fleet with this
+much run-to-run variance: it compares seeded leads against cold ones inside a
+single leg, so machine speed, queueing and CI weather cancel. It has reported
+`n=1` on the cold side in every seeded run, and the obvious response - seed
+only SOME of the cache ids and leave the rest cold - does not work.
+
+A lead is assigned by `any`, not `all`:
+
+```rust
+if caches.iter().any(|id| seeds.contains_key(id)) { seeded } else { cold }
+```
+
+and the comment above it is correct about why: a lead naming a seeded id
+alongside an unseeded one is not a control, so it cannot be counted cold.
+
+Now the arithmetic. On `+test-ast`, of 359 cache-bearing leads, **358 mount
+`go-mod` and 353 mount `go-build`**. Seeding either id puts essentially every
+lead in the seeded arm. The cold arm can only hold leads that mount SOME
+cache and none of the seeded ones, and there is at most one such lead in the
+target.
+
+So `n=1` is not a sampling accident to be fixed by seeding a subset. It is
+what this target's mount structure permits, and it would be `n=1` however the
+ids were chosen, because the two big ones co-occur on almost every lead.
+
+**The instrument is fine and the target is wrong for it.** Making the arms
+line say something needs either a target whose cache ids do NOT co-occur, or
+per-MOUNT attribution of a lead's duration - and a lead's duration cannot
+honestly be split between the mounts it holds.
+
+Recorded so the next person does not spend a run on `REBUCK2_SEED_IDS` with
+one id in it, which is the obvious next move and would produce the same
+`n=1` for a third reason.
