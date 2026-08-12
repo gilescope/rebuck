@@ -7441,3 +7441,44 @@ Wire `worth_offering` into the gateway's dispatch decision, default off,
 measure on `+test-ast`. If the median lead stops travelling and the leg falls
 towards the baseline, the fleet's problem was never per-unit cost - it was
 that it was paying the toll four hundred times for work worth seconds.
+
+#### And the estimate it needs exists too
+
+I under-sold this a moment ago by assuming `worth_offering` had no source
+for its `est_p90`. It has one, built and banked:
+
+| piece | where | state |
+| ------------------------- | ---------------------------- | -------- |
+| the decision | `dispatch::worth_offering` | written, tested, no callers |
+| p90 per target | `bank::timings::Stats.p90_ms` | written, banked between runs |
+| observations that fill it | `bank::logstream::samples` | written, parses earthly's log |
+| solve to target name | `dispatch::describe_root` | written, already used for `job_names` |
+
+Every part is present. The store is keyed on "target ref plus the build args
+that reach it - never the cache key, never the content", and its module doc
+argues that choice exactly right for this use:
+
+> a cache key must be exact, or a follower gets someone else's layer; an
+> estimate must be STABLE, because being 20% wrong costs a slightly worse
+> schedule while having no entry at all costs no schedule. Key an estimate
+> on content and it is perfect and useless - every commit empties the table.
+
+So the experiment is a wiring job after all, and the shape of it is:
+
+1. the gateway already calls `describe_root` on every dispatched subtree to
+   name it; use that name as the timings `Key`,
+2. read `stats(key).p90_ms` out of the banked store, which the coordinator
+   already restores as `~/.cache/rebuck2/coord`,
+3. gate the offer on `worth_offering(Some(p90), elapsed)`, behind its own
+   switch, counted,
+4. first run of a target has no entry and dispatches as today, which is what
+   `est_p90.unwrap_or(running_for)` already means.
+
+The one real unknown is whether `describe_root`'s name and the timings
+`Key`'s target ref are the same string. If they are not, that is the whole
+job: a mapping, or a second key.
+
+Recorded at this depth because "wire up worth_offering" is the kind of task
+that reads as trivial and turns out to be a missing join - and because the
+opposite happened tonight with `manifest_dig`, which read as trivial, was
+trivial, and shipped a regression anyway.
