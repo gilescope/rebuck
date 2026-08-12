@@ -335,6 +335,16 @@ is two call sites in one file. Both are invisible to a test that mocks both
 ends, and both were found by reading what production actually passes rather
 than what the test passes.
 
+**Why only one site broke.** `op_by_worker` has three other readers - the
+affinity term, the duplication metric, the placement scorer - and all three
+are correct. Each of them re-derives its key by hashing the op bytes
+(`sha256_hex(b)`), so it cannot help but produce the stored spelling.
+`consumers_of` was the only caller handed a key from LLB metadata
+(`Input.digest`) instead of computing one. **The odd one out was the one
+that did not hash**, and that is a cheap thing to look for: when a table is
+keyed by a derived value, any reader that receives its key rather than
+deriving it is where the spellings can diverge.
+
 **Countermeasure:** a second test that constructs each side the way its
 production site does - `sha256_hex(bytes)` on the write, `format!("sha256:
 {hex}")` on the read - with `assert_ne!` on the two spellings first, so the
