@@ -6623,9 +6623,19 @@ six fills is a few hundred seconds at the very most - against **4,716s** of
 excess building to explain. Off by an order of magnitude.
 
 The mechanism that WOULD explain it is a per-lead key: if every lead got a
-fresh empty directory, the refill is paid 359 times rather than 6. But that
-is what SEEDING introduces (`seed_cache_mounts` rewrites the mount input by
-design), not what the unseeded checkpoint did.
+fresh empty directory, the refill is paid 359 times rather than 6.
+
+**And nothing produces one.** I wrote here that seeding introduces it,
+because `seed_cache_mounts` rewrites the mount input by design. Reading that
+function settles it the other way: the input it substitutes is a `Source` op
+built purely from the seed's image reference, which is the same string for
+every lead in the run. Same bytes, same digest, same ref, same key. The
+first lead on a worker materialises the mount from the seed and every later
+lead reuses it - which is the behaviour you would want, and the opposite of
+what I claimed.
+
+So there is no per-lead key in either arm, seeded or not, and the `du -v`
+should show a handful of mounts per worker whichever way run C goes.
 
 **So the honest state is: I do not know what the 13.6x is.** Export is
 bounded at 5-10%. Duplication is measured at 1.8x. Cold mounts look an order
