@@ -7049,3 +7049,41 @@ needed", which a staggered or chained distribution also satisfies.
 
 If instead they say `not found`, the bytes were never reachable and the
 contention is a red herring.
+
+### A comment that describes a mechanism the code skips
+
+`share_of`, on the broadcast path, says:
+
+> Splitting is still right for the herd it was written against, and
+> `seeder_for` spreads the SOURCE per blob either way, so a broadcast pulls
+> each blob from a different peer rather than stampeding one.
+
+The code underneath it:
+
+```rust
+pub fn share_of(hashes: &[String], ids: &[String], me: &str, broadcast: bool) -> Vec<String> {
+    if broadcast || ids.len() <= 1 {
+        return hashes.to_vec();          // <- seeder_for is never reached
+    }
+    hashes.iter().filter(|h| seeder_for(h, ids).as_deref() == Some(me)) ...
+}
+```
+
+Broadcast returns before `seeder_for` is consulted. So the claim is
+aspirational: it describes what the SPLIT path does, on the branch that does
+not take it. Under broadcast every worker asks for every blob at once, no
+peer holds any of them yet, and all six go to the driver together - which is
+precisely the stampede the sentence says cannot happen.
+
+This is shape 13 with the polarity reversed. Usually a mechanism is wired,
+documented and inert; here the documentation describes a mechanism the code
+deliberately skips, and the sentence is reassuring enough that nobody
+re-reads the three lines above it. I wrote the broadcast path tonight and
+read that comment as support for it.
+
+**The fix, if run D confirms the contention, is an ordering rather than a
+policy.** In broadcast mode a worker should fetch its `seeder_for` share
+FIRST and the remainder after: each blob then has exactly one machine
+pulling it from the driver, and the other five find it on that peer via the
+bloom moments later. Same total set, one source per blob, no stampede - the
+thing the comment already promised.
