@@ -18,17 +18,41 @@
 # quantities in one evening.
 set -euo pipefail
 
-verdict=""; leg=""; base=""; workers=6; building=""
+verdict=""; leg=""; base=""; workers=6; building=""; basecpu=""; wcpu=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --verdict)  verdict=$2; shift 2 ;;
-    --leg)      leg=$2; shift 2 ;;
-    --baseline) base=$2; shift 2 ;;
-    --workers)  workers=$2; shift 2 ;;
-    --building) building=$2; shift 2 ;;
+    --verdict)      verdict=$2; shift 2 ;;
+    --leg)          leg=$2; shift 2 ;;
+    --baseline)     base=$2; shift 2 ;;
+    --workers)      workers=$2; shift 2 ;;
+    --building)     building=$2; shift 2 ;;
+    --baseline-cpu) basecpu=$2; shift 2 ;;
+    --worker-cpu)   wcpu=$2; shift 2 ;;   # comma-separated, one per worker
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+
+# CPU FIRST when it is available, because it is the only like-for-like
+# comparison here: wall clock on the fleet side is a critical path and on
+# the baseline side is one machine's whole run, and dividing them has
+# produced three wrong headline figures in this project.
+#
+# The amplification is also the quantity the ancestry hypothesis makes a
+# prediction about - it should track the WORKER COUNT - so this prints the
+# ratio against the count rather than leaving it to be eyeballed.
+if [ -n "$basecpu" ] && [ -n "$wcpu" ]; then
+  echo "$wcpu" | tr ',' '\n' | awk -v b="$basecpu" -v w="$workers" '
+    { n++; t += $1; if (mn=="" || $1 < mn) mn=$1; if ($1 > mx) mx=$1 }
+    END {
+      printf "worker CPU     : %ds across %d worker(s), spread %d-%d = %.1fx\n", t, n, mn, mx, mx/(mn?mn:1)
+      printf "baseline CPU   : %ds\n", b
+      printf "AMPLIFICATION  : %.1fx  (CPU against CPU - the only like-for-like one)\n", t/b
+      printf "per worker     : %.1fx\n", (t/b)/w
+      printf "\nancestry test  : if materialising ancestry dominates, AMPLIFICATION\n"
+      printf "                 tracks the worker count, so per-worker stays near 1.0.\n"
+      printf "                 This run: %.2f\n\n", (t/b)/w
+    }'
+fi
 
 field() { printf '%s' "$verdict" | grep -oE "$1=[0-9.]+" | head -1 | cut -d= -f2; }
 

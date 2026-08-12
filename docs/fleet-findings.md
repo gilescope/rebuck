@@ -7848,3 +7848,50 @@ Its CPU amplification, meanwhile, is no worse than unseeded - 6.5x and 8.7x
 seeded against 9.2x unseeded. So seeding does not add work so much as
 lengthen the critical path, which is what waiting for a seed that has not
 arrived would do.
+
+### Ancestry duplication caps at 6x. We measure 9.2x
+
+The arithmetic, which `leg-arithmetic.sh` now prints as `per worker` and
+which I should have done before writing the hypothesis up:
+
+Let the baseline's CPU be `A + W` - ancestry materialised once, plus the
+real work. If every worker materialises the whole ancestry and the work is
+merely split between them, the fleet's CPU is `6A + W`, and
+
+```text
+amplification = (6A + W) / (A + W) = 1 + 5f      where f = A / (A + W)
+```
+
+`f` is a fraction, so **with six workers this cannot exceed 6.0x**, and it
+reaches 6.0 only if the baseline is ALL ancestry and no work.
+
+| measured | implied f | verdict |
+| -------- | --------- | -------------- |
+| 6.5x | 1.10 | impossible |
+| 8.7x | 1.54 | impossible |
+| 9.2x | 1.64 | impossible |
+
+**So ancestry duplication cannot be the whole of it, and not by a little.**
+Even the most generous reading leaves 1.5x per worker unaccounted for.
+
+The hypothesis is not dead - a 6x ceiling that we are pressed against is
+still a strong claim, and nothing else on the table explains even that much.
+But something ADDS to it, and the candidates are the ones a worker does that
+the baseline never does:
+
+- **export and push** every subtree result as an image. Bounded earlier at
+  5-10% of `building`, on traffic figures - which now looks like an
+  underestimate worth redoing on CPU rather than bytes.
+- **materialise MORE than the baseline's ancestry.** A dispatched subtree is
+  a portable rewrite naming every input by digest; the baseline builds
+  incrementally and may never materialise some of what the rewrite forces.
+  This one would not be a duplication of the baseline's work at all, but
+  work the baseline never does.
+
+The second is the more interesting and has never been looked at. It also
+survives the `-w3` test differently: pure ancestry duplication scales with
+the worker count, but "each dispatched graph forces more materialisation
+than the baseline needed" is per-LEAD and would not fall at three workers.
+
+So the test now separates three things rather than two, which makes it
+better rather than worse.
