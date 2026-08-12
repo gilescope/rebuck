@@ -47,6 +47,26 @@ grep -rah "prefetched [0-9]*/[0-9]* of my share" "$dir" | strip \
   | sed -E 's/.*prefetched ([0-9]+)\/([0-9]+) of my share \(([0-9]+) announced\)/\1 of \3/' \
   | sort | uniq -c | sort -rn | head -6
 
+echo; echo "── fetches that found nothing anywhere ─────"
+# The end of the whole lookup chain: local store, peers by bloom, the
+# driver, then upstream. Each one of these is a 404 the caller sees, and a
+# caller that was resolving an image fails its build on it - which arrives
+# as `worker declined ... could not fetch content descriptor`, 274 times in
+# one run, with nothing on our side saying which digest or who was asked.
+grep -rah "\[registry\] MISS" "$dir" | strip \
+  | sed -E 's/sha256:[0-9a-f]{8}[0-9a-f]*/<digest>/g' \
+  | sort | uniq -c | sort -rn | head -8
+echo "  (none is the good answer)"
+
+echo; echo "── why a lead was declined ─────────────────"
+# A decline is not always a refusal. `consider()` gives three reasons -
+# saturated, undispatchable, wrong platform - and anything else here is the
+# worker having TAKEN the lead and failed to build it, which is a different
+# problem with a different fix.
+grep -rah "declined subtree" "$dir" | strip \
+  | sed -E 's/.*declined subtree job [0-9]+: //; s/sha256:[0-9a-f]+/<digest>/g' \
+  | cut -c1-100 | sort | uniq -c | sort -rn | head -6
+
 echo; echo "── seeding ─────────────────────────────────"
 # THE ONLY HONEST READ, and it needs its own block rather than a line inside
 # `mechanisms`. A seeded mount reports 0.0 MiB in the harvest table - its
