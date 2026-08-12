@@ -1144,6 +1144,19 @@ jobs:
           #
           # One `du -v` answers a question that has been argued from first
           # principles twice tonight.
+          # THE OTHER HALF of the amplification comparison. The baseline
+          # step records its daemon's CPU; this records each worker's, and
+          # the sum over workers is the only figure that can honestly be put
+          # beside it. Wall-clock ratios between a summed lead time and a
+          # single baseline are shape 22 and have been wrong twice.
+          wcpu=$(docker exec own-bk sh -c \
+                   'awk "/^usage_usec/{print \$2}" /sys/fs/cgroup/cpu.stat' 2>/dev/null || true)
+          if [ -n "${wcpu:-}" ]; then
+            echo "worker cpu: $((wcpu / 1000000))s"
+          else
+            echo "worker cpu: unavailable (no cgroup v2 reading from own-bk)"
+          fi
+
           echo "=== cache mounts this worker's daemon ended with"
           # `own-bk` is this worker's daemon - the same name the start step
           # uses. Named wrongly once already this session (worker-*.log
@@ -1608,6 +1621,26 @@ jobs:
           grep -aoE "^[[:space:]]*[^[:space:]]+ \*failed\*" /tmp/baseline.log \
             | sed 's/^[[:space:]]*//;s/ \*failed\*//' | sort -u > /tmp/baseline.failed || true
           echo "BASELINE_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
+          # CPU, not wall, and this is the missing half of every
+          # amplification figure in fleet-findings.md. The baseline's 201
+          # seconds is ONE wall clock over work buildkit parallelises across
+          # the runner's cores; a dispatched subtree is small and
+          # parallelises less. Comparing the fleet's summed lead time to that
+          # wall clock produced a 24.5x that was not a quantity - shape 22 in
+          # how-this-lies.md.
+          #
+          # cgroup v2, read from inside the daemon's own container, so it is
+          # that daemon's CPU and not the runner's. Best effort: if the
+          # container or the file is gone the line says so rather than
+          # printing a zero that reads as "the baseline used no CPU".
+          bcpu=$(docker exec base-bk sh -c \
+                   'awk "/^usage_usec/{print \$2}" /sys/fs/cgroup/cpu.stat' 2>/dev/null || true)
+          if [ -n "${bcpu:-}" ]; then
+            echo "BASELINE_CPU_S=$((bcpu / 1000000))" >> "$GITHUB_ENV"
+            echo "baseline cpu: $((bcpu / 1000000))s against $((SECONDS - start))s wall"
+          else
+            echo "baseline cpu: unavailable (no cgroup v2 reading from base-bk)"
+          fi
           # HOW MUCH did this leg get through before it stopped? Both legs
           # abort on the same failed target, and "186s versus 525s" is only a
           # comparison if they attempted the same work first - a leg that
