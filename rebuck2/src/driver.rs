@@ -1956,11 +1956,21 @@ impl Driver {
     /// has been demanded by two machines, which is the definition of worth
     /// pushing. One pairing means one consumer, and pre-positioning that is
     /// bandwidth spent making five machines hold something none will read.
+    /// TWO SPELLINGS of one digest meet here, and comparing them raw made
+    /// the gate unable ever to say yes. `place_subtree` stores
+    /// `sha256_hex(bytes)` - bare hex - while the terminal it records for
+    /// the same op is an LLB `Input.digest`, which is `sha256:<hex>`. The
+    /// counter therefore read 0 for every op that had consumers: 0
+    /// acceptances against 14 refusals and 292 bypasses in the field.
+    ///
+    /// Normalised on BOTH sides rather than at one call site, so a future
+    /// caller holding either spelling gets the right answer.
     async fn consumers_of(self: &Arc<Self>, op: &str) -> usize {
+        let want = crate::store::bare_digest(op);
         let pairs = self.op_by_worker.lock().await;
         pairs
             .iter()
-            .filter(|(o, _)| o == op)
+            .filter(|(o, _)| crate::store::bare_digest(o) == want)
             .map(|(_, w)| *w)
             .collect::<std::collections::BTreeSet<u64>>()
             .len()
@@ -3780,6 +3790,41 @@ mod tests {
             "leaf: do not pre-position"
         );
         assert!(d.consumers_of("shared").await >= 2, "shared: pre-position");
+    }
+
+    /// The two sides of the gate, spelled the way PRODUCTION spells them.
+    ///
+    /// The test above invents `"leaf"` and `"shared"` and uses the same
+    /// string on both sides, so it cannot see a mismatch between them - and
+    /// there is one. `place_subtree` stores `sha256_hex(bytes)`, bare hex;
+    /// `place_subtree` also records the terminal's `input.digest`, which LLB
+    /// spells `sha256:<hex>`. `consumers_of` compares them with `==`.
+    ///
+    /// Symptom in the field: 0 acceptances, 14 refusals, 292 bypasses. The
+    /// gate has never once said yes, and could not have.
+    #[tokio::test]
+    async fn the_gate_sees_the_op_the_terminal_actually_names() {
+        let d = super::Driver::for_test();
+
+        // As `place_subtree` writes it (driver.rs, `op_by_worker.insert`).
+        let op_bytes = b"an op, as marshalled into Definition.def";
+        let stored = crate::store::sha256_hex(op_bytes);
+        {
+            let mut pairs = d.op_by_worker.lock().await;
+            pairs.insert((stored.clone(), 1));
+            pairs.insert((stored.clone(), 2));
+        }
+
+        // As `subtree_built` reads it: the terminal op's `input.digest`,
+        // which every producer of LLB in this crate writes with the prefix.
+        let asked = format!("sha256:{stored}");
+        assert_ne!(asked, stored, "the two spellings really do differ");
+
+        assert_eq!(
+            d.consumers_of(&asked).await,
+            2,
+            "two machines were sent this op; the gate must see both"
+        );
     }
     use super::*;
 

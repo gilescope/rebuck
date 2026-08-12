@@ -51,6 +51,17 @@ pub fn note_gained(hash: &str) {
     GAINED.1.notify_waiters();
 }
 
+/// A digest without its algorithm prefix.
+///
+/// One digest is written two ways in this crate: [`sha256_hex`] returns bare
+/// hex, while every LLB `Input.digest` and `Op` reference carries
+/// `sha256:`. Comparing the two spellings raw is silent and always false -
+/// it made the prefetch consumer gate refuse every op it was asked about.
+/// Normalise before comparing, on both sides.
+pub fn bare_digest(s: &str) -> &str {
+    s.strip_prefix("sha256:").unwrap_or(s)
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let d = Sha256::digest(bytes);

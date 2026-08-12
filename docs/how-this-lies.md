@@ -299,9 +299,51 @@ which states the filter AND the aggregation and cannot be read as a duration
 of anything. No general guard - the rule is that a field name must survive
 being read alone, beside `lead_ms`, by someone building a table.
 
+## 20. A test that supplies both sides of a seam
+
+**Instance:** the prefetch consumer gate. `consumers_of(op)` counts how many
+distinct workers have been sent an op, and refuses to pre-position anything
+with fewer than two. In the field it recorded **0 acceptances, 14 refusals,
+292 bypasses** - it has never once said yes.
+
+It could not. Two production sites write the same digest two ways:
+
+```rust
+// place_subtree, storing what a worker will need:
+pairs.insert((crate::store::sha256_hex(bytes), first));   // bare hex
+
+// place_subtree, recording the terminal for the same subtree:
+self.job_terminal.lock().await.insert(job, input.digest); // "sha256:<hex>"
+```
+
+and `consumers_of` compared them with `==`.
+
+The existing test passes, and always would have:
+
+```rust
+pairs.insert(("shared".to_owned(), 1));
+assert_eq!(d.consumers_of("shared").await, 3);
+```
+
+It invents `"shared"`, writes it, and reads it back. **A test that chooses
+the spelling for both sides of a comparison cannot detect that the two real
+sides spell it differently.** The function is correct in isolation; the seam
+is where the bug lives, and the test carefully stayed off it.
+
+This is the sibling of shape 18. There the boundary was a process; here it
+is two call sites in one file. Both are invisible to a test that mocks both
+ends, and both were found by reading what production actually passes rather
+than what the test passes.
+
+**Countermeasure:** a second test that constructs each side the way its
+production site does - `sha256_hex(bytes)` on the write, `format!("sha256:
+{hex}")` on the read - with `assert_ne!` on the two spellings first, so the
+test fails loudly if someone later unifies them and makes it vacuous. The
+fix normalises both sides through `store::bare_digest`.
+
 ## The common thread
 
-Twelve of these thirteen produced a GREEN result. Not one announced itself.
+Nineteen of these twenty produced a GREEN result. Not one announced itself.
 
 The discipline that caught them is the same every time: **find the
 observation that differs between the world where it works and the world where
