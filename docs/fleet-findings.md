@@ -2436,10 +2436,10 @@ The standing goal is larger and larger parts of it, so here is the ledger.
 | `+test-no-qemu-group1`   | one group, nested earthly, WITH DOCKER | parity, locally                                           |
 | `+test-no-qemu-group2`   | the same, one group                    | parity, in CI, six machines                               |
 | `+test-no-qemu-group10`  | the same, one group                    | where graft and cut-prefix were measured                  |
-| `+test-no-qemu` (all 14) | 14 groups on one 192s base chain       | completes, parity, 508s vs 285s                           |
+| `+test-no-qemu` (all 14) | 14 groups on one 192s base chain       | parity - fleet 508s against a 285s baseline               |
 | `+all-binaries`          | 5 cross-compiles off one `+code` stem  | **green both legs** - fleet 712s vs a 262s baseline       |
 | `+lint-all`              | 3 independent lint targets, no docker  | parity - fleet 252s against an 88s baseline (was 628s)    |
-| `+all-buildkitd`         | multi-arch buildkitd, needs qemu       | **parity**, 1161s vs 1188s - arm64 half is undispatchable |
+| `+all-buildkitd`         | multi-arch buildkitd, needs qemu       | **parity** - fleet 1188s against a 1161s baseline (+2.3%) |
 | `+test-ast`              | 412 solves, the densest fan-out here   | **parity** - the target every mechanism is measured on    |
 | `+all`                   | the whole Earthfile                    | **parity**, 2724s, zero failed - a chain, not a fan-out   |
 
@@ -7378,6 +7378,8 @@ Consolidating what the targets actually say, on wall clock:
 
 | target | baseline | fleet | ratio |
 | ---------------- | -------- | ------ | ----------- |
+| `+all-buildkitd` | 1188s | 1161s | level (+2.3%) |
+| `+test-no-qemu` | 285s | 508s | 1.8x slower |
 | `+lint-all` | 88s | 252s | 2.9x slower |
 | `+test-ast` | ~210s | ~1400-1800s | 7-8x slower |
 | `+all-binaries` | 262s | 712s | 2.7x slower |
