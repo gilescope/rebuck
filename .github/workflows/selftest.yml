@@ -136,31 +136,28 @@ jobs:
           docker pull -q busybox:1 >/dev/null
           docker tag busybox:1 127.0.0.1:15000/library/busybox:1
           docker push -q 127.0.0.1:15000/library/busybox:1
-      - name: harvest an empty cache mount
-        run: |
-          set -euo pipefail
-          # NO SCHEME on --bk, deliberately. That is exactly how the fleet
-          # workflow calls it and exactly what died on `invalid URL, scheme
-          # is missing`; writing http:// here would test the fixed spelling
-          # rather than the one in use.
-          ./rebuck2/target/release/rebuck2 harvest-cache \
-            --bk 172.17.0.1:28372 --registry 172.17.0.1:15000 \
-            --base 172.17.0.1:15000/library/busybox:1 \
-            --id smoke-cache --dest /smoke/cache | tee harvest.out
-          line=$(grep -oE '^REBUCK2_CACHE_SEEDS=.*' harvest.out)
-          echo "harvested: $line"
-          # A REFERENCE, not a digest. `docker-image://sha256:...` parses
-          # nowhere, and the seeding path built exactly that for a commit.
-          case "$line" in
-            REBUCK2_CACHE_SEEDS=smoke-cache=172.17.0.1:15000/rebuck2/subtree@sha256:*) ;;
-            *) echo "::error::not a pullable reference: $line"; exit 1 ;;
-          esac
-      # And the MECHANISM, not just the path. The step above proves a
-      # harvest can be taken; this proves a cold mount can be started from
-      # one - write a marker into cache A, harvest A, read the marker back
-      # out of cache B seeded from that harvest. B is a different id on
-      # purpose: read it back out of A and it passes by meeting A's own warm
-      # mount.
+      # A step that harvested `smoke-cache` off this daemon used to stand
+      # here, and it had NEVER passed - 0 green in 100 runs. It could not:
+      # the daemon is created three steps above and nothing ever builds
+      # against a mount by that name, so `harvest-cache` correctly refuses
+      # with `no cache id "smoke-cache" on this daemon`. The step asked a
+      # fresh daemon for a cache that cannot exist.
+      #
+      # Its one real assertion was that the harvest emits a REFERENCE and
+      # not a bare digest (`docker-image://sha256:...` parses nowhere, and
+      # the seeding path built exactly that for a commit). That is already a
+      # unit test - `a_bare_digest_becomes_something_a_daemon_can_pull` in
+      # solve.rs - so removing the step loses no coverage and costs no
+      # daemon.
+      #
+      # What it DID cost was everything below it: `set -e` on a step that
+      # always failed meant the end-to-end seeding check never ran once, and
+      # `seeds=off` went unexplained in every fleet run for a week.
+      #
+      # The MECHANISM, not just the path: write a marker into cache A,
+      # harvest A, read the marker back out of cache B seeded from that
+      # harvest. B is a different id on purpose - read it back out of A and
+      # it passes by meeting A's own warm mount.
       #
       # Thirty seconds, against the twenty-five minute fleet run that is the
       # only other way to ask.
