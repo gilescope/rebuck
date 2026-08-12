@@ -1127,6 +1127,37 @@ jobs:
           grep -E '^\[worker\] (vertices|[0-9]+ blobs over|of that,|served [0-9]+ MiB)' \
             "worker-${WORKER_N}.log" || echo "  (worker printed no serve summary)"
 
+          # HOW MANY CACHE MOUNTS THIS DAEMON ENDED UP WITH, which decides
+          # whether cold mounts can be the amplification at all.
+          #
+          # A mount persists on the daemon that made it, so if leads reuse
+          # them this should be a HANDFUL - the same few ids the baseline
+          # holds - and cold mounts then cost about one fill per worker,
+          # a few hundred seconds across the fleet. That is nowhere near the
+          # 4,716s of excess `building` to be explained.
+          #
+          # If instead it is HUNDREDS, every lead got a fresh empty
+          # directory, because `getRefCacheDir` keys on `id + ":" +
+          # ref.ID()` and a per-lead rewrite gives a per-lead input ref. Then
+          # the refill is paid 359 times rather than 6, and cold mounts are
+          # the whole story.
+          #
+          # One `du -v` answers a question that has been argued from first
+          # principles twice tonight.
+          echo "=== cache mounts this worker's daemon ended with"
+          # `own-bk` is this worker's daemon - the same name the start step
+          # uses. Named wrongly once already this session (worker-*.log
+          # grepped on the coordinator, which has no such file), so it is
+          # taken from the `docker run` above rather than guessed.
+          du=$(docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 du -v 2>/dev/null || true)
+          if [ -z "$du" ]; then
+            echo "cache mounts: (du unavailable - the daemon is already gone)"
+          else
+            echo "cache mounts: $(printf '%s' "$du" | grep -c 'cached mount')"
+            printf '%s' "$du" | grep -oE 'with id "[^"]*"' \
+              | sort | uniq -c | sort -rn | head -10
+          fi
+
   coordinator:
     needs: plan
     runs-on: ubuntu-latest
