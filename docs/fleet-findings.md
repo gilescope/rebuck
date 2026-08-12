@@ -8404,3 +8404,42 @@ was ~8,000s at occupancy 7.5 on six workers. At four slots on one, the leg
 should be roughly 2,000s - and less if the ancestry hypothesis is right,
 since a single machine materialises the common 705 MiB once rather than six
 times. Job cap is 150 minutes, so there is ample room either way.
+
+### What the 705 MiB is, and why no distribution change touches it
+
+The coordinator's registry, run D:
+
+```text
+29 blobs over 1MiB: 690 MiB distinct, 725 MiB served (1.1x re-served)
+   171 MiB x1   sha256:5b2edfa0...
+    65 MiB x1   sha256:b05ba1b3...
+    64 MiB x1   sha256:451dca8a...
+    63 MiB x1   sha256:6e77fc65...
+    37 MiB x1   sha256:485a2ed9...
+```
+
+690 MiB distinct on the coordinator against ~705 MiB per worker - the same
+set, one copy each. One 171 MiB layer dominates, four more in the 37-65 MiB
+range, then a tail. That is the shape of a language toolchain image plus a
+few build outputs, and the build genuinely needs it.
+
+**The bytes are already being distributed well.** The coordinator serves its
+set 1.1x - almost no repeat - and 81% of worker fetches are local. Prefetch
+announces base-image layers, and layer digests do NOT change under
+`make_portable`, which rewrites the reference and leaves the content
+addresses alone. So the layers are pre-positioned, arrive early, and are
+found locally when wanted.
+
+**And it does not help, because the cost is not the fetch.** Each machine
+must UNPACK those 690 MiB into snapshots before it can run anything on top
+of them. That is CPU, it is paid once per machine, and no amount of clever
+routing changes how many machines have to do it. Six machines unpack a
+toolchain that one machine unpacks once.
+
+This closes the "what is the ancestry" question. It is a real, necessary,
+irreducible ~700 MiB, distributed efficiently, and unpacked six times.
+
+The only levers principle 30 leaves are therefore the two it named: **fewer
+machines**, or **more work per machine to amortise it**. Both are workload
+decisions, not scheduler ones - and `-w1` is the first measurement of what
+the lever is worth.
