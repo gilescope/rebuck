@@ -1673,6 +1673,16 @@ impl Wire {
                     "prefetch",
                     std::env::var("REBUCK2_PREFETCH").as_deref() == Ok("1")
                 ),
+                // Distinct from `prefetch`, which announces base images and
+                // cut prefixes the proxy already knows are shared. This one
+                // announces SUBTREE RESULTS whose op has two or more
+                // consumers - the branch that compared two spellings of a
+                // digest and therefore never fired. Listed separately so a
+                // run says which of the two was on.
+                (
+                    "prefetch_results",
+                    std::env::var("REBUCK2_PREFETCH_RESULTS").as_deref() == Ok("1")
+                ),
                 (
                     "graft",
                     std::env::var("REBUCK2_GRAFT").as_deref() == Ok("1")

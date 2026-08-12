@@ -2001,6 +2001,19 @@ impl Driver {
             return;
         }
         if let Some(op) = op {
+            // ITS OWN SWITCH, default off, and the reason is experimental
+            // hygiene rather than doubt. This branch has never once fired -
+            // it compared two spellings of a digest and always read zero -
+            // so fixing that comparison silently turns on a new source of
+            // announcements, and the thing it announces is a SUBTREE RESULT:
+            // 65 MiB apiece, per the note at the call site. Landing that in
+            // the same run as a seeding measurement would confound both.
+            //
+            // The bug is fixed either way. Whether the mechanism it unblocks
+            // pays is a separate question with its own run.
+            if std::env::var("REBUCK2_PREFETCH_RESULTS").as_deref() != Ok("1") {
+                return;
+            }
             let n = self.consumers_of(op).await;
             if n < 2 {
                 // ONE consumer is not shared content. Pushing it spends
@@ -2010,6 +2023,7 @@ impl Driver {
                 println!("[driver] not prefetching {image_ref}: {n} consumer(s)");
                 return;
             }
+            crate::mech::applied("prefetch_results");
             println!("[driver] prefetching {image_ref}: {n} consumers");
         } else {
             // The other reason, and it needs its own line: `None` here means
