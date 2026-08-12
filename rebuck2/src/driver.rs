@@ -2109,46 +2109,27 @@ impl Driver {
             // FIRST. Every worker fetched it at lead time instead, and 60
             // leads in run 31554856118 died on
             // `...subtree@sha256:...: not found`.
+            // ONE implementation of "which blobs does this image mean",
+            // in solve.rs where it is tested. The driver's job is only to
+            // answer whether this CAS holds the manifest - and `size_of`
+            // returning None IS that answer, which the first version threw
+            // away with `unwrap_or(0)` and announced the digest regardless.
             let blobs = match blobs {
-                Some(mut d) => {
-                    // The HASH comes from `manifest_dig`, not from
-                    // `bare_digest`. The latter strips a leading `sha256:`
-                    // and nothing else, so handed a full
-                    // `host/repo@sha256:...` it returns the whole reference
-                    // and the size lookup silently misses - which is how a
-                    // "free to be right" size ends up always zero.
-                    // ONLY IF WE HOLD IT, and `size_of` is that test - not
-                    // a nicety about getting the size right.
-                    //
-                    // The first version passed `unwrap_or(0)` and announced
-                    // the digest anyway. Every worker then asked the fleet
-                    // for a manifest the coordinator did not have, and run
-                    // 31559656955 is full of the result:
-                    //
-                    //   prefetch MISS f3f3190a (0 bytes):
-                    //     driver CAS missing blob f3f3190a.../0
-                    //
-                    // A manifest reaches the CAS when a client PUTs it here;
-                    // one resolved upstream, or held only as a tag, never
-                    // does. Announcing what we cannot serve turns a
-                    // pre-position into a guaranteed round trip and a failed
-                    // fetch, which is worse than not announcing at all.
-                    if let Some(m) = crate::solve::manifest_dig(&r, 0) {
-                        match this.store.size_of(&m.hash).await {
-                            Some(size) if !d.iter().any(|x| x.hash == m.hash) => {
-                                d.push(crate::mesh::Dig {
-                                    size: size as i64,
-                                    ..m
-                                });
-                            }
-                            Some(_) => {}
-                            None => println!(
-                                "[driver] prefetch: not announcing manifest {} for {r} -                                  this CAS does not hold it",
+                Some(d) => {
+                    let held = match crate::solve::manifest_dig(&r, 0) {
+                        Some(m) => this.store.size_of(&m.hash).await,
+                        None => None,
+                    };
+                    if held.is_none() {
+                        if let Some(m) = crate::solve::manifest_dig(&r, 0) {
+                            println!(
+                                "[driver] prefetch: not announcing manifest {} for {r} - \
+                                 this CAS does not hold it",
                                 m.hash
-                            ),
+                            );
                         }
                     }
-                    Some(d)
+                    Some(crate::solve::announce_set(&r, d, held))
                 }
                 None => None,
             };

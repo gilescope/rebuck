@@ -554,6 +554,31 @@ pub async fn publish_context(
 /// expect - a manifest LIST rather than a manifest, an empty layers array,
 /// a digest without its algorithm - and none of those need a registry to
 /// reproduce.
+/// The blobs to announce for an image: its contents, plus the manifest
+/// itself when this CAS actually holds it.
+///
+/// `manifest_size` is an `Option` and not a number with a zero fallback,
+/// because the two cases are different facts and the first wiring conflated
+/// them. `size_of` returning None means we do not have the blob; announcing
+/// it anyway makes every worker ask the fleet for something nobody can
+/// serve, which is a guaranteed round trip and a failed fetch rather than a
+/// pre-position. Run 31559656955 did exactly that, dozens of times.
+pub fn announce_set(
+    reference: &str,
+    mut blobs: Vec<crate::mesh::Dig>,
+    manifest_size: Option<u64>,
+) -> Vec<crate::mesh::Dig> {
+    let Some(size) = manifest_size else {
+        return blobs;
+    };
+    if let Some(m) = manifest_dig(reference, size as i64) {
+        if !blobs.iter().any(|b| b.hash == m.hash) {
+            blobs.push(m);
+        }
+    }
+    blobs
+}
+
 /// The manifest's own blob, when the reference names it by digest.
 ///
 /// [`manifest_blobs`] returns what a manifest POINTS AT, namely config and
@@ -1339,6 +1364,66 @@ mod tests {
         // tcp:// is what earthly writes and what tonic cannot dial, so it
         // becomes http:// rather than being passed through to fail later.
         assert_eq!(d("tcp://host:8372"), "http://host:8372");
+    }
+
+    /// Announcing a manifest the coordinator does not hold.
+    ///
+    /// The first wiring of `manifest_dig` read the size with
+    /// `size_of(..).unwrap_or(0)` and announced the digest regardless. But
+    /// `size_of` returning None means THIS CAS DOES NOT HAVE IT, and run
+    /// 31559656955 is full of what that costs:
+    ///
+    /// ```text
+    /// prefetch MISS f3f3190a (0 bytes): driver CAS missing blob f3f3190a.../0
+    /// ```
+    ///
+    /// Dozens of digests, all zero bytes, every worker asking the fleet for
+    /// a manifest nobody had. Announcing what cannot be served is worse than
+    /// announcing nothing: it converts a pre-position into a guaranteed
+    /// round trip and a failed fetch, on every worker, for every image.
+    ///
+    /// The size is now an `Option` all the way to the decision, so "we do
+    /// not hold it" cannot be spelled as "it is zero bytes long".
+    #[test]
+    fn a_manifest_we_do_not_hold_is_not_announced() {
+        use super::announce_set;
+        use crate::mesh::Dig;
+        let layers = vec![Dig {
+            hash: "aa".into(),
+            size: 10,
+        }];
+        let r = "172.17.0.1:15000/rebuck2/subtree@sha256:abc123";
+
+        // Held: the manifest joins its own contents, with its real size.
+        let with = announce_set(r, layers.clone(), Some(493));
+        assert_eq!(with.len(), 2);
+        let m = with
+            .iter()
+            .find(|d| d.hash == "abc123")
+            .expect("manifest announced");
+        assert_eq!(m.size, 493);
+
+        // NOT held: contents only. This is the whole point.
+        let without = announce_set(r, layers.clone(), None);
+        assert_eq!(
+            without.len(),
+            1,
+            "a manifest we cannot serve must not be announced"
+        );
+        assert!(!without.iter().any(|d| d.hash == "abc123"));
+
+        // A tag names no manifest blob, so there is nothing to add either way.
+        assert_eq!(
+            announce_set("ghcr.io/me/x:v1", layers.clone(), Some(493)).len(),
+            1
+        );
+
+        // Already present: not duplicated.
+        let dup = vec![Dig {
+            hash: "abc123".into(),
+            size: 493,
+        }];
+        assert_eq!(announce_set(r, dup, Some(493)).len(), 1);
     }
 
     /// A prefetch that announces an image's contents but not the image.
