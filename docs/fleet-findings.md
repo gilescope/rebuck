@@ -98,6 +98,8 @@ confident version first - which has happened to me, in this file, twice.
 | The amplification is inside `building` | placing 0s, waiting 4115s, building 4917s - the RATIO to the baseline is unsettled, see the correction |
 | More machines cannot fix it | building alone needs 25 machines to reach the baseline; Amdahl caps at 5.67x |
 | Cache-mount seeding has never once run | four mechanical reasons, plus a fifth that defeats even a warm bank |
+| Seeding now runs, and does not pay | four seeded runs, best leg 1396s against an unseeded band that starts near 1113s |
+| Delivery failure is NOT why the fleet is slow | 325 prefetch misses cost 7 lead failures; the lazy path absorbs the rest |
 | Cold cache mounts are NOT the amplification | each worker ends with 2-4 mounts, so they are reused across its ~69 leads |
 | The fleet costs ~6-9x the CPU of one machine | 3900/604 and 5155/592 on two runs of identical code - like-for-like at last, and not yet precise |
 | The baseline parallelises 2.73x internally | 604 CPU-s in 221s wall - which is why every wall-clock ratio overstated |
@@ -114,11 +116,12 @@ confident version first - which has happened to me, in this file, twice.
 
 | question | why it is open |
 | -------- | -------------- |
-| How much of the fleet's traffic crosses a wire | `SERVED_BYTES` mixes loopback with peer serving; `SERVED_LOCAL_BYTES` exists and has never reported |
-| Whether the fleet repeats itself, and by how much | the coordinator reports 1.1x; the per-worker figure has never printed |
-| What made the reference run take 50 minutes | not the tap, which costs 1ms. Still unexplained |
-| **What the per-unit cost is** | Two samples of the same binary: 6.5x and 8.7x in CPU. So ~6-9x with a third of run-to-run variance, not a number. Cold mounts eliminated (a handful of mounts per worker, stable across runs). Export bounded at 5-10%. No candidate for the remainder |
-| Whether seeding pays once it can be delivered | never yet measured - every run so far failed before the question could be asked |
+| **Whether the leads are simply too small** | THE live hypothesis. `+all-binaries` wins 2.7x with five leads of minutes; `+test-ast` loses with 412 leads whose median is 2.6s. Same fleet, same per-unit cost. `worth_offering` would test it and has no callers |
+| **What the per-unit cost is** | Two samples of the same binary: 6.5x and 8.7x in CPU. So ~6-9x with a third of run-to-run variance, not a number. Cold mounts eliminated. Export bounded at 5-10%. Delivery eliminated (325 prefetch misses cost 7 leads). No candidate for the remainder |
+| What the run-to-run noise band actually is | never measured. Two identical runs are in flight to find out, and until they land no tens-of-percent claim in this file is safe |
+| How much of the fleet's traffic crosses a wire | `SERVED_BYTES` mixes loopback with peer serving; `SERVED_LOCAL_BYTES` exists and has never reported. The per-worker `N MiB left it` lines now answer most of this |
+| Whether the fleet repeats itself, and by how much | the coordinator reports 1.1x; per-worker figures now print and run to 21x re-served |
+| What made the reference run take 50 minutes | not the tap, which costs 1ms. Still unexplained, and now suspected to be ordinary variance |
 
 **Retracted.** Written here confidently and wrong. Left in place with the
 correction attached, because a deleted mistake gets made again.
