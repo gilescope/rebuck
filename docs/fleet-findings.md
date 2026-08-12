@@ -7005,3 +7005,47 @@ as a seeding measurement:
 
 The placement path is where `-imports` and `-minops` each cost a run, so it
 gets its own experiment with nothing else moving.
+
+### The leading hypothesis for the missing blob, filed before run D
+
+Run C, worker 1, at teardown:
+
+```text
+[worker] 14 blobs over 1MiB: 590 MiB distinct, 3981 MiB served (7x re-served)
+[worker] served 4005 MiB in 104435ms (38.3 MB/s from this registry)
+[worker] of that, 0 MiB went to a client on this box and 4005 MiB left it
+```
+
+Broadcast is doing exactly what it was asked to. 590 MiB of distinct content
+left this machine seven times over - every other worker fetching the same
+seed blobs from whoever had them first - and none of it was for a local
+client. Six workers at that rate is roughly **24 GiB across the mesh** in
+one leg.
+
+**And that is the likely cause of the missing third blob.** A worker
+saturated serving four gigabytes cannot necessarily answer a new blob
+request within `PEER_BLOB_TIMEOUT`, which is five seconds. The walk then
+abandons it, tries the next peer - also busy - and falls through to the
+driver, which is serving everyone at once.
+
+This is not a new discovery so much as a bill coming due. When the handshake
+bound was split from the bulk bound earlier tonight, the entry written then
+said:
+
+> under heavy contention, where a busy worker might genuinely take longer
+> than five seconds to reply to a blob request, more traffic lands on the
+> coordinator than before... if a future run shows the coordinator serving
+> more than it used to, this is the first thing to check.
+
+Broadcast is what created the contention that makes the bound bite, and the
+two changes shipped in the same run.
+
+**If run D's `prefetch MISS` lines say "did not answer for ... in time",
+that is this**, and the fix is not a longer timeout - it is not asking six
+machines to fetch the same 456 MiB simultaneously. The split existed for
+this reason; the mistake was treating "wanted by everyone" as "must be
+fetched by everyone at once" rather than "must reach everyone before it is
+needed", which a staggered or chained distribution also satisfies.
+
+If instead they say `not found`, the bytes were never reachable and the
+contention is a red herring.
