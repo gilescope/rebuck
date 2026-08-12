@@ -6280,10 +6280,20 @@ Three things follow, and the third is the useful one.
 **Placing is free.** Zero seconds across 414 leads. Whatever is wrong, it is
 not the dispatcher deciding.
 
-**Waiting is not waste, but it bounds the machine count.** 4,115s of leads
-sitting behind other leads on a busy worker. The line's own caveat is right
-that this is a worker being busy rather than a fleet failing - but it also
-says six machines is fewer than this workload wants, and that is a knob.
+**Waiting is not waste, and it is NOT an argument for more machines.**
+4,115s of leads sitting behind other leads on a busy worker. The obvious
+reading - 46% queueing, therefore buy machines - is wrong, and worth killing
+before it costs a run.
+
+Building alone is 4,917s. Spread perfectly over six workers that is 820s,
+against a 201s baseline. To get build time under the baseline on
+per-unit costs like today's you would need **25 machines**, and Amdahl caps
+the whole thing at 5.67x however many are present. More machines make the
+fleet faster than the fleet; they cannot make it faster than one machine
+while each unit of work costs fourteen times what it costs there.
+
+So `-w12` stays cancelled, now for a second and better reason than the
+ceiling arithmetic that cancelled it the first time.
 
 **The amplification lives entirely in `building`.** 4,917s of building
 against a 201s baseline is **24.5x the build work one machine does for the
