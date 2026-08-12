@@ -20,7 +20,7 @@ for anything that only needs one daemon.
 | ----- | --- |
 | *Current state of belief* | what is established, open and retracted, in three tables |
 | *Superseded figures* (just below it) | the number you are about to read may be one this file has since withdrawn |
-| *Run C: the first like-for-like amplification* | 6.5x in CPU, and cold cache mounts eliminated |
+| *Run D, and the correction it forces* | the amplification is 6-9x in CPU, and one run does not measure it |
 | *`-balance` evens the counts* | leads vary 1.96x, CPU varies 8.2x - the cheapest remaining win |
 | *The workload sets the ceiling* (principle 19) | most "the fleet is slow" numbers are Amdahl |
 
@@ -32,7 +32,8 @@ wrong answer was mine and the correction is in the same file.
 **The state in one paragraph.** Every named target in earthbuild's Earthfile
 runs through the fleet; coverage is done. The fleet spends about **6.5x the
 CPU** one machine spends on the same target, which is the whole remaining
-problem and the first honestly-measured version of it - every larger figure
+problem. Two runs of identical code put it at 6.5x and 8.7x, so treat it as
+a range with a third of variance rather than a figure; every LARGER number
 in this file divided a sum over concurrent leads by a wall clock. Cache-mount
 seeding works mechanically and is not yet deliverable at scale. Nothing
 currently explains the 6.5x.
@@ -98,7 +99,7 @@ confident version first - which has happened to me, in this file, twice.
 | More machines cannot fix it | building alone needs 25 machines to reach the baseline; Amdahl caps at 5.67x |
 | Cache-mount seeding has never once run | four mechanical reasons, plus a fifth that defeats even a warm bank |
 | Cold cache mounts are NOT the amplification | each worker ends with 2-4 mounts, so they are reused across its ~69 leads |
-| The fleet costs ~6.5x the CPU of one machine | 3900 worker CPU-s against 604 baseline CPU-s, the first like-for-like figure |
+| The fleet costs ~6-9x the CPU of one machine | 3900/604 and 5155/592 on two runs of identical code - like-for-like at last, and not yet precise |
 | The baseline parallelises 2.73x internally | 604 CPU-s in 221s wall - which is why every wall-clock ratio overstated |
 | Worker load is 8.2x unequal | 160s to 1316s of CPU across six machines on one target |
 | The seeding mechanism itself works | `check-seeding` green on x86 CI and arm64 local: write, harvest, seed a COLD mount, read back |
@@ -116,7 +117,7 @@ confident version first - which has happened to me, in this file, twice.
 | How much of the fleet's traffic crosses a wire | `SERVED_BYTES` mixes loopback with peer serving; `SERVED_LOCAL_BYTES` exists and has never reported |
 | Whether the fleet repeats itself, and by how much | the coordinator reports 1.1x; the per-worker figure has never printed |
 | What made the reference run take 50 minutes | not the tap, which costs 1ms. Still unexplained |
-| **What the per-unit cost is** | MEASURED: 3900 worker CPU-seconds against 604 baseline CPU-seconds = 6.5x, ~4.6x after duplication. Cold mounts eliminated (2-4 mounts per worker = reuse works). Export bounded at 5-10%. Still no candidate for the remainder |
+| **What the per-unit cost is** | Two samples of the same binary: 6.5x and 8.7x in CPU. So ~6-9x with a third of run-to-run variance, not a number. Cold mounts eliminated (a handful of mounts per worker, stable across runs). Export bounded at 5-10%. No candidate for the remainder |
 | Whether seeding pays once it can be delivered | never yet measured - every run so far failed before the question could be asked |
 
 **Retracted.** Written here confidently and wrong. Left in place with the
@@ -7228,3 +7229,63 @@ Found by running the tool I had just changed, against a run I had already
 downloaded and grepped by hand twice. The map was in the step log the whole
 time; I had been reading `declined` lines and never the `not routed` field
 that aggregates them by cause.
+
+## Run D, and the correction it forces: one run does not measure the amplification
+
+Run `31559656955`. Between it and run C, **nothing functional changed** - the
+diff is the `prefetch MISS` line, a shortfall warning, a size-attribution fix
+in a diagnostic, and documentation.
+
+| | run C | run D |
+| ---------------- | ------ | ------ |
+| worker CPU total | 3,900s | 5,155s |
+| baseline CPU | 604s | 592s |
+| **amplification** | **6.5x** | **8.7x** |
+| leg | 1,625s | 1,396s |
+| placing | 1,751s | 443s |
+| home | 91 | 7 |
+| CPU spread | 8.2x | 5.9x |
+
+**The CPU cost rose 34% while the leg fell 14%, with no functional change.**
+
+So the 6.5x I published two hours ago as "the first like-for-like
+amplification" is not a measurement, it is a sample. Two samples of the same
+binary give 6.5x and 8.7x. The honest statement is **"between about 6x and
+9x, on six shared CI runners, with run-to-run variance of a third"**, and
+anything narrower needs repetition this file has never done.
+
+That is the same error as the 24.5x, one level up. There the arithmetic was
+wrong; here the arithmetic is right and the sample size is one. I corrected a
+figure by replacing it with a better-computed figure and did not ask how
+stable it was.
+
+**It also undermines the run-to-run story tonight.** A 91-to-7 fall in `home`
+and a 1751s-to-443s fall in `placing` looked like the delivery fixes landing.
+Nothing functional changed. Either those numbers swing by an order of
+magnitude between identical runs, or the failing content differs per run -
+and run C's 87-of-91 single blob says the latter is at least partly true.
+
+### What survives
+
+**Cold cache mounts are still eliminated.** C: 2 4 2 2 0 2. D: 2 4 2 4 4 4. A
+handful both times, so mounts are reused across a worker's leads in both, and
+one fill per worker cannot be a 6-9x amplification. That conclusion rests on
+a count that is stable across runs rather than on a duration that is not.
+
+**The load spread is real but its size is not settled.** 8.2x in C, 5.9x in
+D. Both large, neither precise.
+
+**325 prefetch misses in run D, and all of them are mine** - the manifest
+digests announced without checking the CAS held them, fixed in the commit
+above. Run D therefore measures a fleet carrying a regression I introduced,
+which is a further reason its numbers are not a baseline for anything.
+
+### What this changes about method
+
+Every comparison in this file between two runs is a comparison of single
+samples. Where the effect was large - prefetch 1773s to 1240s, `-balance`
+1240s to 1050s - that is probably still safe. Where it was tens of percent,
+it may be noise, and the entries claiming those should be read with that in
+mind rather than rewritten now on the strength of one more sample.
+
+The cheap remedy for anything that matters from here: run it twice.
