@@ -7482,3 +7482,44 @@ Recorded at this depth because "wire up worth_offering" is the kind of task
 that reads as trivial and turns out to be a missing join - and because the
 opposite happened tonight with `manifest_dig`, which read as trivial, was
 trivial, and shipped a regression anyway.
+
+#### The unknown resolves: the two names are not the same string
+
+Checked, and the join named in step 1 does not hold.
+
+`describe_root` returns the LLB vertex's `llb.customname` - earthly's
+DISPLAY name - while `timings::Key` is built from an earthly TARGET REF plus
+build args. Different things, and the difference is already recorded in this
+repo as having cost someone six attempts:
+
+> earthly ABBREVIATES the directory in its display names and in the target
+> names it puts in OTLP spans, so the traces say
+> `./t/integration-base+test-base` and there is no such path. Six warm-ups
+> failed identically on "No Earthfile nor build.earth file found" because
+> the target was copied out of a log.
+
+So the mapping is not just absent, it is **lossy in the direction that
+matters**: display name to target ref cannot be done by string manipulation,
+because `./t/` could have been `./tests/` or `./tools/`.
+
+Three ways out, and the choice is a real design decision rather than a
+detail:
+
+- **map it anyway**, by listing the Earthfile's targets once at startup and
+  matching display names against them. Cheap, and it fails closed - an
+  unmatched name simply has no estimate and dispatches as today.
+- **key the estimate on the graph** instead of the target: the proxy already
+  sees the terminal op digest and could bank observed `lead_ms` against it.
+  The timings module argues against exactly this - "key an estimate on
+  content and it is perfect and useless, every commit empties the table" -
+  but a SUBTREE's digest is stable across commits that do not touch it,
+  which is most commits for most subtrees. Worth measuring rather than
+  assuming.
+- **take the name from the traces**, which the workflow already collects
+  with `rebuck2.target` resource attributes - and which carry the same
+  abbreviation, so this is the first option wearing a hat.
+
+Recorded because the previous entry called this "the one real unknown" and
+it took four minutes to answer. The answer makes the experiment bigger than
+it looked, which is exactly what wanted knowing before someone started it at
+the end of a long night.
