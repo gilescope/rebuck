@@ -2435,6 +2435,21 @@ The standing goal is larger and larger parts of it, so here is the ledger.
 | `+all-binaries`          | 5 cross-compiles off one `+code` stem  | **green both legs**, 262s vs 712s, 2.3x ceiling           |
 | `+lint-all`              | 3 independent lint targets, no docker  | parity, 88s vs 252s after the retry fix (was 628s)        |
 | `+all-buildkitd`         | multi-arch buildkitd, needs qemu       | **parity**, 1161s vs 1188s - arm64 half is undispatchable |
+| `+test-ast`              | 412 solves, the densest fan-out here   | **parity** - the target every mechanism is measured on    |
+| `+all`                   | the whole Earthfile                    | **parity**, 2724s, zero failed - a chain, not a fan-out   |
+
+**Coverage is complete.** Every named target in earthbuild's Earthfile has
+been through the fleet with parity against a one-machine baseline. The
+standing goal of "larger and larger parts" has no larger part left to take;
+what remains is the cost of taking them, which is the rest of this file.
+
+`+test-ast` earns its place at the bottom of the list and the top of the
+attention: it is where the 6.5x CPU amplification was finally measured,
+because 412 solves on a 221-second baseline is the densest fan-out in the
+repo and the only target where a mechanism's effect is visible above noise.
+`+all` is the opposite - occupancy 0.99 against a 2.81 ceiling, one solve in
+flight at a time, because earthly orders its targets and the fleet cannot
+reorder them.
 
 Everything above the last line is the same shape wearing different numbers:
 a long serial base chain, then nested earthly builds that each want a 600
