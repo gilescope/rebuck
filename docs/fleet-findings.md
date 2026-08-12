@@ -7935,3 +7935,48 @@ run is enough).
 If same-config CPU agrees to ~10%, one run at three workers settles it. If
 it agrees to ~40%, the `-w3` test needs repeating too, and that is worth
 knowing before firing it rather than after.
+
+### Better than `-w3`: one worker isolates the per-lead cost
+
+Writing the model down properly gives a cleaner first run than the ratio
+test:
+
+```text
+fleet CPU at n workers  ~  n*A  +  W  +  leads*P
+                           |       |     |
+                           |       |     per-lead overhead (export, push,
+                           |       |     over-materialisation)
+                           |       the real work, split between machines
+                           ancestry, materialised once per machine
+```
+
+At **n = 1** there is no duplication at all: one machine materialises the
+ancestry once, exactly as the baseline does. So
+
+```text
+fleet CPU at 1 worker  -  baseline CPU  =  leads * P
+```
+
+which is the per-lead overhead **measured directly**, with no model fitting
+and no assumption about how much of the baseline is ancestry. Subtract it
+from the six-worker figure and what is left is `5A`.
+
+| run | gives |
+| --- | ------------------------------------------- |
+| `-w1` | `leads * P` directly, as the excess over baseline CPU |
+| `-w6` | already measured: 5,575s CPU, 9.2x |
+| the two together | `A` and `P` separately, which is the whole question |
+| `-w3` | a check that the model is linear, not the measurement |
+
+It is also the cheapest run in the series - two runners - and the one most
+likely to be misread as pointless, because a "fleet" of one machine sounds
+like a null experiment. It is the opposite: it is the only configuration
+where the ancestry term vanishes and the per-lead term stands alone.
+
+Both branches added to the trigger list, parsing verified (`-w1` strips to
+workload `ast`, `W=1`).
+
+One caveat to record before the run rather than after: with a single worker
+the leg will be long and occupancy near 1, so **the leg from this run means
+nothing** and only the CPU figures should be read. A fleet of one is not a
+fleet; it is an instrument.

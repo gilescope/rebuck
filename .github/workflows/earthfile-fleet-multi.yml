@@ -91,6 +91,18 @@ on:
       #
       # `-w3` is stripped by the plan job before the workload suffixes, so
       # the target still resolves to `+test-ast`.
+      # ONE WORKER isolates the per-lead cost. With a single machine there
+      # is no ancestry duplication at all - it materialises once, exactly as
+      # the baseline does - so whatever CPU amplification remains is purely
+      # what a worker does that the baseline never does: export, push, and
+      # any over-materialisation forced by the portable rewrite.
+      #
+      # fleet CPU at n workers ~ n*A + W + leads*P. At n=1 that is
+      # A + W + leads*P, and the baseline is A + W, so the excess IS
+      # leads*P. Subtracting it from the six-worker figure leaves 5A.
+      # Two runs, both terms; -w3 becomes a check rather than the
+      # measurement.
+      - giles-dispatch-ci-ast-balance-w1
       - giles-dispatch-ci-ast-balance-w3
       - giles-dispatch-ci-ast-balance-w12
       # Seeding ON TOP of balance, not instead of it. `-ast-seed` already
