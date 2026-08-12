@@ -6153,3 +6153,43 @@ available before the evidence.
   there; `watch-vertices` already reads them. This is the only option that
   costs one run, and it shares machinery with the `-vtx` step currently
   gated off under suspicion.
+
+### Why you cannot just read the cache key off the daemon
+
+The obvious escape from the ordering problem: the daemon knows which
+directory it wrote, so ask it. `buildctl du -v` names every cache mount, the
+harvest already parses those names, and if the name carried the full key the
+harvest could mount it directly and need no observed input at all.
+
+It does not. From `solver/llbsolver/mounts/mount.go` in the earthbuild fork:
+
+```go
+name := fmt.Sprintf("cached mount %s from %s", m.Dest, mm.managerName)
+if id != m.Dest {
+    name += fmt.Sprintf(" with id %q", id)      // <- id, not key
+}
+...
+key := id
+if ref != nil { key += ":" + ref.ID() }         // <- what lookup uses
+...
+sis, err := SearchCacheDir(ctx, g.cm, key, false)
+```
+
+The description is built from **`id`**; the persisted record is found by
+**`key`**. They differ by `":" + ref.ID()`, and `ref.ID()` is
+`identity.NewID()` - random at record creation, not derived from content,
+and not exposed by any API the harvest can reach.
+
+So `du -v` can tell you a mount called `go-mod` exists and how big it is,
+and cannot tell you which directory it is. The only way to name that
+directory is to present the same mount INPUT and let buildkit hand back the
+same cached ref, with the same random id, from its own records.
+
+Which is what the existing design does, and why it needs inputs observed
+from a real graph. The ordering problem is therefore not an implementation
+shortcut to be routed around - it is forced.
+
+That leaves exactly two routes: carry inputs between runs in the bank
+(already built, and until this evening defeated by a truncating write), or
+observe the baseline by putting something in front of its daemon that
+records graphs without dispatching them.
