@@ -63,7 +63,7 @@ confident version first - which has happened to me, in this file, twice.
 | Building is roughly a quarter of lead time | 4,407s of `took Nms` against 14,812s of `lead_ms` |
 | A cap inside a cap turns slow into failed | worker `timeout 3000` under a 150-minute job |
 | Fixing prefetch took 30% off the fleet leg | 1773s -> 1240s, same target, same 412 solves |
-| Choosing a worker costs nothing | `placing 0s (0%)` - no offer was ever refused |
+| No offer was ever refused, on the runs that worked | `placing 0s (0%)` - and that is ALL that field says: it is stamped only on a decline, so it can never report the cost of choosing |
 | Queueing WAS the largest cost | `waiting 6583s (65%)`; trading warmth against queue depth cut it to 3670s (45%) |
 | Spreading beats concentrating, and costs what it should | 1240s -> 1050s, no idle machine, `building` up 1004s against `waiting` down 2913s |
 | **Building is now the majority term** | 4521s (55%) - what `-bcast` aims at |
@@ -85,6 +85,16 @@ confident version first - which has happened to me, in this file, twice.
 | The prefetch counting gate is dead | 0 acceptances, 14 refusals, 292 prefetches bypassing it |
 | The worker vertex tap costs 15% and is confounded | 1050s -> 1207s; 4,964s of vertex time in a 1,207s leg |
 | **The apparatus still works after ~640 commits** | checkpoint run: parity green, 1113s leg, 201s baseline, 412/412 routed |
+| The amplification is entirely inside `building` | placing 0s, waiting 4115s, building 4917s against a 201s baseline = 24.5x |
+| More machines cannot fix it | building alone needs 25 machines to reach the baseline; Amdahl caps at 5.67x |
+| Cache-mount seeding has never once run | four mechanical reasons, plus a fifth that defeats even a warm bank |
+| The seeding mechanism itself works | `check-seeding` green on x86 CI and arm64 local: write, harvest, seed a COLD mount, read back |
+| A diagnostic deleted the data its consumer needed | `check-seeding` truncated the inputs file 3s before `harvest-cache` read it |
+| Merging instead of truncating fixed the harvest | run A harvest 8s (read nothing), run B 65s against 1.6 GB held |
+| An empty seed is not neutral | emitted anyway, applied to 360 mounts, leg 1113s -> 1783s |
+| A seed was split 1-in-N across the fleet | `usable_seeds` says "on every machine" and used the splitting path; 274 leads failed fetching it |
+| One timeout bounded two different failures | 5s around dial AND transfer makes any blob over ~50 MB unfetchable by construction |
+| The two peer fetches disagreed | driver over-bounded, worker unbounded - two wrong answers, nothing connecting them |
 
 **Open.** Believed for a reason, not measured.
 
@@ -93,8 +103,9 @@ confident version first - which has happened to me, in this file, twice.
 | How much of the fleet's traffic crosses a wire | `SERVED_BYTES` mixes loopback with peer serving; `SERVED_LOCAL_BYTES` exists and has never reported |
 | Whether the fleet repeats itself, and by how much | the coordinator reports 1.1x; the per-worker figure has never printed |
 | What made the reference run take 50 minutes | not the tap, which costs 1ms. Still unexplained |
-| **What the 12.5x is** | fleet builds 21.3x the baseline, duplication explains 1.7x |
-| Why `-bcast` breaks `+test-ast` | two hypotheses checked and refuted; cause unknown |
+| **What the 13.6x is** | it is entirely inside `building`; export is bounded at 5-10%, cold cache mounts are the only candidate of the right size |
+| Why `-bcast` breaks `+test-ast` | three hypotheses refuted; two families eliminated by tracing the error to containerd `images.Manifest()` |
+| Whether seeding pays once it can be delivered | never yet measured - every run so far failed before the question could be asked |
 
 **Retracted.** Written here confidently and wrong. Left in place with the
 correction attached, because a deleted mistake gets made again.
@@ -106,6 +117,10 @@ correction attached, because a deleted mistake gets made again.
 | "...therefore it was loopback" | `upstream: None` says where a registry FETCHES, not who it SERVES |
 | "93x re-served" | fleet-wide served divided by one machine's distinct - two different registries |
 | `worth_spreading`, a worker-count cap | 162 machine-seconds read as wall clock |
+| "94% of lead time is cache mounts" | `mounts_ms` counts the WHOLE lead of any lead naming a cache - a filter, not a duration |
+| "placing is free, the dispatcher is not the problem" | the field is stamped only on a decline; a zero was never evidence about placement |
+| "seeding costs 1872s rewriting every graph" | wrong mechanism - that 1872s is decline-and-re-offer round trips |
+| "the seed address is unreachable from a worker" | `172.17.0.1:15000` correctly names each worker's own mesh-backed registry; the bytes were not there yet |
 
 The pattern in every retraction is one shape: **a real counter, correctly
 incremented, answering a question I was not asking.** Before building on a
