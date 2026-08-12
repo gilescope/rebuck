@@ -86,6 +86,30 @@ grep -rah "declined subtree" "$dir" | strip \
   | sed -E 's/.*declined subtree job [0-9]+: //; s/sha256:[0-9a-f]+/<digest>/g' \
   | cut -c1-100 | sort | uniq -c | sort -rn | head -6
 
+echo; echo "── CPU, the only like-for-like comparison ──"
+# The leg is a critical path and the baseline's wall is one machine's whole
+# run; dividing them produced three wrong headline figures here. These two
+# lines are comparable to each other and nothing else is. Feed them to
+# scripts/leg-arithmetic.sh rather than dividing by hand - that is what the
+# hand did wrong.
+# NOT a bare grep for the label. A step log contains the workflow's own
+# `echo "baseline cpu: ..."` COMMAND as well as its output, and the first
+# version of this block printed the command twice and no number. Matching
+# the rendered shape - label, digits, `s` - excludes the echo, and `-o`
+# keeps timestamps out of the arithmetic, which the first version summed
+# into a 45-million-second total across 96 imaginary workers.
+grep -rahoE "baseline cpu: [0-9]+s against [0-9]+s wall" "$dir" | sort -u | sed 's/^/  /' | head -2
+wcpu=$(grep -rahoE "worker cpu: [0-9]+s" "$dir" | grep -oE "[0-9]+" | sort -u | paste -sd, -)
+if [ -n "${wcpu:-}" ]; then
+  echo "  worker cpu: $wcpu"
+  printf '%s' "$wcpu" | tr ',' '\n' \
+    | awk '{n++; t+=$1; if(mn==""||$1<mn)mn=$1; if($1>mx)mx=$1}
+           END {printf "  total %ds across %d worker(s), spread %d-%d = %.1fx\n", t, n, mn, mx, mx/(mn?mn:1)}'
+else
+  echo "  (no worker cpu lines - run predates the counters, or cgroup v2 was unreadable)"
+fi
+grep -rahoE "cache mounts: [0-9]+" "$dir" | sort | uniq -c | head -4
+
 echo; echo "── seeding ─────────────────────────────────"
 # THE ONLY HONEST READ, and it needs its own block rather than a line inside
 # `mechanisms`. A seeded mount reports 0.0 MiB in the harvest table - its
