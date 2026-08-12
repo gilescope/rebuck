@@ -5958,3 +5958,62 @@ The genuine residue is smaller and still worth having: **the 55 leads with no
 cache mount average 9.2s; the 359 with one average 23.7s.** That is a 2.6x
 difference between two populations of lead, and it is a real place to look
 next. It is not 94% of anything.
+
+## Why `seeds=off` in every run: the test that never ran
+
+`seeds=off` and `mount arms : seeded p50 0ms (n=0)` have appeared in every
+fleet run this project has recorded. The verdict line was rewritten
+specifically so it could say `off` rather than `0/0`, because three seeding
+attempts had produced no seeding for three different mechanical reasons and
+each time the question "did it even run" cost a log dig.
+
+There is a fourth reason, and it is not in the fleet workflow at all.
+
+`selftest.yml` has a job called `harvest` whose second-to-last step,
+`can a cold cache mount be seeded at all`, is a complete end-to-end test of
+the mechanism: write a marker into cache A, harvest A, seed a COLD cache B
+from that harvest, read the marker back out of B. Different ids on purpose,
+so it cannot pass by meeting A's own warm mount. Thirty seconds, against the
+twenty-five-minute fleet run that is the only other way to ask.
+
+**It has never run.** Not once.
+
+The step before it, `harvest an empty cache mount`, creates a buildkit
+daemon, never builds anything against a cache mount, and then asks
+`harvest-cache` for `smoke-cache`:
+
+```text
+[harvest] 172.17.0.1:28372 reports NO cache mounts at all
+[harvest] no cache id "smoke-cache" on this daemon - skipping.
+Error: harvest-cache: every pair failed
+```
+
+The tool is right and the test is wrong - it asks a fresh daemon for a cache
+that cannot exist. With `set -e`, that failure takes the rest of the job with
+it. Selftest has 0 green runs in its last 100, 65 of them outright failures,
+and the reason has been the same every time.
+
+So the picture is not "seeding was tried and did not pay". It is **seeding
+has never been exercised anywhere** - gated off in the fleet workflow behind
+a `-seed` branch suffix nobody has used, and unreachable in the selftest
+behind a step that cannot pass.
+
+The dead step's only real assertion - that a harvest yields a pullable
+reference rather than a bare digest - is already a unit test
+(`a_bare_digest_becomes_something_a_daemon_can_pull`). Deleted rather than
+repaired.
+
+### Why this matters more than it looks
+
+From the checkpoint run: 359 of 414 leads name a cache mount, and those leads
+average **23.7s against 9.2s** for the 55 that do not. A 2.6x difference
+between two populations of lead, on the target that is furthest from its own
+ceiling.
+
+That is not proof that mounts cause the gap - cache-touching leads are also
+the substantial ones, and the causation could run entirely the other way.
+But it is the largest structural split visible in the data, and the mechanism
+aimed at it has never been switched on.
+
+**Order of work:** let the selftest answer "does seeding work at all" in
+thirty seconds. Only if it does is a `-seed` fleet run worth half an hour.
