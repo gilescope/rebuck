@@ -6326,3 +6326,36 @@ the seeding work already targets.
 **If seeding works and `building` does not move, the 13.6x is something
 else and this whole line of attack is wrong.** That is the falsifiable form,
 and the arms line plus the phase split will answer it in one run.
+
+### The second candidate, and why it is not the answer
+
+13.6x is a lot to hang on cold cache mounts alone, so the other structural
+difference deserves naming: **the baseline exports nothing, and the fleet
+exports everything.**
+
+`solve_request` attaches `publish_attrs(...)` to every dispatched subtree, so
+each of the 414 leads serialises its result, compresses it, and pushes it to
+the mesh registry - inside the same `solve()` call the worker times as
+`build_ms`. So `building` is really build + export + compress + push. One
+machine building the same target does none of it.
+
+That is real, and it is structural rather than a bug: it is the price of
+making a result travel, and principle 10 already says the trees have to
+travel.
+
+**But it cannot be the dominant term.** A fleet run has been observed
+serving ~25.6 GiB. Taking that as the traffic:
+
+| assumption | cost | across 6 workers |
+| ---------------------------- | ------ | ---------------- |
+| transfer at ~100 MiB/s | ~260s | ~43s each |
+| compression at ~50 MiB/s/core | ~520s | ~87s each |
+
+Against 4,917s of building, export accounts for something on the order of
+5-10%, not 1,360%. The assumptions are coarse - deliberately, per principle
+13 - but they are wrong by a factor of two, not by two orders of magnitude,
+and that is all this needs to decide.
+
+So export is named, bounded, and set aside. The per-unit cost is still
+unexplained, and cold cache mounts remain the only candidate on the table
+that is the right SIZE.
