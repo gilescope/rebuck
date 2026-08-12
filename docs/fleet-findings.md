@@ -19,14 +19,23 @@ for anything that only needs one daemon.
 | entry | why |
 | ----- | --- |
 | *Current state of belief* | what is established, open and retracted, in three tables |
-| *Prefetch, once it worked: 1773s to 1240s* | the first change to move the headline by more than noise |
-| *`-balance`: 1240s to 1050s* | and no machine idle; the fault was a preference with no brake |
-| *Building is a quarter of lead time* | and the split that made every mechanism rankable |
+| *Superseded figures* (just below it) | the number you are about to read may be one this file has since withdrawn |
+| *Run C: the first like-for-like amplification* | 6.5x in CPU, and cold cache mounts eliminated |
+| *`-balance` evens the counts* | leads vary 1.96x, CPU varies 8.2x - the cheapest remaining win |
 | *The workload sets the ceiling* (principle 19) | most "the fleet is slow" numbers are Amdahl |
 
 **Read `docs/how-this-lies.md` too**, if you are going to trust any number
-here. Seventeen ways this system has produced a confident wrong answer, four
-of them found in a single day.
+here. Twenty-three ways this system has produced a confident wrong answer,
+six of them found in a single night - including four where the confident
+wrong answer was mine and the correction is in the same file.
+
+**The state in one paragraph.** Every named target in earthbuild's Earthfile
+runs through the fleet; coverage is done. The fleet spends about **6.5x the
+CPU** one machine spends on the same target, which is the whole remaining
+problem and the first honestly-measured version of it - every larger figure
+in this file divided a sum over concurrent leads by a wall clock. Cache-mount
+seeding works mechanically and is not yet deliverable at scale. Nothing
+currently explains the 6.5x.
 
 It lived in `src/proxy.rs` as a module comment until it reached 1342 lines --
 a third of the file, and a chronological log rather than documentation. The
