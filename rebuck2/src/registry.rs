@@ -81,6 +81,7 @@ const MAX_UPLOAD: u64 = 16 * 1024 * 1024 * 1024;
 const MAX_MANIFEST: usize = 32 * 1024 * 1024;
 
 const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
 
 /// What the registry needs of a blob store. Implemented for the local [`Store`]
 /// today; the mesh-backed driver is the same methods with a network hop, which
@@ -571,12 +572,25 @@ fn parse_digest(s: &str) -> Option<&str> {
 
 /// The manifest's own `mediaType`, read back out of the stored bytes. Avoids a
 /// second metadata store, and keeps the manifest itself the single source of
-/// truth (both OCI and Docker v2 manifests carry the field).
+/// truth (Docker v2 always carries the field; OCI only from spec v1.1).
+///
+/// When it is absent, the SHAPE decides: a document with `manifests` is an
+/// index, anything else is an image manifest. Defaulting to manifest for both
+/// is the trap - BuildKit then looks for `config`/`layers` in a list of
+/// descriptors and rejects the media type, blaming the type for a mislabel we
+/// applied ourselves.
 fn media_type_of(bytes: &[u8]) -> String {
-    serde_json::from_slice::<serde_json::Value>(bytes)
-        .ok()
-        .and_then(|v| v.get("mediaType")?.as_str().map(str::to_owned))
-        .unwrap_or_else(|| OCI_MANIFEST.to_string())
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return OCI_MANIFEST.to_string();
+    };
+    if let Some(t) = v.get("mediaType").and_then(|t| t.as_str()) {
+        return t.to_owned();
+    }
+    if v.get("manifests").is_some_and(|m| m.is_array()) {
+        OCI_INDEX.to_string()
+    } else {
+        OCI_MANIFEST.to_string()
+    }
 }
 
 fn err(code: StatusCode, oci_code: &str, msg: &str) -> Response {
@@ -2355,6 +2369,41 @@ mod tests {
         let r = router(store());
         let (st, _, _) = call(&r, post("/_rebuck/lease/claim/k")).await;
         assert_eq!(st, StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// `mediaType` is OPTIONAL in the OCI image spec — v1.0 marks it reserved,
+    /// and only v1.1 makes it required for a standalone document. So a real
+    /// index can arrive without it, and guessing "manifest" hands BuildKit a
+    /// list of manifests typed as an image: it reads `config`/`layers`, finds
+    /// neither, and fails on the media type rather than on the content.
+    ///
+    /// Sniff the shape instead: `manifests` means index, `layers` means
+    /// manifest. That is what the field would have said.
+    #[test]
+    fn an_untyped_index_is_not_served_as_a_manifest() {
+        let index = br#"{"schemaVersion":2,"manifests":[
+            {"mediaType":"application/vnd.oci.image.manifest.v1+json",
+             "digest":"sha256:aa","size":1,
+             "platform":{"os":"linux","architecture":"arm64"}}]}"#;
+        assert_eq!(
+            media_type_of(index),
+            "application/vnd.oci.image.index.v1+json"
+        );
+
+        // The other half of the sniff, so the fix cannot be "always index".
+        let manifest = br#"{"schemaVersion":2,
+            "config":{"digest":"sha256:bb","size":1},"layers":[]}"#;
+        assert_eq!(media_type_of(manifest), OCI_MANIFEST);
+
+        // An explicit field always wins over the shape — including the Docker
+        // types, which the sniff must never rewrite into their OCI cousins.
+        let docker_list = br#"{"schemaVersion":2,
+            "mediaType":"application/vnd.docker.distribution.manifest.list.v2+json",
+            "manifests":[]}"#;
+        assert_eq!(
+            media_type_of(docker_list),
+            "application/vnd.docker.distribution.manifest.list.v2+json"
+        );
     }
 
     /// A repo name is a path segment too. Hashing the tag key makes traversal

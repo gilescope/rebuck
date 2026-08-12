@@ -84,6 +84,7 @@ confident version first - which has happened to me, in this file, twice.
 | `+test-ast` is 15x off its own ceiling | 2.97x at seven machines means a 71s best leg against 1050s |
 | The prefetch counting gate is dead | 0 acceptances, 14 refusals, 292 prefetches bypassing it |
 | The worker vertex tap costs 15% and is confounded | 1050s -> 1207s; 4,964s of vertex time in a 1,207s leg |
+| **The apparatus still works after ~640 commits** | checkpoint run: parity green, 1113s leg, 201s baseline, 412/412 routed |
 
 **Open.** Believed for a reason, not measured.
 
@@ -5903,3 +5904,57 @@ experiment instead of a free rider on every baseline.
 Recorded before changing anything, because "my instrument broke the build"
 has happened twice today and both times the fix was to make it optional
 rather than to argue it was safe.
+
+## The checkpoint: the apparatus still works
+
+Two runs in a row had failed parity - `-bcast` at 353s and the join run at
+636s. Both were fast, and both were fast because they stopped early. Before
+attributing either failure to the thing it was testing, the question worth a
+half-hour of CI was the boring one: **does HEAD still produce a working
+build?** Six hundred and forty commits is a lot of apparatus to have never
+re-baselined.
+
+Run `31550028841`, `giles-dispatch-ci-ast-balance`, plain shipped
+configuration - no `-vtx`, so neither the worker vertex tap nor the baseline
+history read. Step 15 reported `skipped`, which is the confirmation that
+mattered: the two-job flag fix holds and the run genuinely excludes both
+suspects.
+
+| | |
+| ---------------------- | ----------------------------------------- |
+| baseline | 201s (band 204-227s) |
+| fleet leg | 1113s (reference 1050s, +6%) |
+| parity | green |
+| solves | 412, all routed, 0 home |
+| occupancy | 8.19, peak 11 |
+| lead time | 9,033,118ms over 414 leads |
+
+**Parity passes.** So the two failures belong to the things that were gated
+off, and the 1050s reference band is intact - 1113s is 6% above it, which is
+within the spread these legs have shown all week.
+
+The leg identity holds again without adjustment: 9033s of lead work at 8.19
+concurrency predicts 1103s against a measured 1113s, 1% out.
+
+### What the run nearly taught me, wrongly
+
+The verdict line also carried `mounts_ms=8527063`, next to
+`lead_ms=9033118`. Ninety-four per cent. Cache-mount arming eating almost the
+whole fleet, the 12.5x explained in a single field, and the seeding mechanism
+that would fix it sitting at `n=0`.
+
+It is not true. `mounts_ms` counted the WHOLE duration of every lead that
+NAMED a cache mount - a filter, not a measurement of mounts. With 359 of 414
+leads touching a cache, 94% was close to arithmetic necessity. The arms line
+two rows down said `cold p50 5677ms`, and a 23.7s mean against a 5.7s median
+was the tell.
+
+Renamed to `lead_ms_with_cache`. Written up as shape 19 in
+`docs/how-this-lies.md`, because the defect was not the counter - whose own
+doc comment was accurate - but the name, and a name is what gets pasted into
+a table.
+
+The genuine residue is smaller and still worth having: **the 55 leads with no
+cache mount average 9.2s; the 359 with one average 23.7s.** That is a 2.6x
+difference between two populations of lead, and it is a real place to look
+next. It is not 94% of anything.

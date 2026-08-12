@@ -2725,8 +2725,8 @@ pub async fn serve(
                  inflight={peak} \
                  occupancy={occupancy:.2} ceiling={ceiling:.2} ceiling_{machines}m={finite:.2} \
                  dup={:.1} seeds={} leads={all_leads} lead_ms={all_lead_ms} \
-                 mounts_ms={} \
-                 mount_leads={}",
+                 lead_ms_with_cache={} \
+                 leads_with_cache={}",
                 std::env::var("REBUCK2_TARGET").unwrap_or_else(|_| "?".into()),
                 w.solves,
                 w.routed,

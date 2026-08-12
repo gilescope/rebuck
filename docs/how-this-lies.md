@@ -265,6 +265,40 @@ broadcast. No general fix: the honest rule is that a counter belongs to the
 process that increments it, and a report may only list what its own process
 counts.
 
+## 19. A name that states the filter and hides the aggregation
+
+**Instance:** the verdict line carried `mounts_ms=8527063` beside
+`lead_ms=9033118`. Read straight off, that is *94% of all lead time spent
+arming cache mounts* - a spectacular finding, and one I wrote down before
+checking. The counter behind it is `driver.rs:949`:
+
+```rust
+if !caches.is_empty() {
+    self.cache_lead_ms.fetch_add(ms, Ordering::Relaxed);
+}
+```
+
+`ms` is the WHOLE lead. The condition is a filter on which leads count; the
+value is not mount time at all. The true statement is the far duller *94% of
+lead time sits in leads that happen to touch a cache* - which, with 359 of
+414 leads touching one, is nearly a tautology.
+
+The function's own doc comment said this correctly (`Lead time spent in leads
+that named ANY cache mount`). Only the wire name lied, and the wire name is
+what gets pasted into a table. **A metric is read at the width of its name,
+not the width of its definition** - nobody greps `verdict` and then opens
+`driver.rs`.
+
+The tell was arithmetic, and it is worth keeping: mean mount-lead cost came
+to 23.7s while the arms line right underneath said `cold p50 5677ms`. A mean
+four times the median is possible, but here it meant the two lines were
+measuring different things.
+
+**Countermeasure:** renamed to `lead_ms_with_cache` / `leads_with_cache`,
+which states the filter AND the aggregation and cannot be read as a duration
+of anything. No general guard - the rule is that a field name must survive
+being read alone, beside `lead_ms`, by someone building a table.
+
 ## The common thread
 
 Twelve of these thirteen produced a GREEN result. Not one announced itself.
