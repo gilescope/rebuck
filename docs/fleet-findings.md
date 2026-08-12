@@ -103,7 +103,7 @@ confident version first - which has happened to me, in this file, twice.
 | How much of the fleet's traffic crosses a wire | `SERVED_BYTES` mixes loopback with peer serving; `SERVED_LOCAL_BYTES` exists and has never reported |
 | Whether the fleet repeats itself, and by how much | the coordinator reports 1.1x; the per-worker figure has never printed |
 | What made the reference run take 50 minutes | not the tap, which costs 1ms. Still unexplained |
-| **What the 13.6x is** | it is entirely inside `building`; export is bounded at 5-10%, cold cache mounts are the only candidate of the right size |
+| **What the 13.6x is** | inside `building`. Export bounded at 5-10%, duplication measured at 1.8x, cold mounts an order of magnitude too small once per-daemon reuse is counted. No candidate currently fits |
 | Why `-bcast` breaks `+test-ast` | three hypotheses refuted; two families eliminated by tracing the error to containerd `images.Manifest()` |
 | Whether seeding pays once it can be delivered | never yet measured - every run so far failed before the question could be asked |
 
@@ -6561,3 +6561,36 @@ real seeds carry the same delivery problem as empty ones, and 1-in-N
 splitting of a blob every worker needs immediately is what produced 274
 `could not fetch content descriptor` failures. Large seeds should make that
 worse, not better.
+
+### Arguing against my own hypothesis, before the measurement
+
+"Cold cache mounts are the only candidate of the right size" is probably
+wrong, and the reasoning is available without waiting for the `du -v`.
+
+A cache mount is keyed `id + ":" + ref.ID()` and persists on the daemon that
+made it. The baseline proves reuse works: after building the whole target it
+holds **six** mounts, not one per exec.
+
+On an UNSEEDED run - which is where the 13.6x was measured - each lead
+carries earthly's own mkdir as the mount input, identical across leads. Same
+key, same directory. A worker taking ~69 of the 414 leads fills `go-mod`
+once and reuses it for the other 68.
+
+So cold mounts should cost about **one fill per worker**, six fills across
+the fleet. The baseline fills all 1.6 GB somewhere inside its whole 201s, so
+six fills is a few hundred seconds at the very most - against **4,716s** of
+excess building to explain. Off by an order of magnitude.
+
+The mechanism that WOULD explain it is a per-lead key: if every lead got a
+fresh empty directory, the refill is paid 359 times rather than 6. But that
+is what SEEDING introduces (`seed_cache_mounts` rewrites the mount input by
+design), not what the unseeded checkpoint did.
+
+**So the honest state is: I do not know what the 13.6x is.** Export is
+bounded at 5-10%. Duplication is measured at 1.8x. Cold mounts look an order
+of magnitude too small once reuse is accounted for. The `du -v` will settle
+the last of those - a handful of mounts per worker confirms the reuse and
+kills the hypothesis; hundreds resurrects it.
+
+Written now because the measurement is already queued and it would be easy,
+afterwards, to remember having expected whichever answer arrived.
