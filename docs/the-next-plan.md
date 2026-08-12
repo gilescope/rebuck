@@ -445,13 +445,23 @@ in one line: **placement decides who does the work, not how much there is.**
 1. Critical path of the op graph. No run. Can end the project.
 2. `-norepro`. One env var, one run. Predicted the largest CPU drop yet.
 3. `-forcecomp`, to de-confound `-nocomp`. One run.
-4. **`-estargz`. One env var, one run, and the code is already wired** —
-   `compression_attrs` (`solve.rs:135`) accepts `estargz` today; the
-   workflow case statement simply has no arm for it. Add
-   `*-estargz*) comp=estargz ;;` beside the `-nocomp` and `-zstd` arms.
-   This is the only lever aimed at the unpack term, it was named in
-   9ed52d5 and never pulled, and it costs less than the reasoning above
-   did.
+4. **`-estargz`, and it is no longer speculative.** Measured locally on
+   x86: a consumer read one file out of a 192 MiB image and fetched
+   **1,143,096 bytes — 5/1000 of the layer**, 9 of 12 blob GETs being
+   HTTP 206. See `scripts/stargz-check.sh` and the ledger entry.
+
+   Two pieces are needed and only one is wired. `compression_attrs`
+   (`solve.rs:135`) accepts `estargz` today, so the export side is an env
+   var plus `*-estargz*) comp=estargz ;;` in the workflow case statement.
+   The consuming side is the work: the snapshotter **cannot** be set via
+   `EARTHLY_ADDITIONAL_BUILDKIT_CONFIG` — the image template hardcodes
+   `[worker.oci] snapshotter = "auto"` and TOML forbids a duplicate table
+   — so each worker's `docker run` must edit the template before the
+   entrypoint renders it, and pass `--device /dev/fuse`.
+
+   **Shipping only the export half measures a regression**, because an
+   estargz blob is bigger than gzip and nothing is skipped without the
+   mount. That is the shape-13 trap this arm has to be built to avoid.
 5. Admission predicate, printed, in the corrected units. No run.
 6. Then, and only if 1 leaves headroom: a load that clears admission, on
    workers that outlive it.

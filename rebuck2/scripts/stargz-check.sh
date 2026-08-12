@@ -17,7 +17,7 @@
 # touch everything moves the same bytes - so the count of 206s is what says
 # the mechanism engaged at all, and the byte total says what it bought.
 #
-# `docker rm -f stargz-reg stargz-src stargz-dst` when done.
+# `docker rm -f stargz-reg stargz-src stargz-dst && docker network rm stargznet`.
 set -uo pipefail
 MIB=192
 while [ $# -gt 0 ]; do
@@ -30,12 +30,19 @@ done
 BK=${BK:-earthbuild/buildkitd:v0.8.17}
 REGPORT=${REGPORT:-15099}
 RUN=${RUN:-${TMPDIR:-/tmp}/rebuck2-stargzcheck}
-# How the daemons reach the registry. Both are containers on the default
-# bridge, so this is the bridge gateway and NOT `host.docker.internal` -
-# that name is how a container reaches the HOST, and the host is not what
-# is serving here. Getting this wrong is how `check-reserve` printed a
-# clean flat line for a total instrument failure (shape 15).
-GW=${GW:-172.17.0.1}
+# How the daemons reach the registry: by CONTAINER NAME on a user-defined
+# network, never through the bridge gateway.
+#
+# `172.17.0.1:$REGPORT` is the host, and reaching the host from a container
+# is the one direction that is not dependable - the x86 box's docker0
+# firewall drops exactly that, which would present here as a registry that
+# is plainly up and plainly unreachable. A user-defined network gives
+# container-name DNS and keeps the traffic off the host entirely.
+#
+# The published port stays, because THIS script still curls the manifest,
+# and host-to-container through a published port is the direction that works.
+NET=${NET:-stargznet}
+REG_ADDR=stargz-reg:5000
 
 mkdir -p "$RUN"
 rm -f "$RUN"/*.log
@@ -55,10 +62,12 @@ docker run --rm --device /dev/fuse alpine:3.20 test -e /dev/fuse >/dev/null 2>&1
   || fail "/dev/fuse is absent in the docker daemon's kernel; stargz cannot mount"
 
 docker rm -f stargz-reg stargz-src stargz-dst >/dev/null 2>&1
+docker network rm "$NET" >/dev/null 2>&1
 sleep 1
+docker network create "$NET" >/dev/null || fail "could not create network $NET"
 
 echo "── registry ──────"
-docker run -d --name stargz-reg -p "$REGPORT:5000" registry:2 >/dev/null \
+docker run -d --name stargz-reg --network "$NET" -p "$REGPORT:5000" registry:2 >/dev/null \
   || fail "could not start registry:2"
 for _ in $(seq 1 60); do
   curl -sf "http://127.0.0.1:$REGPORT/v2/" >/dev/null 2>&1 && break
@@ -66,7 +75,7 @@ for _ in $(seq 1 60); do
 done
 curl -sf "http://127.0.0.1:$REGPORT/v2/" >/dev/null || fail "registry never came up"
 
-REGCFG="[registry.\"$GW:$REGPORT\"]
+REGCFG="[registry.\"$REG_ADDR\"]
   http = true
   insecure = true"
 
@@ -90,7 +99,7 @@ REGCFG="[registry.\"$GW:$REGPORT\"]
 # putting this in CI, not an artefact of testing locally.
 boot() { # name, snapshotter
   local name=$1 snap=$2
-  docker run -d --name "$name" --privileged --device /dev/fuse \
+  docker run -d --name "$name" --network "$NET" --privileged --device /dev/fuse \
     -e BUILDKIT_TCP_TRANSPORT_ENABLED=true -e BUILDKIT_TLS_ENABLED=false \
     -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG="$REGCFG" \
     --entrypoint sh "$BK" -c \
@@ -125,7 +134,7 @@ RUN dd if=/dev/urandom of=/big.bin bs=1M count=$MIB 2>/dev/null \\
 EOF
 docker cp "$RUN/Dockerfile.src" stargz-src:/Dockerfile >/dev/null
 
-IMG="$GW:$REGPORT/stargz/probe:v1"
+IMG="$REG_ADDR/stargz/probe:v1"
 echo "building and exporting as estargz (${MIB} MiB payload)"
 docker exec stargz-src buildctl --addr tcp://127.0.0.1:8372 build \
   --frontend dockerfile.v0 --local context=/ --local dockerfile=/ \
@@ -162,16 +171,36 @@ docker exec stargz-dst buildctl --addr tcp://127.0.0.1:8372 build \
 
 echo "── verdict ──────"
 docker logs stargz-reg 2>&1 | tail -n "+$((MARK+1))" > "$RUN/reg.log"
-GETS=$(grep -c '"GET /v2/stargz/probe/blobs' "$RUN/reg.log")
-PARTIAL=$(grep '"GET /v2/stargz/probe/blobs' "$RUN/reg.log" | grep -c '206')
-SERVED=$(grep '"GET /v2/stargz/probe/blobs' "$RUN/reg.log" \
-         | grep -o '"http.response.written":[0-9]*' | cut -d: -f2 \
+# registry:2 emits BOTH an Apache-style access line and a logrus key=value
+# line for every request. Only the logrus one carries named fields, and it
+# spells the path `http.request.uri="/v2/..."` rather than `GET /v2/...`.
+#
+# Two parses got this wrong before this one, in the same direction:
+#  - `"http.response.written":[0-9]*` - a JSON shape that appears nowhere -
+#    matched nothing, awk summed the empty set to 0, and the script
+#    announced "fetched 0% of the largest layer". Shape 15: a parse that
+#    could not look, reported as a measurement, flatteringly.
+#  - filtering on `GET /v2/...blobs` then reading `http.response.status=`
+#    selected the Apache lines, which have no such field, and found none.
+#
+# Selecting on the logrus line also avoids double-counting every request.
+BLOBLINES=$(grep -c 'stargz/probe/blobs' "$RUN/reg.log")
+BLOB='http.request.uri="/v2/stargz/probe/blobs'
+GETS=$(grep "$BLOB" "$RUN/reg.log" | grep -c 'http.response.status=')
+PARTIAL=$(grep "$BLOB" "$RUN/reg.log" | grep -c 'http.response.status=206')
+SERVED=$(grep "$BLOB" "$RUN/reg.log" \
+         | grep -o 'http.response.written=[0-9]*' | cut -d= -f2 \
          | awk '{s+=$1} END {printf "%d", s+0}')
+
+# A search must state its own size, or "found nothing" and "never looked"
+# print the same thing (shape 12).
+[ "$BLOBLINES" -gt 0 ] || fail "no blob requests in the registry log at all - the consumer did not reach this registry"
+[ "$GETS" -gt 0 ] || fail "$BLOBLINES blob request(s) logged but the status parse matched none - the log format changed"
 
 printf '  blob GETs          %s\n' "$GETS"
 printf '  of those, partial  %s  (HTTP 206 - the lazy-pull signature)\n' "$PARTIAL"
-printf '  bytes served       %s MiB\n' "$((SERVED/1024/1024))"
-printf '  largest blob       %s MiB\n' "$((LAYER_BYTES/1024/1024))"
+printf '  bytes served       %s (%s KiB)\n' "$SERVED" "$((SERVED/1024))"
+printf '  largest blob       %s (%s MiB)\n' "$LAYER_BYTES" "$((LAYER_BYTES/1024/1024))"
 
 # A fallback to a whole-layer pull is a CORRECT build and a failed
 # experiment. Say which, and never let the two print the same thing.
@@ -189,6 +218,9 @@ if [ "$SERVED" -ge "$LAYER_BYTES" ]; then
   echo "  whole layer. The mount works; this workload reads all of it."
   exit 0
 fi
-PCT=$((SERVED * 100 / LAYER_BYTES))
-echo "◈ LAZY: fetched ${PCT}% of the largest layer to read one file."
+# Per mille, because the whole point is that the ratio is small and a
+# percentage of a good result rounds to the zero this script already
+# printed once for the wrong reason.
+PERMILLE=$((SERVED * 1000 / LAYER_BYTES))
+echo "◈ LAZY: fetched ${SERVED} bytes - ${PERMILLE}/1000 of the largest layer - to read one file."
 echo "  This is the unpack term being skipped rather than made cheaper."

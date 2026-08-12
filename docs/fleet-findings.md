@@ -8660,3 +8660,88 @@ now few and all measurable:
 
 The `building` split - materialise / run / export - separates all three and
 still does not exist. It is now unambiguously the next instrument.
+
+## estargz mounts instead of unpacking: 0.5% of a layer fetched, measured
+
+`scripts/stargz-check.sh`, on the x86 box, against a plain registry. Two
+daemons, one image, one file read.
+
+| | |
+| ----------------------------- | ------------------------- |
+| largest layer | 201,392,438 B (192 MiB) |
+| bytes the consumer fetched | **1,143,096 B (1.1 MiB)** |
+| ratio | **5/1000** |
+| blob GETs | 12 |
+| of those, HTTP 206 | **9** |
+
+**A worker read one small file out of a 192 MiB image and moved half a
+percent of it.** The layer was never unpacked; it was mounted.
+
+This is the first thing measured in this project that attacks `N x
+ancestry` itself rather than deciding where the bytes go or when they
+arrive. Principle 30's uncomfortable corollary - "no scheduler can make a
+machine run a lead without the lead's ancestry" - is true of *materialising*
+the ancestry and not of *having it addressable*. A lazy mount turns "every
+machine needs the whole 705 MiB" into "every machine needs the part it
+touches".
+
+### The prerequisite is a flag, not a fork
+
+Believed hard since 9ed52d5, which is why it went unpulled for months.
+
+- `earthbuild/buildkitd:v0.8.17` already contains stargz -
+  `prepareRemoteSnapshotsStargzMode`, `estargz.JTOC`,
+  `labels.buildkit.io/compression/estargz`.
+- It starts with `worker.snapshotter:stargz`.
+- `compression=estargz,force-compression=true` writes real estargz: both
+  layers came back carrying `containerd.io/snapshot/stargz/toc.digest`.
+- The consumer logs `preparing filesystem mount at .../runc-stargz/...` and
+  `fusermount detected`, with no `failed to restore remote snapshot`.
+
+**Two constraints on putting it in CI**, both found the hard way:
+
+- The snapshotter CANNOT go in `EARTHLY_ADDITIONAL_BUILDKIT_CONFIG`. The
+  image's template hardcodes `[worker.oci] snapshotter = "auto"` and TOML
+  forbids a duplicate table, so a second `[worker.oci]` is a parse error
+  rather than an override. The template must be edited before the
+  entrypoint renders it.
+- Overriding the entrypoint to run `buildkitd` directly skips that
+  rendering, so the registry stanza never lands and the consumer attempts
+  HTTPS against a plain-HTTP registry.
+
+Also: `/dev/fuse` must be in the daemon's container. On macOS the mount
+succeeds and `exec` out of it fails with `invalid argument` - a Docker
+Desktop VM limitation, not a buildkit one. On Linux, which is what a runner
+is, it works.
+
+### What this does NOT say
+
+The workload is deliberately extreme: one small file out of 192 MiB. **0.5%
+is the ceiling of the mechanism, not a forecast.** A real lead reads far
+more of its ancestry, and what the fleet would save is bounded by how much
+of the 705 MiB its leads actually touch - which nothing here measures. The
+claim that survives is narrower and still new: *the fetch tracks what is
+read*, and until now every byte of ancestry was paid whether read or not.
+
+Base images are still outside it - Docker Hub does not serve estargz - but
+the 171 MiB blob that dominates the ancestry table is fleet-produced, so the
+largest single item is inside the reachable half.
+
+### Three parses of my own were wrong before this number existed
+
+Worth recording because all three failed in the same direction.
+
+1. A `/dev/fuse` guard that tested the Mac rather than the kernel the daemon
+   runs on. Failed on a working setup.
+2. `"size":[0-9]*` against a pretty-printed manifest with `"size": 952` - a
+   space - so the largest layer printed as 0 MiB.
+3. `"http.response.written":[0-9]*` against a log that is logrus key=value,
+   not JSON. Matched nothing, `awk` summed the empty set, and the script
+   announced **"fetched 0% of the largest layer"** - shape 15, a parse that
+   could not look reported as a measurement, and flattering. Then a second
+   attempt filtered on `GET /v2/...blobs`, which selects the Apache-style
+   line that carries no named fields, and found no statuses at all.
+
+The guard that now precedes the arithmetic - *this many blob lines, this
+many parsed* - is what turned the third one from a headline into an error
+message.
