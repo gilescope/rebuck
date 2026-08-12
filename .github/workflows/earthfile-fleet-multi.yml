@@ -80,6 +80,19 @@ on:
       # actually show.
       - giles-dispatch-ci-ast-balance-bcast
       - giles-dispatch-ci-ast-balance-vtx
+      # THE MACHINE-COUNT TEST, and it is not a scaling experiment.
+      #
+      # If materialising a subtree's ancestry is the amplification, the
+      # fleet's CPU over the baseline's should be roughly the WORKER COUNT -
+      # each machine unpacks once what one machine unpacked once. Six
+      # workers measured 6.5x and 8.7x. Three should give ~3x if that is
+      # right and ~6-9x if it is not, and nothing else on the table predicts
+      # a dependence on the machine count at all.
+      #
+      # `-w3` is stripped by the plan job before the workload suffixes, so
+      # the target still resolves to `+test-ast`.
+      - giles-dispatch-ci-ast-balance-w3
+      - giles-dispatch-ci-ast-balance-w12
       # Seeding ON TOP of balance, not instead of it. `-ast-seed` already
       # existed and would answer a different question: the 1113s reference
       # this is measured against is a balanced leg, so an unbalanced seeded

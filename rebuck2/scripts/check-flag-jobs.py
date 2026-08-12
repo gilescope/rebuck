@@ -58,7 +58,12 @@ for v, r in bad:
 # which is the code-side defect this repo keeps finding, arriving from the
 # documentation instead. A doc mention counts as implemented if the binary
 # reads it OR the workflow's own shell expands it.
-shell_used = set(re.findall(r"\$\{?(REBUCK2_[A-Z_]+)[:}\s]", WF.read_text()))
+# A WORD BOUNDARY, not a list of terminators. The first version accepted
+# `$X:`, `$X}` and `$X ` and so missed `--pairs "$REBUCK2_SEED_IDS"`, where
+# the expansion is closed by a quote - which made a real, used flag look
+# like a phantom the moment a doc mentioned it by name. The check then
+# argues for deleting the mention, which is the wrong repair twice over.
+shell_used = set(re.findall(r"\$\{?(REBUCK2_[A-Z_]+)\b", WF.read_text()))
 phantom = []
 for d in sorted((ROOT / "docs").glob("*.md")):
     text = d.read_text()
