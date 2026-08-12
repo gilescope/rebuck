@@ -6691,3 +6691,34 @@ competing mechanisms:
 Plus two instruments: each worker's ending cache-mount count, which decides
 whether cold mounts can be the amplification at all, and CPU on both sides,
 which is the missing half of every amplification figure in this file.
+
+### What run C should show, written before it does
+
+Five fixes and two instruments. Each has a distinct observable, so a partial
+result is still readable:
+
+| observable | fix it tests | failure reads as |
+| ------------------------------------ | ---------------- | ------------------------- |
+| `prefetched N/N` on all six workers | seed broadcast | `N < M` on five of six |
+| no `[registry] MISS` lines | all delivery | a digest, and who was asked |
+| declines near zero | delivery | the three-way breakdown again |
+| `mount arms` with both arms non-tiny | the whole chain | one arm at `n<=1` |
+| `cache mounts: <n>` per worker | nothing - it is a QUESTION | see below |
+| `baseline cpu` / `worker cpu` | nothing - also a question | |
+
+The last two are not tests of anything. They settle arguments this file has
+had with itself:
+
+- **a handful of cache mounts per worker** means mounts are reused across
+  leads, cold mounts cost ~6 fills, and they cannot be the amplification;
+  **hundreds** means every lead got a fresh directory and they can be.
+- **CPU on both sides** is the first like-for-like amplification number this
+  project will have had. Every previous one divided a sum over concurrent
+  leads by a single wall clock, which is shape 22.
+
+And the honest possibility: seeding may still not pay. A seeded arm was
+5.0s against a cold 5.7s in run B - a 12% saving per arm. If delivery
+becomes free and that is all seeding is worth, the mechanism is a wash and
+the finding is that **the cache mounts were never the expensive part**,
+which sends the whole investigation back to `building` with one fewer
+candidate.
