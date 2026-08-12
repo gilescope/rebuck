@@ -102,8 +102,12 @@ on:
       # leads*P. Subtracting it from the six-worker figure leaves 5A.
       # Two runs, both terms; -w3 becomes a check rather than the
       # measurement.
+      # The export-cost test - see the `-nocomp` case in the plan job.
+      - giles-dispatch-ci-ast-balance-nocomp
       - giles-dispatch-ci-ast-balance-w1
       - giles-dispatch-ci-ast-balance-w3
+      # The export-cost test - see the `-nocomp` case in the plan job.
+      - giles-dispatch-ci-ast-balance-nocomp
       - giles-dispatch-ci-ast-balance-w12
       # Seeding ON TOP of balance, not instead of it. `-ast-seed` already
       # existed and would answer a different question: the 1113s reference
@@ -606,7 +610,7 @@ jobs:
             # leaves a stray `1` on the workload.
             workload=${workload%-w[0-9]}
             workload=${workload%-w[0-9][0-9]}
-            for suffix in -seed -graft -arm -zstd -minops -imports -bcast -balance -nested -sandbox -vtx -nobase; do
+            for suffix in -seed -graft -arm -nocomp -zstd -minops -imports -bcast -balance -nested -sandbox -vtx -nobase; do
               # QUOTED: unquoted, `$suffix` is taken as a glob pattern
               # rather than a literal, which shellcheck SC2295 catches and
               # which would misbehave the moment a suffix contained a `?`
@@ -698,7 +702,25 @@ jobs:
           # it sounds, because dispatch is unreachable for a workflow that
           # lives off the default branch. The suffix has been the real
           # interface since `-binaries`; from here it is the only one.
-          case "$REF" in *-zstd*) comp=zstd ;; *) comp="" ;; esac
+          #
+          # `-nocomp`: the decisive test for the per-solve cost. Run
+          # 31566167945 measured a dispatched solve at 23.5 CPU-seconds
+          # against 1.9 for the same solve built locally, and ancestry
+          # cannot explain it - ancestry is paid once per machine and
+          # amortised over every lead that machine takes. What a dispatched
+          # solve does and a local one does not, per solve, is EXPORT its
+          # result: compress every layer, write a manifest, push. That was
+          # once bounded at "5-10%" from bytes and a transfer rate, which is
+          # the wrong unit - compression is CPU and was priced as network.
+          #
+          # `uncompressed` removes the compress half entirely. If worker CPU
+          # collapses, export is the answer; if it barely moves, export is
+          # exonerated and the portable rewrite is what remains.
+          case "$REF" in
+            *-nocomp*) comp=uncompressed ;;
+            *-zstd*)   comp=zstd ;;
+            *)         comp="" ;;
+          esac
           echo "compression: ${comp:-buildkit default}"
           echo "compression=$comp" >> "$GITHUB_OUTPUT"
 
