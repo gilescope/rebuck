@@ -1730,9 +1730,21 @@ impl Wire {
                     let _ = std::fs::create_dir_all(dir);
                 }
                 match std::fs::write(&path, &body) {
+                    // WHICH IDS, not just how many. A run reported
+                    // `2 written` while the harvest needed four, and there
+                    // was no way to tell whether the two were the ids that
+                    // matter (`go-mod`, `go-build`, between them 358 and 353
+                    // of 359 cache-touching leads) or two irrelevant ones.
+                    // The count is the same either way and the conclusions
+                    // are opposite.
                     Ok(()) => println!(
-                        "[wire] cache inputs  : {} written to {path}",
-                        self.cache_inputs.len()
+                        "[wire] cache inputs  : {} written to {path} - {}",
+                        self.cache_inputs.len(),
+                        self.cache_inputs
+                            .keys()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(" ")
                     ),
                     Err(e) => println!("[wire] cache inputs  : could not write {path}: {e}"),
                 }
