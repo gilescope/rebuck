@@ -98,7 +98,7 @@ confident version first - which has happened to me, in this file, twice.
 | The amplification is inside `building` | placing 0s, waiting 4115s, building 4917s - the RATIO to the baseline is unsettled, see the correction |
 | More machines cannot fix it | building alone needs 25 machines to reach the baseline; Amdahl caps at 5.67x |
 | Cache-mount seeding has never once run | four mechanical reasons, plus a fifth that defeats even a warm bank |
-| Seeding now runs, and does not pay | four seeded runs, best leg 1396s against an unseeded band that starts near 1113s |
+| Seeding trades critical path for total work | CPU 9.2x -> 6.5x, leg ~1065s -> 1396s+. It loses HERE because this fleet is critical-path bound, not because it does nothing |
 | Delivery failure is NOT why the fleet is slow | 325 prefetch misses cost 7 lead failures; the lazy path absorbs the rest |
 | Cold cache mounts are NOT the amplification | each worker ends with 2-4 mounts, so they are reused across its ~69 leads |
 | The fleet costs ~6-9x the CPU of one machine | 3900/604 and 5155/592 on two runs of identical code - like-for-like at last, and not yet precise |
@@ -119,7 +119,7 @@ confident version first - which has happened to me, in this file, twice.
 | Whether the small leads matter | BOUNDED: they are half the count and at most 15% of lead time, so `worth_offering` is worth wiring and cannot be the 6-9x |
 | **Why the BIG leads cost what they do** | THE live question. The top 10% of leads hold 45% of lead time at 87-302s each - the size a build farm wants - and `+all-binaries` proves large leads can win. Something makes these cost several times their one-machine equivalent |
 | **What the per-unit cost is** | Two samples of the same binary: 6.5x and 8.7x in CPU. So ~6-9x with a third of run-to-run variance, not a number. Cold mounts eliminated. Export bounded at 5-10%. Delivery eliminated (325 prefetch misses cost 7 leads). No candidate for the remainder |
-| What the run-to-run noise band actually is | never measured. Two identical runs are in flight to find out, and until they land no tens-of-percent claim in this file is safe |
+| ~~What the run-to-run noise band is~~ | MEASURED: worker CPU total 0.1%, baseline CPU 0.5%, leg 5.1%. The per-worker split is not reproducible at all |
 | How much of the fleet's traffic crosses a wire | `SERVED_BYTES` mixes loopback with peer serving; `SERVED_LOCAL_BYTES` exists and has never reported. The per-worker `N MiB left it` lines now answer most of this |
 | Whether the fleet repeats itself, and by how much | the coordinator reports 1.1x; per-worker figures now print and run to 21x re-served |
 | What made the reference run take 50 minutes | not the tap, which costs 1ms. Still unexplained, and now suspected to be ordinary variance |
