@@ -7142,3 +7142,44 @@ checkpoint that cleared HEAD after 640 commits.
 Written now because the temptation, with run D landing shortly, is to read
 its leg against 1,113s and call it progress or regress. Neither reading
 would be sound.
+
+### A third candidate, and it explains the lead failures rather than the misses
+
+Run C, worker 1: **554 prefetch announcements**. `REBUCK2_PREFETCH_LANES` is
+not set in the workflow, so `prefetch_permits` defaults to **1**, and the
+lane is taken for the whole of an announcement's loop:
+
+```rust
+let _lane = prefetch_gate().acquire().await;
+for d in mine { ... Blobs::get(&*blobs, &d) ... }
+```
+
+So every worker processes 554 announcements strictly one at a time, and a
+seed is two of them. Two consequences, in opposite directions:
+
+- **the seed waits.** If its announcement lands behind two hundred others,
+  its blobs are fetched long after the leads that need them have started.
+- **the seed blocks.** When it does run, it holds the only lane while
+  fetching a 456 MiB layer, and the other 552 announcements queue behind it.
+
+**This is a better explanation of the LEAD failures than contention is.** A
+queued announcement does not error - `acquire().await` waits - so it
+produces no `prefetch MISS` at all. It produces content that is not there
+yet, which is exactly what 649 `could not fetch content descriptor` and 60
+`subtree@...: not found` look like from the lead's side.
+
+The two mechanisms are therefore distinguishable, and run D separates them:
+
+| observation | means |
+| ------------------------ | ---------------------------------------- |
+| many `prefetch MISS` | fetches are failing - contention, or bytes genuinely absent |
+| few misses, many declines | fetches are LATE - the lane, not the network |
+
+The gate was written to stop six announcements interleaving into six
+concurrent pulls on the coordinator, which was right when announcements were
+rare. At 554 per worker it is a queue with one server in front of everything
+the fleet needs pre-positioned, and the thing most needed first has no way
+to say so.
+
+Not changed tonight: it is a third variable, run D is in flight, and the
+diagnostic that distinguishes it from the other two lands in ten minutes.
