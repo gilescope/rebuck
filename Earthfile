@@ -60,7 +60,17 @@ vendor:
 
 src:
     FROM +vendor
-    COPY --dir rebuck2/src rebuck2/buildkit-session rebuck2/patches ./
+    # `tests/fixtures` and `actions/` are NOT optional extras. The suite
+    # `include_str!`s them, so they are needed at COMPILE time, not run
+    # time - leaving them out fails the build with `couldn't read
+    # src/bank/../../tests/fixtures/logstream-nested.jsonl`, which reads
+    # like a missing file at runtime and is not.
+    #
+    # Found by running the target. A copy set assembled by looking at the
+    # source tree would have missed all four, because nothing in `src/`
+    # looks like it depends on them.
+    COPY --dir rebuck2/src rebuck2/buildkit-session rebuck2/patches \
+                rebuck2/tests rebuck2/actions ./
     COPY rebuck2/Cargo.toml rebuck2/Cargo.lock ./
 
 # What CI runs, so a failure here is a failure there.
