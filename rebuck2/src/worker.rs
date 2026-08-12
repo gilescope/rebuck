@@ -720,8 +720,27 @@ fn prefetch_gate() -> &'static Semaphore {
 /// Alone, both answers are everything. A prefetch that quietly does nothing
 /// when there is nobody to split with fails at the moment it matters most.
 pub fn share_of(hashes: &[String], ids: &[String], me: &str, broadcast: bool) -> Vec<String> {
-    if broadcast || ids.len() <= 1 {
+    if ids.len() <= 1 {
         return hashes.to_vec();
+    }
+    if broadcast {
+        // EVERYTHING, but this worker's seeder share FIRST - which is what
+        // the paragraph above has always claimed and what the code did not
+        // do. Returning early here skipped `seeder_for` entirely, so six
+        // workers asked for six copies of every blob at once, no peer held
+        // any of them yet, and all six went to the driver together. Run
+        // 31557310760 moved ~24 GiB across the mesh that way and still lost
+        // one blob in three.
+        //
+        // Ordering costs nothing and changes nothing about WHAT is fetched.
+        // Each worker pulls the blobs it owns from the driver; by the time
+        // it asks for the rest, the machines that owned those have them and
+        // the bloom says so. One source per blob, which is the promise.
+        let (mine, rest): (Vec<String>, Vec<String>) = hashes
+            .iter()
+            .cloned()
+            .partition(|h| seeder_for(h, ids).as_deref() == Some(me));
+        return mine.into_iter().chain(rest).collect();
     }
     hashes
         .iter()
@@ -1683,6 +1702,54 @@ async fn sync_shard(
 
 #[cfg(test)]
 mod tests {
+    /// Under broadcast, a worker takes every blob but takes ITS OWN first.
+    ///
+    /// `share_of`'s comment has always claimed that `seeder_for` spreads the
+    /// source per blob "either way, so a broadcast pulls each blob from a
+    /// different peer rather than stampeding one". It did not: the broadcast
+    /// branch returned before `seeder_for` was reached, so six workers asked
+    /// for six copies of everything at once, no peer held any of it yet, and
+    /// all six went to the driver together.
+    ///
+    /// Ordering fixes it without changing what is fetched. Each worker pulls
+    /// the blobs it is the seeder for from the driver, and by the time it
+    /// asks for the rest, the machines that owned those have them and the
+    /// bloom says so.
+    #[test]
+    fn broadcast_takes_everything_but_its_own_share_first() {
+        let ids: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        // Real-shaped digests: `seeder_for` reads the trailing eight hex
+        // digits, so the tails have to differ.
+        let hashes: Vec<String> = (0..9u32)
+            .map(|i| format!("{:064x}", 0x1000_0000u64 + u64::from(i)))
+            .collect();
+
+        for me in &ids {
+            let got = super::share_of(&hashes, &ids, me, true);
+            assert_eq!(
+                got.len(),
+                hashes.len(),
+                "broadcast still means everything - ordering is the only change"
+            );
+            assert_eq!(
+                got.iter().collect::<std::collections::BTreeSet<_>>(),
+                hashes.iter().collect::<std::collections::BTreeSet<_>>(),
+                "same set, reordered"
+            );
+
+            let mine = super::share_of(&hashes, &ids, me, false);
+            assert!(!mine.is_empty(), "test needs this worker to own something");
+            // Everything this worker seeds comes before anything it does not.
+            let last_own = got.iter().rposition(|h| mine.contains(h)).unwrap();
+            assert_eq!(
+                last_own,
+                mine.len() - 1,
+                "the seeder share must be a prefix, or the driver is still \
+                 asked for blobs a peer is about to have"
+            );
+        }
+    }
+
     /// Splitting an announcement defeats what the announcement is for.
     ///
     /// `my_share` gives each blob to exactly ONE worker, chosen by
