@@ -90,7 +90,12 @@ jobs:
           WORK: "20"
           BUILDS: "12"
           SLOTS: "8"
-        run: ./scripts/fleet-check.sh
+        # `pipefail` is load-bearing: without it the pipeline's status is
+        # tee's, which is always 0, and a workflow that has never passed
+        # would become one that can never fail. That is strictly worse.
+        run: |
+          set -o pipefail
+          ./scripts/fleet-check.sh 2>&1 | tee "$RUNNER_TEMP/fleet-check.log"
 
       - name: what the fleet did
         if: always()
@@ -103,3 +108,30 @@ jobs:
             echo "=== $f"
             grep -E '^\[wire\]|^\[proxy\]' "$f" || true
           done
+
+      # KEPT AS AN ARTIFACT, unconditionally. This workflow has never passed
+      # - 96 failures and 0 successes in its recorded history - and the
+      # reason it has stayed unfixed is that `gh run view --log` returns
+      # only `UNKNOWN STEP` entries for it, so nobody can see what the check
+      # said. Diagnosis is blocked on legibility, not on difficulty.
+      #
+      # `if: always()`, because the only interesting run is a failing one.
+      - name: keep what the check said
+        if: always()
+        run: |
+          d="$RUNNER_TEMP/fleet-artifacts"
+          mkdir -p "$d"
+          cp "$RUNNER_TEMP/fleet-check.log" "$d/" 2>/dev/null || true
+          i=0
+          for f in "${TMPDIR:-/tmp}"/rebuck2-*/proxy.log; do
+            [ -f "$f" ] || continue
+            cp "$f" "$d/proxy-$i.log" || true
+            i=$((i + 1))
+          done
+          echo "kept $(find "$d" -type f | wc -l | tr -d ' ') file(s)"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: fleet-check-logs-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fleet-artifacts
+          if-no-files-found: warn
