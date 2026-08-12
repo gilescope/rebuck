@@ -8745,3 +8745,72 @@ Worth recording because all three failed in the same direction.
 The guard that now precedes the arithmetic - *this many blob lines, this
 many parsed* - is what turned the third one from a headline into an error
 message.
+
+## The `-estargz` run: 26% more CPU, because our registry has no Range GET
+
+Run `31638559820`, six workers, all eight jobs green, guard confirmed
+`snapshotter=stargz` on every daemon.
+
+| | ref1 | `-estargz` | |
+| ----------------- | ------ | ---------- | ------ |
+| baseline CPU | 607s | **605s** | reproduces |
+| baseline wall | 216s | 218s | reproduces |
+| worker CPU total | 5,575s | **7,008s** | **+26%** |
+| leg | 1,092s | **1,192s** | +9% |
+| dup | 1.9 | 1.6 | better |
+| routed / home | - | 412 / 0 | everything dispatched |
+
+**Worse on both axes**, and the reason is one line of this repo's own
+module documentation, `registry.rs:23`:
+
+> **No Range GET.** The client falls back to a serial fetch when the server
+> ignores `Range`.
+
+Lazy pull IS range requests. `stargz-check.sh` measured 5/1000 of a layer
+fetched against `registry:2`, which serves ranges - 9 of its 12 blob GETs
+came back **206**. The mesh registry ignores `Range`, so the snapshotter
+cannot fetch chunks and pulls whole layers. Every cost of estargz, none of
+the benefit:
+
+- estargz blobs are BIGGER than gzip - TOC, footer, per-file gzip members
+- `force-compression=true` rode in with the codec and forces conversion of
+  **every** layer, not just new ones
+- and this is the first run in which any of that reached a worker at all
+
+`[registry] 21 blobs over 1MiB: 370 MiB distinct, 3584 MiB served (9.7x
+re-served)`. More bytes moved, not fewer.
+
+### The guard checked the wrong end
+
+The workflow fails the job unless the daemon reports
+`snapshotter:stargz`, and it did, on all seven daemons. That guard is sound
+and it is not enough: **it verifies the CONSUMER can mount and never asks
+whether the TRANSPORT can serve a range.** A snapshotter that cannot
+range-fetch does not error - it falls back to a whole-layer pull and
+builds correctly. Fail open, again.
+
+Shape 17, a guard with a symmetric hole, and I wrote this one *while*
+quoting shape 13 at the mechanism it was protecting. The local rig had a
+registry that served ranges and so could not have surfaced it; the
+difference between the rig and the fleet was the one component the rig
+substituted.
+
+### What it does not overturn
+
+`stargz-check.sh`'s 5/1000 stands - it was measured against a registry that
+serves ranges, and it says what the mechanism does when its transport
+supports it. **The prerequisite was misidentified, not the mechanism.**
+
+It also is not an attributable measurement of estargz. Two things moved at
+once: the codec reached the workers for the first time (see the
+`REBUCK2_COMPRESSION` job-placement bug) and the snapshotter was enabled.
+With the mount inert, the +26% is most simply read as the export side
+getting more expensive: bigger blobs plus whole-image `force-compression`,
+which is also the first direct evidence that **the export term is large** -
+the standing hypothesis of `the-next-plan.md`.
+
+### The actual next step
+
+Range GET in `registry.rs`, then re-run this branch unchanged. Until then
+`-estargz` cannot win, and the guard should refuse to run it: ask the
+registry for a range at startup and fail if the answer is not 206.
