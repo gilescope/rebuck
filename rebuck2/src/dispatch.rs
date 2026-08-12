@@ -489,6 +489,30 @@ pub fn encode_cache_inputs(m: &BTreeMap<String, (Vec<u8>, String)>) -> String {
         .join("\n")
 }
 
+/// Fold freshly observed cache-mount inputs into whatever a previous run
+/// left, WITHOUT losing the previous run's.
+///
+/// The file is written by two processes that both run before the harvest
+/// reads it: the proxy, at the end of a fleet leg, and `check-seeding`, from
+/// its own synthetic probe. `check-seeding` used a plain truncating write,
+/// so its single `seedcheck-src-<pid>` entry replaced the real inputs the
+/// bank had carried - and the harvest then found no `go-mod`, reconstructed
+/// the input, and read a directory nothing had written.
+///
+/// OBSERVED WINS on a clash. A probe's input is synthetic; the harvest has
+/// to present the one the client actually sent, or `getRefCacheDir` keys it
+/// to a different directory.
+pub fn merge_cache_inputs(
+    carried: &str,
+    fresh: &BTreeMap<String, (Vec<u8>, String)>,
+) -> BTreeMap<String, (Vec<u8>, String)> {
+    let mut out = decode_cache_inputs(carried);
+    for (id, v) in fresh {
+        out.entry(id.clone()).or_insert_with(|| v.clone());
+    }
+    out
+}
+
 /// The reverse of [`encode_cache_inputs`]. A malformed line is dropped.
 ///
 /// Dropped rather than repaired: the file rides between runs in a cache and
@@ -3228,6 +3252,55 @@ mod tests {
         let back = super::decode_cache_inputs("go-mod\t/cache\nnot-a-line\n\n");
         assert!(back.is_empty(), "a line missing its payload is not a seed");
         assert!(super::decode_cache_inputs("").is_empty());
+    }
+
+    /// `check-seeding` writes the SAME file the harvest then reads, and it
+    /// ran first. A plain write truncates, so its one synthetic probe entry
+    /// replaced whatever the bank had carried from a previous run's leg -
+    /// and the harvest, looking for `go-mod`, found nothing and fell back to
+    /// the reconstruction that has been measured wrong.
+    ///
+    /// Fifth mechanical reason for `seeds=off`, and the only one that
+    /// defeats a WARM bank. Merging keeps both: the probe still exercises
+    /// the cross-process seam it was added for, and the real inputs survive.
+    #[test]
+    fn the_seeding_probe_does_not_evict_the_inputs_the_harvest_needs() {
+        let mut real = BTreeMap::new();
+        real.insert("go-mod".to_owned(), (vec![7u8, 8, 9], "/cache".to_owned()));
+        real.insert("go-build".to_owned(), (vec![1u8], "/cache".to_owned()));
+        let carried = super::encode_cache_inputs(&real);
+
+        let mut probe = BTreeMap::new();
+        probe.insert(
+            "seedcheck-src-1234".to_owned(),
+            (vec![42u8], "/cache".to_owned()),
+        );
+
+        let merged = super::merge_cache_inputs(&carried, &probe);
+
+        assert_eq!(
+            merged.get("go-mod"),
+            real.get("go-mod"),
+            "the harvest's own input must survive the probe that runs before it"
+        );
+        assert!(merged.contains_key("go-build"));
+        assert!(
+            merged.contains_key("seedcheck-src-1234"),
+            "and the probe still records itself, or the local rig stops \
+             exercising the cross-process seam"
+        );
+
+        // An id observed for real WINS over a probe claiming the same id.
+        // The probe's input is synthetic; the harvest must present the one
+        // the client actually sent.
+        let mut clash = BTreeMap::new();
+        clash.insert("go-mod".to_owned(), (vec![0u8], "/wrong".to_owned()));
+        let merged = super::merge_cache_inputs(&carried, &clash);
+        assert_eq!(merged.get("go-mod"), real.get("go-mod"));
+
+        // Nothing carried: the probe is all there is, which is the local rig.
+        let merged = super::merge_cache_inputs("", &probe);
+        assert_eq!(merged, probe);
     }
 
     #[test]

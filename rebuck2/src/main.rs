@@ -638,6 +638,15 @@ async fn main() -> Result<()> {
             // everything EXCEPT the seam that carries the input bytes
             // between processes - and an untested seam is how all thirteen
             // faults happened.
+            //
+            // MERGED, not written. In the fleet workflow this check runs
+            // inside the harvest step, BEFORE the harvest, against a file
+            // the bank may have carried from a previous run's leg. A
+            // truncating write put one `seedcheck-src-<pid>` entry where
+            // `go-mod` had been, so the harvest reconstructed an input that
+            // has been measured wrong and read a directory nothing wrote.
+            // Fifth mechanical reason for `seeds=off`, and the only one that
+            // defeats a warm bank.
             if let Ok(path) = std::env::var("REBUCK2_CACHE_INPUTS_FILE") {
                 let path = dispatch::expand_home(&path);
                 let observed = dispatch::cache_mount_inputs(&dispatch::cache_probe_graph(
@@ -646,9 +655,13 @@ async fn main() -> Result<()> {
                 if let Some(dir) = std::path::Path::new(&path).parent() {
                     let _ = std::fs::create_dir_all(dir);
                 }
-                let _ = std::fs::write(&path, dispatch::encode_cache_inputs(&observed));
+                let carried = std::fs::read_to_string(&path).unwrap_or_default();
+                let kept = dispatch::decode_cache_inputs(&carried).len();
+                let merged = dispatch::merge_cache_inputs(&carried, &observed);
+                let _ = std::fs::write(&path, dispatch::encode_cache_inputs(&merged));
                 println!(
-                    "[check] wrote {} observed input(s) to {path}",
+                    "[check] wrote {} observed input(s) to {path}, keeping {kept} \
+                     already there",
                     observed.len()
                 );
             }
