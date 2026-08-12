@@ -451,15 +451,11 @@ async fn main() -> Result<()> {
                 };
                 let id = &id;
                 let input = inputs.get(id).cloned();
-                // What the daemon said about THIS id, matched on the same
-                // name `cache_ids_held` extracted, so the two cannot drift.
-                let held_bytes = held
-                    .iter()
-                    .find(|(what, _)| {
-                        what.contains(&format!("with id {id:?}")) || what.contains(id)
-                    })
-                    .map(|(_, sz)| *sz)
-                    .unwrap_or(0);
+                // What the daemon said about THIS id. Not a substring
+                // search: `/go/pkg/mod` occurs inside other rows' command
+                // lines, so a loose match attributes one mount's size to
+                // another and the shortfall warning cries wolf.
+                let held_bytes = dispatch::held_for(&held, id);
                 if let Err(e) =
                     harvest_one(&bk, &registry, &base, id, dest, input, held_bytes).await
                 {

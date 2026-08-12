@@ -501,6 +501,29 @@ pub fn encode_cache_inputs(m: &BTreeMap<String, (Vec<u8>, String)>) -> String {
 /// number so the warning and the decision cannot drift apart.
 pub const SEED_FLOOR_BYTES: i64 = 64 * 1024;
 
+/// What the daemon says THIS cache id holds, from its own `du -v` rows.
+///
+/// buildkit writes the id only when it differs from the destination
+/// (`getRefCacheDir`: `if id != m.Dest { name += " with id %q" }`), so there
+/// are two shapes to match and a substring search gets it wrong in a way
+/// that looks right - `/go/pkg/mod` occurs inside other rows' command lines.
+///
+/// 0 means "not found here", which [`harvest_is_short`] reads as no signal
+/// rather than as a complaint.
+pub fn held_for(mounts: &[(String, i64)], id: &str) -> i64 {
+    let quoted = format!("with id {id:?}");
+    if let Some((_, sz)) = mounts.iter().find(|(what, _)| what.contains(&quoted)) {
+        return *sz;
+    }
+    // The self-keying form: `cached mount <dest> from ...`, with no id.
+    let prefix = format!("cached mount {id} from ");
+    mounts
+        .iter()
+        .find(|(what, _)| what.starts_with(&prefix) && !what.contains(" with id "))
+        .map(|(_, sz)| *sz)
+        .unwrap_or(0)
+}
+
 /// Did the harvest read far less than the daemon says the mount holds?
 ///
 /// [`worth_seeding`] catches an empty harvest. It does not catch a partial
@@ -3290,6 +3313,42 @@ mod tests {
         let back = super::decode_cache_inputs("go-mod\t/cache\nnot-a-line\n\n");
         assert!(back.is_empty(), "a line missing its payload is not a seed");
         assert!(super::decode_cache_inputs("").is_empty());
+    }
+
+    /// Attributing a daemon's mount size to the right cache id.
+    ///
+    /// buildkit writes two shapes, and only one carries the id:
+    ///
+    /// ```text
+    /// cached mount /root/.cache/go-build from exec ... with id "go-build"
+    /// cached mount /go/pkg/mod from exec ...          <- id IS the dest
+    /// ```
+    ///
+    /// A loose `contains(id)` gets this wrong in a way that looks right:
+    /// the id `/go/pkg/mod` appears inside the go-build line's own path list
+    /// and inside the go-mod line, so the first match wins and the size is
+    /// attributed to whichever came back first.
+    #[test]
+    fn a_mount_size_goes_to_the_id_that_owns_it() {
+        use super::held_for;
+        let mounts = vec![
+            (
+                "cached mount /root/.cache/go-build from exec /bin/sh -c go build                  GOPATH=/go/pkg/mod with id \"go-build\""
+                    .to_owned(),
+                555,
+            ),
+            ("cached mount /go/pkg/mod from exec /bin/sh -c go mod download".to_owned(), 456),
+        ];
+
+        // Named id: the quoted form wins, even though the OTHER line also
+        // contains the string `/go/pkg/mod`.
+        assert_eq!(held_for(&mounts, "go-build"), 555);
+        // Self-keying id: matched on the destination, not by substring.
+        assert_eq!(held_for(&mounts, "/go/pkg/mod"), 456);
+        // Unknown is 0, which `harvest_is_short` reads as no signal.
+        assert_eq!(held_for(&mounts, "golangci_lint"), 0);
+        // A partial id must not match a longer one.
+        assert_eq!(held_for(&mounts, "go"), 0);
     }
 
     /// A harvest that is not empty can still be wrong.
