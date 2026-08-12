@@ -7394,3 +7394,50 @@ Which sharpens the open question. The per-unit cost of 6-9x is not a tax the
 fleet pays everywhere - `+all-binaries` pays it too and still wins, because
 its leads are large enough to absorb it. **The fleet is not slow. Its leads
 are too small**, and every target where that is false is a target it beats.
+
+### The mechanism that addresses "the leads are too small" exists, and has no callers
+
+If the fleet is not slow but its leads are too small, the fix is to stop
+dispatching the small ones. That mechanism is written, documented, tested,
+and connected to nothing:
+
+```rust
+/// Is this subtree big enough to be worth sending anywhere?
+#[allow(dead_code)] // driver line, not the proxy - see lease.rs
+pub fn worth_offering(
+    est_p90: Option<std::time::Duration>,
+    running_for: std::time::Duration,
+) -> bool {
+    est_p90.unwrap_or(running_for) > STALL
+}
+```
+
+`grep -rn worth_offering src/` returns its definition and five assertions in
+its own test. **No production caller anywhere** - not the proxy, and not the
+driver line the `allow(dead_code)` names. That comment is shape 23: it
+explains where the function is used, and it is used nowhere.
+
+What makes this the most consequential of the four unconnected mechanisms
+found here is that it is aimed exactly at tonight's sharpest finding, and
+aimed better than the thing that was tried. `-minops` gated dispatch on op
+COUNT, measured five times slower, and this file already records why: op
+count is size, and size is not cost. `worth_offering` gates on **the timing
+store's p90 for this target**, which is cost, observed, per target, with the
+stall as the fallback when there is no history - so no cold-start path is
+needed.
+
+The doc comment on the neighbouring `min_ops` puts the case better than I
+can:
+
+> `+test-ast` dispatched 412 solves to run a 204-second build and took
+> 1773s: the median lead ran 2.6 seconds to do a `jq` and a `diff`.
+
+A 2.6-second lead cannot repay a placement round trip, a graph rewrite, an
+export, a push and a pull. Four hundred of them cannot. `+all-binaries` wins
+with five leads of minutes each, and it is the same fleet.
+
+**This is the next experiment, and it is a better one than any seeding run.**
+Wire `worth_offering` into the gateway's dispatch decision, default off,
+measure on `+test-ast`. If the median lead stops travelling and the leg falls
+towards the baseline, the fleet's problem was never per-unit cost - it was
+that it was paying the toll four hundred times for work worth seconds.
