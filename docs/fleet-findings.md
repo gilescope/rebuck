@@ -6193,3 +6193,29 @@ That leaves exactly two routes: carry inputs between runs in the bank
 (already built, and until this evening defeated by a truncating write), or
 observe the baseline by putting something in front of its daemon that
 records graphs without dispatching them.
+
+### The clobber, reproduced and fixed locally
+
+Staged the exact fleet scenario against the local rig: a carried inputs file
+holding one real `go-mod` entry, as the bank restores it, then
+`check-seeding` run against it - which is the order the fleet's harvest step
+uses.
+
+```text
+[check] wrote 1 observed input(s) to .../cache-inputs.tsv, keeping 1 already there
+go-mod               /cache  AAECAw==
+seedcheck-src-29540  /cache  IiUSIwj///////////8BEP...
+```
+
+Both lines present. Before the fix the file held only the second, and
+`harvest-cache` - looking for `go-mod` a few seconds later - found nothing
+and fell back to the reconstruction.
+
+So the bank route is intact after all. It was built, it carried the right
+bytes, and a diagnostic that ran three seconds before the consumer deleted
+them. Nothing about the mechanism was wrong.
+
+**Expected sequence from here:** the run in flight writes real inputs into
+the bank at the end of its leg. The next `-seed` run restores them, merges
+rather than clobbers, and is the first run in this project's history whose
+harvest can present the input earthly actually sent.
