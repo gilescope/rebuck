@@ -476,9 +476,47 @@ anyone". So the window is bounded by design rather than absent, which is a
 different sentence from the one in the comment and matters exactly when a
 seed is being raced to six machines.
 
+## 24. A trade-off judged on one side of the trade
+
+**Instance:** cache-mount seeding, measured four times and written off three
+times, on the leg alone.
+
+| run | leg | CPU amplification |
+| ---- | ------ | ----------------- |
+| unseeded | ~1,065s | 9.2x |
+| seeded | 1,396s+ | **6.5x** |
+
+Seeding makes the fleet do **29% less total work** and take **31% longer**.
+It fills cache mounts so a worker skips work it would otherwise repeat, and
+it lengthens the critical path because a lead cannot start until its seed
+arrives. Both effects are real, both were measured correctly, and reading
+only the leg gives "seeding does not pay" - which is true of this fleet and
+false of the mechanism.
+
+The difference matters: on a throughput-bound fleet - many targets queued,
+machines saturated - a 29% cut in total work is exactly what you want, and
+the extra critical path is absorbed by the queue. The same code, the same
+number, opposite verdict.
+
+**This is not shape 6.** There the metric is a stand-in for the quantity you
+actually want. Here both metrics are the quantity you want; they simply
+disagree, because the mechanism *trades one for the other* and nothing
+forced me to look at both.
+
+What made it invisible for four runs was that the leg is the number this
+file has always led with, for good reasons - it is what a user waits for.
+CPU only became readable tonight, and the instant it did the verdict
+inverted.
+
+**Countermeasure:** before judging a mechanism, ask what it trades. If the
+answer is "nothing, it is strictly better", that is a claim to check rather
+than an assumption. Anything that moves work between machines, or between
+now and later, is trading latency against throughput and needs both numbers
+or neither.
+
 ## The common thread
 
-Twenty-two of these twenty-three produced a GREEN result. Not one announced itself.
+Twenty-three of these twenty-four produced a GREEN result. Not one announced itself.
 
 The discipline that caught them is the same every time: **find the
 observation that differs between the world where it works and the world where
