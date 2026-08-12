@@ -1158,3 +1158,10 @@ war, and it explains why five of them measured as no better than nothing.
   The mechanisms that measured as nothing - `-minops`, `-imports`, `-bcast`,
   seeding - all tried to change WHICH bytes go WHERE. The two that paid
   changed WHEN.
+
+  There is a third axis the rule must not be read as excluding: HOW the
+  content comes to exist on a machine. Grafting imports a published prefix
+  as an image where the alternative is re-running its ops, which changes
+  neither the bytes nor their timing but the price of having them. That is
+  the only lever aimed at `N x ancestry` itself, and the rule above is about
+  distribution, not about it.
