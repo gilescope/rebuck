@@ -6459,3 +6459,63 @@ previous run, where nothing was seeded and there was no seeded arm. **The
 within-run comparison needs a SUBSET seeded**, which is what the next run
 gets for free: the bank carries inputs for only some ids, and the empty ones
 are now skipped rather than emitted.
+
+## The declines were build failures, and the seed address is why
+
+Chasing "why does a seeded lead get refused" through run `31552464169`'s
+worker logs. The refusal is not `Saturated` and not `Undispatchable` - the
+three reasons `consider()` can give. It is not a refusal at all:
+
+```text
+worker declined subtree job N: build failed: solve: failed to load cache key:
+  failed to copy: httpReadSeeker: failed open: could not fetch content
+  descriptor sha256:4642b241... (application/vnd.docker.container.image.v1+json)
+  from remote: not found
+```
+
+**The worker took the lead, tried to build it, and could not fetch an image
+config blob.** 274 of these.
+
+### The address means something different on every machine
+
+The harvest publishes seeds with `--registry 172.17.0.1:15000` and emits
+references like `172.17.0.1:15000/rebuck2/subtree@sha256:...`. On the
+coordinator that is correct - `172.17.0.1` is the docker bridge, and the
+coordinator's registry is on the other side of it.
+
+But every worker runs **its own** registry at exactly the same address:
+
+```yaml
+--registry-bind 0.0.0.0:15000 \
+--registry-addr 172.17.0.1:15000
+```
+
+So the seed reference is shipped verbatim to six machines where the same
+string names a *different registry* - the worker's own, which has never held
+the coordinator's harvest. The fetch 404s, the build fails, the lead is
+declined and re-offered, and `placing` fills up.
+
+This is the same class as the busybox note already in the workflow ("Pushed
+to 127.0.0.1, pulled from 172.17.0.1. Same registry, two addresses"), except
+here the two addresses are on two different HOSTS and nothing said so.
+
+### What this corrects
+
+The `-seed` run's +670s is **not an empty-seed tax**. The seeds were empty,
+but that is not what cost the time: the workers could not fetch them at all.
+Rewriting the graph, failing the build, declining, and re-offering is the
+expense, and it would be paid identically by a seed full of real bytes.
+
+### The prediction for the run in flight
+
+`worth_seeding` stops an EMPTY harvest becoming a seed, which would have
+spared this run. It does nothing about the address. So:
+
+- if run B's bank yields real inputs and the harvest produces real seeds,
+  **it should fail the same way**, because a real seed carries the same
+  unreachable reference;
+- if the bank yields too little and every harvest is empty, no seeds are
+  emitted at all and the leg should look like the checkpoint's 1,113s.
+
+Written before it lands. Either outcome is informative, and neither is the
+seeding measurement - that needs the address fixed first.
