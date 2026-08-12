@@ -7155,25 +7155,26 @@ for d in mine { ... Blobs::get(&*blobs, &d) ... }
 ```
 
 So every worker processes 554 announcements strictly one at a time, and a
-seed is two of them. Two consequences, in opposite directions:
+seed is two of them. That suggested two consequences in opposite directions,
+and **checking the logs killed the first one immediately**:
 
-- **the seed waits.** If its announcement lands behind two hundred others,
-  its blobs are fetched long after the leads that need them have started.
-- **the seed blocks.** When it does run, it holds the only lane while
-  fetching a 456 MiB layer, and the other 552 announcements queue behind it.
+- ~~**the seed waits**, behind however many announcements precede it~~ -
+  **no.** The seed announcement was **#2 of 554** on every worker checked.
+  `usable_seeds` runs on the first dispatch, so the seed is at the front of
+  the queue by construction. It is not late, and the `2/3` is therefore a
+  genuine fetch failure rather than a fetch that had not happened yet.
+- **the seed blocks.** This half stands. When the seed's loop runs it holds
+  the ONE lane while fetching up to 456 MiB, and the other 552 announcements
+  wait behind it - so the lane delays every OTHER pre-position in the run,
+  including the base images and cut prefixes that leads also need.
 
-**This is a better explanation of the LEAD failures than contention is.** A
-queued announcement does not error - `acquire().await` waits - so it
-produces no `prefetch MISS` at all. It produces content that is not there
-yet, which is exactly what 649 `could not fetch content descriptor` and 60
-`subtree@...: not found` look like from the lead's side.
+That is a real cost and a different one from the seed's own failure. It also
+explains a shape nobody had accounted for: prefetch is supposed to remove
+transfer from the critical path, and a single lane behind a half-gigabyte
+fetch puts most of it back.
 
-The two mechanisms are therefore distinguishable, and run D separates them:
-
-| observation | means |
-| ------------------------ | ---------------------------------------- |
-| many `prefetch MISS` | fetches are failing - contention, or bytes genuinely absent |
-| few misses, many declines | fetches are LATE - the lane, not the network |
+Checked before run D landed, with data already on disk. The hypothesis was
+worth an hour of CI and cost two minutes of grep.
 
 The gate was written to stop six announcements interleaving into six
 concurrent pulls on the coordinator, which was right when announcements were
