@@ -79,7 +79,7 @@ confident version first - which has happened to me, in this file, twice.
 | That ceiling is 2.32x on six machines | 670s of 2,120s serial by construction |
 | **And cutting at the exclusion does not raise it** | 13s before the first exclusion against 2,223s from it on - 1% |
 | A red run can be a green experiment | coordinator green, one worker exiting non-zero, intermittent |
-| `-bcast` breaks the build on `+test-ast` | parity failed, one target unreached, media type unexplained |
+| `-bcast` breaks the build on `+test-ast` | parity failed, one target unreached - and the media-type error is NOT a broadcast mechanism: it appears in run B with no broadcast at all, among 185 other fetch failures |
 | **The leg is lead time over concurrency** | 8,239s / 7.85 = 1049 against a measured 1050s |
 | `+test-ast` is 15x off its own ceiling | 2.97x at seven machines means a 71s best leg against 1050s |
 | The prefetch counting gate is dead | 0 acceptances, 14 refusals, 292 prefetches bypassing it |
@@ -104,7 +104,6 @@ confident version first - which has happened to me, in this file, twice.
 | Whether the fleet repeats itself, and by how much | the coordinator reports 1.1x; the per-worker figure has never printed |
 | What made the reference run take 50 minutes | not the tap, which costs 1ms. Still unexplained |
 | **What the per-unit cost is** | inside `building`, and between ~6x and ~18x depending on units - `lead_ms` sums concurrent leads and the baseline's CPU time has never been measured. Export bounded at 5-10%, duplication 1.8x, cold mounts too small. No candidate fits, and the range itself is not tight |
-| Why `-bcast` breaks `+test-ast` | three hypotheses refuted; two families eliminated by tracing the error to containerd `images.Manifest()` |
 | Whether seeding pays once it can be delivered | never yet measured - every run so far failed before the question could be asked |
 
 **Retracted.** Written here confidently and wrong. Left in place with the
@@ -6616,3 +6615,79 @@ kills the hypothesis; hundreds resurrects it.
 
 Written now because the measurement is already queued and it would be easy,
 afterwards, to remember having expected whichever answer arrived.
+
+## Run B: the harvest works, the delivery does not, and `-bcast` is explained
+
+`31554856118`. Both earlier fixes confirmed by their own log lines.
+
+```text
+[harvest] 3 observed cache-mount input(s)
+[harvest] go-mod: using the input observed from a real graph
+[harvest] NOT seeding //go/pkg/mod: 491 bytes is under the 65536 byte floor
+```
+
+`using the input observed from a real graph` has never appeared before -
+every previous harvest printed `RECONSTRUCTING earthly's input, which has
+been measured wrong`. And `worth_seeding` fired on exactly the case it was
+written for: one id whose reconstruction produced 491 bytes, skipped instead
+of shipped.
+
+Two real seeds, harvested in 28s and 33s.
+
+| | checkpoint | A (empty seeds) | B (real seeds) |
+| ------- | ---------- | --------------- | -------------- |
+| leg | 1,113s | 1,783s | **1,699s** |
+| placing | 0s | 1,872s | 995s |
+| building | 4,917s | 6,653s | 7,035s |
+| home | 0 | 19 | 9 |
+| seeds | off | 3/3, empty | **2/2, real** |
+
+And the arms line has both arms for the first time:
+
+```text
+[wire] mount arms : seeded p50 5017ms (n=294), cold p50 74511ms (n=1)
+```
+
+One cold sample is not a comparison, so this still does not price seeding.
+What it does say is that a seeded arm is 5.0s where the checkpoint's cold
+arms were 5.7s - a 12% difference, against a mechanism that is costing 53%
+overall. Seeding is not yet paying for its delivery.
+
+### The declines name the next two bugs
+
+192 of them, in three groups:
+
+| count | reason |
+| ----- | ------------------------------------------------------- |
+| 125 | `could not fetch content descriptor ... not found` |
+| 60 | `.../rebuck2/subtree@sha256:...: not found` |
+| 4 | `unexpected media type application/octet-stream for ...` |
+
+The 60 are their own defect. `manifest_blobs` returns config and layers -
+everything the manifest POINTS AT, never the manifest itself - so a
+pre-positioned image left every worker needing the one blob a puller reads
+first, fetched at lead time. Fixed by `manifest_dig`.
+
+**The 4 are the `-bcast` failure.** That error has been open since `-bcast`
+was measured, with three hypotheses refuted and two families eliminated by
+tracing it to containerd's `images.Manifest()`. It appears here in a run
+with no broadcast at all, alongside 185 other fetch failures, which settles
+it: it was never a `-bcast` mechanism. It is the same unfetchable-content
+family, and broadcast only changed how often it was reached.
+
+### What run C carries
+
+Five fixes, all of them "make seeding able to work at all" rather than
+competing mechanisms:
+
+| fix | what it addresses |
+| ------------------- | ------------------------------------------------ |
+| `merge_cache_inputs` | the clobber - confirmed fixed in B |
+| `worth_seeding` | empty harvests shipped as seeds - confirmed in B |
+| seed broadcast | a blob every machine needs, split 1-in-N |
+| two-phase peer bounds | 5s around dial AND transfer |
+| `manifest_dig` | the 60 |
+
+Plus two instruments: each worker's ending cache-mount count, which decides
+whether cold mounts can be the amplification at all, and CPU on both sides,
+which is the missing half of every amplification figure in this file.
