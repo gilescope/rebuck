@@ -162,11 +162,44 @@ jobs:
       # Thirty seconds, against the twenty-five minute fleet run that is the
       # only other way to ask.
       - name: can a cold cache mount be seeded at all
+        env:
+          # THE CLOBBER, as a regression test rather than a unit test.
+          #
+          # In the fleet workflow `check-seeding` runs inside the harvest
+          # step, BEFORE `harvest-cache`, against a file the bank restored
+          # from a previous run's leg. It wrote that file with a truncating
+          # `std::fs::write`, so its one synthetic probe entry replaced the
+          # real `go-mod` input seconds before the harvest read it - which
+          # is why cache-mount seeding had never once worked.
+          #
+          # `merge_cache_inputs` is unit-tested, and a unit test cannot see
+          # this: the defect was a call site choosing `write` over `merge`,
+          # not the merge itself. Shape 20 - a test that supplies both sides
+          # of a seam cannot see a mismatch in it.
+          REBUCK2_CACHE_INPUTS_FILE: ${{ runner.temp }}/cache-inputs.tsv
         run: |
           set -euo pipefail
+          # A carried entry, shaped like the ones a real leg writes:
+          # id, selector, base64 op bytes.
+          printf 'go-mod\t/cache\tAAECAw==\n' > "$REBUCK2_CACHE_INPUTS_FILE"
+
           ./rebuck2/target/release/rebuck2 check-seeding \
             --bk 172.17.0.1:28372 --registry 172.17.0.1:15000 \
             --base 172.17.0.1:15000/library/busybox:1
+
+          echo "=== the inputs file after check-seeding"
+          cat "$REBUCK2_CACHE_INPUTS_FILE"
+          # The probe must record itself - that is what the file is for, and
+          # a test that only checked survival would pass against a no-op.
+          grep -q '^seedcheck-src-' "$REBUCK2_CACHE_INPUTS_FILE" || {
+            echo "::error::check-seeding recorded no observed input of its own"; exit 1; }
+          # And it must not have eaten what was already there.
+          # `grep -F` against a printf-built literal, NOT `\t` in a pattern.
+          # BSD grep reads `\t` as a tab and GNU grep reads it as `t`, so a
+          # pattern that passes on a laptop fails on the runner - and this
+          # assertion failing is indistinguishable from the bug it guards.
+          grep -qF "$(printf 'go-mod\t/cache\tAAECAw==')" "$REBUCK2_CACHE_INPUTS_FILE" || {
+            echo "::error::check-seeding CLOBBERED the carried go-mod input - the harvest that runs next would reconstruct it and read an empty directory"; exit 1; }
 
       - name: what it left behind
         if: always()
