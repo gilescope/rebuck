@@ -8474,11 +8474,27 @@ to BE in estargz format:
   mirror would have to convert on the way through, which is a real feature
   and not a flag.
 
-So the reachable half is the fleet's own results, and the 171 MiB blob that
-dominates the table is more likely a base layer than a subtree result -
-which would put the biggest single item on the wrong side of the
-prerequisite. Checking which it is costs one manifest lookup and has not
-been done.
+So the reachable half is the fleet's own results. I guessed the 171 MiB blob
+that dominates the table was a base layer, which would have put the biggest
+single item outside the prerequisite.
+
+**Checked, and it is not.** The three base images the Earthfile names, from
+their public manifests, amd64:
+
+| image | total | largest layer |
+| -------------------------- | ------ | ------------- |
+| `golang:1.26.5-alpine3.24` | 68 MiB | 64.2 MiB |
+| `node:26.7.0-alpine3.24` | 60 MiB | 56.8 MiB |
+| `alpine:3.24.1` | 4 MiB | 3.7 MiB |
+
+No base layer exceeds 65 MiB. That accounts neatly for the 65, 64 and 63 MiB
+entries in the fleet's table and leaves the **171 MiB blob unexplained by any
+base image** - so it is produced by the build, most likely a `+deps` or
+`+code` stage carrying the module cache or the compiled tree.
+
+The single largest item in the ancestry is therefore written by our own
+exporter, and could be written as estargz. The opposite of my guess, and it
+moves the biggest piece of the problem inside the reachable half.
 
 **Recorded as the only idea found tonight that attacks the unpack rather
 than the transfer**, with its prerequisite named and its likely limitation
