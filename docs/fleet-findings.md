@@ -6065,3 +6065,40 @@ retrofitted:
 
 The measurement to trust is `mount arms : seeded p50 ... (n=N)` with **both
 arms non-empty**. Every run so far has printed `n=0` on the seeded side.
+
+## `-bcast`: narrowing by elimination, not a fourth hypothesis
+
+Three candidate mechanisms for `unexpected media type application/octet-stream`
+have been refuted. Rather than propose a fourth, the error string was traced
+to its source. It is containerd's, in
+`vendor/github.com/containerd/containerd/v2/core/images/image.go:242`:
+
+```go
+return nil, fmt.Errorf("unexpected media type %v for %v: %w",
+    desc.MediaType, desc.Digest, errdefs.ErrNotFound)
+```
+
+Reached only after the descriptor failed both `IsManifestType` and
+`IsIndexType`. So the failure is not a fetch going wrong: **buildkit already
+held a descriptor typed `application/octet-stream` and expected a manifest
+or an index.** The question is only where that descriptor was minted.
+
+Two families can now be eliminated outright:
+
+- **Our manifest endpoint cannot produce it.** Every `/v2/*/manifests/*`
+  GET and HEAD goes through `media_type_of`, whose worst case is
+  `oci.image.manifest.v1+json`. The three `application/octet-stream`
+  literals in `registry.rs` are all on `/blobs/`, where octet-stream is
+  correct OCI.
+- **We author no manifests.** Outside tests, nothing in `src/` constructs
+  manifest JSON; `solve.rs:574` only reads `layers` out of one. Every
+  manifest in the mesh was written by buildkit's own exporter.
+
+That leaves the descriptor arriving through buildkit's own metadata - a
+lazy ref remembering a descriptor from when it was created - which is
+consistent with the error appearing during `unlazy force execution` and not
+during a pull.
+
+Still open, and deliberately not guessed at. But the search space is two
+families smaller, and the next person does not have to re-refute the
+registry.
