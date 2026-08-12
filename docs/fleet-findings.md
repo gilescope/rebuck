@@ -6219,3 +6219,39 @@ them. Nothing about the mechanism was wrong.
 the bank at the end of its leg. The next `-seed` run restores them, merges
 rather than clobbers, and is the first run in this project's history whose
 harvest can present the input earthly actually sent.
+
+### The seed ids match where the time is
+
+Before spending another run on seeding, the question worth asking is whether
+the four configured `seed_ids` are the ids this target actually spends its
+seconds behind. From the checkpoint run's cache-cost table (rows overlap - a
+lead counts under every id it names):
+
+| lead ms | leads | id |
+| --------- | ----- | --------------- |
+| 8,370,361 | 358 | `go-mod` |
+| 8,288,021 | 353 | `go-build` |
+| 3,153,880 | 97 | `//go/pkg/mod` |
+| 3,153,880 | 97 | `//root/.cache` |
+
+`go-mod` and `go-build` cover 358 and 353 of the 359 cache-touching leads,
+and both are in the default `seed_ids`. So a working harvest reaches
+essentially every lead that has a mount at all - the mechanism is aimed at
+the right thing.
+
+Two details worth writing down:
+
+- **The bare-path ids carry a DOUBLE leading slash** - `//go/pkg/mod`, not
+  `/go/pkg/mod`. `resolve_cache_id` survives it by matching on the tail
+  (`h.ends_with("/go/pkg/mod")`), which is luck rather than design; an exact
+  comparison would have missed both rows. The configured
+  `/root/.cache/golangci_lint` does NOT match `//root/.cache` and will be
+  skipped, which is correct - it is a different directory.
+- **The two 97-lead rows are identical to the millisecond** because they are
+  the same 97 leads counted twice, once under each id they name. That is
+  what the header warns about, and it is the kind of row that gets summed
+  into a headline by accident.
+
+So the remaining risk in the seeding prediction is not aim. It is whether
+the harvest can present the right input - which is the bank question, now
+that the truncating write is gone.
