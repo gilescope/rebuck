@@ -8501,3 +8501,43 @@ than the transfer**, with its prerequisite named and its likely limitation
 named too. The measurement that would justify pursuing it is the same one
 everything else waits on: how much of the 6-9x is unpack, which `-w1`
 answers.
+
+## `-w1` did not measure what it was designed to, and said something better
+
+Run `31564650459`. Parity green. And the verdict line is not what the design
+assumed:
+
+```text
+solves=412 routed=40 home=372 occupancy=1.95 dup=1.0 leads=41
+```
+
+**372 of 412 solves were built at home.** One worker with four slots cannot
+absorb 412 solves, so `consider()` returned `Saturated` and the gateway
+fell back to the coordinator's own daemon - which is correct behaviour and
+destroys the measurement. The worker's 1,046 CPU-seconds exclude the
+coordinator's daemon, which did 90% of the work and is not instrumented.
+
+So `leads*P` is not isolated and the ancestry term is not derivable from
+this run. The design missed that `HOME_SLOTS=0` forces dispatch only where
+a worker will take it.
+
+**What it did produce is more interesting than what it was for:**
+
+| | leg |
+| ------------------------ | ------ |
+| six workers (ref1/ref2) | 1,039-1,092s |
+| **one worker, 90% at home** | **814s** |
+| baseline, one machine | 212s |
+
+Doing nine tenths of the work on one warm machine and dispatching the rest
+beat distributing across six, by 21%. That is principle 30 stated as a
+result rather than a model: the machine that already holds the ancestry is
+the cheapest place to run anything, and the fleet's job is to find the few
+leads worth paying the ancestry for elsewhere.
+
+`dup=1.0` says it exactly - with one worker nothing was built twice, and the
+leg fell.
+
+**The instrument this needs** is CPU on the coordinator's own daemon, which
+the baseline step measures for `base-bk` and nothing measures for `own-bk`.
+One line, the same cgroup read, and then a `-w1` run is interpretable.
