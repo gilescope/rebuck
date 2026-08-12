@@ -8208,3 +8208,42 @@ serve purposes its comment does not list, and a mirror stanza changes who
 fetches from where at exactly the moment credentials matter - the area where
 this project has produced `no active sessions` twice. It wants reading
 before it wants doing.
+
+### Grafting is the mechanism principle 30 asks for, and it is off
+
+Principle 30 says the fleet's cost is `N x ancestry`, and that no scheduler
+can help because every machine that runs a lead needs that lead's ancestry.
+There is one mechanism here that does not try to schedule around it and
+instead changes what "needing the ancestry" costs.
+
+**Grafting** imports a published prefix as an image rather than rebuilding
+it from its ops. Same content on the machine either way, but a pull-and-
+unpack instead of running every `RUN` and `COPY` in the chain. Against an
+ancestry that is mostly build steps, those are very different prices - and
+`cut_prefix` already publishes the prefixes for it to import, 113 of them in
+run D.
+
+The audit above records its status honestly and the entry now reads
+differently in the light of tonight:
+
+> `graft` - off. Measured ON one shape (+107s) and never re-measured against
+> a warm bank. Its +107s was measured within a single run, where the
+> ancestor has to be built before it can be imported. Across runs the bank
+> already holds it.
+
+So the one measurement grafting has is of the case where it cannot win: in a
+cold run the prefix must be built once before anyone can import it, and the
+importer pays a pull on top. Everything tonight says the cost being attacked
+is real and large, and that the measurement which condemned grafting was
+taken in the configuration least favourable to it.
+
+**That does not make it a good idea; it makes the existing evidence
+inadmissible.** With the bank warm the prefix is already published, and
+grafting becomes "pull one image" against "rebuild the chain on six
+machines" - which is exactly the `N x ancestry` term.
+
+Priority against the other candidates: `-w1` first, because it says how big
+the ancestry term is and everything else is guesswork until then. But if
+`-w1` confirms it, grafting against a warm bank is the cheapest attack on
+it, needs no new code, and its only contrary measurement is one this file
+already calls unrepresentative.
