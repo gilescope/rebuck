@@ -6722,3 +6722,21 @@ becomes free and that is all seeding is worth, the mechanism is a wash and
 the finding is that **the cache mounts were never the expensive part**,
 which sends the whole investigation back to `building` with one fewer
 candidate.
+
+### The vertex join is superseded, not forgotten
+
+Two instruments were built to price the amplification. The **join** - the
+baseline daemon's per-vertex times against each worker's, matched on the
+vertex digest - cost 15% when its worker half was switched on, confounded
+the run it measured, and never produced a number. The **CPU counters** cost
+nothing, are read once at teardown, and answer the headline question
+directly.
+
+So the join is not the priority any more, and this is written down so it is
+not resurrected out of momentum. What it would still add is per-vertex
+detail: *which* vertices cost more on a worker, not just that they do. That
+is worth having once there is a figure to explain, and not before.
+
+`REBUCK2_WORKER_VERTICES` and the `-vtx` baseline history step stay gated
+off. Both were suspects in two parity failures, and the checkpoint that
+cleared HEAD ran with them off.
