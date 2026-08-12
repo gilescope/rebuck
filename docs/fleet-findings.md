@@ -8098,3 +8098,48 @@ It also explains the 43% run-to-run variance in worker CPU while the leg
 holds to 2%: which machine ends up materialising which part of the ancestry
 depends on placement, and placement changes every run - but the critical
 path does not care who did it.
+
+### Portability may be the 1.5x that ancestry duplication cannot explain
+
+Ancestry duplication caps at `N` and we measure 9.2x on six machines, so
+something adds roughly 1.5x per worker. This file already contains a
+candidate, filed months ago under a different question:
+
+> Warming cannot work, because portability changes the cache keys. Making a
+> graph portable rewrites the ops that name a local context or a base image,
+> every digest downstream of them changes, and buildkit's cache is keyed on
+> exactly those digests. A warm worker cannot key-match a dispatched graph.
+> One measured warm worker still fetched 354 MiB.
+
+That was written about warming. It says something larger.
+
+**The fleet does not build the baseline's graph.** `make_portable` rewrites
+every source, so every digest downstream of a rewritten op differs from the
+one the baseline computed. The two legs therefore materialise DIFFERENT
+content, and the fleet's set is not a copy of the baseline's - it is a
+parallel universe of the same build with different addresses.
+
+Two consequences that the ancestry model does not capture:
+
+- **Nothing is shared between the legs.** Whatever the baseline warmed, the
+  fleet cannot use, in either direction. That is already known and is why
+  warming was abandoned.
+- **The fleet may materialise MORE than the baseline needs.** A rewritten
+  graph names every input by digest; the baseline builds incrementally and
+  can skip materialising an intermediate it already holds under a different
+  identity. This has never been checked, and it is exactly the shape of a
+  per-lead term that does not scale with the machine count.
+
+So the `-w1` run separates three things rather than two, and the third now
+has a name and a mechanism rather than being "something else":
+
+| term | scales with | isolated by |
+| ------------------- | ------------- | ---------------- |
+| ancestry | machine count | `-w6` minus `-w1` |
+| per-lead toll | lead count | `-w1` minus baseline |
+| portability overhead | lead count | inside the above, and only a `building` split separates it |
+
+The connection was available all along - the warming finding is 2,500 lines
+above tonight's measurements in the same file. It took measuring the
+ancestry to notice that a paragraph about warm workers was really about
+what a dispatched graph costs.
