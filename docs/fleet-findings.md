@@ -7111,3 +7111,34 @@ FIRST and the remainder after: each blob then has exactly one machine
 pulling it from the driver, and the other five find it on that peer via the
 bloom moments later. Same total set, one source per blob, no stampede - the
 thing the comment already promised.
+
+### The 1,113s reference is now stale, and the next comparison must not use it
+
+Every seeded run tonight has been measured against the checkpoint's 1,113s
+unseeded leg. That reference predates two changes which are **not** gated by
+`-seed`:
+
+| change | affects |
+| ----------------------- | ---------------------------------------------- |
+| `manifest_dig` | EVERY prefetch, not just seeds - base images and cut prefixes now announce their manifest too |
+| the peer timeout split | every peer blob fetch on both driver and worker |
+
+Both are believed to be improvements and neither has been measured on its
+own. The seeder-first ordering is genuinely seed-only (it lives on the
+broadcast branch, and only seeds broadcast), and the rest of the night's
+work is diagnostics.
+
+So `1,113s` is a number from a different binary. Comparing the next seeded
+leg to it would attribute the difference to seeding when part of it belongs
+to a prefetch that now carries one more blob per image and a fetch that no
+longer abandons large transfers.
+
+**Before any further seeding conclusion: fire a plain `-ast-balance` run on
+current HEAD and re-establish the unseeded band.** It costs half an hour and
+it is the difference between a measurement and an anecdote. The same
+discipline caught `-bcast` riding in with the prefetch fix, and the
+checkpoint that cleared HEAD after 640 commits.
+
+Written now because the temptation, with run D landing shortly, is to read
+its leg against 1,113s and call it progress or regress. Neither reading
+would be sound.
