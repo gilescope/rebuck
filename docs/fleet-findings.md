@@ -8541,3 +8541,40 @@ leg fell.
 **The instrument this needs** is CPU on the coordinator's own daemon, which
 the baseline step measures for `base-bk` and nothing measures for `own-bk`.
 One line, the same cgroup read, and then a `-w1` run is interpretable.
+
+### There may be no fleet configuration with one materialising machine
+
+`-w1` was designed to isolate `n = 1`: one machine materialising the
+ancestry, exactly as the baseline does, so the CPU excess over the baseline
+would be the per-lead term alone.
+
+It cannot exist. One worker has four slots; 412 solves saturate it;
+`consider()` returns `Saturated`; the gateway builds at home. The
+configuration that would keep everything on one machine is
+`HOME_SLOTS = everything`, which is the baseline with extra steps.
+
+**So `n` is bounded below by 2 for any fleet that dispatches at all** - the
+coordinator's daemon and at least one worker - and the model has to be
+solved from two points rather than anchored at one:
+
+```text
+T6  =  6A + W + leads*P        six workers, home 0
+T2  =  2A + W + leads*P        one worker, coordinator takes the rest
+------------------------------------------------------------------
+T6 - T2  =  4A                 the per-lead term cancels
+```
+
+`A = (T6 - T2) / 4`, and the per-lead term drops out of the subtraction
+entirely, which is better than isolating it - it removes the need to know
+`leads * P` at all.
+
+The prerequisite is that BOTH totals include the coordinator's daemon, which
+no run has ever recorded. That instrument landed this hour and `-w1` is
+re-running with it.
+
+One caveat to state before the numbers arrive: `T2`'s coordinator is not
+doing baseline work. It builds 372 solves through the proxy, from PORTABLE
+graphs - rewritten sources, different digests - so its CPU is not the
+baseline's 598s and should not be assumed to be. That difference is the
+portability term, and this arrangement folds it into `W` rather than
+separating it. Two points cannot resolve three terms.
