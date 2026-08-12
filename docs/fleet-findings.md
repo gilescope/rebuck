@@ -7895,3 +7895,43 @@ than the baseline needed" is per-LEAD and would not fall at three workers.
 
 So the test now separates three things rather than two, which makes it
 better rather than worse.
+
+### The `-w3` test, stated as a ratio rather than a level
+
+"Amplification should be about the worker count" was the wrong form, because
+the measured 9.2x is already above the 6.0x ceiling that model allows - so
+comparing a level against a broken model proves nothing. The RATIO between
+two worker counts survives the model being incomplete:
+
+| ancestry share of baseline CPU | CPU at 6 / CPU at 3 |
+| ------------------------------ | ------------------- |
+| 90% | 1.96x |
+| 70% | 1.88x |
+| 50% | 1.75x |
+| 30% | 1.56x |
+| 10% | 1.25x |
+
+Whatever the extra 1.5x per worker turns out to be, it is per-LEAD and the
+lead count does not change with the machine count - so it contributes to
+both runs equally and cancels in the ratio. That is the whole reason to
+measure a ratio here.
+
+**The test:** run `-w3`, take the worker CPU total, and divide ref1's 5,575s
+by it.
+
+- near **2.0** - ancestry duplication dominates, and the fix is to place
+  leads so that fewer machines touch a given ancestry, not to make transfers
+  faster.
+- near **1.0** - it does not, the cost is per-lead, and `worth_offering` plus
+  the `building` split are the way in.
+
+### The pair is doing double duty
+
+`ref1` and `ref2` differ in nothing at all, so their spread is the noise
+band for BOTH quantities: the leg (expected ~2%, from 1113 against 1092) and
+the worker CPU total (unknown, and the thing that decides whether one `-w3`
+run is enough).
+
+If same-config CPU agrees to ~10%, one run at three workers settles it. If
+it agrees to ~40%, the `-w3` test needs repeating too, and that is worth
+knowing before firing it rather than after.
