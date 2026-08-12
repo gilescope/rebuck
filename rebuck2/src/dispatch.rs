@@ -2014,37 +2014,6 @@ pub fn offer_score(warmth: u32, queued: usize, terms: usize) -> i64 {
     i64::from(warmth) - (queued as i64) * BIG * (terms.max(1) as i64)
 }
 
-/// The most virtual queue slots a worker can be penalised for being ahead
-/// on work.
-///
-/// Bounded because affinity still matters: a machine that has done twice
-/// the fleet's work may also be the only one holding the ops for the next
-/// subtree, and excluding it outright trades a known transfer for an
-/// unknown queue.
-pub const WORK_AHEAD_CAP: usize = 6;
-
-/// How far ahead of the fleet this worker is on WORK, in queue slots.
-///
-/// Run C measured leads per worker spanning 1.96x while CPU per worker
-/// spanned 8.2x: `-balance` evens the count of leads and the count of leads
-/// is not the work. Expressing the imbalance as virtual queue depth lets the
-/// existing brake in [`offer_score`] carry it, rather than adding a second
-/// mechanism with its own weight to get wrong.
-///
-/// Brakes the busy only. A worker BELOW the mean is not rewarded here -
-/// warmth already prefers it, and paying twice for the same fact is how
-/// `-imports` doubled a preference against a brake sized for one.
-///
-/// `mean_ms == 0` is no signal: before any lead completes, nothing is known
-/// and nothing should be reordered.
-pub fn work_ahead(done_ms: u64, mean_ms: u64) -> usize {
-    if mean_ms == 0 || done_ms <= mean_ms {
-        return 0;
-    }
-    let over = (done_ms as f64 / mean_ms as f64) - 1.0;
-    ((over * 2.0).round() as usize).min(WORK_AHEAD_CAP)
-}
-
 /// Trade warmth against queue depth when ordering offers.
 ///
 /// OFF by default. It changes where every subtree goes, and the run that
@@ -3344,38 +3313,6 @@ mod tests {
         let back = super::decode_cache_inputs("go-mod\t/cache\nnot-a-line\n\n");
         assert!(back.is_empty(), "a line missing its payload is not a seed");
         assert!(super::decode_cache_inputs("").is_empty());
-    }
-
-    /// Work imbalance, expressed as queue slots so the existing brake can
-    /// carry it.
-    ///
-    /// Run C: leads per worker spanned 1.96x and CPU per worker 8.2x. So
-    /// `-balance` is working on the metric it optimises and that metric is
-    /// the wrong one - the work inside a lead varies four times more than
-    /// the number of leads does, and the busiest machine sets the leg.
-    #[test]
-    fn a_worker_ahead_on_work_carries_virtual_queue_depth() {
-        use super::work_ahead;
-
-        // At the fleet mean, nothing is owed.
-        assert_eq!(work_ahead(1000, 1000), 0);
-        // Below it, still nothing - this brakes the busy, it does not
-        // reward the idle twice (warmth already does that).
-        assert_eq!(work_ahead(200, 1000), 0);
-        // Twice the mean is two slots of penalty; four times is four.
-        assert_eq!(work_ahead(2000, 1000), 2);
-        assert_eq!(work_ahead(3000, 1000), 4);
-
-        // NO SIGNAL is not a penalty. Before any lead completes the mean is
-        // zero, and a fleet that has done nothing must not be reordered on
-        // the strength of it.
-        assert_eq!(work_ahead(0, 0), 0);
-        assert_eq!(work_ahead(5000, 0), 0);
-
-        // Bounded. One pathological worker must not be excluded for the
-        // rest of the run - it would still be the right machine for a
-        // subtree only it has the ops for.
-        assert!(work_ahead(u64::MAX, 1) <= super::WORK_AHEAD_CAP);
     }
 
     /// Attributing a daemon's mount size to the right cache id.

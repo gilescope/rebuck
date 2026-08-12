@@ -6968,11 +6968,27 @@ recorded.
 
 #### The wiring, specified but not done
 
-`work_ahead(done_ms, mean_ms)` exists and is tested: it turns "this worker
-is ahead of the fleet on work" into virtual queue slots, so the brake in
-`offer_score` carries it and no second weight has to be tuned. It brakes the
-busy only - warmth already prefers the idle, and paying twice for one fact
-is how `-imports` cost 425s.
+The shape is settled and the code is NOT in the tree, deliberately.
+
+`work_ahead(done_ms, mean_ms)` turns "this worker is ahead of the fleet on
+work" into virtual queue slots, so the brake in `offer_score` carries it and
+no second weight has to be tuned:
+
+- brake the busy only. A worker below the mean is not rewarded here, because
+  warmth already prefers it, and paying twice for one fact is how `-imports`
+  cost 425s.
+- `mean_ms == 0` is NO SIGNAL, not a penalty: before any lead completes
+  nothing is known and nothing should be reordered.
+- bounded, around six slots. A worker that has done twice the fleet's work
+  may also be the only one holding the ops for the next subtree, and
+  excluding it outright trades a known transfer for an unknown queue.
+
+It was written, tested, and then **removed again** rather than committed
+unwired. This file records "third mechanism on this branch built and left
+unconnected" as a recurring failure, and an eight-line function behind an
+`#[allow(dead_code)]` is that failure with a tidier hat on. The thinking is
+here, where it does not rot; the code is two minutes' work when there is a
+run to measure it with.
 
 What remains is plumbing, and it is deliberately not done at the same time
 as a seeding measurement:
