@@ -8051,3 +8051,50 @@ tracks the 6.9x CPU spread. The busiest machine is not just doing more
 leads, it is touching more distinct content - which is what an
 ancestry-dominated cost looks like when placement is uneven, and another
 reason the `-balance` work should weigh content rather than counts.
+
+## 32 GiB to distribute 700 MiB: the ancestry, measured
+
+Run D's artifacts hold the number this hypothesis needed, and it had not
+been looked at.
+
+| quantity | run D |
+| ------------------------------------ | ------------- |
+| content that LEFT the workers | **32,924 MiB** |
+| distinct content, summed per worker | 4,232 MiB |
+| distinct per worker | **705 MiB** |
+| the coordinator's registry served | **742 MiB** |
+
+The coordinator served **742 MiB** - almost exactly one worker's distinct
+set. It seeded the content once and the peers redistributed it among
+themselves, moving **32 GiB** to do so. The mesh is doing precisely its job
+and the job should not exist.
+
+**Each worker ends up holding about 705 MiB of distinct content.** If those
+six sets are largely the same content - and they must be, or the coordinator
+would have had to serve far more than one set's worth - then the fleet
+materialises the SAME ~700 MiB on every machine.
+
+That is the ancestry term, measured rather than inferred:
+
+```text
+A  ~  705 MiB per machine
+baseline unpacks it once ;  six workers unpack it six times
+```
+
+### What it does and does not settle
+
+**Settles the mechanism.** Transfer is not the cost (81% of fetches are
+local, the coordinator serves one set), but DISTRIBUTION plus per-machine
+unpacking of a common 700 MiB is real, is paid six times, and is invisible
+in every counter this project had before tonight.
+
+**Does not settle the magnitude.** Whether unpacking 705 MiB accounts for
+the 9.2x depends on what unpacking costs in CPU against the 607s the
+baseline spends, and nothing here measures that. `-w1` does: with one worker
+the 705 MiB is materialised once, like the baseline, and any amplification
+left over is the per-lead term.
+
+It also explains the 43% run-to-run variance in worker CPU while the leg
+holds to 2%: which machine ends up materialising which part of the ancestry
+depends on placement, and placement changes every run - but the critical
+path does not care who did it.
