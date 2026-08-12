@@ -6965,3 +6965,27 @@ SIZE, and `-minops` already proved size is not cost - a 20-op dispatch floor
 made the fleet five times slower while improving every per-lead number.
 Observed `lead_ms` per worker is the honest signal, and it is already
 recorded.
+
+#### The wiring, specified but not done
+
+`work_ahead(done_ms, mean_ms)` exists and is tested: it turns "this worker
+is ahead of the fleet on work" into virtual queue slots, so the brake in
+`offer_score` carries it and no second weight has to be tuned. It brakes the
+busy only - warmth already prefers the idle, and paying twice for one fact
+is how `-imports` cost 425s.
+
+What remains is plumbing, and it is deliberately not done at the same time
+as a seeding measurement:
+
+1. `offer_order_warm` takes a second closure `work: &dyn Fn(u64) -> usize`,
+   mirroring the `warm` closure it already has. The simple caller passes
+   `&|_| 0`.
+2. The driver accumulates completed `ms` per worker - it already has the
+   value at `driver.rs:929`, where `all_lead_ms` is incremented - and
+   supplies the closure as `work_ahead(done[id], mean)`.
+3. Its own switch, default off, counted as `balance_work`, because
+   `-balance` is already on in every recent run and a change that rides
+   inside it cannot be attributed.
+
+The placement path is where `-imports` and `-minops` each cost a run, so it
+gets its own experiment with nothing else moving.
