@@ -7555,3 +7555,45 @@ size it first appeared to be. Option 1 is not a compromise, it is exact.
 Two models, both guesses, before one measurement settled it - first that all
 components are abbreviated (37 ambiguous), then that the first one is (0
 ambiguous). The repo was on disk the whole time.
+
+### A missed prefetch is not a failed lead, and the "one blob" was a one-off
+
+Run D's `not routed` map has seven failure buckets, **one occurrence each**,
+matching its `home=7`. Run C's had five buckets and one of them accounted
+for **87 of 91**. So the single-blob concentration is not a structural
+pattern - it happened once, to one object, and did not recur.
+
+Which makes the 91-to-7 fall between the runs mostly the absence of that one
+object rather than any fix, and it is another case where two identical
+binaries produced numbers an order of magnitude apart.
+
+**The more useful number is the pair.** Run D had:
+
+| | |
+| --------------- | --- |
+| prefetch misses | 325 |
+| lead failures | 7 |
+
+Three hundred and twenty-five blobs that a prefetch announced and failed to
+fetch, and seven leads that failed. So **a missed prefetch overwhelmingly
+does not fail a lead** - the lazy path picks it up, exactly as the design
+intends, and the comment that has been in the prefetch loop all along is
+right:
+
+> Failures are dropped - a blob that does not arrive now arrives lazily
+> later, which is what happens today.
+
+I quoted that comment earlier tonight as an example of a claim that "was
+true when a prefetch was advisory and is not true for a seed". The 325-to-7
+ratio says it is still true, seeds included. The comment was right and my
+correction of it was wrong.
+
+**So the delivery investigation has been chasing the wrong quantity.**
+Prefetch misses are loud, numerous, and mostly harmless; lead failures are
+rare and were once dominated by a single unlucky blob. Neither is the 6-9x.
+
+What remains worth fixing from that thread is narrow and already done: the
+manifest regression that produced most of those 325 misses, and the seeder-
+first ordering that stops six machines asking one for the same bytes. What
+does NOT deserve another run is the theory that delivery failure is why the
+fleet is slow. It is not, and the arithmetic was available in this run.
