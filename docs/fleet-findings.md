@@ -7788,3 +7788,63 @@ Worth doing before anything else, including the `building` split - the split
 says WHERE the time goes, and this says whether the answer scales with
 machines, which is the difference between a tuning problem and a structural
 one.
+
+## The unseeded band is intact, and the noise is not where I said it was
+
+Run `31561556653` - plain `-ast-balance` on current HEAD, unseeded, with the
+manifest regression fixed.
+
+| | |
+| --------------- | ---------------------- |
+| leg | **1,092s** |
+| baseline | 216s wall, **607s CPU** |
+| worker CPU | 5,575s |
+| amplification | **9.2x** |
+| placing / home | 0s / 0, 412 of 412 routed |
+
+**The 1,113s reference survives.** I retired it two hours ago on the grounds
+that `manifest_dig` and the peer-timeout split had moved the default path.
+They had not, at least not measurably: 1,092s against 1,113s is 1.9% apart.
+The caution was right and the conclusion was wrong, which is the cheaper way
+round.
+
+### Where the variance actually lives
+
+Splitting the samples by what they measure:
+
+| quantity | samples | spread |
+| ----------------- | -------------------------- | ------ |
+| baseline CPU | 604, 592, 607 | **2.5%** |
+| unseeded leg | 1113, 1092 | **1.9%** |
+| seeded legs | 1783, 1699, 1625, 1396 | 28% |
+| worker CPU total | 3900, 5155, 5575 | **43%** |
+
+So "a third of run-to-run variance" was too broad. **The leg is
+reproducible to about 2%. The CPU total is not, at 43%.** They are different
+kinds of number and I lumped them.
+
+That makes sense once said: the leg is set by the critical path, so work
+that shifts between machines does not move it. The CPU total sums everything
+every machine did, including whatever ancestry each happened to
+materialise - so it moves with placement, which changes every run.
+
+**Two consequences.**
+
+- Tonight's leg comparisons are sounder than I feared. 1783 -> 1396 across
+  the seeded runs is well outside 2%, and prefetch's 1773 -> 1240 and
+  `-balance`'s 1240 -> 1050 are far outside it.
+- The CPU amplification is the number that needs repetition, and it is
+  exactly the number the ancestry hypothesis predicts should track the
+  worker count. Testing that at 43% noise needs the effect to be large -
+  which, at 3 workers against 6, it should be.
+
+### And seeding is worse than it looked
+
+The unseeded leg is **1,092s**. The best seeded leg all night was 1,396s.
+That gap is fifteen times the leg's own noise, so it is real: **seeding
+costs about 300 seconds on this target and returns nothing measurable.**
+
+Its CPU amplification, meanwhile, is no worse than unseeded - 6.5x and 8.7x
+seeded against 9.2x unseeded. So seeding does not add work so much as
+lengthen the critical path, which is what waiting for a seed that has not
+arrived would do.
