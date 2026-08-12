@@ -275,8 +275,219 @@ const MAX_ATTEMPTS: u32 = 3;
 /// second worker — otherwise every action in a small build runs twice.
 const SPECULATE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// One subtree in flight: who wants it, what it is, and how far down the
+/// candidate list we have got.
+/// Who asked for a subtree to be placed.
+///
+/// Two, because the gateway is not on the mesh. A worker that subdivides
+/// reaches us over the control stream and is answered the same way; the
+/// buildkit proxy runs in THIS process, holding a client's Solve open, and
+/// answering it over a wire to ourselves would be a second transport for a
+/// question we can answer with a channel.
+/// Why a subtree came back without a result.
+///
+/// A string could not carry this. The gateway's two responses are opposite -
+/// build it here, or tell the client it failed - and until now both arrived
+/// as `Err(String)` and the first was the only one implemented.
+pub enum LeadRefusal {
+    /// Nobody took it, or nobody could. Build it at home: fail open.
+    Unplaced(String),
+    /// A peer ran the CLIENT'S OWN graph and the build failed. Rebuilding it
+    /// here would fail identically, ~40s later. Only produced when
+    /// [`crate::dispatch::trust_verdict`] allows it.
+    Verdict(String),
+}
+
+impl LeadRefusal {
+    pub fn why(&self) -> &str {
+        match self {
+            LeadRefusal::Unplaced(w) | LeadRefusal::Verdict(w) => w,
+        }
+    }
+}
+
+enum Requester {
+    Worker(u64),
+    /// The gateway in-process. Resolves to the image ref a peer published,
+    /// or `None` for "nobody took it" - which the caller treats as "build it
+    /// here", exactly as a worker does with `Unplaced`.
+    Gateway(tokio::sync::oneshot::Sender<Result<String, LeadRefusal>>),
+}
+
+impl Requester {
+    /// The worker that must not be offered its own subtree back. `None` for
+    /// the gateway, which holds no worker slot and is not a candidate.
+    fn worker_id(&self) -> Option<u64> {
+        match self {
+            Requester::Worker(id) => Some(*id),
+            Requester::Gateway(_) => None,
+        }
+    }
+}
+
+struct Subtree {
+    requester: Requester,
+    subtree: Vec<u8>,
+    frontier: Vec<Dig>,
+    placement: crate::dispatch::Placement,
+    /// When this subtree was first offered, and which caches it names.
+    ///
+    /// Together these answer the only question that decides what is worth
+    /// seeding: not which cache ids appear most often in the Earthfile -
+    /// frequency in the source says nothing about time - but which ones the
+    /// fleet actually SPENDS its seconds behind.
+    started: std::time::Instant,
+    /// When the offer that was ACCEPTED went out, as ms since `started`.
+    ///
+    /// Driver-local, so no clock crosses a machine. Updated on every offer,
+    /// so after the last one it is the moment placement stopped costing
+    /// round trips and refusals - which is what `placing` means.
+    offered_ms: u64,
+    caches: std::collections::BTreeSet<String>,
+    /// Did this go out byte-identical to what the client sent?
+    ///
+    /// Decides whether a peer's failure may be reported as the client's. See
+    /// [`crate::dispatch::trust_verdict`].
+    verbatim: bool,
+}
+
 pub struct Driver {
     pub store: Arc<Store>,
+    /// Milliseconds and lead-count spent behind each cache id.
+    ///
+    /// The question this exists to answer is which caches are worth SEEDING
+    /// on a cold worker. Counting how often an id appears in the Earthfile
+    /// answers a different question and gets it wrong: `npm` and `go-build`
+    /// appear eighteen times each, which says nothing about whether either
+    /// costs a minute or a second.
+    cache_cost: tokio::sync::Mutex<std::collections::BTreeMap<String, (u64, u64)>>,
+    /// Lead durations split by whether the mounts they named were seeded.
+    ///
+    /// A WITHIN-RUN comparison, which is the only kind this rig can make
+    /// honestly: baseline variance here runs about 30%, so a 10% effect
+    /// between two runs is unreadable. Seed a SUBSET of the cache ids and
+    /// the same run contains both arms - leads that met a filled mount and
+    /// leads that met an empty one.
+    ///
+    /// It also separates what the per-id cost table cannot. That table
+    /// charges a lead to every id it names, so `go-mod`, `go-build` and the
+    /// rest all score nearly the same seconds and none of them can be told
+    /// apart. Seeding one and not the others makes the difference show up
+    /// as duration.
+    seeded_leads: tokio::sync::Mutex<Vec<u64>>,
+    cold_leads: tokio::sync::Mutex<Vec<u64>>,
+
+    /// The same milliseconds, counted ONCE per lead.
+    ///
+    /// The map above adds a lead's whole duration to every cache id it
+    /// names, which is right for ranking ids and wrong for a total: a lead
+    /// naming `go-mod`, `go-build`, `/go/pkg/mod` and `/root/.cache` is in
+    /// there four times. Summing the map gave "5,841,146ms of cache cost" in
+    /// a run whose entire fleet leg was 789 seconds, which is a number that
+    /// cannot be true and was very nearly quoted.
+    cache_lead_ms: std::sync::atomic::AtomicU64,
+    cache_leads: std::sync::atomic::AtomicU64,
+    /// EVERY lead's duration, summed, and how many.
+    ///
+    /// The number that reframes this project's results. group2: 143 solves,
+    /// occupancy 3.53, 598s of wall - so about 2100 machine-seconds of lead
+    /// work against a baseline that finished the same target in 233. The
+    /// fleet does roughly NINE TIMES the work, and no scheduler divides 9x
+    /// across 7 machines into a win.
+    ///
+    /// So the thing to attack is amplification, not parallelism. Reported
+    /// rather than derived, because deriving it needs occupancy and a wall
+    /// clock and gets rounded twice on the way.
+    all_lead_ms: std::sync::atomic::AtomicU64,
+    /// Lead time, split three ways. See [`crate::dispatch::lead_split`].
+    ///
+    /// Every remedy tried so far aims at `building`, which is a quarter of
+    /// the total. These two say whether the rest is a fleet being slow to
+    /// place work or a fleet legitimately busy.
+    placing_ms: std::sync::atomic::AtomicU64,
+    waiting_ms: std::sync::atomic::AtomicU64,
+    building_ms: std::sync::atomic::AtomicU64,
+    all_leads: std::sync::atomic::AtomicU64,
+    /// The most subtrees ever in flight at once.
+    ///
+    /// The question that outranks every transfer optimisation: can this
+    /// build use a fleet at all? Six machines took 590s against 307s on one,
+    /// and before blaming cold caches it is worth knowing whether more than
+    /// one worker was ever busy. A graph whose critical path IS its total
+    /// cannot be made faster by any number of machines, and every second
+    /// spent tuning the mesh for it is spent on the wrong problem.
+    peak_inflight: std::sync::atomic::AtomicUsize,
+    /// Every distinct op digest ever dispatched, and the running total.
+    ///
+    /// The ratio between them IS the duplication factor. Two machines beat
+    /// six on the same target, which only happens when work is multiplied
+    /// rather than divided - but "the prefix is rebuilt per worker" was
+    /// inferred from subtree SIZES and a duration histogram, not counted.
+    ///
+    /// `sum / unique` says it outright: 1.0 means the subtrees are disjoint
+    /// and the fleet divides the work, 10.0 means ten machines would each
+    /// build nine tenths of the same graph.
+    dispatched_ops: tokio::sync::Mutex<(std::collections::HashSet<String>, u64)>,
+    /// op digest -> the image a peer published for it.
+    ///
+    /// What makes the step from N prefixes to 1 possible: a later graph
+    /// containing this op can import the result instead of rebuilding the
+    /// chain beneath it. Sound because an op's bytes embed its inputs'
+    /// digests, so equal digests mean equal ancestry, transitively.
+    built: tokio::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Image digest -> the worker that published it, recorded the instant it
+    /// says so.
+    ///
+    /// The blooms answer the same question and answer it too late: they are
+    /// gossiped on a tick, and a child is placed seconds after its parent
+    /// finishes. An affinity term that only saw parents from the previous
+    /// gossip round would fire rarely and read as a mechanism that does not
+    /// help - the exact failure this codebase keeps finding. This map is
+    /// exact, immediate, and has no false positives; the bloom stays as the
+    /// fallback for images a worker PULLED rather than built.
+    holder_of: tokio::sync::Mutex<std::collections::HashMap<String, u64>>,
+    /// Distinct `(op, worker)` pairs - what the fleet will actually EXECUTE.
+    ///
+    /// Dispatch duplication is an upper bound and not the cost: a worker's
+    /// buildkit caches an op it has already built, so sending the same op to
+    /// the same worker twice is free the second time. Sending it to a
+    /// different worker is not.
+    ///
+    /// distinct pairs / distinct ops is therefore the honest multiplier, and
+    /// it should approach the number of WORKERS if every worker is rebuilding
+    /// the same ancestry.
+    op_by_worker: tokio::sync::Mutex<std::collections::HashSet<(String, u64)>>,
+    /// Which cache mount ids each worker has actually filled.
+    ///
+    /// Not which it has been SENT: a lead that was declined or died leaves
+    /// the mount as cold as it found it, and offering the next subtree to
+    /// that peer on the strength of it would be affinity pointed at nothing.
+    /// Recorded where the duration is, which is where a build finished.
+    cache_by_worker: tokio::sync::Mutex<std::collections::HashSet<(String, u64)>>,
+    /// The terminal op of each dispatched subtree, so its result can be
+    /// tested for sharing when it completes. Without it `prefetch_image_for`
+    /// has no op to count consumers of, and the gate it was built for is
+    /// never reached.
+    job_terminal: tokio::sync::Mutex<std::collections::BTreeMap<u64, String>>,
+
+    /// Ops the CALLER said more than one graph wants. See
+    /// [`Driver::lead_subtree_shared`].
+    shared_ops: tokio::sync::Mutex<std::collections::BTreeSet<String>>,
+
+    /// What each job is, so the line that reports its DURATION can name it.
+    ///
+    /// A lead is otherwise logged as the digest it produced, and the job
+    /// that owned 40% of a wall clock could not be identified from the log
+    /// at all - which is the difference between "one target is genuinely
+    /// long" and "one cold pull is the tax", two conclusions that want
+    /// opposite fixes.
+    job_names: tokio::sync::Mutex<std::collections::BTreeMap<u64, String>>,
+    /// Cross-machine single-flight. One per driver: it is the fleet's single
+    /// coordinator, so there is no consensus problem to solve, only a
+    /// liveness one.
+    leases: crate::lease::Leases,
+    /// Subtrees offered by one worker and being placed with another.
+    subtrees: Mutex<std::collections::HashMap<u64, Subtree>>,
     cfg: DriverCfg,
     jobs: Mutex<HashMap<u64, Job>>,
     workers: Mutex<Vec<WorkerConn>>,
@@ -343,12 +554,40 @@ pub struct Driver {
     mesh_ep: tokio::sync::OnceCell<Endpoint>,
 }
 
+/// Announce a finished layer to the fleet before anyone asks for it?
+///
+/// Off by default, like every mechanism here, so its effect is one variable.
+fn prefetch_ahead() -> bool {
+    std::env::var("REBUCK2_PREFETCH").as_deref() == Ok("1")
+}
+
 impl Driver {
     pub fn new(store: Arc<Store>, cfg: DriverCfg) -> Arc<Self> {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
         Arc::new(Self {
+            leases: crate::lease::Leases::default(),
+            subtrees: Mutex::new(std::collections::HashMap::new()),
+            cache_cost: Default::default(),
+            seeded_leads: Default::default(),
+            cold_leads: Default::default(),
+            all_lead_ms: Default::default(),
+            placing_ms: Default::default(),
+            waiting_ms: Default::default(),
+            building_ms: Default::default(),
+            all_leads: Default::default(),
+            cache_lead_ms: Default::default(),
+            cache_leads: Default::default(),
+            peak_inflight: Default::default(),
+            dispatched_ops: Default::default(),
+            built: Default::default(),
+            holder_of: Default::default(),
+            op_by_worker: Default::default(),
+            cache_by_worker: Default::default(),
+            job_names: Default::default(),
+            job_terminal: Default::default(),
+            shared_ops: Default::default(),
             store,
             cfg,
             jobs: Mutex::new(HashMap::new()),
@@ -607,6 +846,164 @@ impl Driver {
                     return Ok(()); // clean disconnect
                 };
                 match msg {
+                    // A worker has subdivided and wants a peer for a branch.
+                    // We arbitrate and carry nothing: the subtree bytes go
+                    // straight back out in a Lead, and the result never
+                    // comes near this machine.
+                    W2D::Offer { subtree, frontier } => {
+                        self.place_subtree(Requester::Worker(worker_id), subtree, frontier, false)
+                            .await;
+                    }
+                    // The subtree built somewhere else and is fetchable from
+                    // the builder's mirror. The driver is told WHERE, and
+                    // holds no bytes: principle 6, and the test for it is
+                    // to look at this machine's disk afterwards.
+                    W2D::Led {
+                        job,
+                        image_ref,
+                        build_ms,
+                    } => {
+                        // Read the open record BEFORE `led` consumes it: the
+                        // timing and the cache ids live there, and the whole
+                        // point is to attribute this job's seconds.
+                        // The op this image IS, so a later graph can import
+                        // it rather than rebuild its chain. The terminal op is
+                        // buildkit's marshalling convention: last in `def`,
+                        // inputs pointing at the real root.
+                        {
+                            use prost::Message;
+                            let root = self.subtrees.lock().await.get(&job).and_then(|st| {
+                                bollard_buildkit_proto::pb::Definition::decode(
+                                    st.subtree.as_slice(),
+                                )
+                                .ok()
+                                .and_then(|d| {
+                                    d.def.last().and_then(|term| {
+                                        bollard_buildkit_proto::pb::Op::decode(term.as_slice())
+                                            .ok()
+                                            .and_then(|o| {
+                                                o.inputs.first().map(|i| i.digest.clone())
+                                            })
+                                    })
+                                })
+                            });
+                            if let Some(r) = root {
+                                self.built.lock().await.insert(r, image_ref.clone());
+                            }
+                            // Who holds it, by the digest a child will name.
+                            // `image_ref` is the bare `sha256:...` the builder
+                            // published; a child imports it as
+                            // `docker-image://<reg>/<repo>@sha256:...` and
+                            // `imported_images` hands back the bare hash, so
+                            // the two meet without either knowing a registry.
+                            let h = image_ref.trim_start_matches("sha256:").to_owned();
+                            self.holder_of.lock().await.insert(h, worker_id);
+                        }
+                        let (ms, caches, offered_ms) = {
+                            let open = self.subtrees.lock().await;
+                            match open.get(&job) {
+                                Some(st) => (
+                                    st.started.elapsed().as_millis() as u64,
+                                    st.caches.clone(),
+                                    st.offered_ms,
+                                ),
+                                None => (0, Default::default(), 0),
+                            }
+                        };
+                        let what = self
+                            .job_names
+                            .lock()
+                            .await
+                            .get(&job)
+                            .cloned()
+                            .unwrap_or_else(|| image_ref.clone());
+                        println!(
+                            "[driver] subtree job {job} built at {image_ref} in {ms}ms [{what}]"
+                        );
+                        // Attribute the SECONDS to the cache ids the graph
+                        // named. A subtree with no cache mount contributes
+                        // to nothing here, which is the point: this table
+                        // ranks what seeding a warm cache would actually
+                        // buy, and cannot be derived from the Earthfile.
+                        {
+                            self.all_lead_ms.fetch_add(ms, Ordering::Relaxed);
+                            self.all_leads.fetch_add(1, Ordering::Relaxed);
+                            // `started` is derived, not measured: the worker
+                            // reports a DURATION and the driver knows when
+                            // the lead was last offered, so the moment the
+                            // build began is `ms - build_ms` on one clock.
+                            // Nothing crosses machines, so nothing can be
+                            // skewed into a headline.
+                            // The DURATION, not a derived start. Deriving
+                            // it as `ms - build_ms` puts a build that filled
+                            // its whole lead on zero, which is the sentinel
+                            // for "the worker never said" - and would book a
+                            // busy worker as a slow fleet.
+                            let split = crate::dispatch::lead_split(0, offered_ms, build_ms, ms);
+                            self.placing_ms
+                                .fetch_add(split.placing_ms, Ordering::Relaxed);
+                            self.waiting_ms
+                                .fetch_add(split.waiting_ms, Ordering::Relaxed);
+                            self.building_ms
+                                .fetch_add(split.building_ms, Ordering::Relaxed);
+                            if !caches.is_empty() {
+                                self.cache_lead_ms.fetch_add(ms, Ordering::Relaxed);
+                                self.cache_leads.fetch_add(1, Ordering::Relaxed);
+                            }
+                            {
+                                let mut cw = self.cache_by_worker.lock().await;
+                                for id in &caches {
+                                    cw.insert((id.clone(), worker_id));
+                                }
+                            }
+                            // Which arm this lead is in. `any`, not `all`:
+                            // one filled mount is enough to change what the
+                            // build does, and a lead naming a seeded id
+                            // alongside an unseeded one is not a control.
+                            if !caches.is_empty() {
+                                let seeds = crate::dispatch::cache_seeds();
+                                if caches.iter().any(|id| seeds.contains_key(id)) {
+                                    self.seeded_leads.lock().await.push(ms);
+                                } else {
+                                    self.cold_leads.lock().await.push(ms);
+                                }
+                            }
+                            let mut c = self.cache_cost.lock().await;
+                            for id in &caches {
+                                let e = c.entry(id.clone()).or_insert((0u64, 0u64));
+                                e.0 += ms;
+                                e.1 += 1;
+                            }
+                        }
+                        self.subtree_built(job, image_ref).await;
+                    }
+                    // Refusal is not a failure - it is how the driver learns
+                    // the fleet is saturated without asking (principle 12).
+                    // The job stays ours to place elsewhere or build here.
+                    W2D::Decline { job, why } => {
+                        println!("[driver] worker declined subtree job {job}: {why}");
+                        // The one refusal worth explaining rather than
+                        // counting. A daemon with no `[registry]` stanza
+                        // pushes happily and cannot PULL, so the fleet fills
+                        // the mirror, declines everything, and every build
+                        // still succeeds at home - the quiet green this
+                        // project keeps arguing against. The proxy used to
+                        // say this; it cannot see refusals any more, and
+                        // this is where they arrive.
+                        if why.contains("server gave HTTP response to HTTPS client") {
+                            println!(
+                                "[driver] LIKELY CAUSE: a worker cannot PULL from the mirror over\n\
+                                 [driver]   plain HTTP. Publishing is insecure per-solve, so the\n\
+                                 [driver]   mirror filled and the log looked fine; pulling needs\n\
+                                 [driver]   daemon config. Add to every buildkitd's\n\
+                                 [driver]   /etc/buildkit/buildkitd.toml:\n\
+                                 [driver]     [registry.\"<REBUCK2_MIRROR>\"]\n\
+                                 [driver]       http = true\n\
+                                 [driver]       insecure = true"
+                            );
+                        }
+                        self.subtree_declined(job, worker_id, &why).await;
+                    }
                     W2D::Done {
                         job,
                         action_result,
@@ -1236,6 +1633,981 @@ impl Driver {
         Ok(None)
     }
 
+    /// Arbitrate one offered subtree: choose a peer, offer, and remember
+    /// who is holding it so a decline can move on.
+    ///
+    /// The driver carries NOTHING. The subtree bytes it received go
+    /// straight back out in the `Lead`, and the result travels from the
+    /// builder's mirror to the requester without touching this machine.
+    /// That is principle 6, and the test for it is to look at this
+    /// machine's disk after a dispatched build.
+    async fn place_subtree(
+        self: &Arc<Self>,
+        requester: Requester,
+        subtree: Vec<u8>,
+        frontier: Vec<Dig>,
+        // Whether this is byte-for-byte what the client sent. A worker's own
+        // Offer is never verbatim from the CLIENT's point of view: it is a
+        // branch of a graph we already rewrote.
+        verbatim: bool,
+    ) {
+        use prost::Message;
+
+        let job = self.next_job.fetch_add(1, Ordering::Relaxed);
+        let Ok(def) = bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice()) else {
+            self.unplaced(
+                requester,
+                job,
+                LeadRefusal::Unplaced("subtree is not a buildkit Definition".to_owned()),
+            )
+            .await;
+            return;
+        };
+        let verdict = crate::dispatch::inspect(&def);
+
+        // The SECOND dispatch site, and it needs the same floor as the
+        // first. A worker handing a five-op branch to a peer makes that peer
+        // materialise a base image to run it, exactly as the proxy did 412
+        // times on `+test-ast` for 73x. Principle 25.
+        //
+        // Refusing here is not a failure: the requester builds it itself,
+        // which is the outcome the rule wants. For a verbatim client graph
+        // this is a no-op - the proxy already applied the same floor to the
+        // same bytes - so what it actually gates is subdivision.
+        if crate::dispatch::too_small_to_send(def.def.len(), crate::dispatch::min_ops()) {
+            crate::mech::applied("min_ops");
+            self.unplaced(
+                requester,
+                job,
+                LeadRefusal::Unplaced(format!(
+                    "{} ops is below the {}-op floor: smaller than the bytes it would drag",
+                    def.def.len(),
+                    crate::dispatch::min_ops()
+                )),
+            )
+            .await;
+            return;
+        }
+
+        // Subtree leads a worker is already holding. `inflight` counts REAPI
+        // jobs ONLY, so without this every worker prices as idle however many
+        // subtrees it is sitting on - measured: four leads, all to worker 1,
+        // worker 2 never offered anything. At nineteen workers that is a
+        // fleet doing one machine's work.
+        //
+        // Locked before `workers`, matching `subtree_declined`, which takes
+        // subtrees and then reaches for workers via `tell`.
+        //
+        // The guard is held from the COUNT to the INSERT below, because
+        // releasing between them is check-then-act: four offers arriving
+        // together each counted zero leads before any of them had recorded
+        // one, and three landed on the same worker. Same shape as the
+        // proxy's reservation, which had to be moved to its decision for
+        // exactly this reason.
+        let mut open = self.subtrees.lock().await;
+        let leads: std::collections::BTreeMap<u64, usize> = {
+            let mut m = std::collections::BTreeMap::new();
+            for s in open.values() {
+                if let Some(w) = s.placement.holder() {
+                    *m.entry(w).or_default() += 1;
+                }
+            }
+            m
+        };
+        let candidates: Vec<crate::dispatch::Candidate> = {
+            let ws = self.workers.lock().await;
+            ws.iter()
+                // Never offer a worker its own subtree back. It asked us
+                // precisely because it is blocked on this branch.
+                .filter(|w| Some(w.id) != requester.worker_id())
+                .map(|w| crate::dispatch::Candidate {
+                    id: w.id,
+                    platform: format!("{}/{}", w.os, w.arch),
+                    load: crate::dispatch::Load {
+                        slots: w.slots as usize,
+                        peer: 0,
+                        driver: w.inflight.load(Ordering::Relaxed) as usize
+                            + leads.get(&w.id).copied().unwrap_or(0),
+                    },
+                })
+                .collect()
+        };
+
+        // How much of this subtree each candidate has already built. The
+        // pairs are already tracked for the duplication metric; this is the
+        // same fact read for a decision instead of a report.
+        let warm: std::collections::BTreeMap<u64, u32> = if crate::dispatch::affinity() {
+            use prost::Message;
+            let def = bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice()).ok();
+            let ops: Vec<String> = def
+                .as_ref()
+                .map(|d| d.def.iter().map(|b| crate::store::sha256_hex(b)).collect())
+                .unwrap_or_default();
+            // The mounts this subtree will want. Measured as the bigger half
+            // of affinity: a worker holding the ops saves a rebuild, a
+            // worker holding the MOUNT saves ~24s of `go mod download` that
+            // no amount of op reuse can avoid, because a lifted cache mount
+            // starts cold on whoever gets it.
+            let wants: std::collections::BTreeSet<String> = def
+                .as_ref()
+                .map(crate::dispatch::cache_ids)
+                .unwrap_or_default();
+            // The parent images this subtree imports, and who is known to
+            // hold them. The BLOOMS answer this - they already exist, they
+            // are already gossiped, and `FleetBlobs::by_hash` already trusts
+            // them for exactly this question. A bloom lies only in the safe
+            // direction, so a false positive here misplaces one subtree and a
+            // false negative is impossible.
+            let imports = def
+                .as_ref()
+                .map(crate::dispatch::imported_images)
+                .unwrap_or_default();
+            let endpoints: std::collections::BTreeMap<u64, String> = {
+                let ws = self.workers.lock().await;
+                ws.iter().map(|w| (w.id, w.endpoint.clone())).collect()
+            };
+            let pairs = self.op_by_worker.lock().await;
+            let mounts = self.cache_by_worker.lock().await;
+            let blooms = self.blooms.lock().await;
+            let holders = self.holder_of.lock().await;
+            candidates
+                .iter()
+                .map(|c| {
+                    let n = ops
+                        .iter()
+                        .filter(|o| pairs.contains(&((*o).clone(), c.id)))
+                        .count();
+                    let m = wants
+                        .iter()
+                        .filter(|id| mounts.contains(&((*id).clone(), c.id)))
+                        .count();
+                    // By ENDPOINT, because that is how blooms are keyed;
+                    // candidates carry worker ids. A candidate whose
+                    // endpoint we cannot find scores zero imports, which is
+                    // the safe direction - it loses a tie it might have won,
+                    // rather than winning one it should not.
+                    let i = imports
+                        .iter()
+                        // Gated separately from affinity: see
+                        // `imports_affinity`. An empty count leaves `warmth`
+                        // exactly as it was, so OFF is the old behaviour and
+                        // not a different code path.
+                        .filter(|_| crate::dispatch::imports_affinity())
+                        .filter(|h| {
+                            // EXACT first. `holder_of` is written the moment a
+                            // worker reports a result; the bloom is gossiped
+                            // on a tick and a child is placed seconds after
+                            // its parent lands, so the bloom alone would miss
+                            // the case this term exists for.
+                            if holders.get(*h) == Some(&c.id) {
+                                return true;
+                            }
+                            // Then the bloom, which covers images a worker
+                            // PULLED rather than built. Keyed by endpoint; a
+                            // candidate we cannot map scores zero, losing a
+                            // tie it might have won rather than winning one
+                            // it should not.
+                            endpoints
+                                .get(&c.id)
+                                .and_then(|e| blooms.get(e))
+                                .is_some_and(|b| b.contains(h))
+                        })
+                        .count();
+                    // COUNTED where it is non-zero, not where the flag is
+                    // read. "A candidate already holds a parent" is the whole
+                    // claim, and a run where that never happens is a run
+                    // where this changed nothing - the distinction mech.rs
+                    // exists to make, and three mechanisms have needed it.
+                    if i > 0 {
+                        crate::mech::applied("affinity_imports");
+                    }
+                    (c.id, crate::dispatch::warmth(n as u32, m as u32, i as u32))
+                })
+                .collect()
+        } else {
+            Default::default()
+        };
+        let mut placement = crate::dispatch::Placement::new_warm(
+            &verdict,
+            &candidates,
+            // The SAME policy the gateway used to decide this was worth
+            // offering. Two answers to one question is what left four idle
+            // workers looking like the reason nothing moved.
+            crate::dispatch::policy(),
+            &|id| warm.get(&id).copied().unwrap_or(0),
+        );
+        let Some(first) = placement.offer() else {
+            drop(open);
+            // WHICH peers, and why each was no good. "no peer can take it"
+            // was reported five times with three workers idle, and named
+            // nothing that could be checked - platform mismatch, saturation
+            // and an empty fleet all print the same sentence.
+            let who: Vec<String> = candidates
+                .iter()
+                .map(|c| format!("{}:{} {}/{}", c.id, c.platform, c.load.driver, c.load.slots))
+                .collect();
+            let why = format!(
+                "no peer can take it (wanted {:?}; had {})",
+                verdict.platform,
+                if who.is_empty() {
+                    "nobody".to_owned()
+                } else {
+                    who.join(", ")
+                }
+            );
+            self.unplaced(requester, job, LeadRefusal::Unplaced(why.to_owned()))
+                .await;
+            return;
+        };
+        // After the insert below there will be `len() + 1` in flight; record
+        // the peak here where the lock is already held.
+        self.peak_inflight
+            .fetch_max(open.len() + 1, Ordering::Relaxed);
+        // Count what this subtree carries, against everything dispatched so
+        // far. An op is identified the way buildkit identifies it: the
+        // digest of its encoded bytes.
+        {
+            use prost::Message;
+            if let Ok(d) = bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice()) {
+                let mut seen = self.dispatched_ops.lock().await;
+                for bytes in &d.def {
+                    seen.0.insert(crate::store::sha256_hex(bytes));
+                    seen.1 += 1;
+                }
+            }
+        }
+        open.insert(
+            job,
+            Subtree {
+                requester,
+                subtree: subtree.clone(),
+                frontier: frontier.clone(),
+                placement,
+                started: std::time::Instant::now(),
+                offered_ms: 0,
+                // From the graph, not the verdict: `inspect` answers
+                // may-it-travel and does not carry the ids.
+                caches: {
+                    use prost::Message;
+                    bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice())
+                        .map(|d| crate::dispatch::cache_ids(&d))
+                        .unwrap_or_default()
+                },
+                verbatim,
+            },
+        );
+        // Claim recorded; `tell` needs the workers lock and must not hold
+        // this one across it.
+        drop(open);
+        // Same shape as the REAPI line above, deliberately: WHICH machine
+        // took a subtree is only visible here now that the gateway offers
+        // instead of choosing, and `grep -o -- '-> worker [0-9]*' | uniq -c`
+        // is how spread is read in CI.
+        {
+            use prost::Message;
+            if let Ok(d) = bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice()) {
+                if let Some(name) = crate::dispatch::describe_root(&d) {
+                    self.job_names.lock().await.insert(job, name);
+                }
+                // The op this subtree PRODUCES - the one whose consumers
+                // decide whether its result is worth pre-positioning. The
+                // terminal is a pointer; the op it points at is the result.
+                if let Some(last) = d.def.last() {
+                    if let Ok(t) = bollard_buildkit_proto::pb::Op::decode(last.as_slice()) {
+                        if let Some(input) = t.inputs.first() {
+                            self.job_terminal
+                                .lock()
+                                .await
+                                .insert(job, input.digest.clone());
+                        }
+                    }
+                }
+            }
+        }
+        println!("[driver] subtree job {job} -> worker {first}");
+        // Which ops THIS worker will now have to have. A pair it already
+        // holds is free - buildkit caches it - so only new pairs are work.
+        {
+            use prost::Message;
+            if let Ok(d) = bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice()) {
+                let mut pairs = self.op_by_worker.lock().await;
+                for bytes in &d.def {
+                    pairs.insert((crate::store::sha256_hex(bytes), first));
+                }
+            }
+        }
+        self.tell(
+            first,
+            D2W::Lead {
+                job,
+                subtree,
+                frontier,
+            },
+        )
+        .await;
+    }
+
+    /// Send one frame to one worker, if it is still connected. A worker
+    /// that has gone costs us the offer, not the build.
+    /// How many distinct workers have been sent an op - the consumer count.
+    ///
+    /// `op_by_worker` was built to report duplicate materialisation and is
+    /// exactly the oracle a prefetch needs: an op paired with two worker ids
+    /// has been demanded by two machines, which is the definition of worth
+    /// pushing. One pairing means one consumer, and pre-positioning that is
+    /// bandwidth spent making five machines hold something none will read.
+    /// TWO SPELLINGS of one digest meet here, and comparing them raw made
+    /// the gate unable ever to say yes. `place_subtree` stores
+    /// `sha256_hex(bytes)` - bare hex - while the terminal it records for
+    /// the same op is an LLB `Input.digest`, which is `sha256:<hex>`. The
+    /// counter therefore read 0 for every op that had consumers: 0
+    /// acceptances against 14 refusals and 292 bypasses in the field.
+    ///
+    /// Normalised on BOTH sides rather than at one call site, so a future
+    /// caller holding either spelling gets the right answer.
+    async fn consumers_of(self: &Arc<Self>, op: &str) -> usize {
+        let want = crate::store::bare_digest(op);
+        let pairs = self.op_by_worker.lock().await;
+        pairs
+            .iter()
+            .filter(|(o, _)| crate::store::bare_digest(o) == want)
+            .map(|(_, w)| *w)
+            .collect::<std::collections::BTreeSet<u64>>()
+            .len()
+    }
+
+    /// Pre-position an image that MANY machines will want.
+    ///
+    /// The caller decides that, and the distinction is the whole mechanism:
+    /// the first version fired on every finished subtree, including leaf
+    /// results that only the requester would ever want, which spends
+    /// bandwidth to make a machine hold something it will never read.
+    ///
+    /// Fire this for content that is shared BY CONSTRUCTION - a mirrored
+    /// base image, a prefix cut extracted because several graphs share it -
+    /// not for whatever happened to finish.
+    pub async fn prefetch_image(self: &Arc<Self>, image_ref: &str) {
+        self.prefetch_image_for(image_ref, None).await
+    }
+
+    /// [`Driver::prefetch_image`], but every worker takes ALL of the blobs
+    /// instead of its share.
+    ///
+    /// For a CACHE SEED, and the case is not a judgement call: every graph
+    /// naming that cache id wants it, on every machine, at the start of its
+    /// first lead. Split 1-in-N, five workers in six have to fetch it
+    /// peer-to-peer at exactly the moment it is needed - and run
+    /// 31552464169 shows what that costs, with 274 leads failing on
+    /// `could not fetch content descriptor ... not found`.
+    ///
+    /// Not gated behind a switch of its own. Seeding is already behind
+    /// `-seed`, and seeding without this is measured broken rather than
+    /// merely slower, so there is no configuration worth preserving.
+    pub async fn prefetch_image_everywhere(self: &Arc<Self>, image_ref: &str) {
+        self.prefetch_image_inner(image_ref, None, true).await
+    }
+
+    /// As [`Driver::prefetch_image`], but only if `op` has more than one
+    /// consumer.
+    ///
+    /// `None` means the caller already knows the content is shared - a
+    /// mirrored base image is needed by every graph that names it, and no
+    /// count is required to establish that.
+    pub async fn prefetch_image_for(self: &Arc<Self>, image_ref: &str, op: Option<&str>) {
+        self.prefetch_image_inner(image_ref, op, false).await
+    }
+
+    async fn prefetch_image_inner(
+        self: &Arc<Self>,
+        image_ref: &str,
+        op: Option<&str>,
+        everyone: bool,
+    ) {
+        if !prefetch_ahead() {
+            return;
+        }
+        if let Some(op) = op {
+            // ITS OWN SWITCH, default off, and the reason is experimental
+            // hygiene rather than doubt. This branch has never once fired -
+            // it compared two spellings of a digest and always read zero -
+            // so fixing that comparison silently turns on a new source of
+            // announcements, and the thing it announces is a SUBTREE RESULT:
+            // 65 MiB apiece, per the note at the call site. Landing that in
+            // the same run as a seeding measurement would confound both.
+            //
+            // The bug is fixed either way. Whether the mechanism it unblocks
+            // pays is a separate question with its own run.
+            if std::env::var("REBUCK2_PREFETCH_RESULTS").as_deref() != Ok("1") {
+                return;
+            }
+            let n = self.consumers_of(op).await;
+            if n < 2 {
+                // ONE consumer is not shared content. Pushing it spends
+                // bandwidth to make five machines hold what none will read,
+                // and it competes with the transfer that is on the critical
+                // path.
+                println!("[driver] not prefetching {image_ref}: {n} consumer(s)");
+                return;
+            }
+            crate::mech::applied("prefetch_results");
+            println!("[driver] prefetching {image_ref}: {n} consumers");
+        } else {
+            // The other reason, and it needs its own line: `None` here means
+            // the PROXY already knows the graph is shared - the op is in two
+            // solves, or this is a cut prefix, which is shared by
+            // definition. Without saying so the log shows a prefetch with no
+            // stated cause, and the placement-count gate it replaced is the
+            // obvious thing to blame it on.
+            println!("[driver] prefetching {image_ref}: shared before it was placed");
+        }
+        let this = self.clone();
+        let r = image_ref.to_owned();
+        tokio::spawn(async move {
+            // SAY SO when there is nothing to announce. An unreachable
+            // registry, a manifest list, a repo path this does not parse -
+            // each returns an empty list, and an empty list is
+            // indistinguishable from a mechanism that ran and found nothing
+            // to do. Several mechanisms here have been measured as "no
+            // effect" while silently not running.
+            // A BARE DIGEST has no host and no repo, so there is no URL to
+            // GET - and that is what every subtree result is.
+            // `published_reference` returns `sha256:...` deliberately, because
+            // a digest names content rather than a location and that is what
+            // lets a result travel between machines at all.
+            //
+            // So prefetch has NEVER worked for subtree results. It printed
+            // "could not read the manifest" 412 times in one run and 82 in
+            // another, which is every image it was ever handed by this path,
+            // while the six that succeeded were mirrored base images with a
+            // host in front of them.
+            //
+            // The driver does not need a URL. A manifest is a blob addressed
+            // by its own digest, and `FleetBlobs::by_hash` is exactly how the
+            // coordinator's registry already reaches a blob some worker holds.
+            let blobs = match crate::solve::manifest_url(&r) {
+                Ok(_) => crate::solve::image_blobs(&r).await,
+                Err(_) => {
+                    use crate::registry::FleetBlobs;
+                    match this.by_hash(r.trim_start_matches("sha256:")).await {
+                        Some(bytes) => match std::str::from_utf8(&bytes) {
+                            Ok(json) => Some(crate::solve::manifest_blobs(json)),
+                            Err(_) => {
+                                println!("[driver] prefetch: {r} is not a manifest");
+                                None
+                            }
+                        },
+                        None => {
+                            println!("[driver] prefetch: nobody in the fleet holds {r}");
+                            None
+                        }
+                    }
+                }
+            };
+            // THE MANIFEST TOO. `image_blobs`/`manifest_blobs` return what
+            // the manifest points at - config and layers - so a
+            // pre-positioned image was missing the one blob a puller reads
+            // FIRST. Every worker fetched it at lead time instead, and 60
+            // leads in run 31554856118 died on
+            // `...subtree@sha256:...: not found`.
+            // ONE implementation of "which blobs does this image mean",
+            // in solve.rs where it is tested. The driver's job is only to
+            // answer whether this CAS holds the manifest - and `size_of`
+            // returning None IS that answer, which the first version threw
+            // away with `unwrap_or(0)` and announced the digest regardless.
+            let blobs = match blobs {
+                Some(d) => {
+                    let held = match crate::solve::manifest_dig(&r, 0) {
+                        Some(m) => this.store.size_of(&m.hash).await,
+                        None => None,
+                    };
+                    if held.is_none() {
+                        if let Some(m) = crate::solve::manifest_dig(&r, 0) {
+                            println!(
+                                "[driver] prefetch: not announcing manifest {} for {r} - \
+                                 this CAS does not hold it",
+                                m.hash
+                            );
+                        }
+                    }
+                    Some(crate::solve::announce_set(&r, d, held))
+                }
+                None => None,
+            };
+            match blobs {
+                Some(d) if !d.is_empty() => this.prefetch_everywhere(d, everyone).await,
+                Some(_) => println!("[driver] prefetch: {r} names no blobs"),
+                None => {}
+            }
+        });
+    }
+
+    /// Tell every worker that these blobs are coming, before they ask.
+    ///
+    /// Distribution is otherwise lazy to a fault. The trace timeline: workers
+    /// fetch NOTHING across the whole 284s baseline leg, and nothing again
+    /// until 227s into the fleet leg, when the bulk transfer lands exactly as
+    /// the base chain finishes and the fan-out wants it. A layer that was
+    /// finished minutes earlier sat on one machine until somebody asked for
+    /// it.
+    ///
+    /// Advisory. A worker that drops this builds what it would have built
+    /// anyway, one lazy pull later, so it can never fail a build - which is
+    /// why it is broadcast without waiting for or checking a reply.
+    /// `everyone` forwards to the frame: see [`crate::mesh::D2W::Prefetch`]
+    /// for why a cache seed cannot be split.
+    async fn prefetch_everywhere(self: &Arc<Self>, digests: Vec<crate::mesh::Dig>, everyone: bool) {
+        if digests.is_empty() {
+            return;
+        }
+        let ws = self.workers.lock().await;
+        let n = ws.len();
+        // The authoritative peer list, sent WITH the announcement. Left to
+        // each worker's own gossip the shares do not partition: two workers
+        // computing from different peer sets both claim some blobs and
+        // neither claims others.
+        let peers: Vec<String> = ws.iter().map(|w| w.endpoint.clone()).collect();
+        for w in ws.iter() {
+            let _ = w.tx.send(D2W::Prefetch {
+                digests: digests.clone(),
+                peers: peers.clone(),
+                everyone,
+            });
+        }
+        drop(ws);
+        crate::mech::applied("prefetch");
+        println!(
+            "[driver] prefetch: {} blob(s) announced to {n} worker(s)",
+            digests.len()
+        );
+    }
+
+    async fn tell(self: &Arc<Self>, worker: u64, msg: D2W) {
+        let ws = self.workers.lock().await;
+        if let Some(w) = ws.iter().find(|w| w.id == worker) {
+            let _ = w.tx.send(msg);
+        }
+    }
+
+    /// A peer refused an offered subtree: try the next, or hand it back.
+    async fn subtree_declined(self: &Arc<Self>, job: u64, who: u64, why: &str) {
+        // The Requester is NOT cloned out here: the gateway's half of a
+        // oneshot cannot be, and taking it early would strand a caller that
+        // is still holding a client's Solve open. It is only removed on the
+        // branch that gives up.
+        // A VERDICT stops here. The peer ran the container and the process
+        // exited non-zero, so the next peer will run the same container and
+        // get the same answer - and on `+lint-all` that cost 628s against a
+        // 92s baseline, four peers deep into a lint that fails on purpose.
+        //
+        // Straight to `unplaced`, which means the requester builds it at
+        // home and produces the authentic error from its own daemon. One
+        // extra run of a failing build, which is what a single machine pays
+        // anyway. Returning the PEER's error instead would be faster and is
+        // not obviously safe: the peer's platform and mirror are not the
+        // client's, and principle 5 says a mechanism may make a build faster
+        // and must never make one wrong.
+        if crate::dispatch::is_build_verdict(why) {
+            crate::mech::applied("verdict_stops_retry");
+            let Some(st) = self.subtrees.lock().await.remove(&job) else {
+                return;
+            };
+            // May we hand this straight to the client, or must it be
+            // rebuilt at home? See `trust_verdict` for the conditions.
+            //
+            // Worth being clear about what the home rebuild IS, because
+            // "to be sure" undersells it: today's behaviour is already a
+            // two-opinion protocol, and the second opinion is the client's
+            // own daemon with its own caches - the most authoritative
+            // machine in the fleet. Confirming on a second PEER instead
+            // would cost the same and be weaker evidence. So the only
+            // saving on offer is trusting one peer alone, which is exactly
+            // what the flag buys and exactly why it is a flag.
+            let trusted = crate::dispatch::trust_verdict(
+                crate::dispatch::trust_peer_verdicts(),
+                st.verbatim,
+                !st.caches.is_empty(),
+            );
+            println!(
+                "[driver] subtree job {job} FAILED on worker {who} - not re-offering, the \
+                 build itself did not succeed{}",
+                if trusted {
+                    "; reporting it as the client's own"
+                } else {
+                    "; rebuilding at home to be sure"
+                }
+            );
+            let refusal = if trusted {
+                crate::mech::applied("trust_verdict");
+                LeadRefusal::Verdict(why.to_owned())
+            } else {
+                LeadRefusal::Unplaced(why.to_owned())
+            };
+            self.unplaced(st.requester, job, refusal).await;
+            return;
+        }
+        let (next, subtree, frontier) = {
+            let mut map = self.subtrees.lock().await;
+            let Some(st) = map.get_mut(&job) else { return };
+            let next = st.placement.declined(who);
+            (next, st.subtree.clone(), st.frontier.clone())
+        };
+        match next {
+            Some(peer) if peer != who => {
+                println!("[driver] subtree job {job} -> worker {peer} (after a decline)");
+                // Placement is still costing round trips, so the clock on
+                // `placing` keeps running. Stamped on EVERY offer, so what
+                // survives is the last one - the moment a worker took it.
+                if let Some(st) = self.subtrees.lock().await.get_mut(&job) {
+                    st.offered_ms = st.started.elapsed().as_millis() as u64;
+                }
+                self.tell(
+                    peer,
+                    D2W::Lead {
+                        job,
+                        subtree,
+                        frontier,
+                    },
+                )
+                .await;
+            }
+            Some(_) => {}
+            None => {
+                let Some(st) = self.subtrees.lock().await.remove(&job) else {
+                    return;
+                };
+                self.unplaced(st.requester, job, LeadRefusal::Unplaced(why.to_owned()))
+                    .await;
+            }
+        }
+    }
+
+    /// Nobody took it. A worker hears `Unplaced` and builds it itself; the
+    /// gateway gets `None` and does the same. Fail open, never fail wrong.
+    async fn unplaced(self: &Arc<Self>, requester: Requester, job: u64, refusal: LeadRefusal) {
+        let why = refusal.why();
+        match requester {
+            Requester::Worker(id) => {
+                self.tell(
+                    id,
+                    D2W::Unplaced {
+                        job,
+                        why: why.to_owned(),
+                    },
+                )
+                .await
+            }
+            Requester::Gateway(tx) => {
+                // The `why` the worker branch sends is the same `why` this
+                // branch used to discard, which is how the gateway came to
+                // report every refusal as "fleet took nothing" - one string
+                // covering saturation, exclusion and an empty fleet alike.
+                //
+                // A WORKER requester always hears Unplaced and builds it
+                // itself, whatever the shape: telling it otherwise needs a
+                // new field on a wire message, and the cost this exists to
+                // remove is the GATEWAY's home rebuild.
+                let _ = tx.send(Err(refusal));
+            }
+        }
+    }
+
+    /// What each cache id cost the fleet: total ms, and how many leads.
+    ///
+    /// Ranked by TIME, because that is the only ordering that says what
+    /// seeding would buy. Frequency in the Earthfile is a different number
+    /// and points somewhere else.
+    /// `(distinct ops ever dispatched, total ops dispatched)`.
+    pub async fn op_duplication(&self) -> (usize, u64, usize) {
+        let d = self.dispatched_ops.lock().await;
+        let pairs = self.op_by_worker.lock().await.len();
+        (d.0.len(), d.1, pairs)
+    }
+
+    /// What a peer has already built and published, by op digest.
+    pub async fn built_ops(&self) -> std::collections::HashMap<String, String> {
+        self.built.lock().await.clone()
+    }
+
+    /// Where the built-op map lives between runs, beside the store it
+    /// describes.
+    fn built_path(&self) -> std::path::PathBuf {
+        self.store.root_dir().join("built-ops.json")
+    }
+
+    /// Load the map a previous generation left.
+    ///
+    /// THE POINT OF THE BANK. Restoring the store alone gives a run the
+    /// artefacts and no idea what they are: measured, generation 2 with a
+    /// warm 201-object bank grafted nothing on its first wave and came in
+    /// 19s from cold, inside the noise. The bytes were there; the mapping
+    /// from op digest to published image was not, because it lived only in
+    /// memory.
+    ///
+    /// With it, the very first solve can graft - which is the difference
+    /// between 0 prefixes and N.
+    pub async fn load_built(&self) {
+        let p = self.built_path();
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            return;
+        };
+        // A line per entry rather than a format with a parser: this file is
+        // written by one process and read by the next, and a half-written
+        // line must cost one entry rather than the whole bank.
+        let mut m = self.built.lock().await;
+        let mut n = 0;
+        for line in text.lines() {
+            if let Some((k, v)) = line.split_once('\t') {
+                m.insert(k.to_owned(), v.to_owned());
+                n += 1;
+            }
+        }
+        if n > 0 {
+            println!("[driver] bank: {n} built op(s) restored from a previous run");
+        }
+    }
+
+    /// Persist it for the next generation.
+    pub async fn save_built(&self) {
+        let m = self.built.lock().await;
+        if m.is_empty() {
+            return;
+        }
+        let mut out = String::with_capacity(m.len() * 96);
+        // Sorted, so two runs that built the same things produce the same
+        // file - a bank that churns on ordering is a bank that never hits in
+        // a content-addressed cache.
+        let mut keys: Vec<&String> = m.keys().collect();
+        keys.sort();
+        for k in keys {
+            out.push_str(k);
+            out.push('\t');
+            out.push_str(&m[k]);
+            out.push('\n');
+        }
+        let p = self.built_path();
+        let tmp = p.with_extension("tmp");
+        if std::fs::write(&tmp, out).is_ok() && std::fs::rename(&tmp, &p).is_ok() {
+            println!("[driver] bank: {} built op(s) saved", m.len());
+        }
+    }
+
+    /// The most subtrees in flight at once, over the whole run.
+    pub fn peak_inflight(&self) -> usize {
+        self.peak_inflight.load(Ordering::Relaxed)
+    }
+
+    /// `(median of seeded leads, n, median of cold leads, n)`.
+    ///
+    /// Medians, not means: one 148-second lead in a set of forty drags a
+    /// mean somewhere no lead ever was, and this report has been misread
+    /// that way before.
+    pub async fn seeded_split(&self) -> (u64, usize, u64, usize) {
+        let median = |v: &mut Vec<u64>| -> u64 {
+            if v.is_empty() {
+                return 0;
+            }
+            v.sort_unstable();
+            v[v.len() / 2]
+        };
+        let mut a = self.seeded_leads.lock().await.clone();
+        let mut b = self.cold_leads.lock().await.clone();
+        (median(&mut a), a.len(), median(&mut b), b.len())
+    }
+
+    /// Every lead's milliseconds, summed, and the count.
+    pub fn lead_total(&self) -> (u64, u64) {
+        (
+            self.all_lead_ms.load(Ordering::Relaxed),
+            self.all_leads.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Lead time as `(placing, waiting, building)` milliseconds.
+    ///
+    /// `building` is what every remedy so far aims at and was a quarter of
+    /// the total in the run that prompted this. `placing` is offers and
+    /// refusals and is pure overhead. `waiting` is a lead sitting on a busy
+    /// worker, which is a fleet being USED - large is not automatically bad,
+    /// and confusing the two is why the 10,400-second gap went unexamined.
+    pub fn lead_phases(&self) -> (u64, u64, u64) {
+        (
+            self.placing_ms.load(Ordering::Relaxed),
+            self.waiting_ms.load(Ordering::Relaxed),
+            self.building_ms.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Lead time spent in leads that named ANY cache mount, and how many.
+    pub fn cache_lead_total(&self) -> (u64, u64) {
+        (
+            self.cache_lead_ms.load(Ordering::Relaxed),
+            self.cache_leads.load(Ordering::Relaxed),
+        )
+    }
+
+    pub async fn cache_costs(&self) -> Vec<(String, u64, u64)> {
+        let c = self.cache_cost.lock().await;
+        let mut v: Vec<(String, u64, u64)> =
+            c.iter().map(|(k, (ms, n))| (k.clone(), *ms, *n)).collect();
+        v.sort_by_key(|(id, ms, _)| (std::cmp::Reverse(*ms), id.clone()));
+        v
+    }
+
+    /// Offer a subtree on behalf of the gateway in this process, and wait.
+    ///
+    /// The same arbitration a worker's `Offer` gets - same candidates, same
+    /// refusals, same fail-open - reached by a channel instead of a frame,
+    /// because the caller is inside the driver.
+    ///
+    /// `None` means nobody took it, which is not an error: it is the answer
+    /// that says build it here.
+    /// As [`Driver::lead_subtree`], told whether more than one graph wants
+    /// this subtree.
+    ///
+    /// The caller knows and the driver cannot: sharing is a property of the
+    /// solves the CLIENT has sent, and the driver only sees what has already
+    /// been placed. Gating a prefetch on placements means affinity - whose
+    /// job is to make each op land on one machine - suppresses the very
+    /// pre-positioning that would help.
+    pub async fn lead_subtree_shared(
+        self: &Arc<Self>,
+        subtree: Vec<u8>,
+        frontier: Vec<Dig>,
+        shared: bool,
+        verbatim: bool,
+    ) -> Result<String, LeadRefusal> {
+        // Keyed by the op this subtree PRODUCES, not by a job id: the id is
+        // assigned inside place_subtree and reading it back afterwards is a
+        // race. subtree_built already extracts the same op.
+        if shared {
+            use prost::Message;
+            if let Some(op) = bollard_buildkit_proto::pb::Definition::decode(subtree.as_slice())
+                .ok()
+                .and_then(|d| {
+                    let last = d.def.last()?;
+                    bollard_buildkit_proto::pb::Op::decode(last.as_slice())
+                        .ok()?
+                        .inputs
+                        .first()
+                        .map(|i| i.digest.clone())
+                })
+            {
+                self.shared_ops.lock().await.insert(op);
+            }
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.place_subtree(Requester::Gateway(tx), subtree, frontier, verbatim)
+            .await;
+        rx.await
+            .unwrap_or_else(|_| Err(LeadRefusal::Unplaced("driver went away".into())))
+    }
+
+    /// Dispatch a subtree without a sharing hint - assume not shared.
+    #[allow(dead_code)] // the shared-aware form is what the proxy calls
+    pub async fn lead_subtree(
+        self: &Arc<Self>,
+        subtree: Vec<u8>,
+        frontier: Vec<Dig>,
+    ) -> Result<String, LeadRefusal> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.place_subtree(Requester::Gateway(tx), subtree, frontier, false)
+            .await;
+        // A dropped sender is a driver that forgot the job; treat it as
+        // unplaced rather than hanging on a Solve that will never answer.
+        rx.await
+            .unwrap_or_else(|_| Err(LeadRefusal::Unplaced("driver dropped the job".to_owned())))
+    }
+
+    /// A peer built it. Tell the requester where, and forget the placement -
+    /// the two of them settle the bytes between themselves.
+    async fn subtree_built(self: &Arc<Self>, job: u64, image_ref: String) {
+        let Some(st) = self.subtrees.lock().await.remove(&job) else {
+            return;
+        };
+        // The firing site the consumer gate was built for, and was never
+        // wired to. Base images are announced from `make_portable` and a
+        // prefix cut from the cut path; a subtree RESULT - which is where
+        // the large layers are, 65 MiB apiece - reached neither, so prefetch
+        // announced 2 blobs a time when the base chain is 26 blobs and 527
+        // MiB. Third mechanism on this branch built and left unconnected.
+        // The guard is DROPPED before the call, and that is the whole
+        // point: a temporary in an `if let` scrutinee lives for the entire
+        // body, so the previous form held `job_terminal` across an await
+        // that goes on to take `op_by_worker` and `workers` - while
+        // `place_subtree` needs `job_terminal` to dispatch at all.
+        //
+        // Symptom: routed fell from 94 to 7-8 the moment prefetch was
+        // switched on, across three runs, and a fleet that routes eight
+        // solves is not a fleet.
+        let terminal = { self.job_terminal.lock().await.remove(&job) };
+        if let Some(op) = terminal {
+            // Unconditional when the caller predicted sharing; otherwise
+            // fall back to counting placements, which affinity suppresses.
+            if self.shared_ops.lock().await.contains(&op) {
+                self.prefetch_image_for(&image_ref, None).await;
+            } else {
+                self.prefetch_image_for(&image_ref, Some(&op)).await;
+            }
+        }
+        match st.requester {
+            Requester::Worker(id) => self.tell(id, D2W::Placed { job, image_ref }).await,
+            Requester::Gateway(tx) => {
+                let _ = tx.send(Ok(image_ref));
+            }
+        }
+    }
+
+    /// A driver with a throwaway store, for tests that need one to hang a
+    /// router off. Not `cfg(test)`: the registry's tests are in another
+    /// module and would not see it.
+    #[allow(dead_code)] // test helper for the driver line
+    pub fn for_test() -> Arc<Self> {
+        let dir = tempfile::tempdir().unwrap().keep();
+        Driver::new(
+            Arc::new(Store::new(dir).unwrap()),
+            DriverCfg {
+                session: "test".into(),
+                min_workers: 0,
+                require_shards: 0,
+                local_exec: false,
+                decentralized: false,
+                hardlinks: true,
+                cache_failures: false,
+                finalize_file: None,
+                locality: false,
+                prefetch_metadata: false,
+                name_independent: false,
+                addr_file: None,
+                scratch: std::env::temp_dir(),
+            },
+        )
+    }
+
+    /// The fleet's lease table, for anything coordinating on its behalf -
+    /// the registry mirror's single-flight, notably.
+    pub fn lease_table(&self) -> &crate::lease::Leases {
+        &self.leases
+    }
+
+    /// Blob by hash ALONE, for OCI.
+    ///
+    /// REAPI hands us a `Digest` carrying a size; an OCI registry hands us a
+    /// bare `sha256:...` and nothing else. That difference is not cosmetic
+    /// here, because the size is load-bearing everywhere else in this file:
+    /// [`crate::store::Store::has`] compares it against the file length, so a
+    /// FABRICATED size-0 `Dig` reports "absent" for a blob we are holding,
+    /// and `put` rejects the bytes when they arrive. Hence by-hash lookups
+    /// go through the size-free path rather than inventing a `Dig`.
+    ///
+    /// LOCAL ONLY, deliberately, for now: the mesh fetch chain is
+    /// size-carrying end to end, and threading an unknown size through it
+    /// touches the retry logic that run 29007342337 paid for. A miss here
+    /// means BuildKit re-pushes a layer the fleet may already hold - one
+    /// wasted upload, never wrong bytes. Fail open.
+    pub async fn get_blob_by_hash(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        self.store.get_by_hash(hash).await
+    }
+
     /// Read-through presence: make `d` locally available (streaming fetch
     /// into the store), without ever holding the blob in memory. The serve
     /// paths pair this with `Store::copy_out` so large blobs relay at
@@ -1322,6 +2694,34 @@ impl Driver {
             );
         }
         Ok(false)
+    }
+
+    /// Ask one worker for a blob by hash.
+    /// Two bounds, not one: see [`PEER_BLOB_TIMEOUT`] and
+    /// [`PEER_BLOB_BULK_TIMEOUT`]. The handshake catches a corpse; the bulk
+    /// read must be allowed to take as long as the bytes take.
+    async fn fetch_by_hash_from(&self, endpoint: &str, hash: &str) -> Result<Vec<u8>> {
+        let (mut recv, resp) = tokio::time::timeout(PEER_BLOB_TIMEOUT, async {
+            let conn = self.peer_conn(endpoint).await?;
+            let (mut send, mut recv) = conn.open_bi().await?;
+            mesh::send_frame(&mut send, &BlobReq::GetByHash(hash.to_owned())).await?;
+            send.finish()?;
+            let resp = mesh::recv_frame::<BlobResp>(&mut recv)
+                .await?
+                .context("worker closed blob stream")?;
+            Ok::<_, anyhow::Error>((recv, resp))
+        })
+        .await
+        .with_context(|| format!("worker {endpoint} did not answer for {hash} in time"))??;
+        match resp {
+            BlobResp::Found { size } => Ok(tokio::time::timeout(
+                PEER_BLOB_BULK_TIMEOUT,
+                mesh::recv_raw(&mut recv, size),
+            )
+            .await
+            .with_context(|| format!("worker {endpoint} stalled sending {hash}"))??),
+            other => anyhow::bail!("worker {endpoint} for {hash}: {other:?}"),
+        }
     }
 
     /// One blob fetch from one peer, streamed straight into the store: two
@@ -2195,6 +3595,68 @@ async fn serve_blob_stream(
         return Ok(());
     };
     match req {
+        // Serve from what we hold, and no further. A by-hash request has no
+        // size, so it cannot drive `ensure_blob_local`'s read-through - and
+        // should not: the asker is walking the fleet itself, and a driver
+        // that fetched on its behalf would put the coordinator back on the
+        // data path it is meant to stay off (principle 6).
+        // The driver answers tag lookups from its own registry store, for
+        // the same reason it answers by-hash ones: it is a participant with
+        // content, not a router. It does not go looking on the asker's
+        // behalf - that would put the coordinator back on the data path
+        // (principle 6).
+        BlobReq::TagGet(key) => {
+            let found = driver.store.tag_get(&key).await;
+            mesh::send_frame(&mut send, &BlobResp::Tag(found)).await?;
+            send.finish().ok();
+        }
+        // Same as GetByHash, except the asker is named - so we can send it
+        // to a peer that already has the bytes rather than sending them again.
+        BlobReq::GetByHashAs { hash, me } => {
+            let holder = {
+                let blooms = driver.blooms.lock().await;
+                blooms
+                    .iter()
+                    .find(|(who, b)| **who != me && b.contains(&hash))
+                    .map(|(who, _)| who.clone())
+            };
+            match holder {
+                Some(endpoint) => {
+                    // A bloom only lies in the "have it" direction, so this
+                    // can send the asker somewhere that does not have it. That
+                    // costs one dial, and the caller falls back to asking us
+                    // for the bytes - which is why this reply is safe to make
+                    // without confirming.
+                    mesh::send_frame(&mut send, &BlobResp::Provider { endpoint }).await?;
+                }
+                None => match driver.store.get_by_hash(&hash).await {
+                    Ok(Some(bytes)) => {
+                        mesh::send_frame(
+                            &mut send,
+                            &BlobResp::Found {
+                                size: bytes.len() as u64,
+                            },
+                        )
+                        .await?;
+                        send.write_all(&bytes).await?;
+                    }
+                    _ => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
+                },
+            }
+        }
+        BlobReq::GetByHash(hash) => match driver.store.get_by_hash(&hash).await {
+            Ok(Some(bytes)) => {
+                mesh::send_frame(
+                    &mut send,
+                    &BlobResp::Found {
+                        size: bytes.len() as u64,
+                    },
+                )
+                .await?;
+                send.write_all(&bytes).await?;
+            }
+            _ => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
+        },
         BlobReq::Get(d) => {
             // Decentralized: point the asker at the producer instead of
             // relaying bytes through the driver's NIC.
@@ -2320,8 +3782,206 @@ async fn serve_blob_stream(
     Ok(())
 }
 
+/// How long one peer gets to answer for one blob.
+///
+/// Short on purpose. The caller is usually a registry request that buildkit
+/// is blocked on, and buildkit's own patience is finite - so the choice is
+/// between a fast 404 that it retries or routes around, and a hang that ends
+/// the build. Six unanswering peers at this budget still comes in under any
+/// client timeout worth the name.
+use crate::mesh::{PEER_BLOB_BULK_TIMEOUT, PEER_BLOB_TIMEOUT};
+
+/// The fleet, as the COORDINATOR's registry sees it.
+///
+/// The mirror of the worker's impl, and the half that makes a result
+/// reachable from another machine: a worker publishes a subtree into its own
+/// store, and the coordinator's daemon then pulls that digest from the
+/// coordinator's registry, which does not have it and asks whoever does.
+///
+/// Without this a lead's reference can only name the builder's own registry,
+/// which is fine on one host and unroutable from a second - the reason
+/// multi-runner dispatch did not work.
+#[async_trait::async_trait]
+impl crate::registry::FleetBlobs for Driver {
+    async fn by_hash(&self, hash: &str) -> Option<Vec<u8>> {
+        if let Ok(Some(b)) = self.store.get_by_hash(hash).await {
+            return Some(b);
+        }
+        // Bloom first, then everyone else. A bloom lies only in the safe
+        // direction, so a claimant may not have it; a non-claimant that
+        // acquired it since the last gossip still might, and a build stalling
+        // on stale gossip is worse than one extra round trip.
+        let (claimants, others): (Vec<String>, Vec<String>) = {
+            let blooms = self.blooms.lock().await;
+            let (yes, no): (Vec<_>, Vec<_>) = blooms.iter().partition(|(_, b)| b.contains(hash));
+            (
+                yes.into_iter().map(|(e, _)| e.clone()).collect(),
+                no.into_iter().map(|(e, _)| e.clone()).collect(),
+            )
+        };
+        // BOUNDED per peer. A dead runner does not refuse, it hangs, and
+        // this loop is what a manifest HEAD waits on: buildkit asked for a
+        // subtree manifest, six workers had just been killed by their own
+        // 50-minute cap, and the walk sat on each corpse in turn until
+        // buildkit gave up with `timeout awaiting response headers` and
+        // failed the build. A miss must 404 quickly; it is a perfectly
+        // ordinary answer and buildkit knows what to do with it.
+        // BOUNDED INSIDE the fetch now, in two places rather than one
+        // around the whole call - a single outer bound caps the transfer as
+        // well as the handshake, which made every large blob unfetchable.
+        for who in claimants.iter().chain(others.iter()) {
+            match self.fetch_by_hash_from(who, hash).await {
+                Ok(bytes) => return Some(bytes),
+                Err(e) => println!("[driver] {who} could not supply {hash}: {e:#}"),
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod peer_fetch_bounds {
+    /// Both sides bound their peer fetch, and with the SHARED constants.
+    ///
+    /// There are two `fetch_by_hash_from` implementations - the driver's and
+    /// the worker's - and they had different bugs: the driver bounded the
+    /// whole fetch with the handshake constant, so no large blob could
+    /// arrive, and the worker bounded nothing, so a dead peer hung it
+    /// forever. Two wrong answers to one question, and nothing connected
+    /// them.
+    ///
+    /// A source scan rather than a behavioural test: exercising either
+    /// branch needs two live QUIC endpoints and a peer that deliberately
+    /// stalls, which is a harness worth more than it would prove here. This
+    /// at least fails if someone reintroduces an unbounded fetch.
+    #[test]
+    fn both_peer_fetches_are_bounded_by_the_shared_constants() {
+        for file in ["src/driver.rs", "src/worker.rs"] {
+            let text = std::fs::read_to_string(file).expect(file);
+            let at = text
+                .find("async fn fetch_by_hash_from")
+                .unwrap_or_else(|| panic!("{file} no longer has fetch_by_hash_from"));
+            // The body, generously bounded - long enough to contain both
+            // timeouts, short enough not to reach the next function's.
+            let body = &text[at..(at + 2200).min(text.len())];
+            for want in ["PEER_BLOB_TIMEOUT", "PEER_BLOB_BULK_TIMEOUT"] {
+                assert!(
+                    body.contains(want),
+                    "{file}: fetch_by_hash_from does not mention {want} - an \
+                     unbounded or single-bounded peer fetch is how a corpse hangs \
+                     the walk, and how a 456 MiB seed becomes unfetchable"
+                );
+            }
+        }
+    }
+
+    /// The two bounds are for two different failures and must not be one
+    /// number.
+    ///
+    /// `PEER_BLOB_TIMEOUT` exists because a dead runner does not refuse, it
+    /// hangs - six workers killed by their own cap once left the walk
+    /// sitting on each corpse until buildkit gave up. That is a HANDSHAKE
+    /// problem: dial, ask, hear the first frame back.
+    ///
+    /// Bounding the whole fetch with it makes any blob that takes longer
+    /// than five seconds to move unfetchable by construction, and a cache
+    /// seed is hundreds of megabytes. `go-mod` alone was 456 MiB in run
+    /// 31552464169.
+    #[test]
+    fn the_bulk_bound_fits_a_real_seed_and_the_handshake_bound_does_not() {
+        const SEED_BYTES: u64 = 456 * 1024 * 1024;
+        // Deliberately pessimistic: inter-runner throughput on shared CI is
+        // not a link speed, and a bound that only works on a good day is a
+        // bound that fails under exactly the load it exists for.
+        const SLOW_MIB_PER_S: u64 = 10;
+        let needed = std::time::Duration::from_secs(SEED_BYTES / (SLOW_MIB_PER_S * 1024 * 1024));
+
+        assert!(
+            super::PEER_BLOB_TIMEOUT < needed,
+            "if the handshake bound alone were enough for a seed there would be              nothing to fix and this test should be deleted"
+        );
+        assert!(
+            super::PEER_BLOB_BULK_TIMEOUT >= needed,
+            "a {SEED_BYTES}-byte seed at {SLOW_MIB_PER_S} MiB/s needs {needed:?},              but the bulk bound is {:?}",
+            super::PEER_BLOB_BULK_TIMEOUT
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test]
+    async fn only_content_with_more_than_one_consumer_is_worth_pushing() {
+        let d = super::Driver::for_test();
+
+        // Nothing known: not shared, so not pushed. This is the case that
+        // matters most - the first version fired on EVERY finished subtree,
+        // and most subtrees are leaf results exactly one machine will read.
+        assert_eq!(d.consumers_of("op-unknown").await, 0);
+
+        {
+            let mut pairs = d.op_by_worker.lock().await;
+            // one op, one worker, twice: still one consumer. Counting
+            // PAIRINGS rather than distinct workers would call this two and
+            // push a leaf result to the whole fleet.
+            pairs.insert(("leaf".to_owned(), 1));
+            pairs.insert(("leaf".to_owned(), 1));
+            // and one op wanted by three machines
+            pairs.insert(("shared".to_owned(), 1));
+            pairs.insert(("shared".to_owned(), 2));
+            pairs.insert(("shared".to_owned(), 3));
+        }
+
+        assert_eq!(d.consumers_of("leaf").await, 1, "a leaf has one consumer");
+        assert_eq!(
+            d.consumers_of("shared").await,
+            3,
+            "distinct workers, not pairings"
+        );
+
+        // The rule, stated as the code applies it.
+        assert!(
+            d.consumers_of("leaf").await < 2,
+            "leaf: do not pre-position"
+        );
+        assert!(d.consumers_of("shared").await >= 2, "shared: pre-position");
+    }
+
+    /// The two sides of the gate, spelled the way PRODUCTION spells them.
+    ///
+    /// The test above invents `"leaf"` and `"shared"` and uses the same
+    /// string on both sides, so it cannot see a mismatch between them - and
+    /// there is one. `place_subtree` stores `sha256_hex(bytes)`, bare hex;
+    /// `place_subtree` also records the terminal's `input.digest`, which LLB
+    /// spells `sha256:<hex>`. `consumers_of` compares them with `==`.
+    ///
+    /// Symptom in the field: 0 acceptances, 14 refusals, 292 bypasses. The
+    /// gate has never once said yes, and could not have.
+    #[tokio::test]
+    async fn the_gate_sees_the_op_the_terminal_actually_names() {
+        let d = super::Driver::for_test();
+
+        // As `place_subtree` writes it (driver.rs, `op_by_worker.insert`).
+        let op_bytes = b"an op, as marshalled into Definition.def";
+        let stored = crate::store::sha256_hex(op_bytes);
+        {
+            let mut pairs = d.op_by_worker.lock().await;
+            pairs.insert((stored.clone(), 1));
+            pairs.insert((stored.clone(), 2));
+        }
+
+        // As `subtree_built` reads it: the terminal op's `input.digest`,
+        // which every producer of LLB in this crate writes with the prefix.
+        let asked = format!("sha256:{stored}");
+        assert_ne!(asked, stored, "the two spellings really do differ");
+
+        assert_eq!(
+            d.consumers_of(&asked).await,
+            2,
+            "two machines were sent this op; the gate must see both"
+        );
+    }
     use super::*;
 
     fn test_driver(local_exec: bool) -> Arc<Driver> {
@@ -2998,6 +4658,42 @@ mod tests {
     /// Platform routing: os-tagged jobs only land on matching workers;
     /// untagged jobs land anywhere.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unplaceable_subtree_answers_the_gateway_instead_of_hanging() {
+        // The gateway asks from inside this process while holding a client's
+        // Solve open. Every way an offer can end has to come back, because
+        // the failure mode is not a wrong answer - it is a build that never
+        // returns, which no fail-open elsewhere can rescue.
+        //
+        // An empty fleet is the shortest path to "nobody took it": there are
+        // no candidates, so `placement.offer()` is None on the first pass.
+        let d = test_driver(false);
+        let def = bollard_buildkit_proto::pb::Definition::default();
+        let bytes = prost::Message::encode_to_vec(&def);
+
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            d.lead_subtree(bytes, Vec::new()),
+        )
+        .await
+        .expect("lead_subtree hung with no workers to place on");
+
+        // And SAY SO. A bare no is what let five refusals across four idle
+        // workers all report as "fleet took nothing".
+        let refusal = answer.expect_err("an empty fleet must answer, and answer no");
+        assert!(
+            !refusal.why().is_empty(),
+            "the refusal must carry the driver's reason"
+        );
+        // And it must be UNPLACED, not a verdict. An empty fleet has not
+        // judged the build - it has not seen it - and sending a Verdict here
+        // would report a red target for a fleet that simply had no workers.
+        assert!(
+            matches!(refusal, super::LeadRefusal::Unplaced(_)),
+            "nobody took it is not the same as it failed"
+        );
+    }
+
+    #[tokio::test]
     async fn jobs_route_to_matching_platform_workers() {
         let d = test_driver(false);
         let log = Arc::new(Mutex::new(Vec::new()));

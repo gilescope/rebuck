@@ -1,0 +1,47 @@
+From 7f9fdf2a88fb07fe02846bf349740f3c6d54f0cb Mon Sep 17 00:00:00 2001
+From: Giles Cope <gilescope@gmail.com>
+Date: Sun, 2 Aug 2026 08:00:07 +0100
+Subject: [PATCH 12/12] test(cache-persist): a daemon of its own, like its two
+ siblings
+
+Third of the CACHE-behaviour family, after test-cache-mode and
+test-cache-mount-mode. It measures whether a cache mount SURVIVES between
+builds, so the daemon cache is the subject rather than the environment --
+marking the fixture --no-cache would erase the very thing under test, which is
+the same distinction logbus+test-manifest drew.
+
+Assisted-by: Claude:claude-opus-5 claude-code
+---
+ tests/Earthfile | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/tests/Earthfile b/tests/Earthfile
+index 509df563..e1b04ffb 100644
+--- a/tests/Earthfile
++++ b/tests/Earthfile
+@@ -1599,18 +1599,25 @@ test-shared-cache:
+       --extra_args=" --secret=content=filecontents " \
+       --output_contains="filecontents"
+ 
++# Third of the CACHE-behaviour family, with test-cache-mode and
++# test-cache-mount-mode. What it measures is whether a cache mount SURVIVES
++# between builds, so the daemon's cache is the subject rather than the
++# environment -- --no-cache in the fixture would erase the thing under test.
+ test-cache-persist:
+   DO +RUN_EARTHLY \
++      --force_internal_buildkit=true \
+       --earthfile=cache-persist.earth \
+       --target=+test-persisted \
+       --output_contains="| test persisted ok"
+ 
+   DO +RUN_EARTHLY \
++      --force_internal_buildkit=true \
+       --earthfile=cache-persist.earth \
+       --target=+test-non-persisted \
+       --output_contains="| test non persisted ok"
+ 
+   DO +RUN_EARTHLY \
++      --force_internal_buildkit=true \
+       --earthfile=cache-persist-no-flag.earth \
+       --target=+test-persisted \
+       --output_contains="| test persisted ok"

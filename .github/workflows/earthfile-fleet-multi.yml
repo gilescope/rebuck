@@ -1,0 +1,2250 @@
+# earthbuild's Earthfile across SEPARATE runners.
+#
+# The single-runner sibling (earthfile-fleet.yml) can prove correctness and
+# nothing about capacity: its workers share four cores, so a second worker is
+# contention. This is the one that can answer whether distribution pays,
+# because each worker is a whole machine.
+#
+# It became possible only once a result stopped naming a location. A worker
+# publishes a subtree into its OWN registry and replies with a bare digest;
+# the coordinator prefixes the registry IT can reach, misses, and fetches the
+# layers from the builder over iroh. Measured locally first - the coordinator
+# served twelve blobs having received two uploads, which it could only have
+# got from the workers.
+#
+# Rendezvous is keyless: every job derives the coordinator's identity from
+# GITHUB_RUN_ID, exactly as re-e2e.yml already does for the REAPI line. There
+# is no address to publish and no ordering to arrange.
+#
+# WHAT TO READ FIRST in a failed run: `hits_peer` in the worker logs. Zero
+# means layers did not move peer to peer and everything fell back through the
+# coordinator - which still BUILDS correctly, and is the quiet failure this
+# project keeps being caught by.
+name: earthfile-fleet-multi
+
+on:
+  # A push trigger on a DEDICATED branch, because workflow_dispatch is not
+  # reachable from here: the API resolves a workflow by its presence on the
+  # DEFAULT branch, and these live only on giles-dispatch. Adding them to
+  # main to make a button appear would put unproven, hour-long jobs in
+  # everyone's face.
+  #
+  # To run: `git push -f origin HEAD:giles-dispatch-ci`. Nothing fires on a
+  # normal push to giles-dispatch, so committing stays cheap.
+  # Two branches, because the interesting question is no longer only about
+  # the test groups. `-binaries` builds +all-binaries: five cross-compiles
+  # off one shared stem, no nested earthly, no docker layers of any size.
+  # The test side is 71% serial and caps at 1.4x by Amdahl however well the
+  # fleet works; this side is the shape a build farm is actually for.
+  push:
+    branches:
+      - giles-dispatch-ci
+      - giles-dispatch-ci-binaries
+      - giles-dispatch-ci-lint
+      - giles-dispatch-ci-buildkitd
+      - giles-dispatch-ci-all
+      - giles-dispatch-ci-seed
+      - giles-dispatch-ci-lint-seed
+      - giles-dispatch-ci-binaries-seed
+      - giles-dispatch-ci-ast
+      - giles-dispatch-ci-ast-zstd
+      - giles-dispatch-ci-ast-nobase
+      - giles-dispatch-ci-ast-zstd-nobase
+      - giles-dispatch-ci-ast-minops
+      # `+all` with no baseline leg. The big target's baseline is itself an
+      # hour-scale build, and the job cap is 150 minutes: run both legs and
+      # the fleet leg gets killed rather than measured. Against a KNOWN
+      # target time this still answers the coverage question - how much of
+      # the Earthfile survives the fleet - which is the one `+all` is for.
+      - giles-dispatch-ci-all-nobase
+      # +all with the best placement known. It is the release chain -
+      # all-buildkitd, all-binaries, earthly-docker, prerelease - and three
+      # of its four children have been through the fleet individually while
+      # the whole has never run. -sandbox because earthly-docker and
+      # prerelease are the likeliest nested builds left in the tree.
+      - giles-dispatch-ci-all-balance-sandbox-nobase
+      - giles-dispatch-ci-ast-imports
+      - giles-dispatch-ci-ast-bcast
+      - giles-dispatch-ci-ast-balance
+      # -imports COMPOSED with -balance, deliberately. The imports term adds
+      # warmth mass, and under the old comparator warmth is the first sort
+      # key - so scoring parent images would concentrate work harder onto
+      # the machine already holding them, which is the fault -balance exists
+      # to fix. Tested alone it could only regress; tested on top of
+      # -balance it is a fair question.
+      - giles-dispatch-ci-ast-balance-imports
+      # -bcast where WAITING binds. On +test-no-qemu it cut waiting 45% and
+      # moved the clock by nothing, because that leg is set by host-bind
+      # serial work. +test-ast has no host binds and was 45% waiting after
+      # -balance, so this is the target where removing queue time can
+      # actually show.
+      - giles-dispatch-ci-ast-balance-bcast
+      - giles-dispatch-ci-ast-balance-vtx
+      # THE MACHINE-COUNT TEST, and it is not a scaling experiment.
+      #
+      # If materialising a subtree's ancestry is the amplification, the
+      # fleet's CPU over the baseline's should be roughly the WORKER COUNT -
+      # each machine unpacks once what one machine unpacked once. Six
+      # workers measured 6.5x and 8.7x. Three should give ~3x if that is
+      # right and ~6-9x if it is not, and nothing else on the table predicts
+      # a dependence on the machine count at all.
+      #
+      # `-w3` is stripped by the plan job before the workload suffixes, so
+      # the target still resolves to `+test-ast`.
+      # ONE WORKER isolates the per-lead cost. With a single machine there
+      # is no ancestry duplication at all - it materialises once, exactly as
+      # the baseline does - so whatever CPU amplification remains is purely
+      # what a worker does that the baseline never does: export, push, and
+      # any over-materialisation forced by the portable rewrite.
+      #
+      # fleet CPU at n workers ~ n*A + W + leads*P. At n=1 that is
+      # A + W + leads*P, and the baseline is A + W, so the excess IS
+      # leads*P. Subtracting it from the six-worker figure leaves 5A.
+      # Two runs, both terms; -w3 becomes a check rather than the
+      # measurement.
+      # The export-cost test - see the `-nocomp` case in the plan job.
+      - giles-dispatch-ci-ast-balance-nocomp
+      - giles-dispatch-ci-ast-balance-w1
+      - giles-dispatch-ci-ast-balance-w3
+      # The export-cost test - see the `-nocomp` case in the plan job.
+      - giles-dispatch-ci-ast-balance-nocomp
+      - giles-dispatch-ci-ast-balance-w12
+      # Seeding ON TOP of balance, not instead of it. `-ast-seed` already
+      # existed and would answer a different question: the 1113s reference
+      # this is measured against is a balanced leg, so an unbalanced seeded
+      # run confounds the two mechanisms and neither number means anything.
+      - giles-dispatch-ci-ast-balance-seed
+      - giles-dispatch-ci-tests-nobase
+      # The coverage run, with whatever placement is known best at the time.
+      # A coverage run's deliverable is the failed-target list, not a clock,
+      # so the control-leg discipline that governs the -ast experiments does
+      # not apply: use the good config and find out what breaks.
+      # SIX machines, and first. The reference is 525s on six runners, so a
+      # twelve-machine leg beside it would conflate the fixes with the
+      # machine count - the one-variable rule, which is easy to apply to
+      # mechanisms and easy to forget for the fleet itself.
+      - giles-dispatch-ci-tests-balance-nobase
+      - giles-dispatch-ci-tests-balance-w12-nobase
+      # Whichever of the two the -ast run picks. Both are listed rather
+      # than one added later, because a branch that is pushed and does not
+      # trigger looks exactly like a run that failed to start.
+      - giles-dispatch-ci-tests-balance-imports-w12-nobase
+      - giles-dispatch-ci-tests-balance-nested-w12-nobase
+      - giles-dispatch-ci-tests-balance-sandbox-nobase
+      # -bcast on the WIDE target, not the narrow one. Its whole effect
+      # lands in `building`, which is 72% here against 55% on +test-ast, and
+      # the lane risk agrees rather than conflicting: 128 leads here against
+      # 414 there, so one prefetch lane carries far fewer announcements.
+      - giles-dispatch-ci-tests-balance-sandbox-bcast-nobase
+      - giles-dispatch-ci-ast-minops-nobase
+      - giles-dispatch-ci-ast-seed
+      - giles-dispatch-ci-lint-graft
+      - giles-dispatch-ci-buildkitd-arm
+  workflow_dispatch:
+    inputs:
+      peer_cache_mounts:
+        description: "lift cache mounts so subtrees can travel (1 = yes)"
+        default: "1"
+      home_slots:
+        description: "slots peer 0 keeps for itself - 0 forces dispatch"
+        default: "0"
+      keepalive_s:
+        description: upstream http2 keepalive interval in seconds; 0 disables it
+        type: string
+        default: ''
+      conns:
+        description: upstream connections; 1 shares Control and gateway as before the split
+        type: string
+        default: ''
+      fresh_fleet:
+        description: the baseline gets its own daemon, so the fleet's coordinator starts cold (1/0)
+        type: string
+        default: '1'
+      trust_verdict:
+        description: report a peer's failure as the client's when it ran the client's exact graph (1/0)
+        type: string
+        default: '0'
+      seed_caches:
+        description: harvest the baseline's cache mounts and start the fleet's from them (1/0)
+        type: string
+        default: '0'
+      seed_ids:
+        # Some of these have no `id=` in the Earthfile, so buildkit keys
+        # them on the destination and the id IS the path - hence the
+        # repetition. Read out of a real run's `cache cost` table rather than
+        # guessed from the Earthfile: group2 spends its seconds behind four
+        # ids and TWO of them are bare paths, `/go/pkg/mod` and
+        # `/root/.cache`, which no reading of the source would have offered.
+        #
+        # `/root/.cache` is deliberately absent. It is whatever a target
+        # happens to put there, so principle 20 cannot say it is
+        # self-keying, and a cache that is not self-keying is not one to
+        # hand somebody.
+        # Included because +lint-all is the cheap seeding target and
+        # golangci-lint's cache is where its time goes: the baseline fills it
+        # once and reuses it across four modules, each peer starts empty.
+        # Self-keying, so principle 20 allows it - golangci-lint uses the Go
+        # build cache format and addresses entries by content.
+        description: which cache mounts to harvest, as `id:path` pairs
+        type: string
+        default: 'go-mod:/go/pkg/mod,/go/pkg/mod:/go/pkg/mod,go-build:/root/.cache/go-build,/root/.cache/golangci_lint:/root/.cache/golangci_lint'
+      prefetch:
+        description: announce a finished layer to the fleet before it is asked for (1/0)
+        type: string
+        default: '1'
+      min_siblings:
+        description: keep a solve home unless this many are already in flight
+        type: string
+        default: '0'
+      warm:
+        description: workers build the base chain while the baseline runs (1/0)
+        type: string
+        default: '0'
+      warm_target:
+        description: what to warm with
+        type: string
+        # If a directory-qualified target is used here again: ./tests, not
+        # ./t. earthly ABBREVIATES the directory in its display names and in
+        # the target names it puts in OTLP spans, so the traces say
+        # `./t/integration-base+test-base` and there is no such path. Six
+        # warm-ups failed identically on "No Earthfile nor build.earth file
+        # found" because the target was copied out of a log.
+        default: '+deps'
+      local_nested:
+        description: a nested earthly uses the daemon on the machine running it (1/0)
+        type: string
+        default: '0'
+      sandbox_host:
+        description: nested earthly dials the LOCAL daemon via buildkitsandbox (1/0)
+        type: string
+        default: '0'
+      consolidate:
+        description: nested earthly shares the outer daemon (1) or starts its own (0)
+        type: string
+        default: '1'
+      h2_resets:
+        description: hyper's reset-stream limit; 'none' disables it (experiment)
+        type: string
+        default: ''
+      affinity:
+        description: prefer a peer that already holds the subtree's ancestry (1/0)
+        type: string
+        default: '1'
+      fleet_cache:
+        description: "off | read | readwrite. ALL THREE measured slower - see docs"
+        default: "off"
+      arm_workers:
+        description: how many workers run on arm64, so a pinned arm64 solve has somewhere to go
+        type: string
+        default: ''
+      graft:
+        description: "import an already-built ancestor instead of rebuilding it"
+        # OFF, and the env expression below cannot enforce that on its own:
+        # `inputs.graft || '0'` never sees an empty value while THIS default
+        # is non-empty, so the fallback was unreachable and grafting ran in
+        # every run after the commit that supposedly disabled it. Grafting is
+        # measured at +107s, so several "honest" comparisons carried it.
+        default: "0"
+      cut_prefix:
+        description: "publish the shared ancestry as its own subtree, once"
+        default: "1"
+      earthly_flags:
+        description: "flags for earthly - upstream uses --ci -P"
+        default: "--ci -P"
+      target:
+        # group2, not group10: group10 reaches ./integration-base, which
+        # builds github.com/EarthBuild/earthbuild/buildkitd:main+buildkitd and
+        # wants DOCKERHUB_AUTH. Upstream's reusable-test workflow logs in to
+        # Docker Hub and GHCR before running these; this one has no secrets,
+        # so that group dies in 2s at earthfile2llb resolution with a wall of
+        # empty --DOCKERHUB_* args.
+        #
+        # It passes on a laptop because the laptop is logged in. Noted as a
+        # caveat days ago and then ignored when picking a target.
+        description: "earthbuild target to build - avoid groups needing registry creds"
+        default: "+test-no-qemu-group2"
+      workers:
+        description: "worker runners, as a JSON array - matrix AND barrier read this"
+        default: "[1,2,3,4,5,6]"
+      ref:
+        # PINNED to the commit the vendored patch was cut against, not a
+        # branch. `main` moves: the six-machine run failed with
+        # `patch failed: builder/builder.go:338` because upstream had drifted
+        # past it, and a patch that half-applies is worse than one that fails
+        # - the previous attempt lost a day to exactly that.
+        #
+        # A pin also makes the measurement reproducible: every number in
+        # earthly-dispatch.md is against this tree.
+        description: "earthbuild ref - pinned so the vendored patch applies"
+        default: "3380dc206e463365c865857b32427b6768f93af2"
+
+env:
+  # What upstream's reusable-test.yml passes, and neither is optional.
+  #   -P    makes earthly request the security.insecure entitlement; without
+  #         it every WITH DOCKER target dies as `failed to load LLB`, which
+  #         reads like the proxy stripped something and does not.
+  #   --ci  changes output mode and strictness.
+  # Not --no-cache, which this used to pass and upstream does not.
+  EARTHLY_FLAGS: ${{ inputs.earthly_flags || '--ci -P' }}
+  # WITHOUT THESE THE RUN IS GREEN AND MEASURES NOTHING.
+  #
+  # First green CI run reported:
+  #
+  #   solves routed : 0
+  #   not routed    : {"excluded: CacheMount": 5, "home has room": 1}
+  #
+  # Both are correct behaviour and both are defaults that mean "do not
+  # distribute". Every local probe has passed these since the first day and
+  # neither ever reached the workflow, so CI was exercising the pipeline and
+  # not the fleet - the most convincing kind of green there is.
+  #
+  #   PEER_CACHE_MOUNTS  earthbuild's Earthfile puts a cache mount on most
+  #                      RUNs; without lifting them 5 of 6 solves are
+  #                      excluded before placement is even considered.
+  #   HOME_SLOTS=0       otherwise peer 0 takes the work itself whenever it
+  #                      has room, which on an idle runner is always.
+  REBUCK2_PEER_CACHE_MOUNTS: ${{ inputs.peer_cache_mounts || '1' }}
+  REBUCK2_HOME_SLOTS: ${{ inputs.home_slots || '0' }}
+  # The A/B this exists to settle: six machines took 590s against 307s on
+  # one, and go-mod (~24.2s/lead) plus go-build (~24.7s/lead) account for
+  # the gap. A cache mount does not travel, so one machine pays that once
+  # and six pay it six times.
+  #
+  # Measured HERE rather than on a laptop, where a run of this size fills
+  # the Docker VM's disk and both legs fail for a reason that has nothing
+  # to do with caching.
+  REBUCK2_FLEET_CACHE: ${{ inputs.fleet_cache || 'off' }}
+  # Placement by ancestry rather than by load. Least-loaded-first is load
+  # BALANCING, which spreads work sharing a base across machines - and every
+  # machine that touches a layer pulls, decompresses and unpacks it into its
+  # own snapshotter. Measured at 2.2-2.3x built duplication against an ideal
+  # of 1. Off until it is measured, like the other three.
+  # ON, on evidence that arrived late. Affinity was measured on op
+  # duplication - 2.2x to 1.0x - and left off because the gain looked
+  # marginal. The run that turned prefetch on reported something else
+  # entirely: 2.9x built duplication with affinity OFF, and 1,524,789ms of
+  # lead time across 64 leads that named the `go-mod` cache mount, ~24s
+  # each.
+  #
+  # That is the real cost of lifting cache mounts. Lifting one does not make
+  # it free, it makes every worker pay for a COLD one - and affinity is
+  # exactly worker stickiness, so the same op keeps meeting the same warm
+  # cache. Nobody had measured affinity against cache cost; the two
+  # mechanisms are in agreement, not tension.
+  REBUCK2_AFFINITY: ${{ inputs.affinity || '1' }}
+  REBUCK2_H2_RESETS: ${{ inputs.h2_resets || '' }}
+  REBUCK2_CONSOLIDATE: ${{ inputs.consolidate || '1' }}
+  REBUCK2_SANDBOX_HOST: ${{ inputs.sandbox_host || '0' }}
+  # The funnel fix that does NOT rely on a name resolving inside an exec.
+  # buildkitsandbox works for most execs and not for `--privileged
+  # --entrypoint` ones, where the nested earthly dies on `could not connect
+  # to buildkit`. The worker substitutes its own routable address instead,
+  # which is the one place the answer is known.
+  REBUCK2_LOCAL_NESTED: ${{ inputs.local_nested || '0' }}
+  # Retracted and reinstated for a DIFFERENT reason, so the old note is
+  # wrong and worth correcting rather than deleting.
+  #
+  # Warming was ruled out structurally: making a graph portable rewrites its
+  # op digests, so a warm worker's buildkit cache can never key-match the
+  # dispatched graph, and one measured warm worker still fetched 354 MiB.
+  # That argument is sound and still holds - for buildkit's OP CACHE.
+  #
+  # It does not hold for CACHE MOUNTS, and they are where the time is. A
+  # cache mount is a directory, not a cache key: `go mod download` finds a
+  # module in /go/pkg/mod by module path and version, and does not care what
+  # digest the op carrying it had. So warming cannot make a worker skip an
+  # op, and CAN make the op it runs cheap - which against ~64 leads at ~24s
+  # apiece is the larger of the two prizes.
+  #
+  # Still off: affinity is the variable under test right now, and stacking
+  # two would make neither readable.
+  REBUCK2_WARM: ${{ inputs.warm || '0' }}
+  # Do not dispatch work that has nothing to overlap with. The traces put 192
+  # of the baseline's 271 seconds in a base chain three targets deep, one at
+  # a time - dispatching it cost +90s and could gain nothing, because there
+  # is no second piece of work to run beside it.
+  REBUCK2_MIN_SIBLINGS: ${{ inputs.min_siblings || '0' }}
+  # Pre-position layers against work that has not started. Workers fetch
+  # NOTHING for the whole 284s baseline leg and nothing again until 227s into
+  # the fleet leg, when the bulk transfer lands exactly as the fan-out wants
+  # it - a layer finished minutes earlier sits on one machine until asked.
+  # ON since the gate became a PREDICTION. While it counted placements it
+  # had nothing to announce - affinity drives an op towards one machine and
+  # the gate wanted two - and it measured shares of 0 and 1 blob against a
+  # base chain of 26. Gated on solve counts it should announce that chain.
+  # Off again, with the number, if it does not pay.
+  REBUCK2_PREFETCH: ${{ inputs.prefetch || '1' }}
+  # Both measured workloads lose the same way: a lifted cache mount starts
+  # COLD on whoever gets the work, so six machines each pay for a fill that
+  # one machine pays for once. buildkit can start a cache dir as a
+  # copy-on-write ref over `Mount.input`; this is the switch that uses it.
+  #
+  # READ THE CAVEAT in the harvest step before quoting any number from a run
+  # with this on. It compares a seeded fleet against an unseeded fleet, not
+  # against the baseline.
+  #
+  # Resolved in `plan` and set on the coordinator job, because it is chosen
+  # by branch and a workflow-level `env:` cannot see `needs`. One place
+  # states it, which is the rule the graft episode bought.
+  # OFF. The remaining +lint-all gap is four home rebuilds of a target that
+  # already failed on a peer, ~40s each - and this removes them by reporting
+  # the peer's error instead. It can also report red for a build that is
+  # green, so it is measured rather than assumed: see `trust_verdict` in
+  # dispatch.rs for the three conditions, one of which +lint-all does not
+  # meet.
+  REBUCK2_TRUST_VERDICT: ${{ inputs.trust_verdict || '0' }}
+  REBUCK2_SEED_IDS: ${{ inputs.seed_ids || 'go-mod:/go/pkg/mod,/go/pkg/mod:/go/pkg/mod,go-build:/root/.cache/go-build,/root/.cache/golangci_lint:/root/.cache/golangci_lint' }}
+  # A FILE, not a variable. The seeds are harvested after the proxy is
+  # already running, so a variable set at that point would never reach it;
+  # `cache_seeds()` reads this lazily on the first dispatch.
+  # UNPACK is the bottleneck, measured: 87% of lead time in one run sat in
+  # the seventeen leads that fetched over a MiB, at 7.2 MB/s on a gigabit
+  # runner. That is gzip plus overlayfs on two cores, not the wire - and
+  # every layer this fleet moves is one we exported.
+  #
+  # Empty by default: gzip is what every number in fleet-findings was
+  # measured against. `-zstd` on a branch turns it on.
+  # Resolved in `plan`, like the target and the seeding switch: a
+  # workflow-level env cannot see `needs`, and one place has to state it.
+  REBUCK2_CACHE_SEEDS_FILE: /tmp/cache-seeds.txt
+  # THE BYTES, not a reconstruction of them. Earthly's cache mounts carry an
+  # input and `getRefCacheDir` keys the directory on that input's ref, so a
+  # harvest has to present the same op - and rebuilding it from a reading of
+  # runmount.go produced a different digest and an empty harvest, silently.
+  #
+  # Under the BANKED store, so it survives to the next run. The proxy only
+  # sees graphs during the fleet leg, which is after the harvest, so the
+  # inputs a run observes are for the run after it - which is the warm-CI
+  # case rather than a simulation of one.
+  REBUCK2_CACHE_INPUTS_FILE: ~/.cache/rebuck2/coord/cache-inputs.tsv
+  REBUCK2_FRESH_FLEET: ${{ inputs.fresh_fleet || '1' }}
+  REBUCK2_CONNS: ${{ inputs.conns || '' }}
+  REBUCK2_KEEPALIVE_S: ${{ inputs.keepalive_s || '' }}
+  # `+deps`, not the base chain, and that follows from the paragraph above.
+  # If warming buys a warm cache MOUNT rather than a cache hit, then the
+  # right warm-up is the cheapest target that fills the expensive mounts -
+  # and `+deps` is exactly `go mod download` into /go/pkg/mod behind
+  # `id=go-mod`, the costliest id in the table. The base chain fills them
+  # too, and takes minutes doing it.
+  REBUCK2_WARM_TARGET: ${{ inputs.warm_target || '+deps' }}
+  # Pinned by digest like everything else here: a collector that changes
+  # under us changes the data.
+  OTEL_IMAGE: ghcr.io/open-telemetry/opentelemetry-collector-releases/opentelemetry-collector-contrib:0.145.0
+  # Cut the shared ancestry out as its own dispatch unit, publish it once,
+  # and graft it into everything that follows.
+  #
+  # Local trend across three configurations, group10, three workers:
+  #     graft only          444s
+  #     cut, 32 duplicates  407s
+  #     cut once            373s   17 prefixes, median ops/lead 82 -> 32
+  #
+  # Monotone, and the shape moves - which nothing else in nine attempts did.
+  # But a laptop running four buildkitds on the cores the baseline gets to
+  # itself measures CONTENTION, not capacity: there the same target's
+  # baseline fell to 122s while the fleet sat at 389s. Separate machines are
+  # the only place the question can be answered.
+  # TLS off by ENV, not only in a config file - and this is what makes
+  # daemon consolidation actually happen.
+  #
+  # A nested earthly inherits BUILDKIT_HOST through the forwarded
+  # environment and nothing else. A config file lives in one container and
+  # cannot travel, so without this the nested build dials the shared daemon,
+  # defaults to TLS, and exits 6.
+  #
+  # Its absence is visible in the numbers: this workflow's baseline is 292s
+  # where the same target on a laptop WITH consolidation is 141s. The patch
+  # was applied and the mechanism was inert.
+  EARTHLY_TLS_ENABLED: "false"
+  EARTH_TLS_ENABLED: "false"
+  # GRAFT back ON: `no support for <nil>` is explained and fixed.
+  #
+  # It was buildkit's ResolveOp falling off the end of its switch on the op
+  # union - `%T` of a nil interface prints `<nil>`, which is why the message
+  # named neither op nor field. Grafting orphans the ops beneath a replaced
+  # subtree; the orphans inflated `def.len()`; the cut-prefix picker's
+  # "not the whole graph" test then let a TERMINAL-rooted cut through, and
+  # that cut carries two terminals. Turning grafting off had said which
+  # mechanism, which is what it was for.
+  #
+  # Measured with both fixes: 42 nil errors -> 0, and the fleet passed a
+  # target (`builtin-args-test`) that the single-machine baseline failed.
+  #
+  # OFF as a default all the same, and for a different reason than before -
+  # not broken, PRICED. Same commit, six runners, only this moved:
+  #
+  #   off  216s baseline  504s fleet  44 routed   0 grafts
+  #   on   212s baseline  611s fleet  37 routed  31 grafts
+  #
+  # 31 subtrees really did start from an ancestor someone else had built,
+  # and it cost 107s: a handover here is a registry publish plus a pull on
+  # every machine that wants it, and those constants dwarf the bytes. See
+  # docs/fleet-findings.md.
+  # Resolved in `plan`, like the target and the seeding switch - a
+  # workflow-level env cannot see `needs`, and one place has to state it.
+
+  REBUCK2_CUT_PREFIX: ${{ inputs.cut_prefix || '1' }}
+  # Written before `earthly bootstrap` in BOTH jobs. earthly hands this to the
+  # buildkitd container as EARTHLY_ADDITIONAL_BUILDKIT_CONFIG, and a daemon
+  # that does not trust the registry it is told to pull from fails the SILENT
+  # way: publishing is insecure per-solve so the registry fills, pulling is
+  # governed by daemon config alone, so every lead declines and the build
+  # succeeds at home having distributed nothing.
+  TRUST_SNIPPET: |
+    global:
+      # tls_enabled defaults TRUE and a REMOTE buildkit is expected to
+      # present a certificate. The gateway speaks plain gRPC, so earthly
+      # spends its full 60s connect timeout looking for
+      # ~/.earthly/certs/ca_cert.pem and then reports
+      #
+      #     could not connect to buildkit: timeout 1m0s
+      #
+      # which names the symptom and not one word of the cause. Fixed in the
+      # single-runner workflow first; this file needed it too.
+      tls_enabled: false
+      buildkit_additional_config: |
+        [registry."172.17.0.1:15000"]
+          http = true
+          insecure = true
+
+permissions:
+  contents: read
+
+jobs:
+  # Turn whatever was asked for into a worker list, ONCE, so the matrix and
+  # the coordinator's barrier cannot disagree about how many machines this is.
+  #
+  # `workers: 6` used to expand to nothing at all: the matrix is
+  # `fromJSON(inputs.workers)`, `fromJSON('6')` is the number six rather than
+  # a list, and a matrix over a non-list produces ZERO jobs. The coordinator
+  # then counted `6` as one comma-free field, waited for one runner, got
+  # none, and reported `workers joined: 0/1` on an otherwise green run.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.n.outputs.list }}
+      count: ${{ steps.n.outputs.count }}
+      target: ${{ steps.n.outputs.target }}
+      seed: ${{ steps.n.outputs.seed }}
+      graft: ${{ steps.n.outputs.graft }}
+      fleet: ${{ steps.n.outputs.fleet }}
+      compression: ${{ steps.n.outputs.compression }}
+      minops: ${{ steps.n.outputs.minops }}
+      imports: ${{ steps.n.outputs.imports }}
+      bcast: ${{ steps.n.outputs.bcast }}
+      balance: ${{ steps.n.outputs.balance }}
+      nested: ${{ steps.n.outputs.nested }}
+      sandbox: ${{ steps.n.outputs.sandbox }}
+      vtx: ${{ steps.n.outputs.vtx }}
+      nobase: ${{ steps.n.outputs.nobase }}
+    steps:
+      - id: n
+        env:
+          # `-w<N>` in the branch name, because workflow_dispatch inputs are
+          # unreachable for a workflow that lives off the default branch and
+          # six is not a law of nature. +test-no-qemu has fourteen
+          # independent branches; on six machines its ceiling is six however
+          # good the scheduler is, so testing "the workload sets the ceiling"
+          # needs the machine count to be a variable too.
+          W: ${{ inputs.workers || '6' }}
+          T: ${{ inputs.target || '' }}
+          SEED: ${{ inputs.seed_caches || '' }}
+          GRAFT: ${{ inputs.graft || '' }}
+          ARM: ${{ inputs.arm_workers || '' }}
+          NESTED: ${{ inputs.local_nested || '' }}
+          REF: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # A count or an explicit list - both are things a human types.
+          # ANYWHERE in the name, not only at the end. The first version
+          # anchored the digits to the end of the branch, so
+          # `-tests-balance-w12-nobase` silently fell through to six - a
+          # branch that says twelve and runs six is the worst possible
+          # outcome for a machine-count experiment.
+          case "$REF" in
+            *-w[0-9]*)
+              rest=${REF##*-w}
+              W=${rest%%[!0-9]*}
+              ;;
+          esac
+          case "$W" in
+            \[*) list="$W" ;;
+            *[!0-9]*) echo "::error::workers must be a count or a JSON list, got '$W'"; exit 1 ;;
+            "" | 0) echo "::error::workers must be at least 1"; exit 1 ;;
+            *) list="[$(seq -s, 1 "$W")]" ;;
+          esac
+          count=$(echo "$list" | tr -cd '0-9,' | awk -F, '{print NF}')
+          echo "$count worker(s): $list"
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          # Resolved HERE and nowhere else. It was written out four times -
+          # a bank cache key, its restore prefix, and the two legs - and the
+          # bank key is the one that hurts when they disagree: a run would
+          # restore the test groups' bank, build something else, and save it
+          # back under the same name.
+          # Suffixes COMPOSE. A workload suffix picks the target, and
+          # `-seed` is a mechanism rather than a workload, so it is stripped
+          # first and whatever remains still names a target. That is what
+          # makes `-lint-seed` possible, and it matters: seeding was going to
+          # be measured against +test-no-qemu-group2 at forty minutes a run
+          # when +lint-all answers the same question in fifteen.
+          #
+          # Stripping and re-matching, rather than enumerating the
+          # combinations, because the combinations multiply and the table
+          # would go stale the first time a target was added.
+          # UNTIL NOTHING MATCHES, not once each in order. Stripping in a
+          # fixed sequence only works if the branch names them in that
+          # sequence: `-ast-zstd-nobase` had `-zstd` tested before `-nobase`
+          # was removed, so it never matched, and the workload came out as
+          # `-ast-zstd` - which is not `*-ast` either, so the run would have
+          # quietly built +test-no-qemu-group2 under a branch called -ast.
+          #
+          # Found by running this loop against six names rather than by
+          # reading it.
+          workload=$REF
+          while :; do
+            before=$workload
+            # `-w<N>` is a GLOB, not a fixed string: the count is part of
+            # the suffix. Two patterns because `%` removes the shortest
+            # match, so `-w12` needs the two-digit one and `-w8` the
+            # one-digit one, and trying only the short pattern on `-w12`
+            # leaves a stray `1` on the workload.
+            workload=${workload%-w[0-9]}
+            workload=${workload%-w[0-9][0-9]}
+            for suffix in -seed -graft -arm -nocomp -zstd -minops -imports -bcast -balance -nested -sandbox -vtx -nobase; do
+              # QUOTED: unquoted, `$suffix` is taken as a glob pattern
+              # rather than a literal, which shellcheck SC2295 catches and
+              # which would misbehave the moment a suffix contained a `?`
+              # or a `*`.
+              workload=${workload%"$suffix"}
+            done
+            [ "$workload" = "$before" ] && break
+          done
+          case "${T:-}" in
+            "") case "$workload" in
+                  *-binaries) target=+all-binaries ;;
+                  *-lint)     target=+lint-all ;;
+                  # THREE independent AST test groups, no docker, no
+                  # nested earthly - and, unlike +lint-all, nothing in it
+                  # fails on purpose. Every speed number so far has had a
+                  # deliberately-red target somewhere in it, which the
+                  # verdict fix made cheaper but did not remove: a failing
+                  # target still costs one peer attempt plus one build at
+                  # home. This is the clean measurement.
+                  *-ast)      target=+test-ast ;;
+                  # Multi-arch buildkitd on its own. It is the only untested
+                  # thing inside `+all`, and the only one that needs qemu -
+                  # `+test-no-qemu` exists because that path is painful here
+                  # - so it is worth finding out cheaply rather than ninety
+                  # minutes into the big target.
+                  *-buildkitd) target=+all-buildkitd ;;
+                  # The WIDEST target in the Earthfile: +test-no-qemu is
+                  # +test-misc, twelve independent groups and +test-no-qemu-
+                  # slow. Fourteen siblings with no dependency between them,
+                  # which is the shape a fleet exists for - against +all,
+                  # whose four children each hide a chain.
+                  #
+                  # It HAS run: 186s on one machine against 525s on six,
+                  # which is 2.8x and the best ratio in the findings. That
+                  # was before prefetch worked at all and while two machines
+                  # sat idle, so it is a reference to beat rather than a
+                  # blank.
+                  #
+                  # Run it `-nobase` FIRST. The deliverable there is the
+                  # failed-target count, not a clock: fourteen groups with a
+                  # baseline leg is two hour-scale builds against a
+                  # 150-minute cap, and the last run to exceed a cap did not
+                  # degrade, it died. The cost is that a target failing under
+                  # the fleet cannot be told from one that fails anyway -
+                  # +test-ast was chosen precisely because nothing in it
+                  # fails on purpose, and that is not known to hold here. So:
+                  # -nobase for coverage, then chase individual failures, and
+                  # only pay for a baseline leg if the fleet leg comes in
+                  # well under the cap.
+                  *-tests)    target=+test-no-qemu ;;
+                  *-all)      target=+all ;;
+                  *)          target=+test-no-qemu-group2 ;;
+                esac ;;
+            *)  target="$T" ;;
+          esac
+          echo "target: $target"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+          # A third CI branch, same trick as `-binaries`: workflow_dispatch
+          # is not reachable for a workflow that lives off the default
+          # branch, so an experiment is selected by where it is pushed.
+          case "${SEED:-}" in
+            "") case "$REF" in *-seed*) seed=1 ;; *) seed=0 ;; esac ;;
+            *)  seed="$SEED" ;;
+          esac
+          echo "seed caches: $seed"
+          echo "seed=$seed" >> "$GITHUB_OUTPUT"
+          # GRAFT, and the reason it is worth another look. It was measured
+          # at +107s and switched off - within a RUN, where the ancestor has
+          # to be built and published before anything can import it. Across
+          # runs it is a different proposition entirely: the bank restores
+          # the coordinator's store, so last run's subtrees are already
+          # there and grafting costs a pull rather than a build. Nothing has
+          # tested that. `[wire] grafted` read 0 in every run and I took it
+          # for evidence - but the flag was UNSET in every one of those runs,
+          # so the zero said nothing at all. It now prints OFF instead.
+          case "${GRAFT:-}" in
+            "") case "$REF" in *-graft*) graft=1 ;; *) graft=0 ;; esac ;;
+            *)  graft="$GRAFT" ;;
+          esac
+          echo "graft: $graft"
+          echo "graft=$graft" >> "$GITHUB_OUTPUT"
+
+          # `-zstd`: how our own layers are compressed. Unpack is the
+          # measured bottleneck at ~7 MB/s, zstd decompresses several times
+          # faster than gzip at similar size, and every layer the fleet
+          # moves is one we exported.
+          # BRANCH ONLY, no input. workflow_dispatch takes at most 25
+          # inputs and this file is at the ceiling - which matters less than
+          # it sounds, because dispatch is unreachable for a workflow that
+          # lives off the default branch. The suffix has been the real
+          # interface since `-binaries`; from here it is the only one.
+          #
+          # `-nocomp`: the decisive test for the per-solve cost. Run
+          # 31566167945 measured a dispatched solve at 23.5 CPU-seconds
+          # against 1.9 for the same solve built locally, and ancestry
+          # cannot explain it - ancestry is paid once per machine and
+          # amortised over every lead that machine takes. What a dispatched
+          # solve does and a local one does not, per solve, is EXPORT its
+          # result: compress every layer, write a manifest, push. That was
+          # once bounded at "5-10%" from bytes and a transfer rate, which is
+          # the wrong unit - compression is CPU and was priced as network.
+          #
+          # `uncompressed` removes the compress half entirely. If worker CPU
+          # collapses, export is the answer; if it barely moves, export is
+          # exonerated and the portable rewrite is what remains.
+          case "$REF" in
+            *-nocomp*) comp=uncompressed ;;
+            *-zstd*)   comp=zstd ;;
+            *)         comp="" ;;
+          esac
+          echo "compression: ${comp:-buildkit default}"
+          echo "compression=$comp" >> "$GITHUB_OUTPUT"
+
+          # `-minops`: refuse to dispatch a graph smaller than the bytes it
+          # would drag across. `+test-ast` ran 412 solves, routed every one,
+          # moved 24.7 GiB, and took 1773s against a 204s baseline - the
+          # median lead fetched 26 MiB to run a `jq`. Twenty ops is a coarse
+          # floor and deliberately so: the cost of being wrong is one solve
+          # built at home, against a 73x failure if the floor is absent.
+          case "$REF" in *-minops*) minops=20 ;; *) minops=0 ;; esac
+          echo "min ops: ${minops:-off}"
+          echo "minops=$minops" >> "$GITHUB_OUTPUT"
+
+          # `-imports`: score a candidate on the parent IMAGES it holds, not
+          # just ops and cache mounts. A cut subtree names its parent by
+          # digest instead of carrying its ops, so op overlap is blind to the
+          # one expensive thing - and the local rig shows a daemon serving
+          # zero bytes for a parent it built itself, chained or not.
+          #
+          # Separate from the prefetch fix on purpose. Both aim at the same
+          # 93x re-serve ratio, and two mechanisms in one run measures
+          # neither.
+          case "$REF" in *-imports*) imports=1 ;; *) imports=0 ;; esac
+          echo "affinity imports: $imports"
+          echo "imports=$imports" >> "$GITHUB_OUTPUT"
+
+          # `-bcast`: a prefetch announcement goes to EVERY worker instead of
+          # being split one-blob-one-worker. The driver only announces
+          # content with two or more consumers, so splitting it
+          # pre-positions the bytes for one machine and leaves every other
+          # one to fetch them lazily, on the critical path - the same total
+          # transfer with most of it back where prefetch exists to remove it.
+          case "$REF" in *-bcast*) bcast=1 ;; *) bcast=0 ;; esac
+          echo "prefetch broadcast: $bcast"
+          echo "bcast=$bcast" >> "$GITHUB_OUTPUT"
+
+          # `-balance`: trade warmth against queue depth instead of ranking
+          # it first. Three runs with six workers available placed
+          # 223/125/63/3, 46/37/10 and 153/142/81/3 - two or three machines
+          # never took a lead, because a warm worker with one free slot beats
+          # a cold worker with sixteen and gets warmer each time it wins.
+          case "$REF" in *-balance*) balance=1 ;; *) balance=0 ;; esac
+          echo "balance warmth: $balance"
+          echo "balance=$balance" >> "$GITHUB_OUTPUT"
+
+          # `-nested`: point a nested earthly at the daemon on ITS OWN
+          # machine. earthly forwards its BUILDKIT_HOST into every exec, and
+          # in a fleet that address is the coordinator's - so the five leads
+          # that own a full +test-no-qemu critical path, 231-258s each, are
+          # nested builds dialling back across the network into one funnel.
+          #
+          # Carries a hazard: nested builds under `--privileged
+          # --entrypoint` have died on `could not connect to buildkit:
+          # timeout 1m0s` when retargeted. That is why it is a switch.
+          # An explicit input WINS over the suffix, matching GRAFT beside
+          # it. Without this the job-level env would override a dispatch
+          # input with a value derived from the branch name alone - which is
+          # unreachable today, since dispatch inputs cannot reach a workflow
+          # off the default branch, and would be a silent trap the moment
+          # that changes.
+          # `-sandbox`: forward `tcp://buildkitsandbox:8372` into every exec,
+          # a buildkit constant in each one's /etc/hosts that resolves
+          # locally. DIFFERENT from -nested, which rewrites the graph: this
+          # one changes what earthly hands its nested builds.
+          #
+          # The findings record it producing ZERO h2 protocol errors on a
+          # full target where every previous run collapsed with one - and the
+          # coverage run just died on exactly that error, with the switch off.
+          case "$REF" in *-sandbox*) sandbox=1 ;; *) sandbox=0 ;; esac
+          echo "sandbox host: $sandbox"
+          echo "sandbox=$sandbox" >> "$GITHUB_OUTPUT"
+
+          # `-vtx`: workers record their own per-vertex times, for the join
+          # against the baseline's. Costs about 15% - the collection sits
+          # inside the interval build_ms covers - so the leg from a -vtx run
+          # is NOT comparable to the reference band. Its output is per-vertex
+          # ratios, which is what the 12.5x needs and what no leg time says.
+          case "$REF" in *-vtx*) vtx=1 ;; *) vtx=0 ;; esac
+          echo "worker vertices: $vtx"
+          echo "vtx=$vtx" >> "$GITHUB_OUTPUT"
+
+          case "${NESTED:-}" in
+            "") case "$REF" in *-nested*) nested=1 ;; *) nested=0 ;; esac ;;
+            *)  nested="$NESTED" ;;
+          esac
+          echo "local nested: $nested"
+          echo "nested=$nested" >> "$GITHUB_OUTPUT"
+
+          # `-nobase`: skip the baseline leg. For comparing a MECHANISM
+          # against itself, where the control is another fleet leg and the
+          # baseline is dead weight.
+          # `*-nobase*`, not `*-nobase`. The suffixes compose in any order,
+          # so a trailing-only match reads `-ast-nobase-zstd` as not asking
+          # for it - the same order dependence the workload stripping above
+          # had, and it would present as a run that quietly did the opposite
+          # of its branch name.
+          case "$REF" in *-nobase*) nobase=1 ;; *) nobase=0 ;; esac
+          echo "skip baseline: $nobase"
+          echo "nobase=$nobase" >> "$GITHUB_OUTPUT"
+
+          # `-nobase` and `-seed` do not compose, and the failure is silent:
+          # the harvest reads base-bk, base-bk only exists because the
+          # baseline leg created it, and without one the harvest warns
+          # "nothing to harvest from" and the run measures an unseeded fleet
+          # while its branch name says otherwise. Said here, once, loudly.
+          if [ "$nobase" = "1" ] && [ "$seed" = "1" ]; then
+            echo "::error::-nobase and -seed cannot combine: the harvest reads base-bk, which only the baseline leg creates. This run would measure an UNSEEDED fleet under a branch called -seed."
+            exit 1
+          fi
+
+          # WHICH ARCHITECTURE each worker runs on.
+          #
+          # +all-buildkitd reached parity - 1161s against 1188s - and its
+          # `not routed` said why: `wanted Pinned("linux/arm64"); had
+          # 1:linux/amd64, 2:linux/amd64, ...`. Every worker is amd64, so
+          # the arm64 half stayed home and ran under qemu on peer 0 exactly
+          # as the baseline ran it. The fleet distributed the cheap half.
+          #
+          # An arm64 worker does not merely divide that work, it stops
+          # EMULATING it, and qemu against native is not a 2x difference.
+          # This is the only target measured that would gain from a
+          # platform-diverse fleet, and the only one whose gain is not
+          # bounded by Amdahl.
+          #
+          # A list of OBJECTS, so the label rides with the number. Two
+          # parallel lists would let the count and the architectures drift,
+          # and a matrix that disagrees with the coordinator's barrier is
+          # the `workers: 6` bug that once expanded to zero jobs.
+          arm=${ARM:-0}
+          case "$REF" in *-arm*) [ "$arm" = 0 ] && arm=2 ;; esac
+          pairs=""
+          i=0
+          for n in $(echo "$list" | tr -cd '0-9,' | tr ',' ' '); do
+            i=$((i + 1))
+            if [ "$i" -le "$arm" ]; then os=ubuntu-24.04-arm; else os=ubuntu-latest; fi
+            pairs="$pairs{\"n\":$n,\"os\":\"$os\"},"
+          done
+          fleet="[${pairs%,}]"
+          echo "fleet: $fleet"
+          echo "fleet=$fleet" >> "$GITHUB_OUTPUT"
+
+  # One job per worker. They join the coordinator's mesh, lend their buildkitd
+  # to it, and exit when it disconnects.
+  worker:
+    needs: plan
+    strategy:
+      fail-fast: false
+      # From the input, so the barrier cannot expect a different number of
+      # workers than the matrix starts. Hard-coding both is a trap: set
+      # workers=5 against a fixed [1,2,3] and the coordinator waits out its
+      # timeout for two runners nobody launched.
+      matrix:
+        w: ${{ fromJSON(needs.plan.outputs.fleet) }}
+    # The label rides WITH the number, out of `plan`.
+    runs-on: ${{ matrix.w.os }}
+    # 150, not 60. Sized for ONE group when that is what this built; the
+    # whole `+test-no-qemu` is twelve of them and runs TWICE - baseline then
+    # fleet. The first attempt was killed at 60 minutes, 51 of them into a
+    # run that had finished its baseline and was midway through the fleet
+    # leg, so it reported nothing at all.
+    #
+    # A measurement that cannot finish is not a slow measurement, it is no
+    # measurement.
+    timeout-minutes: 150
+    env:
+      # READ BY THE WORKER, not the coordinator. `my_share` calls
+      # prefetch_broadcast(), so setting this in the coordinator job - where
+      # every other new flag correctly lives, because the driver reads them -
+      # would leave `-bcast` switched on in the branch name and off in the
+      # process that acts on it.
+      #
+      # Caught by asking which JOB reads each variable rather than which job
+      # sets it. That is the sixth mechanism-that-cannot-fire in this session
+      # and the second I wrote myself.
+      REBUCK2_PREFETCH_ALL: ${{ needs.plan.outputs.bcast }}
+      # Also worker-side: worker.rs reads it to retarget a nested build's
+      # BUILDKIT_HOST before handing the graph to its own daemon.
+      REBUCK2_LOCAL_NESTED: ${{ needs.plan.outputs.nested }}
+      REBUCK2_WORKER_VERTICES: ${{ needs.plan.outputs.vtx }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      # earthbuild too, and on the WORKERS as well: the buildkitd image is
+      # compiled into the earthly binary, so a worker that did not build the
+      # same earthly can end up running a different daemon than the
+      # coordinator expects.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: EarthBuild/earthbuild
+          ref: ${{ inputs.ref || '3380dc206e463365c865857b32427b6768f93af2' }}
+          path: earthbuild
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: rebuck2
+      - name: build rebuck2
+        run: cargo build --release --manifest-path rebuck2/Cargo.toml
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
+        with:
+          go-version-file: earthbuild/go.mod
+          cache: false
+
+      - name: build earthly, PATCHED
+        run: |
+          set -euo pipefail
+          # CONSOLIDATED patch, not the four #784 sites alone.
+          #
+          # earthbuild's tests are earthly-in-earthly: RUN_EARTH executes the
+          # entrypoint inside a container, which starts its OWN buildkitd
+          # unless a host is forwarded. Every test's real build then runs on a
+          # daemon the gateway never sees - and those are exactly the solves
+          # refused as `Insecure`, so the fleet was distributing the cheap
+          # prep and leaving the critical path at home.
+          #
+          # Measured locally: consolidation more than HALVES the single-machine
+          # time, ~300s -> 141s. CI has been running without it, which is why
+          # its baselines are 313s and 276s where a laptop now does 141s.
+          #
+          # Released earthly measures ZERO: every non-LOCALLY RUN carries the
+          # debugger's secret, host bind and two fork-only sockets, and each
+          # pins the solve to whoever holds earthly's session. See
+          # rebuck2/patches/README.md and EarthBuild/earthbuild#784.
+          #
+          # Built on the WORKERS too, and not only the coordinator. The
+          # buildkitd image is compiled into the earthly binary as
+          # DefaultBuildkitdImage, so a released worker and a source-built
+          # coordinator can disagree about which daemon to run - the exact
+          # version skew `earthly bootstrap` was used here to make
+          # impossible. Same commit, same patch, same image, everywhere.
+          # Plain apply, then three-way. The patch ADDS two test files,
+          # and `git apply -3` cannot three-way a file with no blob in the
+          # index - it reports "does not exist in index" and drops the whole
+          # patch. Plain apply handles additions; -3 is the fallback for
+          # drift in the files that already exist.
+          git -C earthbuild apply --verbose \
+            "$GITHUB_WORKSPACE/rebuck2/patches/earthbuild-consolidated-plus-784.patch" || {
+              echo "::error::the #784 patch no longer applies to earthbuild"
+              echo "at $(git -C earthbuild rev-parse --short HEAD). Re-derive it"
+              echo "rather than forcing it: gate on whatever the surrounding"
+              echo "code already uses for the debugger. See"
+              echo "rebuck2/patches/README.md."
+              exit 1
+            }
+          # APPLIED is not the same as applied WHOLE. A hunk header carries
+          # the line counts of its own body, so editing the body without
+          # updating the header makes git read only as many lines as the
+          # header claims, apply that much, and exit 0. The dropped remainder
+          # here was a function definition whose caller DID apply, and the
+          # failure surfaced two steps later as `undefined: sortedKeys` -
+          # nowhere near the patch, in a file nobody had touched.
+          # shellcheck disable=SC2013 # Go identifiers: no spaces to split on
+          for sym in $(grep -oE '^\+func [a-zA-Z]+' \
+              "$GITHUB_WORKSPACE/rebuck2/patches/earthbuild-consolidated-plus-784.patch" \
+              | sed 's/^+func //' | sort -u); do
+            grep -rqF "func $sym(" earthbuild || {
+              echo "::error::the patch applied but dropped func $sym - check its @@ line counts"
+              exit 1
+            }
+          done
+          ( cd earthbuild && go build -o /usr/local/bin/earthly ./cmd/earthly )
+          earthly --version
+          # Thirteen feature flags the test targets assume. Missing it does
+          # not fail loudly - it fails as individual tests behaving
+          # differently, which is indistinguishable from a fleet bug.
+          {
+            echo "EARTHLY_VERSION_FLAG_OVERRIDES=$(tr -d '\n' < earthbuild/.earthly_version_flag_overrides)"
+          } >> "$GITHUB_ENV"
+
+      - name: what a machine is
+        run: |
+          set -euo pipefail
+          printf 'worker cores: %s  mem: %s\n' "$(nproc)" \
+            "$(awk '/MemTotal/{printf "%.1fGB", $2/1024/1024}' /proc/meminfo)"
+
+      - name: buildkitd, the fork earthly needs
+        run: |
+          set -euo pipefail
+          # Same reasoning as the single-runner workflow: an earthly graph
+          # carries fork-only ops, so `earthly bootstrap` picks the daemon and
+          # this copies its choice rather than guessing an image.
+          mkdir -p ~/.earthly && printf '%s\n' "$TRUST_SNIPPET" > ~/.earthly/config.yml
+          # PINNED, not discovered by `earthly bootstrap`. A source-built
+          # earthly - which is what the #784 patch requires - has
+          # `ghcr.io/earthbuild/earthbuild:buildkitd-dev-main` compiled in as
+          # DefaultBuildkitdImage, and that tag is not published. The first
+          # CI run ever attempted died on `manifest unknown` before starting
+          # a single daemon.
+          #
+          # The image must still be earthly's FORK: the converter emits host
+          # binds and earthly_interactive sockets that stock moby/buildkit
+          # rejects. earthly's own daemon could not be proxied anyway - it
+          # runs with TCP disabled and the port it publishes is the embedded
+          # registry, which answers HTTP/1.1 to a gRPC client. So we start
+          # our own with gRPC on 8372, the port the fork's tcp template sets.
+          BK_IMAGE=${BK_IMAGE:-earthbuild/buildkitd:v0.8.17}
+          docker pull "$BK_IMAGE"
+          docker rm -f own-bk base-bk >/dev/null 2>&1 || true
+          docker run -d --name own-bk --privileged -p 18372:8372 \
+            -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
+            -e BUILDKIT_TLS_ENABLED=false \
+            -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG='[registry."172.17.0.1:15000"]
+            http = true
+            insecure = true' \
+            "$BK_IMAGE" >/dev/null
+          for _ in $(seq 1 120); do
+            docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers \
+              >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 || {
+            echo "our buildkitd never became ready:"; docker logs --tail 20 own-bk; exit 1; }
+          # Shell variable AND $GITHUB_ENV: the latter only reaches LATER
+          # steps, and this one uses it below. See the single-runner
+          # workflow, where writing only the env file left `set -u` to kill
+          # the proxy with `BK0: unbound variable`.
+          BK_ADDR=127.0.0.1:18372
+          echo "BK_ADDR=$BK_ADDR" >> "$GITHUB_ENV"
+
+      - name: serve until the coordinator goes
+        env:
+          WORKER_N: ${{ matrix.w.n }}
+        run: |
+          set -euo pipefail
+          # WARM, in the window this machine would otherwise spend idle.
+          #
+          # A worker joins, then waits out the coordinator's entire baseline
+          # leg - some 275s - before the fleet leg gives it anything to do.
+          # It then pays to materialise the base chain from cold, and the
+          # traces price that precisely: `+base` costs 3.0s on the machine
+          # that already has it and 20.5s on one that does not, and
+          # `+earthly-docker` underneath it averages 207s.
+          #
+          # In the BACKGROUND, so joining is not delayed. Warming before
+          # joining would make the coordinator's barrier wait for it, which
+          # moves the cost onto the critical path instead of removing it.
+          if [ "${REBUCK2_WARM:-0}" = "1" ]; then
+            # NOT BK_ADDR, which is 127.0.0.1. earthly's IsLocal treats
+            # loopback as "a buildkit I manage" and tries to start its own
+            # container from an image that is not published - the first
+            # warm-up died doing exactly that, printing docker run arguments
+            # instead of building anything. Same trap the nested-host code
+            # documents, walked into two hours after writing the comment.
+            WARM_HOST=$(hostname -I 2>/dev/null | awk '{print $1}')
+            [ -n "$WARM_HOST" ] || WARM_HOST=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $7; exit}')
+            # The redirect goes on the GROUP, not on earthly. Attached to
+            # the inner command, anything failing before it - the cd, or the
+            # command substitution below under `set -e` - aborts the subshell
+            # before the file is ever created, and the only symptom is the
+            # check reporting "not warmed" for a warm-up that plainly
+            # started. Two runs were spent on that.
+            (
+              set +e
+              echo "warm: host=$WARM_HOST cwd=$PWD target=$REBUCK2_WARM_TARGET"
+              cd earthbuild || { echo "no earthbuild directory here"; exit 1; }
+              ov=$(tr -d '\n' < .earthly_version_flag_overrides) || ov=""
+              EARTHLY_BUILDKIT_HOST="tcp://${WARM_HOST}:18372" \
+              EARTHLY_TLS_ENABLED=false EARTH_TLS_ENABLED=false \
+              EARTHLY_VERSION_FLAG_OVERRIDES="$ov" \
+                timeout 900 earthly --ci "$REBUCK2_WARM_TARGET"
+              echo "warm exit=$?"
+            ) > "$GITHUB_WORKSPACE/warm-${WORKER_N}.log" 2>&1 &
+            echo "warming $REBUCK2_WARM_TARGET in the background"
+          fi
+          # Its OWN registry, reachable only from this machine - which is the
+          # point. Its daemon pulls from localhost; a miss is answered by
+          # whichever runner holds the layer, over the mesh.
+          # 8100s = 135 minutes, against the job's 150. It was 3000 - fifty
+          # minutes - and a run that took longer did not degrade, it DIED:
+          # every worker was killed at 50:00, the coordinator went on asking
+          # dead peers for subtree manifests, and buildkit failed the build
+          # with `timeout awaiting response headers` on a HEAD to a registry
+          # that could no longer answer.
+          #
+          # A cap inside a cap turns "slower than expected" into "failed",
+          # which is the worst possible reading of a performance experiment:
+          # it destroys the measurement AND misattributes the cause.
+          timeout 8100 ./rebuck2/target/release/rebuck2 worker \
+            --session "earthfile-${GITHUB_RUN_ID}" \
+            --store "$HOME/.cache/rebuck2/worker" \
+            --buildkit-addr "http://${BK_ADDR}" \
+            --registry-bind 0.0.0.0:15000 \
+            --registry-addr 172.17.0.1:15000 | tee "worker-${WORKER_N}.log"
+
+      - name: did warming finish in time
+        if: always()
+        env:
+          WORKER_N: ${{ matrix.w.n }}
+        run: |
+          set -uo pipefail
+          f="$GITHUB_WORKSPACE/warm-${WORKER_N}.log"
+          [ -f "$f" ] || { echo "not warmed"; exit 0; }
+          # A warm-up still running when the fleet leg starts is not a
+          # warm-up, it is contention - it competes for the same four cores
+          # with the work it was meant to accelerate. The exit line only
+          # appears once it finished.
+          if grep -q '^warm exit=0' "$f"; then
+            echo "warm finished clean: $(grep '^warm exit=' "$f")"
+          elif grep -q '^warm exit=' "$f"; then
+            # LOUD. A warm-up that ran and failed looked exactly like one
+            # that never started, four runs in a row, and each time the fleet
+            # leg was measured as though the workers had been warmed.
+            echo "::warning::warming FAILED - this run measures a cold fleet"
+            grep -aoE "^Error: .*" "$f" | tail -2
+          else
+            echo "::warning::warming did not finish - it competed with the build it meant to help"
+          fi
+          tail -3 "$f"
+
+      # KEEP the worker's logs too. Three iterations went into asking whether
+      # a warm-up ran, by grepping a job log where the echoed SCRIPT and the
+      # actual output look identical - "not warmed" matched the line that
+      # PRINTS "not warmed" more than once. The coordinator's logs have been
+      # uploaded since this morning for exactly this reason.
+      - name: keep this worker's logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: worker-${{ matrix.w.n }}-logs-${{ github.run_attempt }}
+          path: |
+            warm-${{ matrix.w.n }}.log
+            worker-${{ matrix.w.n }}.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: where did this worker's blobs come from
+        if: always()
+        env:
+          WORKER_N: ${{ matrix.w.n }}
+        run: |
+          # local / peer / driver. `peer` non-zero is the evidence that layers
+          # moved runner to runner instead of through the coordinator.
+          grep -E "hits|fetch|leading subtree|declined" "worker-${WORKER_N}.log" | tail -30 || true
+
+          # DISTINCT against SERVED, and how much left this box. Reported as
+          # 93x once, from fleet-wide served over the COORDINATOR's distinct -
+          # two different registries, and not a ratio at all. The per-worker
+          # figures are the comparable ones and have never printed: the run
+          # carrying them died before its workers could.
+          #
+          # HERE, on the worker, because that is where worker-N.log lives.
+          # The first version of this grepped worker-*.log from the
+          # coordinator step, which has no such file and would have matched
+          # nothing forever - the same shape of dead mechanism this session
+          # has now found five times.
+          echo "=== repetition, and which side of the wire"
+          # `vertices` too: the per-digest half of the 12.5x join.
+          grep -E '^\[worker\] (vertices|[0-9]+ blobs over|of that,|served [0-9]+ MiB)' \
+            "worker-${WORKER_N}.log" || echo "  (worker printed no serve summary)"
+
+          # HOW MANY CACHE MOUNTS THIS DAEMON ENDED UP WITH, which decides
+          # whether cold mounts can be the amplification at all.
+          #
+          # A mount persists on the daemon that made it, so if leads reuse
+          # them this should be a HANDFUL - the same few ids the baseline
+          # holds - and cold mounts then cost about one fill per worker,
+          # a few hundred seconds across the fleet. That is nowhere near the
+          # 4,716s of excess `building` to be explained.
+          #
+          # If instead it is HUNDREDS, every lead got a fresh empty
+          # directory, because `getRefCacheDir` keys on `id + ":" +
+          # ref.ID()` and a per-lead rewrite gives a per-lead input ref. Then
+          # the refill is paid 359 times rather than 6, and cold mounts are
+          # the whole story.
+          #
+          # One `du -v` answers a question that has been argued from first
+          # principles twice tonight.
+          # THE OTHER HALF of the amplification comparison. The baseline
+          # step records its daemon's CPU; this records each worker's, and
+          # the sum over workers is the only figure that can honestly be put
+          # beside it. Wall-clock ratios between a summed lead time and a
+          # single baseline are shape 22 and have been wrong twice.
+          wcpu=$(docker exec own-bk sh -c \
+                   'awk "/^usage_usec/{print \$2}" /sys/fs/cgroup/cpu.stat' 2>/dev/null || true)
+          if [ -n "${wcpu:-}" ]; then
+            echo "worker cpu: $((wcpu / 1000000))s"
+          else
+            echo "worker cpu: unavailable (no cgroup v2 reading from own-bk)"
+          fi
+
+          echo "=== cache mounts this worker's daemon ended with"
+          # `own-bk` is this worker's daemon - the same name the start step
+          # uses. Named wrongly once already this session (worker-*.log
+          # grepped on the coordinator, which has no such file), so it is
+          # taken from the `docker run` above rather than guessed.
+          du=$(docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 du -v 2>/dev/null || true)
+          if [ -z "$du" ]; then
+            echo "cache mounts: (du unavailable - the daemon is already gone)"
+          else
+            echo "cache mounts: $(printf '%s' "$du" | grep -c 'cached mount')"
+            printf '%s' "$du" | grep -oE 'with id "[^"]*"' \
+              | sort | uniq -c | sort -rn | head -10
+          fi
+
+  coordinator:
+    needs: plan
+    runs-on: ubuntu-latest
+    env:
+      # HERE, not workflow-wide. Set for every job, a worker's earthly also
+      # tries to export - to 127.0.0.1:4317 on a machine with no collector -
+      # and every build on every worker then retries until it gives up,
+      # logging `traces export: exporter export timeout` and slowing the work
+      # being measured. Found in a warm-up build's own log.
+      OTEL_TRACES_EXPORTER: otlp
+      OTEL_EXPORTER_OTLP_PROTOCOL: grpc
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://127.0.0.1:4317
+      REBUCK2_SEED_CACHES: ${{ needs.plan.outputs.seed }}
+      # Only so the one-line verdict can name itself. Nothing dispatches on
+      # it - a target name is an earthly concept and the proxy sees LLB.
+      REBUCK2_TARGET: ${{ needs.plan.outputs.target }}
+      REBUCK2_GRAFT: ${{ needs.plan.outputs.graft }}
+      REBUCK2_COMPRESSION: ${{ needs.plan.outputs.compression }}
+      REBUCK2_MIN_OPS: ${{ needs.plan.outputs.minops }}
+      REBUCK2_AFFINITY_IMPORTS: ${{ needs.plan.outputs.imports }}
+      REBUCK2_SANDBOX_HOST: ${{ needs.plan.outputs.sandbox }}
+      # Also here, not only in the worker job. The worker reads it to record
+      # its own vertices; the COORDINATOR reads it to decide whether to run
+      # the baseline history step. Two processes, one switch, and the `if:`
+      # on that step is evaluated in this job - so setting it only worker-side
+      # would have made the step silently never run.
+      #
+      # Fourth cross-job flag mistake today, and the first caught by asking
+      # the question before pushing rather than after reading a zero.
+      REBUCK2_WORKER_VERTICES: ${{ needs.plan.outputs.vtx }}
+      REBUCK2_BALANCE: ${{ needs.plan.outputs.balance }}
+      REBUCK2_SKIP_BASELINE: ${{ needs.plan.outputs.nobase }}
+      # ONE path for the binary in this job. It was written out twice and
+      # the copies disagreed: the proxy step had `./rebuck2-repo/...` and
+      # the harvest step `./rebuck2/...`, which is the WORKER job's layout.
+      # The harvest then reported `No such file or directory` for both cache
+      # ids and the run measured an unseeded fleet - correctly labelled as
+      # one, because the step warns rather than assuming success, which is
+      # the only reason it took a minute to find instead of a run.
+      RB: ./rebuck2-repo/rebuck2/target/release/rebuck2
+    # 150, not 60. Sized for ONE group when that is what this built; the
+    # whole `+test-no-qemu` is twelve of them and runs TWICE - baseline then
+    # fleet. The first attempt was killed at 60 minutes, 51 of them into a
+    # run that had finished its baseline and was midway through the fleet
+    # leg, so it reported nothing at all.
+    #
+    # A measurement that cannot finish is not a slow measurement, it is no
+    # measurement.
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: rebuck2-repo
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: EarthBuild/earthbuild
+          ref: ${{ inputs.ref || '3380dc206e463365c865857b32427b6768f93af2' }}
+          path: earthbuild
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: rebuck2-repo/rebuck2
+      - name: build rebuck2
+        run: cargo build --release --manifest-path rebuck2-repo/rebuck2/Cargo.toml
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
+        with:
+          go-version-file: earthbuild/go.mod
+          cache: false
+
+      - name: build earthly, PATCHED
+        run: |
+          set -euo pipefail
+          # Released earthly measures ZERO: every non-LOCALLY RUN carries the
+          # debugger's secret, host bind and two fork-only sockets, and each
+          # pins the solve to whoever holds earthly's session. See
+          # rebuck2/patches/README.md and EarthBuild/earthbuild#784.
+          #
+          # Built on the WORKERS too, and not only the coordinator. The
+          # buildkitd image is compiled into the earthly binary as
+          # DefaultBuildkitdImage, so a released worker and a source-built
+          # coordinator can disagree about which daemon to run - the exact
+          # version skew `earthly bootstrap` was used here to make
+          # impossible. Same commit, same patch, same image, everywhere.
+          # Plain apply, then three-way. The patch ADDS two test files,
+          # and `git apply -3` cannot three-way a file with no blob in the
+          # index - it reports "does not exist in index" and drops the whole
+          # patch. Plain apply handles additions; -3 is the fallback for
+          # drift in the files that already exist.
+          git -C earthbuild apply --verbose \
+            "$GITHUB_WORKSPACE/rebuck2-repo/rebuck2/patches/earthbuild-consolidated-plus-784.patch" || {
+              echo "::error::the #784 patch no longer applies to earthbuild"
+              echo "at $(git -C earthbuild rev-parse --short HEAD). Re-derive it"
+              echo "rather than forcing it: gate on whatever the surrounding"
+              echo "code already uses for the debugger. See"
+              echo "rebuck2/patches/README.md."
+              exit 1
+            }
+          # APPLIED is not the same as applied WHOLE. A hunk header carries
+          # the line counts of its own body, so editing the body without
+          # updating the header makes git read only as many lines as the
+          # header claims, apply that much, and exit 0. The dropped remainder
+          # here was a function definition whose caller DID apply, and the
+          # failure surfaced two steps later as `undefined: sortedKeys` -
+          # nowhere near the patch, in a file nobody had touched.
+          # shellcheck disable=SC2013 # Go identifiers: no spaces to split on
+          for sym in $(grep -oE '^\+func [a-zA-Z]+' \
+              "$GITHUB_WORKSPACE/rebuck2/patches/earthbuild-consolidated-plus-784.patch" \
+              | sed 's/^+func //' | sort -u); do
+            grep -rqF "func $sym(" earthbuild || {
+              echo "::error::the patch applied but dropped func $sym - check its @@ line counts"
+              exit 1
+            }
+          done
+          ( cd earthbuild && go build -o /usr/local/bin/earthly ./cmd/earthly )
+          earthly --version
+          # Thirteen feature flags the test targets assume. Missing it does
+          # not fail loudly - it fails as individual tests behaving
+          # differently, which is indistinguishable from a fleet bug.
+          {
+            echo "EARTHLY_VERSION_FLAG_OVERRIDES=$(tr -d '\n' < earthbuild/.earthly_version_flag_overrides)"
+          } >> "$GITHUB_ENV"
+
+      # THE BANK. The coordinator's registry store, carried between runs.
+      #
+      # Six mechanisms have been measured inside a single run - a shared
+      # cache in three configurations, peer-to-peer transfer, grafting a
+      # built ancestor, and a warm-up barrier - and every one was null or
+      # worse. They share a cause: each needs something built EARLIER, and a
+      # cold run has nothing. The prefix has to already exist when the first
+      # solve arrives, and only a previous generation can have made it.
+      #
+      # SECRETS. A restored layer outlives the run that produced it, so this
+      # is the one cache in the system where a leak persists. Two guards:
+      # the store holds only what `make_portable` published - mirrored base
+      # images, contexts and subtree results, all content-addressed - and
+      # `dispatch::inspect` refuses to dispatch any graph carrying a secret
+      # mount or secretenv in the first place, so a secret-bearing op is
+      # never built by a peer and never reaches this store.
+      #
+      # Keyed by target and week: a bank that never rotates accumulates
+      # layers nothing references, and one keyed by commit never hits.
+      - name: restore the bank
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/rebuck2/coord
+          key: rebuck2-bank-${{ needs.plan.outputs.target }}-${{ github.run_id }}
+          restore-keys: |
+            rebuck2-bank-${{ needs.plan.outputs.target }}-
+
+      - name: what the bank brought
+        run: |
+          set -euo pipefail
+          d="$HOME/.cache/rebuck2/coord"
+          if [ -d "$d" ]; then
+            echo "bank: $(find "$d" -type f | wc -l | tr -d ' ') objects, $(du -sh "$d" 2>/dev/null | cut -f1)"
+          else
+            echo "bank: EMPTY - this run builds every prefix from nothing"
+          fi
+
+      - name: what a machine is
+        run: |
+          set -euo pipefail
+          # Recorded, not assumed. Every ratio in docs/fleet-findings.md is
+          # "one machine against six", and until now the spec of a machine
+          # appeared in no run - only in GitHub's documentation for the
+          # public-runner tier. The fleet holds seven of these, so whether
+          # each is 2 or 4 cores changes the headline by a factor of two.
+          printf 'cores: %s  mem: %s  arch: %s\n' \
+            "$(nproc)" \
+            "$(awk '/MemTotal/{printf "%.1fGB", $2/1024/1024}' /proc/meminfo)" \
+            "$(uname -m)"
+          df -h / | awk 'NR==2{print "disk: " $4 " free of " $2}'
+
+      # Traces, because earthly already emits them and we have been throwing
+      # them away. Every run so far has logged
+      #
+      #   traces export: exporter export timeout: rpc error: code = Unavailable
+      #
+      # which is earthly trying to export OTLP spans to a collector that is
+      # not there. Its spans carry per-target timing directly, which is the
+      # data that has so far been reconstructed by hand out of base64
+      # `llb.customname` strings and a sort.
+      #
+      # ON THE COORDINATOR ONLY. Workers are separate GitHub runners with no
+      # inbound route - they reach this machine through the iroh mesh, not
+      # TCP - so a collector here cannot receive from them. Same reason a
+      # collector on a LAN box cannot receive from any of them.
+      - name: a collector for the traces earthly already sends
+        env:
+          OTLP_FORWARD: ${{ secrets.OTLP_FORWARD }}
+          OTLP_TOKEN: ${{ secrets.OTLP_TOKEN }}
+          OTLP_CA: ${{ secrets.OTLP_CA }}
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/otel"; mkdir -p "$d"; chmod 777 "$d"
+          # Composed in shell rather than templated: the forward exporter is
+          # conditional, and a heredoc that has to be conditionally rewritten
+          # afterwards is how a config ends up half-indented and silently
+          # rejected.
+          {
+            printf 'receivers:\n  otlp:\n    protocols:\n'
+            printf '      grpc: { endpoint: 0.0.0.0:4317 }\n'
+            printf '      http: { endpoint: 0.0.0.0:4318 }\n'
+            printf 'exporters:\n  file:\n    path: /out/traces.jsonl\n'
+            if [ -n "${OTLP_FORWARD:-}" ]; then
+              # `insecure: true` would mean PLAINTEXT, not skip-verify - it
+              # would dial a TLS listener without TLS and drop every batch.
+              #
+              # And NOT insecure_skip_verify either, which was the first
+              # version of this and is worse than it looks: this exporter
+              # carries a bearer token, and skipping verification means
+              # anyone who can intercept the connection presents their own
+              # certificate, takes the token, and reads the traces. The
+              # collector's certificate is self-signed, which is not the same
+              # as unverifiable - pin it and the check is real.
+              printf '  otlp/forward:\n    endpoint: %s\n' "$OTLP_FORWARD"
+              if [ -n "${OTLP_CA:-}" ]; then
+                printf '%s\n' "$OTLP_CA" > "$d/ca.crt"
+                printf '    tls: { ca_file: /etc/otel/ca.crt }\n'
+              else
+                echo "::error::OTLP_FORWARD is set but OTLP_CA is not - refusing to send a token to an unverified endpoint"
+                exit 1
+              fi
+              # The token, or the far end 401s every batch.
+              if [ -n "${OTLP_TOKEN:-}" ]; then
+                printf '    headers: { Authorization: "Bearer %s" }\n' "$OTLP_TOKEN"
+              fi
+            fi
+            printf 'service:\n  telemetry:\n    logs: { level: warn }\n  pipelines:\n    traces:\n'
+            printf '      receivers: [otlp]\n'
+            if [ -n "${OTLP_FORWARD:-}" ]; then
+              printf '      exporters: [file, otlp/forward]\n'
+            else
+              printf '      exporters: [file]\n'
+            fi
+          } > "$d/config.yaml"
+          docker run -d --name otelcol -p 4317:4317 -p 4318:4318 \
+            -v "$d:/etc/otel" -v "$d:/out" "$OTEL_IMAGE" --config /etc/otel/config.yaml
+          for _ in $(seq 1 30); do
+            (echo > /dev/tcp/127.0.0.1/4317) >/dev/null 2>&1 && break
+            sleep 1
+          done
+          (echo > /dev/tcp/127.0.0.1/4317) 2>/dev/null || {
+            echo "::warning::the collector never came up; traces will be dropped as before"
+            docker logs otelcol 2>&1 | tail -20 || true
+          }
+
+      - name: coordinator - gateway, driver and registry
+        env:
+          WANT: ${{ needs.plan.outputs.count }}
+        run: |
+          set -euo pipefail
+          echo "expecting $WANT worker runner(s)"
+          mkdir -p ~/.earthly && printf '%s\n' "$TRUST_SNIPPET" > ~/.earthly/config.yml
+          # PINNED, not discovered by `earthly bootstrap`. A source-built
+          # earthly - which is what the #784 patch requires - has
+          # `ghcr.io/earthbuild/earthbuild:buildkitd-dev-main` compiled in as
+          # DefaultBuildkitdImage, and that tag is not published. The first
+          # CI run ever attempted died on `manifest unknown` before starting
+          # a single daemon.
+          #
+          # The image must still be earthly's FORK: the converter emits host
+          # binds and earthly_interactive sockets that stock moby/buildkit
+          # rejects. earthly's own daemon could not be proxied anyway - it
+          # runs with TCP disabled and the port it publishes is the embedded
+          # registry, which answers HTTP/1.1 to a gRPC client. So we start
+          # our own with gRPC on 8372, the port the fork's tcp template sets.
+          BK_IMAGE=${BK_IMAGE:-earthbuild/buildkitd:v0.8.17}
+          docker pull "$BK_IMAGE"
+          docker rm -f own-bk base-bk >/dev/null 2>&1 || true
+          docker run -d --name own-bk --privileged -p 18372:8372 \
+            -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
+            -e BUILDKIT_TLS_ENABLED=false \
+            -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG='[registry."172.17.0.1:15000"]
+            http = true
+            insecure = true' \
+            "$BK_IMAGE" >/dev/null
+          for _ in $(seq 1 120); do
+            docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers \
+              >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 || {
+            echo "our buildkitd never became ready:"; docker logs --tail 20 own-bk; exit 1; }
+          # Shell variable AND $GITHUB_ENV: the latter only reaches LATER
+          # steps, and this one uses it below. See the single-runner
+          # workflow, where writing only the env file left `set -u` to kill
+          # the proxy with `BK0: unbound variable`.
+          BK_ADDR=127.0.0.1:18372
+          echo "BK_ADDR=$BK_ADDR" >> "$GITHUB_ENV"
+
+          # NOT loopback. earthly's `IsLocal` counts 127.0.0.1, localhost and
+          # ::1 as "a buildkit I manage", so a gateway on loopback makes it
+          # compare its OWN container's settings hash, decide they differ and
+          # restart it - the build then dies before one solve reaches the
+          # proxy, with a TLS error that names nothing relevant. A routable
+          # address is !isLocal and earthly simply connects.
+          LAN=$(hostname -I | awk '{print $1}')
+          echo "LAN=$LAN" >> "$GITHUB_ENV"
+          # PULL-THROUGH. It was added for the harvest's base and does not
+          # in fact serve it - the registry proxies BLOBS, and a manifest
+          # tag it does not hold is a 404 with no upstream consulted, so the
+          # base is pushed in from the host instead. Kept because it is the
+          # documented fallback for a peer with no credentials (principle 9)
+          # and costs nothing when nothing asks.
+          #
+          # `build_subtree` solves without a session and a sessionless solve
+          # cannot reach Docker Hub - buildkit asks the session for
+          # credentials even for an anonymous pull. Our registry does the
+          # token dance itself over plain HTTP, so a reference AT OUR
+          # ADDRESS resolves where a Hub one cannot.
+          #
+          # No confound: this only adds the ability to serve
+          # `172.17.0.1:15000/library/...`. A graph naming `docker.io/...`
+          # does not come through us and is unaffected, so nothing that was
+          # undispatchable becomes dispatchable.
+          REBUCK2_MIRROR=172.17.0.1:15000 REBUCK_UPSTREAM_REGISTRY=1 \
+            "$RB" buildkit-proxy \
+              --listen 0.0.0.0:1234 \
+              --upstream "http://$BK_ADDR" \
+              --registry-bind 0.0.0.0:15000 \
+              --session "earthfile-${GITHUB_RUN_ID}" \
+              --store "$HOME/.cache/rebuck2/coord" > proxy.log 2>&1 &
+          echo $! > proxy.pid
+
+          # Workers are whole runners now, so they can take minutes to appear -
+          # a queued job, a cold cargo build. Waiting is not optional: the
+          # gateway asks whether the fleet is empty PER SOLVE, so a build that
+          # starts early quietly runs alone and reports a fleet that did
+          # nothing.
+          for _ in $(seq 1 120); do
+            j=$(grep -c "joined" proxy.log 2>/dev/null || true)
+            [ "${j:-0}" -ge "$WANT" ] && break
+            sleep 5
+          done
+          # `grep -c ... || echo 0` prints "0\n0" when there are no matches:
+          # grep writes its own 0 AND exits 1, so the fallback fires too. The
+          # count has to be captured before it is judged.
+          joined=$(grep -c joined proxy.log) || joined=0
+          echo "workers joined: $joined/$WANT"
+          if [ "$joined" -eq 0 ]; then
+            echo "::warning::no worker ever joined - the rest measures one machine"
+          fi
+
+      # BEFORE the fleet, on the coordinator's own daemon, so the two
+      # numbers come off the same machine in the same run.
+      #
+      # This workflow has never had a baseline, so every multi-machine
+      # figure so far is a dispatch count with no comparison: 773s for six
+      # machines is unreadable without knowing what one machine costs. The
+      # single-runner workflow has had one since it was written; this one is
+      # the topology where wall clock could actually improve, and it was the
+      # one that could not report it.
+      #
+      # It also gives the parity check something to compare, which is the
+      # only claim a distributed builder can really make.
+      # SKIPPABLE, for a mechanism A/B rather than a fleet-versus-one-machine
+      # one. Comparing `graft` on against `graft` off does not need a
+      # baseline at all: the comparison is fleet against fleet, and the
+      # baseline is half the run.
+      #
+      # Which matters because five mechanisms here have never been measured
+      # and the queue is runs, not code. Halving a run means two of them can
+      # be fired SIMULTANEOUSLY - and simultaneous is the control that
+      # matters, since a baseline measured alone and one measured beside two
+      # other fleet runs differed by a factor of nearly three.
+      - name: baseline - the same target on one machine
+        if: env.REBUCK2_SKIP_BASELINE != '1'
+        working-directory: earthbuild
+        env:
+          TARGET: ${{ needs.plan.outputs.target }}
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          printf 'global:\n  tls_enabled: false\n' > "$RUNNER_TEMP/base.yml"
+          # WHICH LEG a span belongs to. Without it both legs land in one
+          # undifferentiated pile, and the interesting question - does the
+          # FLEET cause the repetition, or does earthly do it anyway - cannot
+          # be asked at all. `+base` resolved 696 times for 4232s of span
+          # time is either the finding of the week or nothing.
+          export OTEL_RESOURCE_ATTRIBUTES="rebuck2.leg=baseline,rebuck2.target=$TARGET"
+          # ITS OWN DAEMON, and this is not tidiness - it removes a
+          # confound that has been under every speed number in this project.
+          #
+          # The baseline used to dial 18372, which is `own-bk`, which is also
+          # the proxy's upstream. So the baseline BUILT THE WHOLE TARGET on
+          # the daemon the fleet leg then used, and peer 0 entered the fleet
+          # leg as the warmest machine present. HOME_SLOTS=0 then forced
+          # every solve off that warm daemon onto cold workers, which is a
+          # plausible explanation for the entire deficit and is a property of
+          # the harness rather than of distribution.
+          #
+          # Both legs now start from an equally cold daemon, which is the
+          # comparison the numbers were always claimed to be.
+          if [ "${REBUCK2_FRESH_FLEET:-1}" = "1" ]; then
+            # Step-local in the daemon step, so named again here rather than
+            # inherited - and pinned to the same tag, or the two legs would
+            # differ by buildkit version as well as by warmth.
+            BK_IMAGE=${BK_IMAGE:-earthbuild/buildkitd:v0.8.17}
+            docker rm -f base-bk >/dev/null 2>&1 || true
+            # The registry stanza, for the HARVEST rather than for the
+            # baseline - which needs nothing from our registry and would run
+            # fine without it. Publishing is insecure per-solve, so the push
+            # works unconfigured; PULLING is governed by daemon config
+            # alone, and the harvest pulls its base image from us. Without
+            # the file buildkit tries https:// and reports `server gave HTTP
+            # response to HTTPS client`.
+            # EARTHLY's mechanism, not upstream buildkit's. This image's
+            # entrypoint runs `envsubst </etc/buildkitd.toml.template
+            # >/etc/buildkitd.toml` and appends
+            # ${EARTHLY_ADDITIONAL_BUILDKIT_CONFIG}. There is no
+            # /etc/buildkit directory in the image at all, so a bind mount
+            # there is a directory nothing ever opens - which is what the
+            # first attempt did, and it failed exactly as if no config had
+            # been written.
+            docker run -d --name base-bk --privileged -p 28372:8372 \
+              -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG='[registry."172.17.0.1:15000"]
+              http = true
+              insecure = true' \
+              -e BUILDKIT_TCP_TRANSPORT_ENABLED=true -e BUILDKIT_TLS_ENABLED=false \
+              "$BK_IMAGE" >/dev/null
+            for _ in $(seq 1 90); do
+              docker exec base-bk buildctl --addr tcp://127.0.0.1:8372 debug workers \
+                >/dev/null 2>&1 && break
+              sleep 1
+            done
+            BASE_PORT=28372
+          else
+            BASE_PORT=18372
+          fi
+          echo "baseline daemon: $BASE_PORT (18372 = shared with the fleet)"
+          # shellcheck disable=SC2086 # a flag LIST: word-splitting is the point
+          EARTHLY_CONFIG="$RUNNER_TEMP/base.yml" \
+          EARTHLY_BUILDKIT_HOST="tcp://${LAN}:${BASE_PORT}" \
+            earthly $EARTHLY_FLAGS "$TARGET" > /tmp/baseline.log 2>&1 && rc=0 || rc=$?
+          tail -20 /tmp/baseline.log
+          # LEADING WHITESPACE, and it is not cosmetic. earthly right-aligns
+          # the target column to the longest target name in the run, so
+          # `*failed*` lines are indented in some runs and not others. The
+          # anchored form silently found ZERO failed targets in a run whose
+          # log plainly showed `./tests+fail-test *failed*` - which then
+          # tripped the died-check and compared the wrong sets for parity.
+          grep -aoE "^[[:space:]]*[^[:space:]]+ \*failed\*" /tmp/baseline.log \
+            | sed 's/^[[:space:]]*//;s/ \*failed\*//' | sort -u > /tmp/baseline.failed || true
+          echo "BASELINE_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
+          # CPU, not wall, and this is the missing half of every
+          # amplification figure in fleet-findings.md. The baseline's 201
+          # seconds is ONE wall clock over work buildkit parallelises across
+          # the runner's cores; a dispatched subtree is small and
+          # parallelises less. Comparing the fleet's summed lead time to that
+          # wall clock produced a 24.5x that was not a quantity - shape 22 in
+          # how-this-lies.md.
+          #
+          # cgroup v2, read from inside the daemon's own container, so it is
+          # that daemon's CPU and not the runner's. Best effort: if the
+          # container or the file is gone the line says so rather than
+          # printing a zero that reads as "the baseline used no CPU".
+          bcpu=$(docker exec base-bk sh -c \
+                   'awk "/^usage_usec/{print \$2}" /sys/fs/cgroup/cpu.stat' 2>/dev/null || true)
+          if [ -n "${bcpu:-}" ]; then
+            echo "BASELINE_CPU_S=$((bcpu / 1000000))" >> "$GITHUB_ENV"
+            echo "baseline cpu: $((bcpu / 1000000))s against $((SECONDS - start))s wall"
+          else
+            echo "baseline cpu: unavailable (no cgroup v2 reading from base-bk)"
+          fi
+          # HOW MUCH did this leg get through before it stopped? Both legs
+          # abort on the same failed target, and "186s versus 525s" is only a
+          # comparison if they attempted the same work first - a leg that
+          # dies early looks fast. earthly prefixes each line with the target
+          # it belongs to, so the distinct prefixes are the targets touched.
+          grep -aoE "^[^ |]+\+[^ |]+ \|" /tmp/baseline.log | sed 's/ |$//' | sort -u > /tmp/baseline.targets || true
+          echo "baseline touched $(wc -l < /tmp/baseline.targets | tr -d ' ') target(s)"
+          echo "baseline: $((SECONDS - start))s, $(wc -l < /tmp/baseline.failed | tr -d ' ') failed"
+          # A build that DIED is not a build that passed. Judged on the EXIT
+          # CODE, not the success banner: a fleet log carries the nested
+          # earthly builds' own banners, so grepping for one finds a success
+          # belonging to somebody else. earthly prints
+          # `*failed*` per target it ran and failed; a transport error, an
+          # OOM or a killed daemon prints none of them, so the count is zero
+          # and the leg scores BETTER than one with a merely red test. A full
+          # +test-no-qemu died on `h2 protocol error` at 497s and was
+          # reported as beating a baseline that had one failure.
+          if [ "$rc" -ne 0 ] && [ ! -s /tmp/baseline.failed ]; then
+            echo "::error::the baseline leg neither succeeded nor named a failed target - it died"
+            grep -aoE "^Error: .*" /tmp/baseline.log | tail -3
+            echo "BASELINE_DIED=1" >> "$GITHUB_ENV"
+          fi
+          # WHAT IT PRODUCED, not merely whether it complained.
+          #
+          # Parity has so far been a set of failed target names, which is the
+          # only claim a test target can support. A target that emits
+          # BINARIES can support a much stronger one: same inputs, same
+          # bytes, wherever the compile happened to run. `SAVE ARTIFACT ...
+          # AS LOCAL` puts them in ./build, and the Go builds here are
+          # deterministic - fixed ldflags, a fixed /earthly build path inside
+          # the image - so a difference is a real difference and not
+          # timestamp noise.
+          #
+          # Moved aside rather than deleted: the second leg must not be able
+          # to pass by leaving the first leg's files in place.
+          find build -type f -print0 2>/dev/null | sort -z \
+            | xargs -0r sha256sum > /tmp/baseline.artifacts || true
+          echo "baseline local artifact(s): $(wc -l < /tmp/baseline.artifacts | tr -d ' ')"
+          rm -rf "/tmp/baseline-build"
+          if [ -d build ]; then mv build "/tmp/baseline-build"; fi
+
+
+      # WHAT THIS DOES AND DOES NOT MEASURE, because the number will be
+      # quoted and the rig is not symmetric.
+      #
+      # It harvests the cache mounts the BASELINE just filled and hands them
+      # to the fleet. That makes the fleet leg strictly better off than the
+      # baseline was, so `one machine Xs / 6 machines Ys` from a seeded run
+      # is NOT a fair fleet-versus-one-machine comparison and must not be
+      # read as one. The question it answers is narrower and is the one
+      # currently open: does starting a cold worker's mount from an image
+      # remove the ~24s-per-lead fill, yes or no. Compare a seeded fleet
+      # against an UNSEEDED fleet.
+      #
+      # The fair version - both legs seeded from a build that preceded both -
+      # is the second experiment, and it is the realistic one: in CI the
+      # seed comes from yesterday's build, and then a single machine has no
+      # special advantage from warming itself as it goes.
+      #
+      # Harvested from base-bk and not own-bk: with FRESH_FLEET=1 the
+      # baseline ran on base-bk, so that is the daemon whose mounts are warm.
+      # The baseline's own vertices, by digest, read from its daemon's build
+      # HISTORY after the leg. Joins against the workers' `vertices` lines on
+      # the same key, and that join is the only thing that prices the 12.5x -
+      # the fleet spends twenty-one times the whole baseline just building,
+      # duplication explains 1.7x, and nothing says what the rest is.
+      #
+      # AFTER the baseline and reading history, so the baseline keeps talking
+      # straight to its daemon and stays the clean single-machine number
+      # every comparison in the findings rests on.
+      - name: what the baseline's own daemon spent, per vertex
+        # BEHIND -vtx, with the worker half. The first run carrying this step
+        # failed parity with `could not fetch content descriptor` - a
+        # suspiciously fast 636s leg that had stopped early. The worker tap
+        # is exonerated (an earlier run carried it and passed), which leaves
+        # this read as the new element: it enumerates build history and opens
+        # a Status stream per record against the baseline's daemon, and
+        # buildkit's history subsystem holds references to build results.
+        #
+        # Unproven either way. Gated because if it IS harmful it is harmful
+        # to the reference band every comparison rests on, and a measurement
+        # that can damage the baseline must not ride along on every baseline.
+        if: env.REBUCK2_SKIP_BASELINE != '1' && env.REBUCK2_WORKER_VERTICES == '1'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          "$RB" watch-vertices --bk "${LAN}:${BASE_PORT}" > baseline-vertices.txt 2>&1 || true
+          head -1 baseline-vertices.txt || true
+          echo "baseline vertex rows: $(grep -c '^\[vertex\]' baseline-vertices.txt || echo 0)"
+
+      - name: harvest the baseline's cache mounts
+        if: env.REBUCK2_SEED_CACHES == '1'
+        run: |
+          set -uo pipefail
+          : > "$REBUCK2_CACHE_SEEDS_FILE"
+          # Named before the loop, so a wrong path is one line and not two
+          # warnings that look like the mechanism failing.
+          if [ ! -x "$RB" ]; then
+            echo "::error::no rebuck2 binary at $RB - nothing can be harvested"
+            exit 0
+          fi
+          if ! docker inspect base-bk >/dev/null 2>&1; then
+            echo "::warning::no base-bk to harvest from (fresh_fleet=0?) - the fleet stays cold"
+            exit 0
+          fi
+          # ONE CALL. The loop was here, in shell, and the shell version
+          # could not be tested and was wrong - it split `id:path` on the
+          # first colon and rejected `id == path`, which is every mount
+          # buildkit keys on its destination. It now lives in Rust with a
+          # test per shape.
+          # PUT THE BASE IN OURSELVES, because the registry's pull-through
+          # is BLOB-only: a manifest tag it does not hold is a 404, with no
+          # upstream consulted (see the GET arm of `/manifests/`). That is
+          # coherent - the mirror is filled by `mirror_image` through a peer
+          # WITH a session, and pull-through only covers blob gaps - but it
+          # means a bare `library/busybox:1` is not there to be had.
+          #
+          # Pushed to 127.0.0.1, pulled from 172.17.0.1. Same registry, two
+          # addresses: docker only allows an insecure push to loopback
+          # without daemon config, and the buildkit container cannot reach
+          # loopback on the host.
+          docker pull -q busybox:1 >/dev/null
+          docker tag busybox:1 127.0.0.1:15000/library/busybox:1
+          docker push -q 127.0.0.1:15000/library/busybox:1
+
+          # WHAT base-bk ACTUALLY HOLDS, from buildkit's own accounting.
+          #
+          # Every harvest came back at 0.0 MiB, so the caches the baseline
+          # was supposed to have filled were empty when the harvest looked.
+          # `buildctl du` names each cache mount the way mount.go builds it
+          # - `cached mount <dest> from <manager> with id "<id>"` - so this
+          # says whether the mounts exist, how big they are, and under
+          # which id. All three are guesses otherwise.
+          echo "=== cache mounts base-bk holds"
+          docker exec base-bk buildctl --addr tcp://127.0.0.1:8372 du -v 2>/dev/null \
+            | grep -iE "cached mount|Total" | head -20 || echo "(du unavailable)"
+
+          # CAN this daemon be seeded at all? Thirty seconds, before the
+          # twenty-five minutes that would otherwise be needed to find out.
+          # It writes a marker into one cache mount, harvests it, and reads
+          # it back out of a DIFFERENT one seeded from that harvest - so a
+          # pass means the mechanism works here and a failure names which
+          # half is broken.
+          #
+          # Advisory: a failure warns and the harvest is still attempted,
+          # because the check uses its own cache ids and could conceivably
+          # fail where the real ones succeed. It is here to make a null
+          # result legible, not to gate one.
+          "$RB" check-seeding --bk "$LAN:28372" --registry "172.17.0.1:15000" \
+            --base "172.17.0.1:15000/library/busybox:1" \
+            || echo "::warning::seeding does not work on this daemon - see above"
+
+          # The base comes from OUR registry, not Docker Hub. `build_subtree`
+          # solves without a session, and a sessionless solve cannot reach
+          # Hub - buildkit asks the session for credentials even anonymously
+          # and answers `failed to load cache key: no active sessions`. That
+          # finding is already in fleet-findings under "a sessionless peer
+          # cannot reach Docker Hub"; the harvest rediscovered it.
+          "$RB" harvest-cache --bk "$LAN:28372" --registry "172.17.0.1:15000" \
+            --base "172.17.0.1:15000/library/busybox:1" \
+            --pairs "$REBUCK2_SEED_IDS" 2>&1 | tee harvest.out || \
+            echo "::warning::no cache mount could be harvested"
+          grep -oE '^REBUCK2_CACHE_SEEDS=.*' harvest.out \
+            | sed 's/^REBUCK2_CACHE_SEEDS=//' >> "$REBUCK2_CACHE_SEEDS_FILE" || true
+          echo "=== seeds the fleet will start from"
+          cat "$REBUCK2_CACHE_SEEDS_FILE" || true
+          [ -s "$REBUCK2_CACHE_SEEDS_FILE" ] || \
+            echo "::warning::nothing harvested - this run measures an unseeded fleet"
+
+      - name: the Earthfile, through the fleet
+        working-directory: earthbuild
+        env:
+          TARGET: ${{ needs.plan.outputs.target }}
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          # CONSOLIDATION, and whether it should survive a fleet.
+          #
+          # earthly forwards its own BUILDKIT_HOST into every RUN, so a nested
+          # earthly shares the outer daemon instead of starting one. On ONE
+          # machine that halved the baseline (292s -> 141s) because the shared
+          # daemon is local. In a fleet it is not local: it is the
+          # coordinator's gateway, so every nested build on every worker dials
+          # back to one machine and re-enters through one gateway.
+          #
+          # The five leads that own the critical path are all nested builds,
+          # at 231-258s each - longer than the entire 221s single-machine
+          # build, and clustered the way a queue clusters.
+          #
+          # The switch needs no patch: the forwarder reads the ENVIRONMENT, so
+          # passing the same address through a config file instead tells the
+          # outer earthly where to build while forwarding nothing.
+          # Share a daemon, but the LOCAL one. earthly forwards its own
+          # address into every nested build, which on one machine is a local
+          # daemon and in a fleet is the coordinator - so every nested build
+          # everywhere dials one machine. `buildkitsandbox` is a buildkit
+          # constant written into every exec's /etc/hosts, so the string is
+          # identical on every machine while resolving locally, which is both
+          # what fixes the funnel and what keeps forwarded RUNs mergeable.
+          #
+          # The patch has always carried this branch and it was `if false`,
+          # disabled because under NETWORK_MODE=cni the name resolves to the
+          # exec itself. That was measured on one machine, where the funnel
+          # costs nothing and the safer option is free.
+          export EARTHLY_SANDBOX_BUILDKIT_HOST="${REBUCK2_SANDBOX_HOST:-0}"
+          export OTEL_RESOURCE_ATTRIBUTES="rebuck2.leg=fleet,rebuck2.target=$TARGET"
+          if [ "${REBUCK2_CONSOLIDATE:-1}" = "1" ]; then
+            export EARTHLY_BUILDKIT_HOST="tcp://${LAN}:1234"
+          else
+            printf 'global:\n  buildkit_host: tcp://%s:1234\n  tls_enabled: false\n' "$LAN" \
+              > "$RUNNER_TEMP/fleet.yml"
+            export EARTHLY_CONFIG="$RUNNER_TEMP/fleet.yml"
+            unset EARTHLY_BUILDKIT_HOST EARTH_BUILDKIT_HOST
+            unset EARTHLY_TLS_ENABLED EARTH_TLS_ENABLED
+          fi
+          # shellcheck disable=SC2086 # a flag LIST: word-splitting is the point
+          earthly $EARTHLY_FLAGS "$TARGET" > /tmp/fleet.log 2>&1 && rc=0 || rc=$?
+          tail -60 /tmp/fleet.log
+          # LEADING WHITESPACE, and it is not cosmetic. earthly right-aligns
+          # the target column to the longest target name in the run, so
+          # `*failed*` lines are indented in some runs and not others. The
+          # anchored form silently found ZERO failed targets in a run whose
+          # log plainly showed `./tests+fail-test *failed*` - which then
+          # tripped the died-check and compared the wrong sets for parity.
+          grep -aoE "^[[:space:]]*[^[:space:]]+ \*failed\*" /tmp/fleet.log \
+            | sed 's/^[[:space:]]*//;s/ \*failed\*//' | sort -u > /tmp/fleet.failed || true
+          # HOW MUCH did this leg get through before it stopped? Both legs
+          # abort on the same failed target, and "186s versus 525s" is only a
+          # comparison if they attempted the same work first - a leg that
+          # dies early looks fast. earthly prefixes each line with the target
+          # it belongs to, so the distinct prefixes are the targets touched.
+          grep -aoE "^[^ |]+\+[^ |]+ \|" /tmp/fleet.log | sed 's/ |$//' | sort -u > /tmp/fleet.targets || true
+          echo "fleet touched $(wc -l < /tmp/fleet.targets | tr -d ' ') target(s)"
+          echo "fleet failed targets: $(wc -l < /tmp/fleet.failed | tr -d ' ')"
+          # A build that DIED is not a build that passed. Judged on the EXIT
+          # CODE, not the success banner: a fleet log carries the nested
+          # earthly builds' own banners, so grepping for one finds a success
+          # belonging to somebody else. earthly prints
+          # `*failed*` per target it ran and failed; a transport error, an
+          # OOM or a killed daemon prints none of them, so the count is zero
+          # and the leg scores BETTER than one with a merely red test. A full
+          # +test-no-qemu died on `h2 protocol error` at 497s and was
+          # reported as beating a baseline that had one failure.
+          if [ "$rc" -ne 0 ] && [ ! -s /tmp/fleet.failed ]; then
+            echo "::error::the fleet leg neither succeeded nor named a failed target - it died"
+            grep -aoE "^Error: .*" /tmp/fleet.log | tail -3
+            echo "FLEET_DIED=1" >> "$GITHUB_ENV"
+          fi
+
+          echo "FLEET_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
+          # Same snapshot as the baseline leg took; the reasoning is there.
+          find build -type f -print0 2>/dev/null | sort -z \
+            | xargs -0r sha256sum > /tmp/fleet.artifacts || true
+          echo "fleet local artifact(s): $(wc -l < /tmp/fleet.artifacts | tr -d ' ')"
+          rm -rf "/tmp/fleet-build"
+          if [ -d build ]; then mv build "/tmp/fleet-build"; fi
+
+      - name: did the fleet change the answer
+        run: |
+          set -euo pipefail
+          # NO BASELINE, NO PARITY CLAIM. With the baseline skipped there is
+          # nothing to compare against, and reporting "the same 0 targets
+          # failed either way" from an empty file would be the most
+          # confidently wrong line in the whole rig.
+          if [ "${REBUCK2_SKIP_BASELINE:-0}" = "1" ]; then
+            echo "baseline skipped - this run compares a mechanism against"
+            echo "another fleet leg, so there is no parity to check here."
+            echo "fleet failed: $(wc -l < /tmp/fleet.failed | tr -d ' ') target(s)"
+            exit 0
+          fi
+          # A target failing BOTH ways is the machine's problem. Failing only
+          # WITH the fleet is ours - and one does:
+          # `copy-test-verbose-output` asserts earthly did not transfer a file
+          # it does not need, and this fleet publishes the whole context.
+          if [ -n "${BASELINE_DIED:-}${FLEET_DIED:-}" ]; then
+            echo "::error::a leg died, so there is nothing to compare"
+            exit 1
+          fi
+          # Comparable only if both legs attempted the same work.
+          bt=$(wc -l < /tmp/baseline.targets | tr -d ' ')
+          ft=$(wc -l < /tmp/fleet.targets | tr -d ' ')
+          echo "targets touched: baseline $bt, fleet $ft"
+          if [ "$bt" -ne "$ft" ]; then
+            echo "::warning::the legs attempted different work ($bt vs $ft targets) - the wall clocks are not comparable"
+            diff -u /tmp/baseline.targets /tmp/fleet.targets || true
+          fi
+          if diff -u /tmp/baseline.failed /tmp/fleet.failed; then
+            echo "PARITY: the same $(wc -l < /tmp/baseline.failed | tr -d ' ') target(s) failed either way"
+          else
+            echo "::warning::the fleet changed the outcome - see the diff above"
+          fi
+          # Nothing to say for a test target, which writes no binaries.
+          if [ -s /tmp/baseline.artifacts ] || [ -s /tmp/fleet.artifacts ]; then
+            if diff -u /tmp/baseline.artifacts /tmp/fleet.artifacts; then
+              echo "BYTE PARITY: $(wc -l < /tmp/baseline.artifacts | tr -d ' ') local artifact(s), identical either way"
+            else
+              echo "::warning::the fleet produced different bytes - see the diff above"
+            fi
+          fi
+
+      - name: is the daemon still alive
+        if: always()
+        run: |
+          set -uo pipefail
+          # The explanation the connection fixes keep failing to be. Several
+          # unrelated calls failing in the same instant, on SEPARATE
+          # connections, is what a daemon going away looks like - and four
+          # rounds of connection isolation have not stopped it, which is
+          # evidence against every theory that assumes the daemon is fine.
+          echo "own-bk: $(docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} restarts={{.RestartCount}}' own-bk 2>&1)"
+          # THE COORDINATOR'S OWN CPU, which no run has ever recorded and
+          # which run 31564650459 needed: with one worker, 372 of 412 solves
+          # were built HERE, so the fleet's CPU total excluded nine tenths of
+          # its own work and the run could not be interpreted at all.
+          #
+          # Same cgroup read the baseline step does against base-bk, so the
+          # two are directly comparable - and on a run where `home` is zero
+          # this reports what an idle daemon costs, which is worth having as
+          # the floor.
+          ccpu=$(docker exec own-bk sh -c \
+                   'awk "/^usage_usec/{print \$2}" /sys/fs/cgroup/cpu.stat' 2>/dev/null || true)
+          if [ -n "${ccpu:-}" ]; then
+            echo "coordinator cpu: $((ccpu / 1000000))s"
+          else
+            echo "coordinator cpu: unavailable (no cgroup v2 reading from own-bk)"
+          fi
+          # THE PANIC LINE, not the last 25 frames of the stack under it.
+          #
+          # `--tail 25` caught the bottom of a goroutine dump ending in
+          # `_LLBBridge_ReadFile_Handler` and cut off the one line that says
+          # WHY - which is the line the whole "h2 protocol error" hunt has
+          # been missing through five eliminated theories. A stack trace is
+          # hundreds of lines; the header is one.
+          docker logs own-bk > /tmp/own-bk.log 2>&1 || true
+          echo "--- did it panic?"
+          grep -anE "^(panic|fatal error):|runtime error:|invalid memory address|SIGSEGV" \
+            /tmp/own-bk.log | head -5 || echo "no panic line"
+          # And the twenty lines after the FIRST one, which is where the
+          # offending call is named.
+          # `|| true`, and it is not decoration. GitHub runs a step with
+          # `bash -e` whatever the script's own `set` line says, so an
+          # assignment from a grep that matches NOTHING exits the step - and
+          # matching nothing is the good news here. This diagnostic turned a
+          # green at-parity +all-buildkitd run into a red job: 1161s against
+          # 1188s, zero failed targets either way, reported as a failure by
+          # the step that checks whether anything went wrong.
+          first=$(grep -anE "^(panic|fatal error):" /tmp/own-bk.log | head -1 | cut -d: -f1) || true
+          if [ -n "${first:-}" ]; then
+            echo "--- from the panic:"
+            sed -n "${first},$((first + 20))p" /tmp/own-bk.log
+          fi
+          echo "--- its last words:"
+          tail -25 /tmp/own-bk.log || true
+          echo "--- host memory:"
+          free -m 2>/dev/null | head -2 || true
+          dmesg 2>/dev/null | grep -ci "out of memory\|oom-kill" || echo "0 oom lines (or dmesg not readable)"
+
+      - name: what the fleet did
+        if: always()
+        env:
+          MACHINES: ${{ needs.plan.outputs.count }}
+        run: |
+          set -euo pipefail
+          kill -INT "$(cat proxy.pid)" 2>/dev/null || true
+          for _ in $(seq 1 20); do
+            grep -q "^\[wire\] placed" proxy.log && break
+            kill -0 "$(cat proxy.pid)" 2>/dev/null || break
+            sleep 1
+          done
+          echo "=== dispatchable at all?"
+          grep -E '^\[wire\] (mechanisms|gateway solves|solves routed|built at home|placed|not routed)' proxy.log || true
+          # Principle 19: the ceiling beside the result, in the log rather
+          # than worked out afterwards from a wall clock. A run at 1.8x
+          # against a 1.4x ceiling is a graph with no seam; the same 1.8x
+          # against a 5x ceiling is a dispatcher with a problem, and until
+          # these two lines existed the two were indistinguishable.
+          grep -E '^\[wire\] (concurrency|amdahl ceiling|verdict|mount arms)' proxy.log || true
+
+          # WHERE a lead's time went, and what the instruments themselves
+          # cost. Both are new and both answer questions that have been open
+          # for several runs: building is roughly a quarter of lead_ms and
+          # nothing said what the rest was, and a 50-minute leg could not be
+          # told apart from an expensive tap without running it twice.
+          echo "=== where the time went, and what measuring it cost"
+          # `cache inputs` decides the NEXT run, not this one. The harvest
+          # can only read the directory earthly wrote if it presents the same
+          # mount input, and the only source of those is this line - written
+          # at the end of the leg, banked, and read by the next run's
+          # harvest. It printed into the artifact and nothing surfaced it, so
+          # "did the bank get anything" cost an artifact download every time.
+          grep -E '^\[wire\] (lead phases|status tap|home vertices|service ms|grafted|trapped ops|refused time|cache inputs|WARNING)' \
+            proxy.log || true
+          # WORK AMPLIFICATION, which is the number that reframes all of
+          # these. The fleet's lead time against the whole baseline wall: if
+          # it is 9, the fleet did nine times the work and no scheduler
+          # divides that across seven machines into a win. Parallelism is
+          # then not the thing to fix.
+          lead_ms=$(grep -oE 'lead_ms=[0-9]+' proxy.log | tail -1 | cut -d= -f2)
+          # Needs a baseline to divide by; silent when there is none.
+          if [ -n "${lead_ms:-}" ] && [ "${BASELINE_SECS:-0}" -gt 0 ]; then
+            awk -v l="$lead_ms" -v b="$BASELINE_SECS" \
+              'BEGIN{printf "amplification : %.1fx - %.0fs of lead work against a %ss baseline\n", l/1000/b, l/1000, b}'
+          fi
+          # A WARNING, deliberately not an error. Peak 1 across N machines is
+          # usually the graph and occasionally us, and a gate that cannot
+          # tell the difference would go red on a correct run of a serial
+          # target.
+          peak=$(grep -oE '^\[wire\] concurrency *: peak [0-9]+' proxy.log | grep -oE '[0-9]+$' | tail -1)
+          if [ "${peak:-0}" -le 1 ] && [ "${MACHINES:-1}" -gt 1 ]; then
+            echo "::warning::peak concurrency ${peak:-0} across $MACHINES machines - nothing overlapped, so no wall-clock claim can be made either way"
+          fi
+          echo "=== which RUNNER took what"
+          grep -oE -- '-> worker [0-9]+' proxy.log | sort | uniq -c || true
+
+          # The SHAPE of the lead durations, which is the open question:
+          # 84 leads at ~24s each is most of the gap to a single machine,
+          # and whether that is a cold cache paid once per worker or a
+          # per-lead overhead paid 84 times decides what to fix. The
+          # workflow was grepping only the [wire] summary out of proxy.log,
+          # so the per-job timings the driver already prints never left the
+          # runner.
+          echo "=== connections this gateway lost"
+          # Whose connection breaks when a target fails is the open question
+          # behind `h2 protocol error: error reading a body from connection`.
+          # The client reports it and names nothing on this side; if OUR
+          # server closed the connection it says so here, and if this is
+          # silent the break was somewhere else - the nested earthly talking
+          # to a daemon we do not front.
+          grep -a '^\[proxy\] connection ended' proxy.log | sort | uniq -c | head -5 || true
+          echo "   (silent = the gateway's own connections were fine)"
+          echo "=== and the connections it MADE"
+          # The distinction that matters. Silence above plus entries here
+          # means the h2 error the user sees is a call this proxy made and
+          # relayed - which is consistent with the phrasing, since earthly is
+          # Go and 'h2 protocol error' is hyper's wording, not Go's.
+          # `local=` is the whole test of pre-positioning: the registry
+          # serves buildkit's pulls from this worker's store, so a blob that
+          # was prefetched turns a registry pull into a LOCAL hit. It has
+          # been 0 in every run so far, because every blob was fetched
+          # exactly once, at the moment it was needed.
+          # Counted by REASON, not by line. Every one of these names an
+          # image digest, so raw `uniq -c` deduplicates nothing and reports
+          # a column of 1s - which is how "prefetch announced 0 or 1 blob"
+          # took a whole run to notice.
+          grep -aE '^\[driver\] (prefetch|not prefetch)' proxy.log \
+            | sed -E 's,[^ ]*sha256:[0-9a-f]+,<img>,g; s,: [0-9]+ consumer,: N consumer,' \
+            | sort | uniq -c | sort -rn | head -6 || true
+          grep -aE '^\[proxy\] (upstream solve failed|upstream Control\.Solve failed|retrying|session)' \
+            proxy.log | sed 's/[0-9a-f]\{12,\}/<id>/g' | sort | uniq -c | sort -rn | head -8 || true
+
+          echo "=== the leads that own the critical path"
+          # One lead took 209s of a 525s wall - 40% of the wall clock in a
+          # single job, which no number of machines can divide. Which job it
+          # is decides whether that is inherent (a genuinely long target) or
+          # tax (a cold pull of something another machine already had), and
+          # those want opposite fixes.
+          # `[^ ]` not `\S`: BSD sed has no `\S`, and the substitution then
+          # silently does not apply - the line comes through unsorted and
+          # looks like the data, not like a broken pipeline.
+          grep -oE '\[driver\] subtree job [0-9]+ built at [^ ]+ in [0-9]+ms \[.*\]' proxy.log \
+            | sed -E 's/.*job ([0-9]+) built at [^ ]+ in ([0-9]+)ms \[(.*)\]/\2ms  job \1  \3/' \
+            | sort -rn | head -8 || true
+
+          echo "=== lead durations"
+          grep -oE 'in [0-9]+ms' proxy.log | grep -oE '[0-9]+' > /tmp/leads.txt || true
+          if [ -s /tmp/leads.txt ]; then
+            sort -n /tmp/leads.txt | awk '
+              {a[NR]=$1; s+=$1}
+              END {
+                printf "n=%d min=%dms p50=%dms p90=%dms max=%dms mean=%dms\n",
+                  NR, a[1], a[int(NR*0.5)+1], a[int(NR*0.9)+1], a[NR], s/NR
+              }'
+            echo "in dispatch order (first 15):"
+            head -15 /tmp/leads.txt | tr '\n' ' '; echo
+          else
+            echo "(no lead timings - nothing was dispatched)"
+          fi
+          echo "=== the coordinator's registry"
+          grep -E '^\[registry\] (served|  *[0-9]+ MiB|[0-9]+ blobs)' proxy.log || true
+
+          echo "   uploads far below blobs served means results were fetched"
+          echo "   from the runners that built them, which is the whole point."
+          echo "=== wall"
+          # WANT lives in the coordinator step's own env, not the job's, so
+          # the headline read "? machines" for every run that printed it.
+          echo "one machine ${BASELINE_SECS:-?}s   ${MACHINES}${MACHINES:+ }machines ${FLEET_SECS:-?}s"
+          # The comparison, stated rather than left to the reader: a fleet
+          # that is slower has still proven dispatch and not yet proven
+          # worth, and saying so here stops the dispatch count being quoted
+          # as if it were a speedup.
+          if [ -n "${BASELINE_SECS:-}" ] && [ -n "${FLEET_SECS:-}" ]; then
+            if [ "$FLEET_SECS" -lt "$BASELINE_SECS" ]; then
+              echo "the fleet was FASTER by $((BASELINE_SECS - FLEET_SECS))s"
+            else
+              echo "the fleet was SLOWER by $((FLEET_SECS - BASELINE_SECS))s - dispatch works, distribution does not yet pay"
+            fi
+          fi
+
+      - name: a fleet that distributed nothing is not a pass
+        if: always()
+        run: |
+          set -euo pipefail
+          # Every step in this job is `|| true` so a failing TARGET still
+          # yields a time and a parity diff. The cost of that is a run which
+          # dispatched NOTHING reporting success - which has now happened
+          # twice, once when the worker matrix expanded to zero jobs. The
+          # fleet legs are allowed to fail; the fleet not existing is not.
+          routed=$(grep -oE '^\[wire\] solves routed *: [0-9]+' proxy.log | grep -oE '[0-9]+$' | tail -1)
+          echo "routed: ${routed:-none}"
+          if [ "${routed:-0}" -eq 0 ]; then
+            echo "::error::no solve reached another machine - this measured a single runner"
+            exit 1
+          fi
+
+      - name: logs
+        if: always()
+        run: tail -150 proxy.log || true
+
+      # KEEP them. Every diagnosis so far has depended on having guessed the
+      # right grep before the run: the h2 collapse, the nested-build funnel
+      # and the indented `*failed*` markers were each invisible until a later
+      # run happened to print the line that showed them. A tail of 150 lines
+      # of proxy.log is not enough to answer a question nobody had yet.
+      - name: flush the collector
+        if: always()
+        run: |
+          set -uo pipefail
+          # The file exporter buffers. Stopping the container flushes it, and
+          # an artifact of a half-written jsonl is worse than none: it looks
+          # like the run produced few spans.
+          docker stop -t 20 otelcol >/dev/null 2>&1 || true
+          f="$RUNNER_TEMP/otel/traces.jsonl"
+          if [ -s "$f" ]; then
+            echo "traces: $(wc -l < "$f" | tr -d ' ') batches, $(du -h "$f" | cut -f1)"
+          else
+            echo "::warning::no traces were collected - earthly may not have exported"
+            docker logs otelcol 2>&1 | tail -10 || true
+          fi
+
+      - name: keep the logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fleet-logs-${{ github.run_attempt }}
+          path: |
+            proxy.log
+            baseline-vertices.txt
+            ${{ runner.temp }}/otel/traces.jsonl
+            /tmp/fleet.log
+            /tmp/baseline.log
+            /tmp/fleet.failed
+            /tmp/baseline.failed
+            /tmp/fleet.targets
+            /tmp/baseline.targets
+            # The daemon's own log. It carried a goroutine dump ending in
+            # `_LLBBridge_ReadFile_Handler` that the step could only print
+            # the tail of, and there was no copy to go back to.
+            /tmp/own-bk.log
+          if-no-files-found: warn
+          retention-days: 7

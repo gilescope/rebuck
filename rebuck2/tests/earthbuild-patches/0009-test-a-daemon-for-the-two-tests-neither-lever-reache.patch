@@ -1,0 +1,112 @@
+From 6cdab5749e9e00aa218774750b5508bcf2fc990e Mon Sep 17 00:00:00 2001
+From: Giles Cope <gilescope@gmail.com>
+Date: Sun, 2 Aug 2026 07:30:36 +0100
+Subject: [PATCH 09/12] test: a daemon for the two tests neither lever reaches
+
+logbus+test-manifest asserts the SHAPE of the log-bus manifest -- an exact
+command count, and a status per command. Both levers fail on it. A shared daemon
+changes the count (measured 17 against the asserted 16), and marking the fixture
+--no-cache changes it too, because the fixture IS what is being counted: the
+previous commit's marks moved the number itself. So the fixture goes back to
+what upstream wrote and the test gets a daemon with nothing in it.
+
+That is worth stating as a rule rather than a one-off. Where the assertion is
+about the BUILD GRAPH rather than about a step's output, the fixture is not a
+place to declare intent -- editing it edits the measurement.
+
+test-cache-mount-mode is test-cache-mode's sibling and takes the same treatment
+for the same reason: it greps for what `stat` prints about a CACHE MOUNT, so the
+step must run and the mount must be fresh. All four call sites.
+
+Groups 3 and 4 failed this round with a bare "Canceled" and no failing target,
+which use-x86-as-fast-build-runners-notes.md already records as this rig's flake
+rather than a signal. Retrying rather than diagnosing.
+
+Assisted-by: Claude:claude-opus-5 claude-code
+---
+ tests/Earthfile             | 6 ++++++
+ tests/logbus/Earthfile      | 7 ++++++-
+ tests/logbus/manifest.earth | 9 +++------
+ 3 files changed, 15 insertions(+), 7 deletions(-)
+
+diff --git a/tests/Earthfile b/tests/Earthfile
+index e3196e29..509df563 100644
+--- a/tests/Earthfile
++++ b/tests/Earthfile
+@@ -1536,26 +1536,32 @@ test-reserved-label:
+        --should_fail=true \
+        --output_contains="LABEL keys starting with .dev.earthly.. are reserved"
+ 
++# Sibling of test-cache-mode, same reasoning: it greps for what `stat` prints
++# about a CACHE MOUNT, so the step must run AND the mount must be fresh.
+ test-cache-mount-mode:
+   DO +RUN_EARTHLY \
++      --force_internal_buildkit=true \
+       --earthfile=cache-mount-mode.earth \
+       --target=+test-chmod \
+       --post_command="--mode=0004 " \
+       --output_contains="d------r-- /cache-folder"
+ 
+   DO +RUN_EARTHLY \
++      --force_internal_buildkit=true \
+       --earthfile=cache-mount-mode.earth \
+       --target=+test-chmod \
+       --post_command="--mode=0777 " \
+       --output_contains="drwxrwxrwx /cache-folder"
+ 
+   DO +RUN_EARTHLY \
++      --force_internal_buildkit=true \
+       --earthfile=cache-mount-mode.earth \
+       --target=+test-mode \
+       --post_command="--mode=0777 " \
+       --output_contains="drwxrwxrwx /cache-folder"
+ 
+   DO +RUN_EARTHLY \
++      --force_internal_buildkit=true \
+       --earthfile=cache-mount-mode.earth \
+       --target=+test-default \
+       --output_contains="drw-r--r-- /cache-folder"
+diff --git a/tests/logbus/Earthfile b/tests/logbus/Earthfile
+index 331a491b..99ed9b8e 100644
+--- a/tests/logbus/Earthfile
++++ b/tests/logbus/Earthfile
+@@ -9,7 +9,12 @@ test-all:
+     BUILD +test-manifest
+ 
+ test-manifest:
+-    DO tests+RUN_EARTHLY --earthfile=manifest.earth --extra_args="--no-output --logstream-debug-manifest-file man.json"
++    # The assertion is the SHAPE of the log-bus manifest -- an exact command
++    # count and a status per command -- so neither lever works here. A shared
++    # daemon changes the count (measured 17 against the asserted 16), and
++    # marking the fixture --no-cache changes it too, because the fixture IS what
++    # is being counted. It needs a daemon with nothing in it.
++    DO tests+RUN_EARTHLY --force_internal_buildkit=true --earthfile=manifest.earth --extra_args="--no-output --logstream-debug-manifest-file man.json"
+     RUN cat man.json | jq '.commands | length' | acbgrep 16
+     RUN cat man.json | jq '.commands[]' | jq 'select(.name | contains("COPY"))' | jq '.dependsOn[0].referencedName' | acbgrep 'src'
+     RUN cat man.json | jq '.commands[]' | jq 'select(.name | contains("COPY"))' | jq '.dependsOn | length' | acbgrep 1
+diff --git a/tests/logbus/manifest.earth b/tests/logbus/manifest.earth
+index cf1e1ffa..34433e85 100644
+--- a/tests/logbus/manifest.earth
++++ b/tests/logbus/manifest.earth
+@@ -2,18 +2,15 @@ VERSION 0.8
+ 
+ FROM alpine:3.24.1
+ 
+-# +test-manifest counts these commands in the log-bus manifest and asserts
+-# RUN_STATUS_SUCCESS on them, so they have to execute rather than come from the
+-# caller's cache -- a cached step moves the count.
+ all:
+     COPY +src/x .
+-    RUN --no-cache cat x
++    RUN cat x
+     BUILD +foo
+ 
+ src:
+-    RUN --no-cache echo foo > x
++    RUN echo foo > x
+     SAVE ARTIFACT x
+ 
+ foo:
+-    RUN --no-cache echo foo > x
++    RUN echo foo > x
+     SAVE IMAGE foo

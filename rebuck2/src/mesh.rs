@@ -132,7 +132,65 @@ pub enum W2D {
     Finalized {
         shard: u8,
     },
+    /// "No." Refusal IS the backpressure (principle 12): a driver that
+    /// cannot place work has learned the fleet is saturated without needing
+    /// a metric to tell it, and a protocol where the coordinator ASSIGNS
+    /// cannot express this and would have to rediscover it as a load
+    /// signal, later and worse.
+    Decline {
+        job: u64,
+        why: String,
+    },
+    /// A subtree was built and published. `image_ref` is what the requester
+    /// pulls - from the BUILDER's mirror, not from the driver, which is
+    /// principle 6 in one field.
+    ///
+    /// Not `Done`: that carries a REAPI `ActionResult`, and a subtree's
+    /// result is an image. Squeezing one into the other would make the
+    /// fleet's reply type mean two things.
+    Led {
+        job: u64,
+        image_ref: String,
+        /// How long the WORKER spent on it, start of solve to result.
+        ///
+        /// A DURATION and not a timestamp, deliberately. The driver measures
+        /// everything else against its own clock, and two machines' clocks
+        /// are not promised to agree - subtracting across them turns a few
+        /// milliseconds of skew into a headline figure. A duration needs no
+        /// agreement about when anything happened.
+        ///
+        /// Without it a lead is one interval: 14,812 seconds across 414
+        /// leads against 4,407 seconds of building, and no way to tell the
+        /// 10,400 in between from a fleet that is simply busy.
+        build_ms: u64,
+    },
+    /// "Place this for me." A worker that has subdivided its tree asks the
+    /// driver to find a peer for one branch. The driver arbitrates; the
+    /// subtree and its result never pass through it.
+    Offer {
+        subtree: Vec<u8>,
+        frontier: Vec<Dig>,
+    },
 }
+
+/// How long a peer gets to ANSWER a blob request - dial, take the request,
+/// send the first frame back. Short on purpose: a dead runner does not
+/// refuse, it hangs, and a walk over six corpses once held a manifest HEAD
+/// until buildkit gave up and failed the build.
+pub const PEER_BLOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long the BYTES get, once a peer has answered.
+///
+/// Separate from [`PEER_BLOB_TIMEOUT`] because they bound different
+/// failures. Using one number for both makes every large blob unfetchable
+/// by construction - a cache seed is hundreds of megabytes (`go-mod` was
+/// 456 MiB in run 31552464169) and does not cross a shared CI network in
+/// five seconds. A peer that has already answered is demonstrably alive, so
+/// what remains is a mid-stream stall rather than a corpse.
+///
+/// Shared by both sides deliberately: the driver had a bound and the worker
+/// had none, which is two different wrong answers to one question.
+pub const PEER_BLOB_BULK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Driver → worker, on the control stream.
 #[derive(Debug, Serialize, Deserialize)]
@@ -167,6 +225,79 @@ pub enum D2W {
     },
     /// Orderly shutdown: exit now (driver teardown, no shard assignment).
     Exit,
+    /// Build this subtree on someone else's behalf - an OFFER, never an
+    /// assignment. Answer with [`W2D::Decline`] to refuse it.
+    ///
+    /// `subtree` is a serialised buildkit `pb.Definition`; `frontier` is the
+    /// blobs the peer needs to start, which it fetches over the mesh. The
+    /// driver arbitrates and carries NEITHER (principle 6) - the frontier
+    /// and the result travel peer to peer, and the test for that is blunt:
+    /// after the build, look at the driver's disk.
+    Lead {
+        job: u64,
+        subtree: Vec<u8>,
+        frontier: Vec<Dig>,
+    },
+    /// Your offered subtree was built by a peer; pull it from there.
+    Placed {
+        job: u64,
+        image_ref: String,
+    },
+    /// Nobody took it. Build it yourself - which is what you would have
+    /// done without dispatch, so this is the normal ending and not an
+    /// error. `why` is for the log, not for a decision.
+    Unplaced {
+        job: u64,
+        why: String,
+    },
+    /// These blobs will be wanted. Fetch them NOW, before anyone asks.
+    ///
+    /// Distribution is otherwise entirely lazy, and the trace timeline says
+    /// what that costs: workers fetch nothing for the whole 284s baseline
+    /// leg, then nothing again until 227s into the fleet leg - the bulk
+    /// transfer lands exactly when the base chain finishes and the fan-out
+    /// wants it. The layer that finished five minutes earlier sat on one
+    /// machine until somebody asked.
+    ///
+    /// So the driver says so as soon as an image exists, while its consumer
+    /// is still building on top of it. Combined with `seeder_for`, six
+    /// workers take six different sixths off the origin at once, and the
+    /// fan-out waits only for the layer that was genuinely not ready.
+    ///
+    /// Advisory, always: a worker that ignores this, or fails every fetch,
+    /// builds exactly what it would have built anyway, one lazy pull later.
+    ///
+    /// APPENDED LAST, and it has to be: postcard encodes enum variants by
+    /// INDEX, so inserting one anywhere else silently renumbers every
+    /// variant after it and a worker built from the other commit reads a
+    /// Lead as a Ping.
+    Prefetch {
+        digests: Vec<Dig>,
+        /// Who is in the fleet, according to the driver.
+        ///
+        /// Carried rather than left to each worker's own gossip, because
+        /// the shares must PARTITION: two workers computing from
+        /// different peer sets both claim some blobs and neither claims
+        /// others, so the split leaves gaps and duplicates at the same
+        /// time. The driver is the only party that knows the list
+        /// authoritatively, and it is the party sending the message.
+        peers: Vec<String>,
+        /// Take ALL of these, not this worker's share of them.
+        ///
+        /// The split exists so six workers do not pull the same layer off
+        /// the coordinator at once. That reasoning fails for content every
+        /// machine needs immediately: a CACHE SEED is wanted by every graph
+        /// naming that cache id, on every worker, at the start of the first
+        /// lead. Split 1-in-N it has to be fetched peer-to-peer at exactly
+        /// the moment it is needed, against gossip that has not propagated
+        /// and a five-second peer timeout - which is how a run seeded three
+        /// mounts and then failed 274 leads with
+        /// `could not fetch content descriptor ... not found`.
+        ///
+        /// Set by the SENDER, because the worker cannot tell a seed blob
+        /// from any other one by looking at it.
+        everyone: bool,
+    },
 }
 
 /// Worker → driver, each on a fresh bi-stream (header, then raw bytes for Put).
@@ -190,6 +321,55 @@ pub enum BlobReq {
     /// sequential per-file staging at ~12 RTT-bound fetches/s was a 20-minute
     /// pre-rustc stall on the big crate forests (run 29160244348).
     GetMany(Vec<Dig>),
+    /// Fetch knowing only the hash.
+    ///
+    /// Every other request carries a `Dig`, because REAPI always knows the
+    /// size. A REGISTRY does not: buildkit asks for
+    /// `/v2/<repo>/blobs/sha256:<hex>` and the size is what the answer is
+    /// supposed to tell it. Without this a mesh-backed registry cannot ask
+    /// the fleet for anything, which is why there was not one.
+    ///
+    /// LAST, not inserted: postcard encodes a variant by index, so a new one
+    /// in the middle would reinterpret every later variant on a mixed-version
+    /// fleet. A peer that predates this replies `Err`, which the caller
+    /// treats as "not here" - the same as a miss.
+    GetByHash(String),
+    /// Resolve a TAG the fleet may hold, when this registry does not.
+    ///
+    /// Content moves by digest everywhere it can, and three separate fixes
+    /// went into making that true - a tag is a name in one machine's
+    /// namespace and the fleet has no namespace. But buildkit's own registry
+    /// CACHE is addressed by tag and nothing else (`type=registry,ref=...`),
+    /// and warm caches are the measured reason six machines are slower than
+    /// one: go-mod and go-build cost ~24s per lead, paid once by a single
+    /// machine and once PER WORKER by a fleet.
+    ///
+    /// So the tag namespace has to be shared after all, for this one purpose.
+    /// Resolution, not replication: the answer is a manifest hash, and the
+    /// manifest and its blobs then travel by content as everything else does.
+    ///
+    /// LAST, for the same reason `GetByHash` is: postcard encodes a variant
+    /// by index, so inserting in the middle reinterprets every later variant
+    /// on a mixed-version fleet.
+    TagGet(String),
+    /// `GetByHash`, but saying who is asking.
+    ///
+    /// The driver keeps every worker's bloom and rebroadcasts them, but a
+    /// worker acts on the copy it last received. On a cold fleet all workers
+    /// need the same base layers at once, nobody holds them yet, and every
+    /// one of them asks the DRIVER - measured at driver=47 against peer=5 per
+    /// worker, 9.4 GiB served, with the coordinator squarely on the data path
+    /// it is supposed to stay off.
+    ///
+    /// The driver's view is fresher than any worker's. Told who is asking, it
+    /// can answer `Provider` and name a peer that has since acquired the blob,
+    /// instead of sending the bytes a third time.
+    ///
+    /// Appended last: postcard encodes by index.
+    GetByHashAs {
+        hash: String,
+        me: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -209,6 +389,15 @@ pub enum BlobResp {
     /// Reply to ListShard.
     HashList(Vec<Dig>),
     Err(String),
+    /// Reply to TagGet: the manifest hash this tag names, if the peer has it.
+    ///
+    /// AFTER `Err`, not before it. Appending means appending: postcard
+    /// encodes by index, and putting this one variant above `Err` renumbers
+    /// `Err` for every peer that has not been restarted - so an old node's
+    /// error frame would decode as a tag answer. Written as "appended last"
+    /// and placed second-to-last on the first attempt, which is precisely
+    /// how that mistake gets made.
+    Tag(Option<String>),
 }
 
 pub async fn send_frame<T: Serialize>(s: &mut SendStream, v: &T) -> Result<()> {
@@ -251,6 +440,110 @@ pub async fn recv_raw(r: &mut RecvStream, size: u64) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_bloom_is_additive_so_it_never_needs_rebuilding() {
+        use super::Bloom;
+
+        // The property the incremental gossip loop rests on: inserting sets
+        // bits and never clears them, so a filter maintained by insertion is
+        // identical to one rebuilt from the whole set. If that were false,
+        // dropping the 256-directory walk would silently lose holdings and
+        // peers would stop being asked for blobs they actually have.
+        let hashes: Vec<String> = (0..500).map(|n| format!("{n:064x}")).collect();
+
+        let mut built_once = Bloom::with_capacity(1024);
+        for h in &hashes {
+            built_once.insert(h);
+        }
+
+        let mut incremental = Bloom::with_capacity(1024);
+        for h in &hashes[..200] {
+            incremental.insert(h);
+        }
+        // ... time passes, more blobs land ...
+        for h in &hashes[200..] {
+            incremental.insert(h);
+        }
+
+        assert_eq!(
+            built_once.bits, incremental.bits,
+            "insertion order and batching must not change the filter"
+        );
+        for h in &hashes {
+            assert!(incremental.contains(h), "lost {h}");
+        }
+    }
+
+    #[test]
+    fn prefetch_is_the_last_variant_and_stays_there() {
+        use super::D2W;
+
+        // postcard encodes an enum variant by its INDEX. Insert one anywhere
+        // but the end and every variant after it silently renumbers, so a
+        // worker built from one commit reads a Lead as a Ping - no error, no
+        // mismatch, just a build doing the wrong thing. Append-only is the
+        // whole contract and nothing else enforces it.
+        let last = D2W::Prefetch {
+            digests: vec![],
+            peers: vec![],
+            everyone: false,
+        };
+        let bytes = postcard::to_allocvec(&last).expect("encode");
+        let idx = bytes[0];
+
+        // Every other variant must encode to a LOWER index, which is the
+        // machine-checkable form of "Prefetch is last".
+        for other in [
+            D2W::Welcome {
+                decentralized: false,
+            },
+            D2W::Exit,
+            D2W::Ping { vitals: None },
+            D2W::Blooms { peers: vec![] },
+            D2W::Finalize { shard: 0, of: 1 },
+        ] {
+            let b = postcard::to_allocvec(&other).expect("encode");
+            assert!(
+                b[0] < idx,
+                "{other:?} encodes at {} but Prefetch is {idx} - a variant was inserted, not appended",
+                b[0]
+            );
+        }
+
+        // And it survives a round trip with a payload, since an empty vec
+        // would pass even if the fields were wrong.
+        let sent = D2W::Prefetch {
+            digests: vec![super::Dig {
+                hash: "abc".into(),
+                size: 7,
+            }],
+            peers: vec!["w1".to_owned(), "w2".to_owned()],
+            everyone: true,
+        };
+        let back: D2W =
+            postcard::from_bytes(&postcard::to_allocvec(&sent).expect("encode")).expect("decode");
+        match back {
+            D2W::Prefetch {
+                digests,
+                peers,
+                everyone,
+            } => {
+                // A SEED is wanted by every machine, so it must not be
+                // split. Carried on the frame rather than inferred, because
+                // the worker cannot tell a seed blob from any other one.
+                assert!(everyone, "the broadcast flag has to survive the wire");
+                assert_eq!(digests.len(), 1);
+                assert_eq!(digests[0].hash, "abc");
+                assert_eq!(digests[0].size, 7);
+                // The peer list rides WITH the announcement, or each worker
+                // computes its share against a different fleet and the
+                // shares stop partitioning.
+                assert_eq!(peers, vec!["w1".to_owned(), "w2".to_owned()]);
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+    }
     use super::*;
 
     #[test]

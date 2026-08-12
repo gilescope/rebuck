@@ -16,6 +16,15 @@ on:
   pull_request:
   workflow_dispatch:
 
+# One run per branch. Six jobs fire on every push, and a busy branch queues
+# them behind each other until the account's 20-job cap is reached - which
+# today meant a fleet experiment waiting on selftests for commits that had
+# already been superseded twice. An older run of the same branch tells you
+# nothing a newer one does not.
+concurrency:
+  group: selftest-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -45,6 +54,163 @@ jobs:
       - name: test
         working-directory: rebuck2
         run: cargo test --locked
+
+  # The cache-mount harvest, against a real daemon, in five minutes.
+  #
+  # Four separate faults have stopped a seeding run in the multi-runner
+  # workflow - a binary path from the wrong job's layout, a bare digest that
+  # is not a reference, a cache id nobody had read off a real run, and a
+  # missing URL scheme - and every one cost a twenty-five minute run to
+  # find, because nothing exercises `harvest-cache` except a run.
+  #
+  # An EMPTY cache is enough. The mechanism being smoke-tested is the path -
+  # dial the daemon, solve a graph with a cache mount and a scratch output,
+  # export it, turn the digest into something pullable - and none of that
+  # cares whether the cache had anything in it. Two of the four faults would
+  # have died here in seconds.
+  harvest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: rebuck2
+      - name: build
+        working-directory: rebuck2
+        run: cargo build --release --locked
+      - name: a daemon and a registry
+        run: |
+          set -euo pipefail
+          # Same pinned image as the fleet workflow: a smoke test against a
+          # different buildkit is a smoke test of a different thing.
+          # THE DAEMON HAS TO BE TOLD, and this is the other half of a
+          # distinction the fleet workflow already documents: publishing is
+          # made insecure per-solve, so a push to a plain-HTTP registry
+          # works with no config at all - but PULLING is governed by daemon
+          # config alone. The harvest pulls its base, so it needs the file,
+          # and without it buildkit reports
+          #
+          #   http: server gave HTTP response to HTTPS client
+          #
+          # having silently tried https:// first.
+          # EARTHLY's mechanism, not upstream buildkit's. This image has its
+          # own entrypoint: it runs `envsubst </etc/buildkitd.toml.template
+          # >/etc/buildkitd.toml` and appends
+          # ${EARTHLY_ADDITIONAL_BUILDKIT_CONFIG} to the end. There is no
+          # /etc/buildkit directory at all, so a bind mount there is a
+          # directory the daemon never opens - which is what the previous
+          # attempt did, silently.
+          docker run -d --name smoke-bk --privileged -p 28372:8372 \
+            -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG='[registry."172.17.0.1:15000"]
+            http = true
+            insecure = true' \
+            -e BUILDKIT_TCP_TRANSPORT_ENABLED=true -e BUILDKIT_TLS_ENABLED=false \
+            earthbuild/buildkitd:v0.8.17 >/dev/null
+          # PULL-THROUGH ON. A sessionless solve cannot reach Docker Hub -
+          # buildkit asks the session for credentials even for an anonymous
+          # pull and answers `failed to load cache key: no active sessions` -
+          # and this project already has that finding written down under "a
+          # sessionless peer cannot reach Docker Hub". Our own registry does
+          # the token dance itself, over plain HTTP the daemon needs no
+          # session for.
+          REBUCK_UPSTREAM_REGISTRY=1 \
+          ./rebuck2/target/release/rebuck2 registry --bind 0.0.0.0:15000 \
+            > registry.log 2>&1 &
+          for _ in $(seq 1 90); do
+            docker exec smoke-bk buildctl --addr tcp://127.0.0.1:8372 debug workers \
+              >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec smoke-bk buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null
+          # PUT THE BASE IN OURSELVES, because the registry's pull-through
+          # is BLOB-only: a manifest tag it does not hold is a 404, with no
+          # upstream consulted (see the GET arm of `/manifests/`). That is
+          # coherent - the mirror is filled by `mirror_image` through a peer
+          # WITH a session, and pull-through only covers blob gaps - but it
+          # means a bare `library/busybox:1` is not there to be had.
+          #
+          # Pushed to 127.0.0.1, pulled from 172.17.0.1. Same registry, two
+          # addresses: docker only allows an insecure push to loopback
+          # without daemon config, and the buildkit container cannot reach
+          # loopback on the host.
+          docker pull -q busybox:1 >/dev/null
+          docker tag busybox:1 127.0.0.1:15000/library/busybox:1
+          docker push -q 127.0.0.1:15000/library/busybox:1
+      # A step that harvested `smoke-cache` off this daemon used to stand
+      # here, and it had NEVER passed - 0 green in 100 runs. It could not:
+      # the daemon is created three steps above and nothing ever builds
+      # against a mount by that name, so `harvest-cache` correctly refuses
+      # with `no cache id "smoke-cache" on this daemon`. The step asked a
+      # fresh daemon for a cache that cannot exist.
+      #
+      # Its one real assertion was that the harvest emits a REFERENCE and
+      # not a bare digest (`docker-image://sha256:...` parses nowhere, and
+      # the seeding path built exactly that for a commit). That is already a
+      # unit test - `a_bare_digest_becomes_something_a_daemon_can_pull` in
+      # solve.rs - so removing the step loses no coverage and costs no
+      # daemon.
+      #
+      # What it DID cost was everything below it: `set -e` on a step that
+      # always failed meant the end-to-end seeding check never ran once, and
+      # `seeds=off` went unexplained in every fleet run for a week.
+      #
+      # The MECHANISM, not just the path: write a marker into cache A,
+      # harvest A, read the marker back out of cache B seeded from that
+      # harvest. B is a different id on purpose - read it back out of A and
+      # it passes by meeting A's own warm mount.
+      #
+      # Thirty seconds, against the twenty-five minute fleet run that is the
+      # only other way to ask.
+      - name: can a cold cache mount be seeded at all
+        env:
+          # THE CLOBBER, as a regression test rather than a unit test.
+          #
+          # In the fleet workflow `check-seeding` runs inside the harvest
+          # step, BEFORE `harvest-cache`, against a file the bank restored
+          # from a previous run's leg. It wrote that file with a truncating
+          # `std::fs::write`, so its one synthetic probe entry replaced the
+          # real `go-mod` input seconds before the harvest read it - which
+          # is why cache-mount seeding had never once worked.
+          #
+          # `merge_cache_inputs` is unit-tested, and a unit test cannot see
+          # this: the defect was a call site choosing `write` over `merge`,
+          # not the merge itself. Shape 20 - a test that supplies both sides
+          # of a seam cannot see a mismatch in it.
+          REBUCK2_CACHE_INPUTS_FILE: ${{ runner.temp }}/cache-inputs.tsv
+        run: |
+          set -euo pipefail
+          # A carried entry, shaped like the ones a real leg writes:
+          # id, selector, base64 op bytes.
+          printf 'go-mod\t/cache\tAAECAw==\n' > "$REBUCK2_CACHE_INPUTS_FILE"
+
+          ./rebuck2/target/release/rebuck2 check-seeding \
+            --bk 172.17.0.1:28372 --registry 172.17.0.1:15000 \
+            --base 172.17.0.1:15000/library/busybox:1
+
+          echo "=== the inputs file after check-seeding"
+          cat "$REBUCK2_CACHE_INPUTS_FILE"
+          # The probe must record itself - that is what the file is for, and
+          # a test that only checked survival would pass against a no-op.
+          grep -q '^seedcheck-src-' "$REBUCK2_CACHE_INPUTS_FILE" || {
+            echo "::error::check-seeding recorded no observed input of its own"; exit 1; }
+          # And it must not have eaten what was already there.
+          # `grep -F` against a printf-built literal, NOT `\t` in a pattern.
+          # BSD grep reads `\t` as a tab and GNU grep reads it as `t`, so a
+          # pattern that passes on a laptop fails on the runner - and this
+          # assertion failing is indistinguishable from the bug it guards.
+          grep -qF "$(printf 'go-mod\t/cache\tAAECAw==')" "$REBUCK2_CACHE_INPUTS_FILE" || {
+            echo "::error::check-seeding CLOBBERED the carried go-mod input - the harvest that runs next would reconstruct it and read an empty directory"; exit 1; }
+
+      - name: what it left behind
+        if: always()
+        run: |
+          echo "=== registry"; tail -20 registry.log || true
+          echo "=== daemon"; docker logs --tail 20 smoke-bk 2>&1 || true
 
   populate:
     runs-on: ubuntu-latest

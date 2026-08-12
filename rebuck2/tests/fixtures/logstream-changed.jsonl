@@ -1,0 +1,53 @@
+{"deltaManifest":{"fields":{"mainTargetId":"594ff1ab-9d52-427e-9410-7325532f0b23","targets":{"594ff1ab-9d52-427e-9410-7325532f0b23":{"name":"+build","canonicalName":"+build","localPath":".","runner":"local:Mac.home"}}}}}
+{"deltaManifest":{"fields":{"targets":{"594ff1ab-9d52-427e-9410-7325532f0b23":{"status":"RUN_STATUS_IN_PROGRESS","startedAtUnixNanos":"1786034007593111916"}}}}}
+{"deltaManifest":{"fields":{"commands":{"594ff1ab-9d52-427e-9410-7325532f0b23/0":{"name":"FROM +base","targetId":"594ff1ab-9d52-427e-9410-7325532f0b23","category":"+build","platform":"linux/arm64","hasCached":true,"hasLocal":true,"hasInteractive":true,"hasSourceLocation":true,"sourceLocation":{"file":"Earthfile","startLine":9,"endLine":12}}}}}}
+{"deltaManifest":{"fields":{"commands":{"594ff1ab-9d52-427e-9410-7325532f0b23/0":{"status":"RUN_STATUS_IN_PROGRESS","startedAtUnixNanos":"1786034007593239500"}}}}}
+{"deltaManifest":{"fields":{"targets":{"594ff1ab-9d52-427e-9410-7325532f0b23":{"dependsOn":["d5e390de-50bc-4a70-9205-3d11bdb6db0b"]}}}}}
+{"deltaManifest":{"fields":{"commands":{"594ff1ab-9d52-427e-9410-7325532f0b23/0":{"dependsOn":[{"targetId":"d5e390de-50bc-4a70-9205-3d11bdb6db0b","referencedName":"base"}]}}}}}
+{"deltaManifest":{"fields":{"targets":{"d5e390de-50bc-4a70-9205-3d11bdb6db0b":{"name":"+base","canonicalName":"+base","localPath":".","runner":"local:Mac.home"}}}}}
+{"deltaManifest":{"fields":{"targets":{"d5e390de-50bc-4a70-9205-3d11bdb6db0b":{"status":"RUN_STATUS_IN_PROGRESS","startedAtUnixNanos":"1786034007593370916"}}}}}
+{"deltaManifest":{"fields":{"commands":{"594ff1ab-9d52-427e-9410-7325532f0b23/0":{"status":"RUN_STATUS_SUCCESS","endedAtUnixNanos":"1786034007593393708"}}}}}
+{"deltaManifest":{"fields":{"targets":{"d5e390de-50bc-4a70-9205-3d11bdb6db0b":{"status":"RUN_STATUS_SUCCESS","endedAtUnixNanos":"1786034007593408958"}}}}}
+{"deltaManifest":{"fields":{"commands":{"594ff1ab-9d52-427e-9410-7325532f0b23/1":{"targetId":"594ff1ab-9d52-427e-9410-7325532f0b23","category":"+build","platform":"linux/arm64","hasCached":true,"hasLocal":true,"hasInteractive":true,"hasSourceLocation":true,"sourceLocation":{"file":"Earthfile","startLine":10,"startColumn":4,"endLine":10,"endColumn":9}}}}}}
+{"deltaManifest":{"fields":{"commands":{"sha256:f72d1f916a4c054612f0898ac77130762dc070037789a816884638e6a79db9af":{"name":"Load metadata alpine:3.20 linux/arm64","category":"alpine:3.20","platform":"linux/arm64","hasCached":true,"hasLocal":true,"hasInteractive":true}}}}}
+{"deltaManifest":{"fields":{"commands":{"sha256:f72d1f916a4c054612f0898ac77130762dc070037789a816884638e6a79db9af":{"status":"RUN_STATUS_IN_PROGRESS","startedAtUnixNanos":"1786034007592970547"}}}}}
+{"deltaManifest":{"fields":{"commands":{"sha256:f72d1f916a4c054612f0898ac77130762dc070037789a816884638e6a79db9af":{"status":"RUN_STATUS_SUCCESS","endedAtUnixNanos":"1786034008021990255"}}}}}
+{"deltaManifest":{"fields":{"commands":{"594ff1ab-9d52-427e-9410-7325532f0b23/2":{"targetId":"594ff1ab-9d52-427e-9410-7325532f0b23","category":"+build","platform":"linux/arm64","hasCached":true,"hasLocal":true,"hasInteractive":true,"hasSourceLocation":true,"sourceLocation":{"file":"Earthfile","startLine":11,"startColumn":4,"endLine":11,"endColumn":24}}}}}}
+{"deltaManifest":{"fields":{"targets":{"594ff1ab-9d52-427e-9410-7325532f0b23":{"dependsOn":["39422203-bbfc-4c62-9905-19e516c3c56c"]}}}}}
+{"deltaManifest":{"fields":{"commands":{"594ff1ab-9d52-427e-9410-7325532f0b23/2":{"dependsOn":[{"targetId":"39422203-bbfc-4c62-9905-19e516c3c56c","referencedName":"deps"}]}}}}}
+{"deltaManifest":{"fields":{"targets":{"39422203-bbfc-4c62-9905-19e516c3c56c":{"name":"+deps","canonicalName":"+deps","localPath":".","runner":"local:Mac.home"}}}}}
+{"deltaManifest":{"fields":{"targets":{"39422203-bbfc-4c62-9905-19e516c3c56c":{"status":"RUN_STATUS_IN_PROGRESS","startedAtUnixNanos":"1786034008025395750"}}}}}
+{"deltaManifest":{"fields":{"commands":{"39422203-bbfc-4c62-9905-19e516c3c56c/0":{"name":"FROM +base","targetId":"39422203-bbfc-4c62-9905-19e516c3c56c","category":"+deps","platform":"linux/arm64","hasCached":true,"hasLocal":true,"hasInteractive":true,"hasSourceLocation":true,"sourceLocation":{"file":"Earthfile","startLine":3,"endLine":7}}}}}}
+{"deltaManifest":{"fields":{"commands":{"39422203-bbfc-4c62-9905-19e516c3c56c/0":{"status":"RUN_STATUS_IN_PROGRESS","startedAtUnixNanos":"1786034008025435958"}}}}}
+{"deltaManifest":{"fields":{"targets":{"39422203-bbfc-4c62-9905-19e516c3c56c":{"dependsOn":["d5e390de-50bc-4a70-9205-3d11bdb6db0b"]}}}}}
+{"deltaManifest":{"fields":{"commands":{"39422203-bbfc-4c62-9905-19e516c3c56c/0":{"dependsOn":[{"targetId":"d5e390de-50bc-4a70-9205-3d11bdb6db0b","referencedName":"base"}]}}}}}
+{"deltaManifest":{"fields":{"commands":{"39422203-bbfc-4c62-9905-19e516c3c56c/0":{"status":"RUN_STATUS_SUCCESS","endedAtUnixNanos":"1786034008025584916"}}}}}
+{"deltaManifest":{"fields":{"commands":{"39422203-bbfc-4c62-9905-19e516c3c56c/1":{"targetId":"39422203-bbfc-4c62-9905-19e516c3c56c","category":"+deps","platform":"linux/arm64","hasCached":true,"hasLocal":true,"hasInteractive":true,"hasSourceLocation":true,"sourceLocation":{"file":"Earthfile","startLine":4,"startColumn":4,"endLine":4,"endColumn":9}}}}}}
+{"deltaManifest":{"fields":{"commands":{"39422203-bbfc-4c62-9905-19e516c3c56c/2":{"targetId":"39422203-bbfc-4c62-9905-19e516c3c56c","category":"+deps","platform":"linux/arm64","hasCached":true,"hasLocal":true,"hasInteractive":true,"hasSourceLocation":true,"sourceLocation":{"file":"Earthfile","startLine":6,"startColumn":4,"endLine":6,"endColumn":36}}}}}}
+{"deltaManifest":{"fields":{"commands":{"39422203-bbfc-4c62-9905-19e516c3c56c/3":{"targetId":"39422203-bbfc-4c62-9905-19e516c3c56c","category":"+deps","platform":"linux/arm64","hasCached":true,"hasLocal":true,"hasInteractive":true,"hasSourceLocation":true,"sourceLocation":{"file":"Earthfile","startLine":7,"startColumn":4,"endLine":7,"endColumn":18}}}}}}
+{"deltaManifest":{"fields":{"commands":{"39422203-bbfc-4c62-9905-19e516c3c56c/3":{"name":"SAVE ARTIFACT /deps.txt"}}}}}
+{"deltaManifest":{"fields":{"commands":{"39422203-bbfc-4c62-9905-19e516c3c56c/3":{"status":"RUN_STATUS_SUCCESS","endedAtUnixNanos":"1786034008026000875"}}}}}
+{"deltaManifest":{"fields":{"commands":{"594ff1ab-9d52-427e-9410-7325532f0b23/3":{"targetId":"594ff1ab-9d52-427e-9410-7325532f0b23","category":"+build","platform":"linux/arm64","hasCached":true,"hasLocal":true,"hasInteractive":true,"hasSourceLocation":true,"sourceLocation":{"file":"Earthfile","startLine":12,"startColumn":4,"endLine":12,"endColumn":31}}}}}}
+{"deltaManifest":{"fields":{"commands":{"39422203-bbfc-4c62-9905-19e516c3c56c/2":{"name":"RUN echo \"deps CHANGED $mode\" > /deps.txt"}}}}}
+{"deltaManifest":{"fields":{"commands":{"39422203-bbfc-4c62-9905-19e516c3c56c/1":{"name":"FROM alpine:3.20"}}}}}
+{"deltaManifest":{"fields":{"commands":{"594ff1ab-9d52-427e-9410-7325532f0b23/3":{"name":"RUN cat /deps.txt && sleep 1"}}}}}
+{"deltaManifest":{"fields":{"commands":{"594ff1ab-9d52-427e-9410-7325532f0b23/2":{"name":"COPY +deps/deps.txt /deps.txt"}}}}}
+{"deltaManifest":{"fields":{"commands":{"sha256:03d266390e5fc1e9857302e597c08371875d0d713ed57446ef519858884d9a10":{"name":"copy /deps.txt /deps.txt","category":"internal internal","hasCached":true,"hasLocal":true,"hasInteractive":true}}}}}
+{"deltaManifest":{"fields":{"commands":{"39422203-bbfc-4c62-9905-19e516c3c56c/1":{"status":"RUN_STATUS_IN_PROGRESS","startedAtUnixNanos":"1786034008040216005"}}}}}
+{"deltaManifest":{"fields":{"commands":{"39422203-bbfc-4c62-9905-19e516c3c56c/1":{"hasHasProgress":true,"hasProgress":true,"progress":100}}}}}
+{"deltaManifest":{"fields":{"commands":{"39422203-bbfc-4c62-9905-19e516c3c56c/1":{"status":"RUN_STATUS_SUCCESS","endedAtUnixNanos":"1786034008047466005"}}}}}
+{"deltaManifest":{"fields":{"commands":{"39422203-bbfc-4c62-9905-19e516c3c56c/1":{"hasCached":true,"isCached":true}}}}}
+{"deltaManifest":{"fields":{"commands":{"39422203-bbfc-4c62-9905-19e516c3c56c/1":{"status":"RUN_STATUS_SUCCESS","endedAtUnixNanos":"1786034008047752838"}}}}}
+{"deltaManifest":{"fields":{"commands":{"39422203-bbfc-4c62-9905-19e516c3c56c/2":{"status":"RUN_STATUS_IN_PROGRESS","startedAtUnixNanos":"1786034008047868463"}}}}}
+{"deltaManifest":{"fields":{"commands":{"39422203-bbfc-4c62-9905-19e516c3c56c/2":{"status":"RUN_STATUS_SUCCESS","endedAtUnixNanos":"1786034008205377755"}}}}}
+{"deltaManifest":{"fields":{"targets":{"39422203-bbfc-4c62-9905-19e516c3c56c":{"status":"RUN_STATUS_SUCCESS","endedAtUnixNanos":"1786034008209228875"}}}}}
+{"deltaManifest":{"fields":{"commands":{"sha256:03d266390e5fc1e9857302e597c08371875d0d713ed57446ef519858884d9a10":{"status":"RUN_STATUS_IN_PROGRESS","startedAtUnixNanos":"1786034008218787130"}}}}}
+{"deltaManifest":{"fields":{"commands":{"sha256:03d266390e5fc1e9857302e597c08371875d0d713ed57446ef519858884d9a10":{"status":"RUN_STATUS_SUCCESS","endedAtUnixNanos":"1786034008228633880"}}}}}
+{"deltaManifest":{"fields":{"commands":{"594ff1ab-9d52-427e-9410-7325532f0b23/2":{"status":"RUN_STATUS_IN_PROGRESS","startedAtUnixNanos":"1786034008229700547"}}}}}
+{"deltaManifest":{"fields":{"commands":{"594ff1ab-9d52-427e-9410-7325532f0b23/2":{"status":"RUN_STATUS_SUCCESS","endedAtUnixNanos":"1786034008239324047"}}}}}
+{"deltaManifest":{"fields":{"commands":{"594ff1ab-9d52-427e-9410-7325532f0b23/3":{"status":"RUN_STATUS_IN_PROGRESS","startedAtUnixNanos":"1786034008240069339"}}}}}
+{"deltaManifest":{"fields":{"commands":{"594ff1ab-9d52-427e-9410-7325532f0b23/3":{"status":"RUN_STATUS_SUCCESS","endedAtUnixNanos":"1786034009379039881"}}}}}
+{"deltaManifest":{"fields":{"targets":{"594ff1ab-9d52-427e-9410-7325532f0b23":{"status":"RUN_STATUS_SUCCESS","endedAtUnixNanos":"1786034009383530333"}}}}}
+{"deltaManifest":{"fields":{"commands":{"sha256:6c3037ef4d834e78d0938a264716eb6ab1ea803e2a4b47103b5684f4b4d30837":{"name":"exporting outputs","category":"output","hasCached":true,"hasLocal":true,"hasInteractive":true}}}}}
+{"deltaManifest":{"fields":{"commands":{"sha256:6c3037ef4d834e78d0938a264716eb6ab1ea803e2a4b47103b5684f4b4d30837":{"status":"RUN_STATUS_IN_PROGRESS","startedAtUnixNanos":"1786034009386774464"}}}}}
+{"deltaManifest":{"fields":{"commands":{"sha256:6c3037ef4d834e78d0938a264716eb6ab1ea803e2a4b47103b5684f4b4d30837":{"status":"RUN_STATUS_SUCCESS","endedAtUnixNanos":"1786034009388250214"}}}}}

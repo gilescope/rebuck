@@ -1,0 +1,137 @@
+name: fleet
+
+# The distributed buildkit, on a real runner.
+#
+# Everything else in CI exercises the buck2 driver line. Nothing touched the
+# fleet until this: every claim in docs/fleet-findings.md rested on someone
+# running scripts/fleet-check.sh by hand, which is the same as not being
+# checked.
+#
+# The suite asserts STRUCTURE - where work was placed, whether the bytes match
+# a one-machine baseline, whether a build survived a peer or the registry
+# being destroyed - and only reports timings. Wall clock on a shared runner
+# says nothing, and a job that fails on a busy machine gets switched off.
+#
+# Local daemons only. The cross-machine numbers need a second box and are not
+# checked here; `REMOTE=` does that when someone has one.
+#
+# Two things here are expected to be the first to give trouble on a runner,
+# recorded so the next person does not rediscover them:
+#
+#   - SLOTS is 8 on a four-core machine. The assertions are arithmetic on the
+#     slot count so they stay correct, but three daemons, a registry, a proxy
+#     and twelve concurrent buildctl clients will contend.
+#   - the straggler scenario is timing-derived. It caps one daemon at 0.15 CPU
+#     and needs that to overshoot three times the observed median; under
+#     contention the median rises too, which narrows the margin.
+#
+# Neither is a reason to weaken an assertion. If one flakes, the fix is to
+# make the property observable, not to widen the grep - see docs/how-this-lies.md.
+
+on:
+  # A DEDICATED branch, matching the convention earthfile-fleet.yml already
+  # states: "nothing fires on a normal push to giles-dispatch, so committing
+  # stays cheap". This one fired on every push to every branch, holding a
+  # runner for up to 45 minutes each time and queueing behind the
+  # experiments it was competing with.
+  #
+  # It is also RED, and has been for all 99 runs in recorded history - not a
+  # regression, and not something to silence: `fleet check` reports "the
+  # driver dispatched nothing", so its harness needs its own look. Scoping
+  # the trigger stops the waste without pretending the test passes.
+  push:
+    branches: [giles-dispatch-ci]
+  # NOT on pull_request. Scoping the push trigger alone changed nothing:
+  # this branch has an open draft PR (#10), so every push still fired the
+  # job through the PR trigger - a 45-minute red job, on every commit,
+  # queueing in front of the experiments.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fleet-check:
+    runs-on: ubuntu-latest
+    # Measured 5m11s for 53 checks on a warm developer machine. A runner has
+    # four cores, pulls the buildkit image cold and installs binfmt first, and
+    # several scenarios wait out a bound on purpose rather than racing.
+    #
+    # Set well above the estimate deliberately: a timeout that trips is
+    # indistinguishable from a hang, and the suite prints its own elapsed time
+    # on every run, so this number can be tightened from evidence instead of
+    # being defended by guesswork.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: rebuck2
+
+      # binfmt, so the foreign-architecture scenario runs instead of skipping
+      # itself. Without it the suite still passes - it probes and skips - but
+      # it passes having tested one thing fewer, which is the quiet kind of
+      # green this whole project keeps arguing against.
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+        with:
+          platforms: arm64
+
+      - name: fleet check
+        working-directory: rebuck2
+        # WORK is small so the builds are short: this proves placement and
+        # correctness, not throughput, and a runner has too few cores to say
+        # anything about throughput anyway.
+        env:
+          WORK: "20"
+          BUILDS: "12"
+          SLOTS: "8"
+        # `pipefail` is load-bearing: without it the pipeline's status is
+        # tee's, which is always 0, and a workflow that has never passed
+        # would become one that can never fail. That is strictly worse.
+        run: |
+          set -o pipefail
+          ./scripts/fleet-check.sh 2>&1 | tee "$RUNNER_TEMP/fleet-check.log"
+
+      - name: what the fleet did
+        if: always()
+        # The proxy's own report, kept even when the job fails - `placed` is
+        # the only honest evidence of distribution, and a failure is exactly
+        # when someone wants to read it.
+        run: |
+          for f in "${TMPDIR:-/tmp}"/rebuck2-*/proxy.log; do
+            [ -f "$f" ] || continue
+            echo "=== $f"
+            grep -E '^\[wire\]|^\[proxy\]' "$f" || true
+          done
+
+      # KEPT AS AN ARTIFACT, unconditionally. This workflow has never passed
+      # - 96 failures and 0 successes in its recorded history - and the
+      # reason it has stayed unfixed is that `gh run view --log` returns
+      # only `UNKNOWN STEP` entries for it, so nobody can see what the check
+      # said. Diagnosis is blocked on legibility, not on difficulty.
+      #
+      # `if: always()`, because the only interesting run is a failing one.
+      - name: keep what the check said
+        if: always()
+        run: |
+          d="$RUNNER_TEMP/fleet-artifacts"
+          mkdir -p "$d"
+          cp "$RUNNER_TEMP/fleet-check.log" "$d/" 2>/dev/null || true
+          i=0
+          for f in "${TMPDIR:-/tmp}"/rebuck2-*/proxy.log; do
+            [ -f "$f" ] || continue
+            cp "$f" "$d/proxy-$i.log" || true
+            i=$((i + 1))
+          done
+          echo "kept $(find "$d" -type f | wc -l | tr -d ' ') file(s)"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: fleet-check-logs-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fleet-artifacts
+          if-no-files-found: warn

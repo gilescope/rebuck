@@ -1,0 +1,545 @@
+# earthbuild's own root Earthfile, through the fleet, on a runner.
+#
+# Everything measured so far is a synthetic fixture: three ops, five seconds,
+# a fanout designed to be dispatchable. This is the first time a real build
+# has been pointed at the gateway, and the target is the one the project is
+# actually for - the 77-target Earthfile at the root of earthbuild.
+#
+# ONE RUNNER, deliberately, and this is the honest limit rather than a
+# simplification. A worker's buildkitd speaks OCI registry and cannot speak
+# the mesh, so it needs a registry it can reach; today that is the
+# coordinator's, over HTTP. Two GitHub runners have no route between them, so
+# a worker on a second runner could not pull. `registry.rs` names the missing
+# piece: "a registry per worker would need tags gossiped over the mesh - that
+# is the next step, not this one."
+#
+# So this measures what a runner-sized fleet does with a real graph:
+#   - how many of earthly's solves are DISPATCHABLE at all (the fixture says
+#     1 in 12 and nobody has checked that against a real target)
+#   - whether the bytes match a no-fleet build of the same target
+#   - what the gateway costs when the graph is not built to be friendly
+#
+# It does NOT measure whether distribution PAYS. Workers here share the
+# runner's four cores, so a second worker adds contention and not capacity.
+#
+# UNPROVEN. This has never run. Three things are assumed and only the first
+# run will settle them: that the pinned buildkitd image is one this earthly
+# accepts, that a worker's daemon started from the same image is
+# accepted by the same earthly binary, and that a real earthly graph gets
+# through `make_portable` at all. Expect the first run to be a probe rather
+# than a measurement, and read the logs step before the timings.
+name: earthfile-fleet
+
+on:
+  # A push trigger on a DEDICATED branch, because workflow_dispatch is not
+  # reachable from here: the API resolves a workflow by its presence on the
+  # DEFAULT branch, and these live only on giles-dispatch. Adding them to
+  # main to make a button appear would put unproven, hour-long jobs in
+  # everyone's face.
+  #
+  # To run: `git push -f origin HEAD:giles-dispatch-ci`. Nothing fires on a
+  # normal push to giles-dispatch, so committing stays cheap.
+  push:
+    branches: [giles-dispatch-ci]
+  workflow_dispatch:
+    inputs:
+      peer_cache_mounts:
+        description: "lift cache mounts so subtrees can travel (1 = yes)"
+        default: "1"
+      home_slots:
+        description: "slots peer 0 keeps for itself - 0 forces dispatch"
+        default: "0"
+      fleet_cache:
+        description: "off | read | readwrite. ALL THREE measured slower - see docs"
+        default: "off"
+      graft:
+        description: "import an already-built ancestor instead of rebuilding it"
+        default: "0"
+      cut_prefix:
+        description: "publish the shared ancestry as its own subtree, once"
+        default: "1"
+      earthly_flags:
+        description: "flags for earthly - upstream uses --ci -P"
+        default: "--ci -P"
+      targets:
+        description: "earthbuild targets, JSON array - one JOB each"
+        default: '["+test-no-qemu-group1","+test-no-qemu-group2","+test-no-qemu-group3","+code"]'
+      workers:
+        description: "workers on the runner"
+        default: "2"
+      ref:
+        # PINNED to the commit the vendored patch was cut against, not a
+        # branch. `main` moves: the six-machine run failed with
+        # `patch failed: builder/builder.go:338` because upstream had drifted
+        # past it, and a patch that half-applies is worse than one that fails
+        # - the previous attempt lost a day to exactly that.
+        #
+        # A pin also makes the measurement reproducible: every number in
+        # earthly-dispatch.md is against this tree.
+        description: "earthbuild ref - pinned so the vendored patch applies"
+        default: "3380dc206e463365c865857b32427b6768f93af2"
+
+env:
+  # What upstream's reusable-test.yml passes, and neither is optional.
+  #
+  #   -P    is what makes earthly request the security.insecure
+  #         entitlement. Without it every WITH DOCKER target dies as
+  #         `failed to load LLB: security.insecure is not allowed`, which
+  #         reads like the proxy stripped something and does not.
+  #   --ci  changes output mode and strictness.
+  #
+  # Not --no-cache, which this used to pass: upstream does not, and on a
+  # test group it turns a measurable run into an unmeasurable one.
+  EARTHLY_FLAGS: ${{ inputs.earthly_flags || '--ci -P' }}
+  # WITHOUT THESE THE RUN IS GREEN AND MEASURES NOTHING.
+  #
+  # First green CI run reported:
+  #
+  #   solves routed : 0
+  #   not routed    : {"excluded: CacheMount": 5, "home has room": 1}
+  #
+  # Both are correct behaviour and both are defaults that mean "do not
+  # distribute". Every local probe has passed these since the first day and
+  # neither ever reached the workflow, so CI was exercising the pipeline and
+  # not the fleet - the most convincing kind of green there is.
+  #
+  #   PEER_CACHE_MOUNTS  earthbuild's Earthfile puts a cache mount on most
+  #                      RUNs; without lifting them 5 of 6 solves are
+  #                      excluded before placement is even considered.
+  #   HOME_SLOTS=0       otherwise peer 0 takes the work itself whenever it
+  #                      has room, which on an idle runner is always.
+  REBUCK2_PEER_CACHE_MOUNTS: ${{ inputs.peer_cache_mounts || '1' }}
+  REBUCK2_HOME_SLOTS: ${{ inputs.home_slots || '0' }}
+  # The A/B this exists to settle: six machines took 590s against 307s on
+  # one, and go-mod (~24.2s/lead) plus go-build (~24.7s/lead) account for
+  # the gap. A cache mount does not travel, so one machine pays that once
+  # and six pay it six times.
+  #
+  # Measured HERE rather than on a laptop, where a run of this size fills
+  # the Docker VM's disk and both legs fail for a reason that has nothing
+  # to do with caching.
+  REBUCK2_FLEET_CACHE: ${{ inputs.fleet_cache || 'off' }}
+  # Cut the shared ancestry out as its own dispatch unit, publish it once,
+  # and graft it into everything that follows.
+  #
+  # Local trend across three configurations, group10, three workers:
+  #     graft only          444s
+  #     cut, 32 duplicates  407s
+  #     cut once            373s   17 prefixes, median ops/lead 82 -> 32
+  #
+  # Monotone, and the shape moves - which nothing else in nine attempts did.
+  # But a laptop running four buildkitds on the cores the baseline gets to
+  # itself measures CONTENTION, not capacity: there the same target's
+  # baseline fell to 122s while the fleet sat at 389s. Separate machines are
+  # the only place the question can be answered.
+  # TLS off by ENV, not only in a config file - and this is what makes
+  # daemon consolidation actually happen.
+  #
+  # A nested earthly inherits BUILDKIT_HOST through the forwarded
+  # environment and nothing else. A config file lives in one container and
+  # cannot travel, so without this the nested build dials the shared daemon,
+  # defaults to TLS, and exits 6.
+  #
+  # Its absence is visible in the numbers: this workflow's baseline is 292s
+  # where the same target on a laptop WITH consolidation is 141s. The patch
+  # was applied and the mechanism was inert.
+  EARTHLY_TLS_ENABLED: "false"
+  EARTH_TLS_ENABLED: "false"
+  # GRAFT OFF while `no support for <nil>` is unexplained.
+  #
+  # The index-0 guard was a hypothesis - an image source has one output, an
+  # ExecOp has one per mount - and it did not fix the error, so the theory
+  # was wrong or incomplete. Two mechanisms rewrite graphs here; turning one
+  # off says which. Guessing at a second theory while a fleet declines every
+  # job is how the last several hours went.
+  REBUCK2_GRAFT: ${{ inputs.graft || '0' }}
+  REBUCK2_CUT_PREFIX: ${{ inputs.cut_prefix || '1' }}
+
+permissions:
+  contents: read
+
+jobs:
+  earthfile:
+    runs-on: ubuntu-latest
+    # ONE JOB PER TARGET, which is how upstream runs these and not an
+    # optimisation. `+test-no-qemu` aggregates twelve groups with BUILD, and
+    # earthly cancels every sibling when one target fails - so an aggregate
+    # run reports the first failure and nothing about the other eleven.
+    # Measured: 118 targets passed and then the whole thing said "Canceled".
+    #
+    # Separate jobs also give a per-group dispatch figure, which is the
+    # number this workflow exists to produce.
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(inputs.targets || '["+test-no-qemu-group1","+test-no-qemu-group2","+test-no-qemu-group3","+code"]') }}
+    name: ${{ matrix.target }}
+    # A real target, cold, on four cores. The fixture suite takes 11 minutes;
+    # this has no prior measurement at all, so the bound is generous and the
+    # run reports its own elapsed time to replace the guess.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: rebuck2-repo
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: EarthBuild/earthbuild
+          ref: ${{ inputs.ref || '3380dc206e463365c865857b32427b6768f93af2' }}
+          path: earthbuild
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: "1.92.0"
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          workspaces: rebuck2-repo/rebuck2
+
+      - name: build rebuck2
+        working-directory: rebuck2-repo/rebuck2
+        run: cargo build --release
+
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5
+        with:
+          go-version-file: earthbuild/go.mod
+          cache: false
+
+      - name: build earthly, PATCHED
+        run: |
+          set -euo pipefail
+          # A released binary would measure ZERO, and would look like the
+          # fleet does not work.
+          #
+          # Stock earthly attaches the interactive debugger's secret, host
+          # bind and two fork-only sockets to every non-LOCALLY RUN, and each
+          # of those pins the solve to the machine holding earthly's session.
+          # Measured: 0 of 6 solves dispatchable on `+code` as shipped, 6 of
+          # 6 with the patch. See rebuck2/patches/README.md and
+          # EarthBuild/earthbuild#784.
+          #
+          # Built from source rather than downloaded because the patch has to
+          # be IN it. Plain `go build` - bootstrapping earthly with earthly
+          # would need a working buildkit before the thing under test exists.
+          # Plain apply, then three-way. The patch ADDS two test files,
+          # and `git apply -3` cannot three-way a file with no blob in the
+          # index - it reports "does not exist in index" and drops the whole
+          # patch. Plain apply handles additions; -3 is the fallback for
+          # drift in the files that already exist.
+          git -C earthbuild apply --verbose \
+            "$GITHUB_WORKSPACE/rebuck2-repo/rebuck2/patches/earthbuild-consolidated-plus-784.patch" || {
+              echo "::error::the #784 patch no longer applies to earthbuild"
+              echo "at $(git -C earthbuild rev-parse --short HEAD). Re-derive it"
+              echo "rather than forcing it: gate on whatever the surrounding"
+              echo "code already uses for the debugger. See"
+              echo "rebuck2/patches/README.md."
+              exit 1
+            }
+          ( cd earthbuild && go build -o /usr/local/bin/earthly ./cmd/earthly )
+          earthly --version
+          # Thirteen feature flags the test targets assume. Missing it does
+          # not fail loudly - it fails as individual tests behaving
+          # differently, which is indistinguishable from a fleet bug.
+          {
+            echo "EARTHLY_VERSION_FLAG_OVERRIDES=$(tr -d '\n' < earthbuild/.earthly_version_flag_overrides)"
+          } >> "$GITHUB_ENV"
+
+      - name: start the fleet
+        id: fleet
+        env:
+          WORKERS: ${{ inputs.workers || '2' }}
+        run: |
+          set -euo pipefail
+          BIN=rebuck2-repo/rebuck2/target/release/rebuck2
+          # The TARGET is in the session, and it has to be.
+          #
+          # Every job in a matrix shares GITHUB_RUN_ID, and the mesh derives
+          # the driver's identity from the session string by
+          # `mesh::secret(session, "driver")`. Four matrix jobs therefore
+          # advertised and searched for the SAME driver, on four different
+          # runners, and iroh happily connected them across job boundaries.
+          #
+          # Measured in one run: `+code` reported three workers joined when
+          # two were started - it had adopted a stranger's - and group2
+          # reported 0/2, having lost both of its own to someone else's
+          # driver. One job stealing another's fleet looks exactly like a
+          # discovery bug, and the fix is a unique rendezvous per fleet.
+          #
+          # Sanitised: a target is `+test-no-qemu-group2`, and the session
+          # string wants no shell-special characters in it.
+          SESSION="earthfile-${GITHUB_RUN_ID}-$(echo '${{ matrix.target }}' | tr -c 'A-Za-z0-9' '-')"
+          echo "SESSION=$SESSION" >> "$GITHUB_ENV"
+
+          # One buildkitd per participant: the coordinator's own, plus one
+          # per worker. Each needs to trust the mirror over plain HTTP or it
+          # pushes happily and cannot pull - the silent failure this project
+          # has already been caught by once.
+          # Let EARTHLY start the first daemon, and copy whatever it chose.
+          #
+          # Its converter emits `llb.HostBind()` and `earthly_interactive`
+          # sockets - fork-only, the surface behind EarthBuild#784 - so stock
+          # moby/buildkit cannot run this graph at all. Which fork, at which
+          # version, with which env, is decided by the earthly BINARY: the
+          # image is compiled in as DefaultBuildkitdImage and it checks a
+          # settings hash against the running container.
+          #
+          # That argument held while we used a RELEASED earthly. It does
+          # not survive building earthly from source - see the pin below.
+          # Every registry in this run, trusted by every daemon. A daemon
+          # that does not trust one pushes happily over HTTP and then
+          # cannot pull from it - and the push is the loud half.
+          # The trailing $'\n' is load-bearing. Command substitution STRIPS
+          # trailing newlines, so `TRUST="$TRUST$(printf ...)"` glued each
+          # stanza to the next and produced
+          #
+          #     insecure = true[registry."172.17.0.1:15001"]
+          #
+          # which buildkitd rejected as
+          #
+          #     (33, 19): unexpected token no value can start with r,
+          #     was expecting a table key
+          #
+          # - the `r` being the start of `registry`. The daemon then never
+          # became ready and the step timed out two minutes later, naming a
+          # symptom three steps from the cause.
+          TRUST=""
+          for r in $(seq 15000 $((15000 + WORKERS))); do
+            TRUST="$TRUST$(printf '[registry."172.17.0.1:%s"]\n  http = true\n  insecure = true' "$r")"$'\n'
+          done
+
+          # PINNED, not discovered. This used to run `earthly bootstrap` and
+          # copy whichever image the binary chose, on the argument that the
+          # binary is the authority. That stopped being true the moment we
+          # started building earthly FROM SOURCE for the #784 patch: a source
+          # build has `ghcr.io/earthbuild/earthbuild:buildkitd-dev-main`
+          # compiled in as DefaultBuildkitdImage, and that tag is not
+          # published. The first CI run ever attempted died on
+          #
+          #     bootstrap | docker: Error response from daemon: manifest unknown
+          #
+          # It worked on a laptop only because a buildkitd container was
+          # already lying around from an earlier release install, so the
+          # discovery step found an image nobody had pulled that day.
+          #
+          # The image still has to be earthly's FORK - the converter emits
+          # host binds and earthly_interactive sockets that stock
+          # moby/buildkit rejects outright - so this pins the fork's last
+          # published tag rather than falling back to upstream.
+          BK_IMAGE=${BK_IMAGE:-earthbuild/buildkitd:v0.8.17}
+          docker pull "$BK_IMAGE"
+          docker ps --format '{{.Names}}\t{{.Image}}\t{{.Ports}}'
+          # OUR OWN daemon, from the image earthly chose.
+          #
+          # earthly starts its buildkitd with BUILDKIT_TCP_TRANSPORT_ENABLED=false
+          # and talks to it over a unix socket; the port it publishes is its
+          # embedded REGISTRY and answers HTTP/1.1, so a gRPC client gets
+          # "frame too large ... looked like an HTTP/1.1 header". Nothing can
+          # proxy that daemon at any address.
+          #
+          # The IMAGE must still be earthly's - the converter emits host binds
+          # and earthly_interactive sockets stock buildkit rejects - so
+          # bootstrap picks it and we start it the way a proxy needs. 8372 is
+          # KNOWN, not discovered: the fork's own buildkitd.tcp.template sets
+          # `[grpc] address = tcp://0.0.0.0:8372` and we are the ones turning
+          # TCP on.
+          echo "buildkitd image: $BK_IMAGE"
+          docker rm -f own-bk >/dev/null 2>&1 || true
+          docker run -d --name own-bk --privileged -p 18372:8372 \
+            -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
+            -e BUILDKIT_TLS_ENABLED=false \
+            -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG="$TRUST" \
+            "$BK_IMAGE" >/dev/null
+          for _ in $(seq 1 120); do
+            docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers \
+              >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec own-bk buildctl --addr tcp://127.0.0.1:8372 debug workers >/dev/null 2>&1 || {
+            echo "::error::our buildkitd never became ready - config it was given:"
+            printf '%s\n' "$TRUST"
+            docker logs --tail 30 own-bk
+            exit 1; }
+          # BOTH: a shell variable for THIS step, and $GITHUB_ENV for the
+          # later ones. Writing only to $GITHUB_ENV set it for every step
+          # except the one that needed it, and `set -u` then killed the
+          # proxy command with
+          #
+          #     line 127: BK0: unbound variable
+          #
+          # Everything after that was a consequence with a more interesting
+          # error message: workers logging `No addressing information
+          # available` because there was no driver to discover, and earthly
+          # reporting `failed to list workers: Unavailable` against a
+          # gateway that had never started. One unset variable, three
+          # plausible wrong diagnoses.
+          BK0=127.0.0.1:18372
+          echo "BK0=$BK0" >> "$GITHUB_ENV"
+
+          # One more daemon per worker, same image, same env earthly uses.
+          for i in $(seq 1 "$WORKERS"); do
+            docker run -d --name "bk-$i" --privileged \
+              -p "$((18372 + i)):8372" \
+              -e BUILDKIT_TCP_TRANSPORT_ENABLED=true \
+              -e BUILDKIT_TLS_ENABLED=false \
+              -e EARTHLY_ADDITIONAL_BUILDKIT_CONFIG="$TRUST" \
+              -v "/tmp/earthbuild-$i:/tmp/earthbuild" \
+              "$BK_IMAGE" >/dev/null
+          done
+          for i in $(seq 1 "$WORKERS"); do
+            for _ in $(seq 1 120); do
+              docker exec "bk-$i" buildctl --addr tcp://127.0.0.1:8372 debug workers \
+                >/dev/null 2>&1 && break
+              sleep 1
+            done
+          done
+          docker ps --format '{{.Names}} {{.Status}}'
+
+          # 172.17.0.1 is the docker bridge gateway: how a container reaches
+          # the runner. `host.docker.internal` is a Docker Desktop thing and
+          # does not resolve here.
+          # NOT loopback. earthly's `IsLocal` counts 127.0.0.1, localhost and
+          # ::1 as "a buildkit I manage", so a gateway on loopback makes it
+          # compare its OWN container's settings hash, decide they differ and
+          # restart it - the build then dies before one solve reaches the
+          # proxy, with a TLS error that names nothing relevant. A routable
+          # address is !isLocal and earthly simply connects.
+          LAN=$(hostname -I | awk '{print $1}')
+          echo "LAN=$LAN" >> "$GITHUB_ENV"
+          REBUCK2_MIRROR=172.17.0.1:15000 \
+            "$BIN" buildkit-proxy --listen 0.0.0.0:1234 \
+              --upstream "http://$BK0" \
+              --registry-bind 0.0.0.0:15000 \
+              --session "$SESSION" --store /tmp/coord > /tmp/proxy.log 2>&1 &
+          echo $! > /tmp/proxy.pid
+
+          # A REGISTRY PER WORKER, not the coordinator's.
+          #
+          # Sharing one registry makes hits_peer structurally zero: a
+          # subtree's layers are already at the address the requester pulls
+          # from, so the fetch path - local, bloom-matched peer, driver - is
+          # never asked a question whose answer could be "peer". Measured
+          # locally: shared registry gave peer=0 every run; a registry per
+          # worker gave peer=6 on the first attempt.
+          for i in $(seq 1 "$WORKERS"); do
+            "$BIN" worker --session "$SESSION" \
+              --store "/tmp/worker-$i" \
+              --buildkit-addr "http://127.0.0.1:$((18372 + i))" \
+              --registry-bind "0.0.0.0:$((15000 + i))" \
+              --registry-addr "172.17.0.1:$((15000 + i))" > "/tmp/worker-$i.log" 2>&1 &
+          done
+
+          # Barrier: a worker joins over iroh a moment after its process
+          # starts, and the gateway asks whether the fleet is empty per solve.
+          for _ in $(seq 1 60); do
+            j=$(grep -c "joined" /tmp/proxy.log 2>/dev/null || true)
+            [ "${j:-0}" -ge "$WORKERS" ] && break
+            sleep 1
+          done
+          # Captured, not inlined: `grep -c ... || echo 0` prints "0\n0" when
+          # nothing matches, because grep writes its own 0 and ALSO exits 1.
+          joined=$(grep -c joined /tmp/proxy.log) || joined=0
+          echo "workers joined: $joined/$WORKERS"
+          if [ "$joined" -eq 0 ]; then
+            echo "::warning::no worker joined - this run measures one machine"
+          fi
+
+      - name: baseline - the same target with no fleet
+        working-directory: earthbuild
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          # tls_enabled defaults TRUE, and a REMOTE buildkit is expected to
+          # present a certificate: earthly goes looking for
+          # ~/.earthly/certs/ca_cert.pem and fails with
+          #
+          #     TLS CA file ".../certs/ca_cert.pem" not found
+          #
+          # Our daemons speak plain gRPC, so it has to be off - for the
+          # BASELINE as much as for the fleet. Known locally since the first
+          # probe; never carried into CI, because the baseline step was
+          # written before the local rig learned it.
+          #
+          # And the LAN address, not $BK0's loopback: earthly's IsLocal
+          # counts 127.0.0.1 as "a buildkit I manage" and tries to start its
+          # own container instead of connecting.
+          printf 'global:\n  tls_enabled: false\n' > "$RUNNER_TEMP/earthly.yml"
+          # shellcheck disable=SC2086 # a flag LIST: word-splitting is the point
+          # NOT `set -e` on the build itself. A red baseline is not a
+          # fleet failure - `+test-no-qemu-group1` fails
+          # ./t/autocompletion+test-no-parent-at-root-from-home on a bare
+          # daemon with no proxy anywhere near it - and failing the job here
+          # would throw away the only comparison worth making.
+          #
+          # What matters is whether the fleet CHANGES the answer, which is
+          # what scripts/parity.sh does locally and what the compare step
+          # below now does here.
+          EARTHLY_CONFIG="$RUNNER_TEMP/earthly.yml" \
+          EARTHLY_BUILDKIT_HOST="tcp://${LAN}:18372" \
+            earthly $EARTHLY_FLAGS "$TARGET" > /tmp/baseline.log 2>&1 || true
+          tail -40 /tmp/baseline.log
+          grep -ao "^[^ ]* \*failed\*" /tmp/baseline.log | sed 's/ \*failed\*//' \
+            | sort -u > /tmp/baseline.failed || true
+          echo "baseline failed targets: $(wc -l < /tmp/baseline.failed | tr -d ' ')"
+          echo "BASELINE_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
+
+      - name: through the fleet
+        working-directory: earthbuild
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          # Same tls_enabled: false as the baseline - the gateway speaks
+          # plain gRPC too.
+          printf 'global:\n  tls_enabled: false\n' > "$RUNNER_TEMP/earthly.yml"
+          # shellcheck disable=SC2086 # a flag LIST: word-splitting is the point
+          EARTHLY_CONFIG="$RUNNER_TEMP/earthly.yml" \
+          EARTHLY_BUILDKIT_HOST="tcp://${LAN}:1234" \
+            earthly $EARTHLY_FLAGS "$TARGET" > /tmp/fleet.log 2>&1 || true
+          tail -40 /tmp/fleet.log
+          grep -ao "^[^ ]* \*failed\*" /tmp/fleet.log | sed 's/ \*failed\*//' \
+            | sort -u > /tmp/fleet.failed || true
+          echo "fleet failed targets: $(wc -l < /tmp/fleet.failed | tr -d ' ')"
+          echo "FLEET_SECS=$((SECONDS - start))" >> "$GITHUB_ENV"
+
+      - name: did the fleet change the answer
+        run: |
+          set -euo pipefail
+          # The whole point. A target that fails BOTH ways is the machine's
+          # problem; a target that fails only with the fleet is ours; and a
+          # target that fails only WITHOUT it means the two runs were not
+          # comparable and the measurement is void.
+          if diff -u /tmp/baseline.failed /tmp/fleet.failed; then
+            n=$(wc -l < /tmp/baseline.failed | tr -d ' ')
+            echo "PARITY: the same $n target(s) failed either way"
+          else
+            echo "::error::the fleet changed the outcome - see the diff above"
+            exit 1
+          fi
+
+      - name: what the fleet actually did
+        if: always()
+        run: |
+          set -euo pipefail
+          kill -INT "$(cat /tmp/proxy.pid)" 2>/dev/null || true
+          for _ in $(seq 1 20); do
+            grep -q "^\[wire\] placed" /tmp/proxy.log && break
+            sleep 1
+          done
+          echo "=== solves, and how many could move"
+          grep -E '^\[wire\] (gateway solves|solves routed|built at home|placed|not routed)' \
+            /tmp/proxy.log || true
+          echo "=== which machine took what"
+          grep -oE -- '-> worker [0-9]+' /tmp/proxy.log | sort | uniq -c || true
+          echo "=== why the rest could not move"
+          grep -E '^\[wire\] not routed' /tmp/proxy.log || true
+          echo "=== wall"
+          echo "baseline ${BASELINE_SECS:-?}s   fleet ${FLEET_SECS:-?}s"
+          echo "NOTE: workers share this runner's cores, so the fleet column"
+          echo "measures OVERHEAD, not speedup. Dispatchability is the result."
+
+      - name: logs
+        if: always()
+        run: |
+          tail -100 /tmp/proxy.log || true
+          for f in /tmp/worker-*.log; do echo "=== $f"; tail -20 "$f"; done || true

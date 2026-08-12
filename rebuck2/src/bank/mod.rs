@@ -15,6 +15,7 @@
 //!   tar <store> <batch> <out>   deterministic USTAR of batch's relative paths
 //!   link <store> <paths> <dst>  hardlink (copy fallback) paths into dst
 //!   purge-failures <dir>        drop AC rows caching a non-zero exit
+//!   timings <verb> ...          record/read coarse per-target estimates
 //!   gen-store/gen-ac/gen-segments <dir> <n>   synthetic corpora for tests
 
 use std::collections::BTreeMap;
@@ -31,9 +32,11 @@ use crate::store::sha256_hex;
 pub mod ac;
 pub mod cas;
 pub mod dice;
+pub mod logstream;
 pub mod manifest;
 pub mod pack;
 pub mod publish;
+pub mod timings;
 
 /// A diff base: one id per line, or nothing at all. `/dev/null` and a
 /// missing file both mean "cold bank" - the callers pass either.
@@ -62,6 +65,24 @@ pub async fn run(args: &[String]) -> Result<()> {
         ["tar", store, batch, out] => tar(Path::new(store), Path::new(batch), Path::new(out)),
         ["link", store, paths, dst] => link(Path::new(store), Path::new(paths), Path::new(dst)),
         ["purge-failures", dir] => purge_failures(Path::new(dir)),
+        // Async, so it cannot live in `timings::cli` with the rest.
+        // Exit 3 = cold, as every other restore in here reports it.
+        ["timings", "restore", file, lineage, rest @ ..] => {
+            let got = timings::restore(
+                timings::Restore {
+                    table: Path::new(file),
+                    lineage,
+                    parent: rest.first().copied().filter(|p| !p.is_empty() && *p != "-"),
+                },
+                &bank_work(),
+            )
+            .await?;
+            if got.is_none() {
+                std::process::exit(3);
+            }
+            Ok(())
+        }
+        ["timings", rest @ ..] => timings::cli(rest),
         ["fetch-list", m, owned] => {
             let m = manifest::Manifest::read(Path::new(m))?;
             for s in m.segments_to_fetch(owned) {

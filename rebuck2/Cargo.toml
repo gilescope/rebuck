@@ -1,3 +1,9 @@
+[workspace]
+# The session crate is a sibling rather than a module: it speaks a protocol
+# that has nothing to do with dispatch, and anyone wanting to serve buildkit
+# attachables should be able to take it without taking a build scheduler.
+members = [".", "buildkit-session"]
+
 [package]
 name = "rebuck2"
 version = "0.0.0"
@@ -8,7 +14,20 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+# The peer-to-peer OCI mirror (`registry`). Principle 6 says the coordinator
+# is never on the data path, and this is the mechanism: a buildkitd pushes to
+# loopback and pulls from whichever peer built the thing.
+axum = "0.8"
 bazel-remote-apis = "0.27"
+# BuildKit's LLB wire types (pb::Op / ExecOp / Definition). The buildkit-
+# facing side of the fleet has to read what a subtree IS before deciding
+# whether it may travel. This crate rides bollard, tracks buildkit, and is
+# on the same prost/tonic 0.14 as everything else here - buildkit-proto,
+# the other candidate, has not moved since 2020.
+bollard-buildkit-proto = "0.8"
+# Serving buildkit session attachables to a peer. A sibling crate because it
+# speaks a protocol that has nothing to do with dispatch.
+buildkit-session = { path = "buildkit-session" }
 futures = "0.3"
 iroh = "1"
 postcard = { version = "1", features = ["use-std"] }
@@ -28,7 +47,22 @@ tokio-stream = "0.1"
 tonic = "0.14"
 # GitHub wraps every artifact in a zip, whatever we put inside it.
 zip = { version = "6", default-features = false, features = ["deflate"] }
+prost-types = "0.14"
+tonic-prost = "0.14"
+tower = { version = "0.5", features = ["util"] }
+hyper-util = { version = "0.1.20", features = ["server", "server-auto", "tokio"] }
+hyper = { version = "1.11.0", features = ["server", "http2"] }
+tower-service = "0.3.3"
+base64 = "0.23.1"
+
+[dev-dependencies]
+# `oneshot` on a Router: the registry's tests drive real HTTP requests
+# through the real router rather than calling handlers directly, so a
+# routing or method mistake shows up as a 404 in a test instead of in CI.
+tower = { version = "0.5", features = ["util"] }
 
 [[bin]]
 name = "rebuck2"
 path = "src/main.rs"
+
+[build-dependencies]

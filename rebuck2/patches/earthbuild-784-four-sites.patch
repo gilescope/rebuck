@@ -1,0 +1,32 @@
+diff --git a/earthfile2llb/converter.go b/earthfile2llb/converter.go
+index 82b1e390..9c12fd1b 100644
+--- a/earthfile2llb/converter.go
++++ b/earthfile2llb/converter.go
+@@ -2715,7 +2715,7 @@ func (c *Converter) internalRun(ctx context.Context, opts ConvertRunOpts) (pllb.
+ 			} else {
+ 				c.opt.Console.Warnf("failed to check LLBCaps for CapExecMountSock: %v", err) // keep going
+ 			}
+-		} else {
++		} else if c.opt.InteractiveDebuggerEnabled || isInteractive {
+ 			runOpts = append(
+ 				runOpts,
+ 				llb.SocketTarget("earthly_interactive", debuggercommon.DebuggerDefaultSocketPath, 0o666, 0, 0),
+@@ -2792,13 +2792,16 @@ func (c *Converter) internalRun(ctx context.Context, opts ConvertRunOpts) (pllb.
+ 		debuggerMount := pllb.AddMount(debuggerPath, pllb.Scratch(),
+ 			llb.HostBind(), llb.SourcePath("/usr/bin/earth_debugger"))
+ 
+-		runOpts = append(runOpts, debuggerSecretMount, debuggerMount)
++		if c.opt.InteractiveDebuggerEnabled || isInteractive {
++			runOpts = append(runOpts, debuggerSecretMount, debuggerMount)
++		}
++
+ 		if opts.WithSSH {
+ 			runOpts = append(runOpts, llb.AddSSHSocket())
+ 		}
+ 	}
+ 	// Shell and debugger wrap.
+-	prependDebugger := !opts.Locally
++	prependDebugger := !opts.Locally && (c.opt.InteractiveDebuggerEnabled || isInteractive)
+ 
+ 	if opts.WithShell {
+ 		finalArgs = opts.shellWrap(finalArgs, extraEnvVars, opts.WithShell, prependDebugger, isInteractive)

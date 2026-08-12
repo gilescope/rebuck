@@ -24,6 +24,20 @@ use crate::store::Store;
 pub struct WorkerCfg {
     pub session: String,
     pub slots: usize,
+    /// gRPC address of a buildkitd this worker may drive, and the loopback
+    /// mirror to publish results into. Both absent = this worker declines
+    /// every subtree offered to it, which is the correct answer rather than
+    /// a degraded one: the requester then builds it itself, exactly as it
+    /// would have without dispatch at all.
+    pub buildkit_addr: Option<String>,
+    pub registry_addr: Option<String>,
+    /// Serve a registry HERE, backed by the fleet.
+    ///
+    /// The piece that lets a worker live on its own machine. Its buildkitd
+    /// speaks OCI and cannot speak the mesh, so it needs a registry it can
+    /// reach; with one on localhost, a miss is answered by whichever machine
+    /// built the layer instead of by an HTTP host every daemon must route to.
+    pub registry_bind: Option<String>,
     pub scratch: std::path::PathBuf,
     pub connect_wait: Duration,
     /// Path to a JSON EndpointAddr for the driver (CI run artifact).
@@ -140,12 +154,31 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
     };
     println!("[worker] connected");
 
+    // What this worker can BUILD, which is its daemon's platform and not its
+    // host's. On macOS the host is darwin/arm64 and the daemon is
+    // linux/arm64, so a worker advertising the host is offered nothing at
+    // all - the driver filters every linux graph out as WrongPlatform and
+    // the fleet reports "took nothing" while looking perfectly healthy.
+    //
+    // Falls back to the host when there is no daemon to ask: such a worker
+    // takes REAPI actions only, and those really are host-platform.
+    let (os, arch) = match cfg.buildkit_addr.as_deref() {
+        Some(bk) => crate::solve::daemon_platforms(bk)
+            .await
+            .first()
+            .and_then(|p| p.split_once('/'))
+            .map(|(o, a)| (o.to_owned(), a.to_owned()))
+            .unwrap_or_else(|| (std::env::consts::OS.to_owned(), arch().to_owned())),
+        None => (std::env::consts::OS.to_owned(), arch().to_owned()),
+    };
+    println!("[worker] offering {os}/{arch}");
+
     let (mut ctrl_send, mut ctrl_recv) = conn.open_bi().await?;
     mesh::send_frame(
         &mut ctrl_send,
         &W2D::Hello {
-            os: std::env::consts::OS.into(),
-            arch: std::env::consts::ARCH.into(),
+            os: os.clone(),
+            arch: arch.clone(),
             slots: cfg.slots as u32,
             preloaded_shard: cfg.preloaded_shard,
         },
@@ -178,6 +211,24 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
         hits_driver: std::sync::atomic::AtomicU64::new(0),
     });
 
+    // A registry on this worker, backed by the fleet behind `blobs`.
+    if let Some(bind) = cfg.registry_bind.clone() {
+        let reg = crate::registry::MeshBacked::new(store.clone(), blobs.clone());
+        match bind.parse() {
+            Ok(addr) => {
+                tokio::spawn(async move {
+                    if let Err(e) = crate::registry::serve_with_upstream(addr, reg, None).await {
+                        eprintln!("[worker] registry died: {e:#}");
+                    }
+                });
+            }
+            // Loud, not fatal: without it this worker's daemon has nowhere to
+            // pull from and every lead will decline, which is correct but
+            // reads as a fleet that mysteriously refuses everything.
+            Err(e) => eprintln!("[worker] --registry-bind {bind:?} is not an address: {e}"),
+        }
+    }
+
     // Fetch-source stats: one line a minute (when changed) makes peer-serving
     // measurable rather than a matter of faith.
     {
@@ -186,7 +237,11 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
             use std::sync::atomic::Ordering::Relaxed;
             let mut last = (0, 0, 0);
             loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                // 15s, not 60. This only prints on CHANGE, so the cost of
+                // a short interval is nothing, and the cost of a long one is
+                // a 90-second build reporting no blob movement at all -
+                // indistinguishable from a fleet where none happened.
+                tokio::time::sleep(Duration::from_secs(15)).await;
                 let now = (
                     blobs.hits_local.load(Relaxed),
                     blobs.hits_peer.load(Relaxed),
@@ -212,23 +267,94 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
         let store = store.clone();
         let ctrl = ctrl_send.clone();
         tokio::spawn(async move {
-            let mut last_n = usize::MAX;
+            // Seeded ONCE from disk, then maintained by insertion. A bloom is
+            // additive - inserting sets bits and never clears them - so it
+            // never needs rebuilding from a directory walk. That walk is why
+            // the tick was 30 seconds, and 30 seconds is longer than the
+            // window in which a freshly-fetched share is worth anything.
+            let mut held: Vec<String> = store.list_hashes();
+            let mut bloom = mesh::Bloom::with_capacity(held.len().max(1024));
+            for h in &held {
+                bloom.insert(h);
+            }
+            let mut sized_for = held.len().max(1024);
+            let mut dirty = true;
             loop {
-                let hashes = store.list_hashes();
-                if hashes.len() != last_n {
-                    last_n = hashes.len();
-                    let mut bloom = mesh::Bloom::with_capacity(hashes.len());
-                    for h in &hashes {
+                // Drain what the store has gained since the last pass.
+                {
+                    let (lock, _) = &*crate::store::GAINED;
+                    if let Ok(mut g) = lock.lock() {
+                        if g.resync {
+                            // The cap was hit and records were dropped, so
+                            // the in-memory filter can no longer be trusted
+                            // to be complete. One walk, then incremental
+                            // again - the old behaviour as a fallback rather
+                            // than as the design.
+                            g.resync = false;
+                            g.hashes.clear();
+                            drop(g);
+                            held = store.list_hashes();
+                            sized_for = held.len().max(1024);
+                            bloom = mesh::Bloom::with_capacity(sized_for);
+                            for h in &held {
+                                bloom.insert(h);
+                            }
+                            dirty = true;
+                        } else if !g.hashes.is_empty() {
+                            for h in g.hashes.drain(..) {
+                                bloom.insert(&h);
+                                held.push(h);
+                            }
+                            dirty = true;
+                        }
+                    }
+                }
+                // RESIZE when the filter is past what it was sized for, or
+                // its false-positive rate climbs and peers start being asked
+                // for blobs they do not have. Sizing is 12 bits an element
+                // rounded to a power of two, so this happens O(log N) times
+                // across a whole run, not per tick.
+                if held.len() > sized_for {
+                    sized_for = held.len() * 2;
+                    bloom = mesh::Bloom::with_capacity(sized_for);
+                    for h in &held {
                         bloom.insert(h);
                     }
-                    if mesh::send_frame(&mut *ctrl.lock().await, &W2D::Holdings { bloom })
-                        .await
-                        .is_err()
+                }
+                if dirty {
+                    dirty = false;
+                    if mesh::send_frame(
+                        &mut *ctrl.lock().await,
+                        &W2D::Holdings {
+                            bloom: bloom.clone(),
+                        },
+                    )
+                    .await
+                    .is_err()
                     {
                         return;
                     }
                 }
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                // 30s WHEN IDLE, but woken the moment holdings change.
+                //
+                // The interval alone made the seed split fictional: a worker
+                // fetches its share, and for up to thirty seconds no peer can
+                // see it - which is longer than the whole fan-out window. So
+                // every worker fell back to the driver anyway, and the split
+                // cost N speculative fetches on top of the N-1 lazy ones it
+                // was meant to replace. Strictly worse than not splitting.
+                //
+                // A share that nobody can see has not been shared.
+                // Woken by a blob landing; the timer is only a safety net
+                // now that nothing depends on it for latency.
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    _ = crate::store::GAINED.1.notified() => {
+                        // Coalesce a burst: a hundred blobs arriving in a
+                        // second should be one gossip, not a hundred.
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
             }
         });
     }
@@ -250,6 +376,15 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
             Ok(frame) => match frame? {
                 Some(msg) => msg,
                 None => {
+                    // BOTH exits, not just the polite one. `D2W::Exit`
+                    // called this and a closed stream did not, so the serve
+                    // summary printed only when the driver got to say
+                    // goodbye - and in every fleet run so far it did not.
+                    // Every worker log this session ends on this line, which
+                    // is why SERVED_LOCAL_BYTES has never once reported the
+                    // local-versus-remote split it was built for.
+                    fetch_summary();
+                    crate::solve::worker_vertex_summary().await;
                     println!("[worker] driver closed control stream — done");
                     return Ok(());
                 }
@@ -257,6 +392,92 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
         };
         let (job, action) = match msg {
             D2W::Run { job, action } => (job, action),
+            // Answers to a subtree WE offered. Both are terminal, and both
+            // are normal: a peer built it and named where, or nobody took
+            // it and we build it ourselves - which is what we would have
+            // done without dispatch at all.
+            D2W::Placed { job, image_ref } => {
+                println!("[worker] subtree {job} placed, pull from {image_ref}");
+                continue;
+            }
+            // Fetch what will be wanted, before it is wanted.
+            //
+            // In the BACKGROUND and never blocking the control loop: this
+            // worker must stay able to take a Lead while it prefetches, or
+            // the mechanism costs exactly what it saves. Failures are
+            // dropped - a blob that does not arrive now arrives lazily
+            // later, which is what happens today.
+            D2W::Prefetch {
+                digests,
+                peers,
+                everyone,
+            } => {
+                let n = digests.len();
+                let blobs = blobs.clone();
+                tokio::spawn(async move {
+                    // Only this worker's share. Six workers pulling the same
+                    // layers off the coordinator at once is the herd
+                    // `seeder_for` exists to prevent - and a prefetch makes
+                    // it arrive EARLIER, so it would hurt more than the lazy
+                    // path it replaces.
+                    let mine = blobs.my_share(digests, &peers, everyone).await;
+                    let share = mine.len();
+                    let mut got = 0usize;
+                    // BEHIND the gate, not around each fetch: holding it for
+                    // the loop is what stops six announcements interleaving
+                    // into six concurrent pulls. Acquired after `my_share`
+                    // so a worker with nothing to do does not queue.
+                    let _lane = prefetch_gate().acquire().await;
+                    for d in mine {
+                        // `get` walks local, then peers by bloom, then the
+                        // driver - the same path a lazy fetch takes, so a
+                        // prefetch warms exactly what a build would have
+                        // pulled and nothing else.
+                        match exec::Blobs::get(&*blobs, &d).await {
+                            Ok(_) => got += 1,
+                            // NAMED, not counted. `prefetched 2/3` says one
+                            // blob did not arrive and nothing said which or
+                            // why - and run 31557310760 reported exactly
+                            // that on ten of the twelve seed announcements,
+                            // with 733 leads then failing to fetch content
+                            // this prefetch was supposed to have placed.
+                            //
+                            // The registry's own MISS line cannot cover
+                            // this: prefetch takes the mesh path directly
+                            // and never goes through the HTTP handler.
+                            Err(e) => {
+                                use std::sync::atomic::Ordering::Relaxed;
+                                PREFETCH_MISSES.fetch_add(1, Relaxed);
+                                PREFETCH_MISS_BYTES.fetch_add(d.size.max(0) as u64, Relaxed);
+                                println!(
+                                    "[worker] prefetch MISS {} ({} bytes): {e:#}",
+                                    d.hash, d.size
+                                );
+                            }
+                        }
+                    }
+                    println!("[worker] prefetched {got}/{share} of my share ({n} announced)");
+                    // No explicit wake needed: the store fires on every
+                    // blob it gains, so a fetched share announces itself.
+                });
+                continue;
+            }
+            D2W::Unplaced { job, why } => {
+                println!("[worker] subtree {job} unplaced ({why}) - building it here");
+                continue;
+            }
+            // An OFFER. Every refusal below is the protocol working, not a
+            // failure: the requester builds it itself, exactly as it would
+            // have without dispatch. Fail open, never fail wrong.
+            D2W::Lead {
+                job,
+                subtree,
+                frontier,
+            } => {
+                let reply = lead_reply(&cfg, &slots, job, &subtree, &frontier).await;
+                let _ = mesh::send_frame(&mut *ctrl_send.lock().await, &reply).await;
+                continue;
+            }
             D2W::Ping { vitals } => {
                 if let Some(v) = vitals {
                     println!("[driver-vitals] {v}");
@@ -264,6 +485,8 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                 continue;
             }
             D2W::Exit => {
+                fetch_summary();
+                crate::solve::worker_vertex_summary().await;
                 println!("[worker] driver said exit — done");
                 return Ok(());
             }
@@ -336,6 +559,31 @@ async fn serve_get(
         return Ok(());
     };
     match req {
+        // A registry asks by hash: buildkit's URL is the digest and the size
+        // is what the reply is meant to supply. Served only from what this
+        // worker holds - it does not walk the fleet on someone else's behalf.
+        // A worker answers tag lookups from its own registry store. This
+        // is what makes buildkit's registry cache usable across machines:
+        // the cache ref is a tag, one worker exported it, and the others
+        // have no way to find it otherwise.
+        BlobReq::TagGet(key) => {
+            let found = store.tag_get(&key).await;
+            mesh::send_frame(&mut send, &BlobResp::Tag(found)).await?;
+            send.finish().ok();
+        }
+        BlobReq::GetByHash(hash) => match store.get_by_hash(&hash).await {
+            Ok(Some(bytes)) => {
+                mesh::send_frame(
+                    &mut send,
+                    &BlobResp::Found {
+                        size: bytes.len() as u64,
+                    },
+                )
+                .await?;
+                send.write_all(&bytes).await?;
+            }
+            _ => mesh::send_frame(&mut send, &BlobResp::Missing).await?,
+        },
         BlobReq::Get(d) => {
             if store.has(&d).await {
                 mesh::send_frame(
@@ -406,6 +654,438 @@ async fn serve_get(
 /// Cacheability is the strict subset of the driver's rule (rpc.rs): exit
 /// 0 and not do_not_cache. `--cache-failures` dedupes failures WITHIN a
 /// lap on the driver; a banked failure row replays forever.
+/// Decide on an offered subtree and, if we take it, build it.
+///
+/// Split out of the control loop so the decision chain is readable in one
+/// place: the checks run in the order `dispatch::consider` defines, and the
+/// build only happens after all of them pass.
+// No explicit wake needed: the store fires on every
+// blob it gains, so a fetched share announces itself./// Which peer is responsible for pulling this blob from the driver first.
+///
+/// The seed is one machine wide today: the first worker to want the base
+/// finds nothing on any peer and pulls all of it from the coordinator - 75
+/// blobs against 3 from peers, measured - while the others wait. The cascade
+/// behind that works (the next worker got 26 of 36 from peers); it is the
+/// SEED that does not spread.
+///
+/// So each blob is assigned an owner by its own hash. Six workers then take
+/// six different sixths off the coordinator at once and exchange the rest.
+/// No coordination: every worker computes the same answer from the same
+/// inputs, which is the only reason two of them do not fetch the same blob.
+///
+/// Sorted first, so the answer cannot depend on the order a peer map happens
+/// to iterate in - that would defeat the agreement it exists to provide.
+// Not yet wired. The requesting side is easy; the SERVING side is the part
+// that matters and it needs a driver handle threaded into `serve_get`, which
+// today deliberately holds only the store ("it does not walk the fleet on
+// someone else's behalf"). Fetch-through to the DRIVER only is loop-free and
+// is what the split needs - but warming attacks the same 192s chain more
+// simply, so this waits on that result rather than both landing at once.
+#[allow(dead_code)]
+/// How many prefetch fetches a worker runs at once.
+///
+/// ONE, and the reason is principle 18's last clause: a prefetch must never
+/// block the taker. Each announcement spawns its own task, so a build that
+/// publishes six subtrees in a minute has six loops pulling megabytes
+/// through the same store the real fetches use - and the real fetch is the
+/// one somebody is waiting on.
+///
+/// Serialising them costs nothing that matters. Pre-positioning is
+/// speculative by construction: arriving second is the whole point, and a
+/// prefetch that loses a race to the build it was warming has still done no
+/// harm.
+fn prefetch_permits(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1)
+}
+
+/// The permits themselves, shared by every prefetch task in the process.
+fn prefetch_gate() -> &'static Semaphore {
+    static G: std::sync::OnceLock<Semaphore> = std::sync::OnceLock::new();
+    G.get_or_init(|| {
+        Semaphore::new(prefetch_permits(
+            std::env::var("REBUCK2_PREFETCH_LANES").ok().as_deref(),
+        ))
+    })
+}
+
+/// Which of these blobs is this worker's to fetch.
+///
+/// `broadcast` is the question the announcement should already have
+/// answered. The driver only announces content with two or more consumers,
+/// and splitting THAT one-way means it is pre-positioned for one machine and
+/// still arrives lazily, on the critical path, for the rest - the same total
+/// transfer with most of it back where prefetch exists to remove it.
+///
+/// Splitting is still right for the herd it was written against, and
+/// `seeder_for` spreads the SOURCE per blob either way, so a broadcast pulls
+/// each blob from a different peer rather than stampeding one.
+///
+/// Alone, both answers are everything. A prefetch that quietly does nothing
+/// when there is nobody to split with fails at the moment it matters most.
+pub fn share_of(hashes: &[String], ids: &[String], me: &str, broadcast: bool) -> Vec<String> {
+    if ids.len() <= 1 {
+        return hashes.to_vec();
+    }
+    if broadcast {
+        // EVERYTHING, but this worker's seeder share FIRST - which is what
+        // the paragraph above has always claimed and what the code did not
+        // do. Returning early here skipped `seeder_for` entirely, so six
+        // workers asked for six copies of every blob at once, no peer held
+        // any of them yet, and all six went to the driver together. Run
+        // 31557310760 moved ~24 GiB across the mesh that way and still lost
+        // one blob in three.
+        //
+        // Ordering costs nothing and changes nothing about WHAT is fetched.
+        // Each worker pulls the blobs it owns from the driver; by the time
+        // it asks for the rest, the machines that owned those have them and
+        // the bloom says so. One source per blob, which is the promise.
+        let (mine, rest): (Vec<String>, Vec<String>) = hashes
+            .iter()
+            .cloned()
+            .partition(|h| seeder_for(h, ids).as_deref() == Some(me));
+        return mine.into_iter().chain(rest).collect();
+    }
+    hashes
+        .iter()
+        .filter(|h| seeder_for(h, ids).as_deref() == Some(me))
+        .cloned()
+        .collect()
+}
+
+/// Whether an announcement goes to every worker or is split between them.
+///
+/// OFF by default: it changes what the fleet transfers, and the run that
+/// would first show it also carries the prefetch fix that made announcements
+/// non-empty at all. One variable.
+pub fn prefetch_broadcast() -> bool {
+    std::env::var("REBUCK2_PREFETCH_ALL").as_deref() == Ok("1")
+}
+
+fn seeder_for(hash: &str, peers: &[String]) -> Option<String> {
+    if peers.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<&String> = peers.iter().collect();
+    sorted.sort();
+    // The digest's TRAILING hex digits, in order. The first version reversed
+    // them, which puts the least-variable digits in the low bits - over 1200
+    // synthetic hashes that sent almost everything to one worker, and the
+    // spread test caught it.
+    let tail = &hash[hash.len().saturating_sub(8)..];
+    let n = u64::from_str_radix(tail, 16).unwrap_or(0);
+    Some(sorted[(n % sorted.len() as u64) as usize].clone())
+}
+
+/// How a nested build should reach the daemon on THIS machine, if it should.
+///
+/// `None` leaves the graph alone, which means a nested earthly keeps dialling
+/// whatever the coordinator forwarded. Off by default like every other
+/// mechanism here: it changes the cache key of any RUN that carries the
+/// variable, so a forwarded RUN stops merging across machines - a real cost
+/// that has to be measured against the funnel it removes rather than assumed
+/// smaller.
+///
+/// Not loopback. earthly's `IsLocal` treats 127.0.0.1 as "a buildkit I
+/// manage" and tries to start its own container from an image that is not
+/// published, so the nested build dies on `manifest unknown` before it
+/// solves anything.
+fn nested_host(enabled: bool, override_addr: Option<&str>, mine: Option<&str>) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let addr = override_addr.or(mine)?;
+    let addr = addr.strip_prefix("tcp://").unwrap_or(addr);
+    let host = addr.split(':').next().unwrap_or(addr);
+    (!host.is_empty() && host != "127.0.0.1" && host != "localhost" && host != "::1")
+        .then(|| format!("tcp://{addr}"))
+}
+
+async fn lead_reply(
+    cfg: &WorkerCfg,
+    slots: &Arc<Semaphore>,
+    job: u64,
+    subtree: &[u8],
+    frontier: &[Dig],
+) -> W2D {
+    use prost::Message;
+
+    let decline = |why: String| W2D::Decline { job, why };
+
+    // Configured to build at all? Absent daemon is a decline, not an error:
+    // this worker simply lends CPU to REAPI actions and nothing else.
+    let (Some(bk), Some(reg)) = (&cfg.buildkit_addr, &cfg.registry_addr) else {
+        return decline("no buildkitd configured on this worker".into());
+    };
+
+    let Ok(def) = bollard_buildkit_proto::pb::Definition::decode(subtree) else {
+        return decline("subtree is not a buildkit Definition".into());
+    };
+
+    // Re-check what the offerer already checked. One pass over the ops, and
+    // a bug on their side cannot ship us a secret or a cache mount.
+    let verdict = crate::dispatch::inspect(&def);
+    let load = crate::dispatch::Load {
+        slots: cfg.slots,
+        peer: 0,
+        driver: cfg.slots - slots.available_permits(),
+    };
+    // The same platform we advertised, not the host's: re-checking against
+    // the host would refuse exactly the work we said we could take.
+    let me = match cfg.buildkit_addr.as_deref() {
+        Some(bk) => crate::solve::daemon_platforms(bk)
+            .await
+            .first()
+            .cloned()
+            .unwrap_or_else(|| format!("{}/{}", std::env::consts::OS, arch())),
+        None => format!("{}/{}", std::env::consts::OS, arch()),
+    };
+    // The fleet's policy, not this worker's opinion. Three components ask
+    // this question - the gateway before offering, the driver before
+    // choosing a peer, and here - and for a while they asked three different
+    // versions of it: the first two agreed to route a cache-mount subtree
+    // and the worker refused every offer of it.
+    if let Err(why) = crate::dispatch::consider(load, &verdict, &me, crate::dispatch::policy()) {
+        return decline(format!("{why:?}"));
+    }
+
+    // Hold a slot for the duration, so this worker's load is honest while
+    // it builds and the next offer is declined rather than over-committed.
+    let Ok(_permit) = slots.acquire().await else {
+        return decline("worker shutting down".into());
+    };
+    println!(
+        "[worker] leading subtree job {job}: {} ops, {} frontier blobs",
+        verdict.ops,
+        frontier.len()
+    );
+    // Where does a lead's time GO?
+    //
+    // 84 leads at ~24s each is most of the 383s by which six machines lose
+    // to one, and three remedies have now been aimed at that number without
+    // anyone knowing what is inside it. A lead is: the daemon fetching what
+    // it needs (base, context, cache), then executing, then pushing the
+    // result. Those have very different fixes and the report cannot tell
+    // them apart.
+    //
+    // `fetched` is what THIS worker's registry served during the build -
+    // the mirror hop, which is the difference between a worker and home.
+    // The DISTRIBUTION is the discriminator, and it needs nothing but a
+    // clock. If the first lead on a worker is slow and the rest are quick,
+    // the cost is a cold cache paid once per machine. If every lead costs
+    // the same, it is per-lead overhead - a mirror hop, or earthly's own
+    // per-solve work paid 84 times instead of inline - and no amount of
+    // cache seeding touches it.
+    //
+    // Three remedies have been aimed at this without anyone knowing which
+    // shape it has.
+    // FETCH versus EXECUTE, which is the split every remedy so far has been
+    // chosen without.
+    //
+    // This worker's registry is in THIS process and serves its daemon's
+    // pulls, so the bytes it hands out during a lead are exactly the mirror
+    // hop - the inputs a worker must fetch where home reads its own content
+    // store. Sampling the counter either side attributes them per lead.
+    //
+    // It is not a clean fetch/execute split: buildkit interleaves the two.
+    // But bytes-per-lead beside duration-per-lead distinguishes "this lead
+    // moved 400MB" from "this lead computed for 90 seconds", and those want
+    // opposite fixes.
+    let bytes_before = crate::registry::SERVED_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    let serve_ms_before = crate::registry::SERVED_MS.load(std::sync::atomic::Ordering::Relaxed);
+    let t = std::time::Instant::now();
+    // Point any nested earthly at THIS machine's daemon before handing the
+    // graph over. earthly forwards its own BUILDKIT_HOST into every RUN, and
+    // in a fleet that address is the coordinator's - so a nested build here
+    // would dial back across the network and re-enter through one gateway.
+    //
+    // Only the worker can do this. The converter runs before placement and
+    // cannot know which machine will execute the op, and earthly's own
+    // machine-independent constant (tcp://buildkitsandbox:8372) resolves for
+    // most execs but not for `--privileged --entrypoint` ones, where the
+    // nested earthly dies on `could not connect to buildkit: timeout 1m0s`.
+    let def = match nested_host(
+        std::env::var("REBUCK2_LOCAL_NESTED").as_deref() == Ok("1"),
+        std::env::var("REBUCK2_NESTED_HOST").ok().as_deref(),
+        cfg.buildkit_addr.as_deref(),
+    ) {
+        Some(addr) => {
+            crate::mech::applied("local_nested");
+            crate::dispatch::retarget_buildkit_host(&def, &addr)
+        }
+        None => def,
+    };
+    let out = crate::solve::build_subtree(bk, reg, job, def).await;
+    let moved =
+        crate::registry::SERVED_BYTES.load(std::sync::atomic::Ordering::Relaxed) - bytes_before;
+    // SERVING ms beside the bytes, because the two together split a number
+    // that was doing two jobs.
+    //
+    // READ IT RIGHT. This registry is started with no upstream and its only
+    // client is the buildkitd on this box, so `moved` is LOOPBACK: bytes out
+    // of this worker's own store, not bytes off the network. Over 414 leads
+    // it correlates with lead duration at r = 0.06 - it is a measure of how
+    // much buildkit re-materialised, which is worth knowing and is not a
+    // transport cost. What crosses the wire is `[cas] fetches: peer/driver`,
+    // and that ran to a few hundred fetches for the whole run.
+    let served_ms =
+        crate::registry::SERVED_MS.load(std::sync::atomic::Ordering::Relaxed) - serve_ms_before;
+    let build_ms = t.elapsed().as_millis() as u64;
+    println!(
+        "[worker] job {job} took {build_ms}ms ({} ops, {} KiB fetched in {served_ms}ms)",
+        verdict.ops,
+        moved / 1024
+    );
+    match out {
+        Ok(image_ref) => W2D::Led {
+            job,
+            image_ref,
+            build_ms,
+        },
+        // A failed subtree is the requester's to rebuild. Reporting it as a
+        // decline rather than swallowing it is what stops them waiting.
+        Err(e) => {
+            // Did the DAEMON survive the attempt?
+            //
+            // earthly's buildkit fork nil-derefs on the error path for
+            // `no active sessions` (llbsolver.(*resultProxy).wrapError,
+            // bridge.go:318) and takes the whole daemon with it. Measured:
+            // three worker daemons dead inside a minute, while all three
+            // workers stayed in the fleet advertising slots and accepting
+            // leads they could no longer build.
+            //
+            // A worker with no daemon is not a slow worker, it is a hole
+            // that silently eats every subtree the driver sends it. Leaving
+            // is the honest move: the mesh connection drops, the driver
+            // stops offering, and the requester builds at home.
+            if crate::solve::daemon_platforms(bk).await.is_empty() {
+                eprintln!(
+                    "[worker] buildkit at {bk} is gone after job {job} - taking no more \
+                     work. Last error: {e:#}"
+                );
+                // Close the slots. Every later offer then declines through
+                // the `acquire` above, which is the mechanism that already
+                // existed for a worker that cannot build.
+                //
+                // Closing rather than EXITING, deliberately: this worker's
+                // registry still holds blobs the fleet may want, and a
+                // process that leaves takes them with it. It stops building
+                // and keeps serving.
+                slots.close();
+                return decline(format!("build failed and daemon died: {e:#}"));
+            }
+            decline(format!("build failed: {e:#}"))
+        }
+    }
+}
+
+/// `std::env::consts::ARCH` in the spelling buildkit platforms use.
+/// One line saying where this worker's time went.
+///
+/// Bytes SERVED, which on this worker means loopback: the registry has no
+/// upstream and its only client is the buildkitd beside it. The rate is
+/// still worth having - it is what re-materialising costs - but it is not
+/// what the fleet moved, and reading it as transport is the mistake that
+/// produced a retracted principle. See the correction in fleet-findings.
+///
+/// The per-lead line carries both, but forty of those need adding up before
+/// they say anything. This is the total, once, where a reader will find it.
+/// Blobs a prefetch announced and failed to fetch, and how many bytes they
+/// were.
+///
+/// A COUNTER as well as the per-blob line, because the per-blob lines are
+/// printed early - prefetch runs at the front of a leg - and the workflow
+/// greps the worker log with `tail -30`. A diagnostic that scrolls off the
+/// end of the thing that reads it is a diagnostic nobody sees.
+pub static PREFETCH_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static PREFETCH_MISS_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn fetch_summary() {
+    use std::sync::atomic::Ordering::Relaxed;
+    // FIRST, because it is the one that fails a build. Everything below is
+    // accounting; this is a lead that could not start.
+    let missed = PREFETCH_MISSES.load(Relaxed);
+    if missed > 0 {
+        println!(
+            "[worker] prefetch missed {missed} blob(s), {} MiB - each one is content \
+             a lead may then fail to fetch on its own",
+            PREFETCH_MISS_BYTES.load(Relaxed) / 1_048_576
+        );
+    } else {
+        println!("[worker] prefetch missed nothing");
+    }
+    let bytes = crate::registry::SERVED_BYTES.load(Relaxed);
+    let ms = crate::registry::SERVED_MS.load(Relaxed);
+    if bytes == 0 {
+        println!("[worker] served nothing - every input was already here");
+        return;
+    }
+    let mib = bytes as f64 / 1048576.0;
+    // LOCAL against REMOTE. This registry binds 0.0.0.0, so its clients are
+    // the buildkitd beside it and any peer wanting a result - one number for
+    // two very different costs. Asserting the total was loopback, on the
+    // strength of the registry having no UPSTREAM, was wrong twice over: that
+    // field says where it fetches, not who it serves.
+    let local = crate::registry::SERVED_LOCAL_BYTES.load(Relaxed);
+    println!(
+        "[worker] of that, {} MiB went to a client on this box and {} MiB left it",
+        local / 1_048_576,
+        bytes.saturating_sub(local) / 1_048_576,
+    );
+    println!(
+        "[worker] served {mib:.0} MiB in {ms}ms ({:.1} MB/s from this registry - \
+         the REST of a lead's time is unpack)",
+        if ms > 0 {
+            mib / (ms as f64 / 1000.0)
+        } else {
+            0.0
+        }
+    );
+    // DISTINCT against SERVED, which is the whole question a total cannot
+    // answer. The coordinator's registry reported 17 blobs over a megabyte
+    // and 277 MiB distinct while the fleet served 25,658 MiB - so the volume
+    // is not volume, it is the same seventeen artifacts handed out again and
+    // again. The workers never printed their own version of that line: the
+    // registry only reports it on ctrl-c, and a worker exits when the
+    // coordinator goes.
+    let big = crate::registry::BIG_BLOBS.lock().expect("blob sizes");
+    if big.is_empty() {
+        return;
+    }
+    let distinct: u64 = big.values().map(|(n, _)| *n).sum();
+    let served: u64 = big.values().map(|(n, c)| n * c).sum();
+    let mut v: Vec<(&String, &(u64, u64))> = big.iter().collect();
+    v.sort_by_key(|(_, (n, c))| std::cmp::Reverse(n * c));
+    println!(
+        "[worker] {} blobs over 1MiB: {} MiB distinct, {} MiB served ({:.0}x re-served)",
+        v.len(),
+        distinct / 1_048_576,
+        served / 1_048_576,
+        if distinct > 0 {
+            served as f64 / distinct as f64
+        } else {
+            0.0
+        }
+    );
+    for (d, (n, c)) in v.into_iter().take(5) {
+        println!(
+            "[worker]   {:>6} MiB x{:<4} {}",
+            n / 1_048_576,
+            c,
+            &d[..24.min(d.len())]
+        );
+    }
+}
+
+fn arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    }
+}
+
 async fn record_local_ac(store: &Store, action_hash: &str, outcome: &exec::Outcome) {
     if outcome.do_not_cache || outcome.action_result.exit_code != 0 {
         return;
@@ -473,6 +1153,55 @@ struct RemoteBlobs {
 }
 
 impl RemoteBlobs {
+    /// Of these blobs, the ones THIS worker is responsible for seeding.
+    ///
+    /// Without this, a prefetch announced to six workers makes six workers
+    /// pull the same layers off the coordinator at once - the thundering
+    /// herd that `seeder_for` exists to prevent, arriving earlier and
+    /// therefore hurting more. Each worker takes its own share; the rest
+    /// reach it from peers, at six times the width, which is principle 16.
+    async fn my_share(&self, digests: Vec<Dig>, fleet: &[String], everyone: bool) -> Vec<Dig> {
+        // The DRIVER's list, not this worker's gossip. Computed locally the
+        // shares do not partition: two workers with different peer sets both
+        // claim some blobs and neither claims others, so the split leaves
+        // gaps and duplicates simultaneously. Falls back to gossip only if
+        // the driver sent nothing.
+        let ids: Vec<String> = if fleet.is_empty() {
+            let p = self.peers.lock().await;
+            let mut v: Vec<String> = p.keys().cloned().collect();
+            if !v.contains(&self.my_id) {
+                v.push(self.my_id.clone());
+            }
+            v
+        } else {
+            fleet.to_vec()
+        };
+        // Alone, or before any gossip has arrived, "my share" is everything -
+        // there is nobody to split with, and fetching nothing would make the
+        // prefetch silently do nothing at exactly the moment it is most
+        // needed.
+        // One policy, in `share_of`, so the broadcast case is testable
+        // without a fleet - and so "alone means everything" is stated once
+        // rather than in each branch.
+        let want: std::collections::BTreeSet<String> = share_of(
+            &digests.iter().map(|d| d.hash.clone()).collect::<Vec<_>>(),
+            &ids,
+            &self.my_id,
+            // Either the SENDER said this is wanted everywhere - a cache
+            // seed - or the operator asked for broadcast globally.
+            everyone || prefetch_broadcast(),
+        )
+        .into_iter()
+        .collect();
+        if prefetch_broadcast() && ids.len() > 1 {
+            crate::mech::applied("prefetch_broadcast");
+        }
+        digests
+            .into_iter()
+            .filter(|d| want.contains(&d.hash))
+            .collect()
+    }
+
     async fn upload_bytes(&self, d: &Dig, bytes: &[u8]) -> Result<()> {
         let (mut send, mut recv) = self.conn.open_bi().await?;
         mesh::send_frame(&mut send, &BlobReq::Put(d.clone())).await?;
@@ -500,6 +1229,136 @@ impl RemoteBlobs {
         match resp {
             BlobResp::PutOk => Ok(()),
             other => bail!("blob put rejected: {other:?}"),
+        }
+    }
+
+    /// `BlobReq::GetByHash` against one peer, dialled directly.
+    /// BOUNDED, in two places - see [`mesh::PEER_BLOB_TIMEOUT`] and
+    /// [`mesh::PEER_BLOB_BULK_TIMEOUT`].
+    ///
+    /// This had no timeout at all while the driver's twin had one, which is
+    /// two different wrong answers to the same question: unbounded, a dead
+    /// peer hangs this worker's registry and therefore its daemon's blob
+    /// GET; bounded by a single short constant, no large blob can ever
+    /// arrive. Seeding makes both matter, because it is exactly the case
+    /// where workers fetch hundreds of megabytes from each other.
+    async fn fetch_by_hash_from(&self, endpoint: &str, hash: &str) -> Result<Vec<u8>> {
+        let id: iroh::EndpointId = endpoint
+            .parse()
+            .map_err(|_| anyhow::anyhow!("bad provider endpoint {endpoint:?} for {hash}"))?;
+        let (mut recv, resp) = tokio::time::timeout(mesh::PEER_BLOB_TIMEOUT, async {
+            let conn = self.ep.connect(id, mesh::ALPN).await?;
+            let (mut send, mut recv) = conn.open_bi().await?;
+            mesh::send_frame(&mut send, &BlobReq::GetByHash(hash.to_owned())).await?;
+            send.finish()?;
+            let resp = mesh::recv_frame::<BlobResp>(&mut recv)
+                .await?
+                .context("provider closed blob stream")?;
+            Ok::<_, anyhow::Error>((recv, resp))
+        })
+        .await
+        .with_context(|| format!("provider {endpoint} did not answer for {hash} in time"))??;
+        match resp {
+            BlobResp::Found { size } => Ok(tokio::time::timeout(
+                mesh::PEER_BLOB_BULK_TIMEOUT,
+                mesh::recv_raw(&mut recv, size),
+            )
+            .await
+            .with_context(|| format!("provider {endpoint} stalled sending {hash}"))??),
+            other => bail!("provider {endpoint} for {hash}: {other:?}"),
+        }
+    }
+
+    /// Ask ONE peer to resolve a tag.
+    ///
+    /// A tag cannot be bloom-routed: a bloom filter answers "do you hold
+    /// this content hash", and a tag is a name whose content is exactly what
+    /// we are trying to learn. So this asks, rather than knowing where to.
+    async fn tag_from(&self, endpoint: &str, key: &str) -> Result<Option<String>> {
+        let id: iroh::EndpointId = endpoint
+            .parse()
+            .map_err(|_| anyhow::anyhow!("bad peer endpoint {endpoint:?} for tag {key}"))?;
+        let conn = self.ep.connect(id, mesh::ALPN).await?;
+        let (mut send, mut recv) = conn.open_bi().await?;
+        mesh::send_frame(&mut send, &BlobReq::TagGet(key.to_owned())).await?;
+        send.finish()?;
+        match mesh::recv_frame::<BlobResp>(&mut recv)
+            .await?
+            .context("peer closed tag stream")?
+        {
+            BlobResp::Tag(found) => Ok(found),
+            // A peer too old to know TagGet answers Err. That is a miss,
+            // not a fault: mixed-version fleets are the normal case during
+            // a rollout.
+            BlobResp::Err(_) => Ok(None),
+            other => bail!("peer {endpoint} for tag {key}: {other:?}"),
+        }
+    }
+
+    /// The same question to the driver, on the connection we already hold.
+    async fn tag_driver(&self, key: &str) -> Result<Option<String>> {
+        let (mut send, mut recv) = self.conn.open_bi().await?;
+        mesh::send_frame(&mut send, &BlobReq::TagGet(key.to_owned())).await?;
+        send.finish()?;
+        match mesh::recv_frame::<BlobResp>(&mut recv)
+            .await?
+            .context("driver closed tag stream")?
+        {
+            BlobResp::Tag(found) => Ok(found),
+            BlobResp::Err(_) => Ok(None),
+            other => bail!("driver for tag {key}: {other:?}"),
+        }
+    }
+
+    /// The same question to the driver, on the connection we already hold.
+    ///
+    /// Names this worker, so the driver can answer `Provider` and point at a
+    /// peer that has since acquired the blob. Its view of who holds what is
+    /// fresher than ours: it collects every worker's bloom, and we act on the
+    /// last copy it broadcast. On a cold fleet that difference is most of the
+    /// coordinator's traffic - measured driver=47 against peer=5 per worker.
+    async fn fetch_by_hash_driver(&self, hash: &str) -> Result<Vec<u8>> {
+        let (mut send, mut recv) = self.conn.open_bi().await?;
+        mesh::send_frame(
+            &mut send,
+            &BlobReq::GetByHashAs {
+                hash: hash.to_owned(),
+                me: self.my_id.clone(),
+            },
+        )
+        .await?;
+        send.finish()?;
+        match mesh::recv_frame::<BlobResp>(&mut recv)
+            .await?
+            .context("driver closed blob stream")?
+        {
+            BlobResp::Found { size } => Ok(mesh::recv_raw(&mut recv, size).await?),
+            // Sent to a peer instead. Try it, and fall back to asking the
+            // driver for the BYTES if that fails.
+            //
+            // The fallback is not optional: a bloom lies in the "have it"
+            // direction, so the driver can name a peer that does not have the
+            // blob. Without this, one false positive turns a fetch into a
+            // failed build - the trade for taking the coordinator off the
+            // data path.
+            BlobResp::Provider { endpoint } => {
+                if let Ok(bytes) = self.fetch_by_hash_from(&endpoint, hash).await {
+                    self.hits_peer
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(bytes);
+                }
+                let (mut send, mut recv) = self.conn.open_bi().await?;
+                mesh::send_frame(&mut send, &BlobReq::GetByHash(hash.to_owned())).await?;
+                send.finish()?;
+                match mesh::recv_frame::<BlobResp>(&mut recv)
+                    .await?
+                    .context("driver closed blob stream on fallback")?
+                {
+                    BlobResp::Found { size } => Ok(mesh::recv_raw(&mut recv, size).await?),
+                    other => bail!("driver fallback for {hash}: {other:?}"),
+                }
+            }
+            other => bail!("driver for {hash}: {other:?}"),
         }
     }
 
@@ -571,6 +1430,67 @@ impl RemoteBlobs {
             }
         }
         Ok(unfetched)
+    }
+}
+
+/// The fleet, as a registry sees it.
+///
+/// `exec::Blobs` needs a `Dig` because REAPI always knows the size; a
+/// registry only ever has the hash. Same walk - ours, then a peer the bloom
+/// claims, then the driver - asked the one way a registry can ask.
+#[async_trait::async_trait]
+impl crate::registry::FleetBlobs for RemoteBlobs {
+    async fn by_hash(&self, hash: &str) -> Option<Vec<u8>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Ok(Some(b)) = self.store.get_by_hash(hash).await {
+            self.hits_local.fetch_add(1, Relaxed);
+            return Some(b);
+        }
+        let candidates: Vec<String> = {
+            let peers = self.peers.lock().await;
+            peers
+                .iter()
+                .filter(|(id, b)| **id != self.my_id && b.contains(hash))
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for who in &candidates {
+            if let Ok(bytes) = self.fetch_by_hash_from(who, hash).await {
+                self.hits_peer.fetch_add(1, Relaxed);
+                return Some(bytes);
+            }
+        }
+        // The driver last. It holds what the gateway mirrored - bases and
+        // published contexts - which a worker needs and no peer built.
+        let bytes = self.fetch_by_hash_driver(hash).await.ok()?;
+        self.hits_driver.fetch_add(1, Relaxed);
+        Some(bytes)
+    }
+
+    async fn tag(&self, key: &str) -> Option<String> {
+        // The DRIVER first, and this is the opposite order to `by_hash`.
+        //
+        // Blobs go peer-first because a bloom filter says which peer has
+        // them and the driver should carry as little as possible. A tag has
+        // no bloom, so peer-first means asking every worker in turn for
+        // something most of them do not have - N dials to learn one string,
+        // on the critical path of every cache lookup.
+        //
+        // The driver is one dial on a connection already open, and for the
+        // cache ref specifically it is the likeliest holder anyway.
+        if let Ok(Some(h)) = self.tag_driver(key).await {
+            return Some(h);
+        }
+        let peers: Vec<String> = {
+            let p = self.peers.lock().await;
+            p.keys().filter(|id| **id != self.my_id).cloned().collect()
+        };
+        for who in &peers {
+            if let Ok(Some(h)) = self.tag_from(who, key).await {
+                return Some(h);
+            }
+        }
+        None
     }
 }
 
@@ -809,6 +1729,242 @@ async fn sync_shard(
 
 #[cfg(test)]
 mod tests {
+    /// Under broadcast, a worker takes every blob but takes ITS OWN first.
+    ///
+    /// `share_of`'s comment has always claimed that `seeder_for` spreads the
+    /// source per blob "either way, so a broadcast pulls each blob from a
+    /// different peer rather than stampeding one". It did not: the broadcast
+    /// branch returned before `seeder_for` was reached, so six workers asked
+    /// for six copies of everything at once, no peer held any of it yet, and
+    /// all six went to the driver together.
+    ///
+    /// Ordering fixes it without changing what is fetched. Each worker pulls
+    /// the blobs it is the seeder for from the driver, and by the time it
+    /// asks for the rest, the machines that owned those have them and the
+    /// bloom says so.
+    #[test]
+    fn broadcast_takes_everything_but_its_own_share_first() {
+        let ids: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        // Real-shaped digests: `seeder_for` reads the trailing eight hex
+        // digits, so the tails have to differ.
+        let hashes: Vec<String> = (0..9u32)
+            .map(|i| format!("{:064x}", 0x1000_0000u64 + u64::from(i)))
+            .collect();
+
+        for me in &ids {
+            let got = super::share_of(&hashes, &ids, me, true);
+            assert_eq!(
+                got.len(),
+                hashes.len(),
+                "broadcast still means everything - ordering is the only change"
+            );
+            assert_eq!(
+                got.iter().collect::<std::collections::BTreeSet<_>>(),
+                hashes.iter().collect::<std::collections::BTreeSet<_>>(),
+                "same set, reordered"
+            );
+
+            let mine = super::share_of(&hashes, &ids, me, false);
+            assert!(!mine.is_empty(), "test needs this worker to own something");
+            // Everything this worker seeds comes before anything it does not.
+            let last_own = got.iter().rposition(|h| mine.contains(h)).unwrap();
+            assert_eq!(
+                last_own,
+                mine.len() - 1,
+                "the seeder share must be a prefix, or the driver is still \
+                 asked for blobs a peer is about to have"
+            );
+        }
+    }
+
+    /// Splitting an announcement defeats what the announcement is for.
+    ///
+    /// `my_share` gives each blob to exactly ONE worker, chosen by
+    /// `seeder_for`. For content the driver has already established has two
+    /// or more consumers, that means the bytes are pre-positioned on one
+    /// machine and still arrive lazily, on the critical path, for every
+    /// other machine that wants them. Same total transfer, most of it moved
+    /// back to where prefetch exists to remove it - principle 18 says
+    /// pre-position layers against work that has not started, and a
+    /// one-in-six share does that for one machine in six.
+    ///
+    /// The split's stated purpose is avoiding a herd on the coordinator, and
+    /// `seeder_for` already spreads the SOURCE per blob - so a broadcast can
+    /// pull each blob from a different peer without any herd at all.
+    #[test]
+    fn a_broadcast_reaches_every_worker_and_a_share_reaches_one() {
+        let ids: Vec<String> = ["a", "b", "c"].iter().map(|s| (*s).to_owned()).collect();
+        let hashes: Vec<String> = (0..30u64)
+            .map(|i| format!("{:064x}", i.wrapping_mul(2_654_435_761)))
+            .collect();
+
+        // Shared: every worker takes every blob.
+        for me in &ids {
+            let got = super::share_of(&hashes, &ids, me, true);
+            assert_eq!(got.len(), hashes.len(), "{me} takes all of it");
+        }
+
+        // Split: the shares partition - no gaps, no duplicates. That is the
+        // property worth keeping, and the reason the driver's peer list is
+        // used rather than each worker's own gossip.
+        let mut seen: Vec<String> = Vec::new();
+        for me in &ids {
+            seen.extend(super::share_of(&hashes, &ids, me, false));
+        }
+        seen.sort();
+        let mut want = hashes.clone();
+        want.sort();
+        assert_eq!(seen, want, "every blob claimed exactly once");
+
+        // Alone, both policies are the same and neither may return nothing:
+        // a prefetch that silently does nothing when there is nobody to
+        // split with fails at the moment it is most needed.
+        let solo = vec!["a".to_owned()];
+        assert_eq!(
+            super::share_of(&hashes, &solo, "a", false).len(),
+            hashes.len()
+        );
+        assert_eq!(
+            super::share_of(&hashes, &solo, "a", true).len(),
+            hashes.len()
+        );
+    }
+
+    /// How many prefetches a worker runs at once, and why it is one.
+    #[test]
+    fn prefetch_concurrency_defaults_to_one_and_can_be_raised() {
+        assert_eq!(super::prefetch_permits(None), 1, "one, unless asked");
+        assert_eq!(super::prefetch_permits(Some("4")), 4);
+        // A zero would deadlock every prefetch task forever on a semaphore
+        // that never issues, and the tasks hold a clone of the store. Read
+        // as "the default", not as "off": switching prefetch off is
+        // REBUCK2_PREFETCH, and two knobs that both claim to disable it is
+        // how a mechanism ends up measured while running.
+        assert_eq!(super::prefetch_permits(Some("0")), 1);
+        assert_eq!(super::prefetch_permits(Some("banana")), 1);
+    }
+
+    #[test]
+    fn a_share_is_a_share_and_alone_means_everything() {
+        use super::seeder_for;
+
+        // The six shares must PARTITION the set: every blob seeded by
+        // exactly one worker. Miss one and it is never pre-positioned;
+        // duplicate one and the herd is back, arriving earlier than the lazy
+        // path it replaced and therefore hurting more.
+        let peers: Vec<String> = (1..=6).map(|n| format!("w{n}")).collect();
+        let blobs: Vec<String> = (0..600).map(|n| format!("{n:064x}")).collect();
+        let mut seeded = std::collections::BTreeMap::new();
+        for b in &blobs {
+            let who = seeder_for(b, &peers).expect("a seeder");
+            *seeded.entry(who).or_insert(0u32) += 1;
+        }
+        assert_eq!(
+            seeded.values().sum::<u32>(),
+            blobs.len() as u32,
+            "every blob seeded exactly once"
+        );
+        assert_eq!(seeded.len(), 6, "and by every worker");
+
+        // A fleet of one is not a fifth of a fleet. Before any gossip
+        // arrives the peer list is empty, and splitting then would prefetch
+        // nothing at exactly the moment it matters most.
+        assert_eq!(
+            seeder_for("abc", &["only".to_owned()]).as_deref(),
+            Some("only")
+        );
+    }
+
+    #[test]
+    fn every_blob_has_one_agreed_seeder_and_the_load_spreads() {
+        use super::seeder_for;
+
+        // The seed is serial today: worker 1 arrives first, finds nothing on
+        // any peer, and pulls the whole base off the coordinator - measured
+        // at 75 blobs from the driver and 3 from peers - while five workers
+        // wait for it. The cascade behind it works (worker 2 then got 26 of
+        // 36 from peers); it is the seed that is one machine wide.
+        //
+        // So each blob gets a designated seeder, chosen from its own hash.
+        // Six workers then pull six different sixths of the base off the
+        // coordinator at once and exchange the rest.
+        let peers: Vec<String> = (1..=6).map(|n| format!("w{n}")).collect();
+
+        // AGREED, without anyone coordinating: every worker computes the
+        // same seeder for the same blob, or two of them fetch it and the
+        // split has bought nothing.
+        let h = "abc123";
+        let a = seeder_for(h, &peers);
+        assert!(a.is_some());
+        assert_eq!(a, seeder_for(h, &peers), "same answer twice");
+        let shuffled: Vec<String> = peers.iter().rev().cloned().collect();
+        assert_eq!(
+            a,
+            seeder_for(h, &shuffled),
+            "order of the peer list must not matter"
+        );
+
+        // SPREAD. A thousand blobs over six workers should not pile up: the
+        // point is six seeds at once, so no worker may take a large share.
+        let mut hits = std::collections::BTreeMap::new();
+        for n in 0..1200 {
+            let who = seeder_for(&format!("{:064x}", n), &peers).expect("a seeder");
+            *hits.entry(who).or_insert(0u32) += 1;
+        }
+        assert_eq!(hits.len(), 6, "every worker seeds something");
+        let (lo, hi) = (
+            *hits.values().min().expect("min"),
+            *hits.values().max().expect("max"),
+        );
+        assert!(hi < lo * 2, "lopsided: {hits:?}");
+
+        // Degenerate cases are not panics.
+        assert_eq!(seeder_for("abc", &[]), None);
+        assert_eq!(seeder_for("", &peers), seeder_for("", &peers));
+    }
+
+    #[test]
+    fn a_nested_host_is_never_loopback_and_never_a_surprise() {
+        use super::nested_host;
+
+        // OFF unless asked for. Retargeting changes the cache key of any RUN
+        // carrying the variable, so a forwarded RUN stops merging across
+        // machines - a real cost that must not arrive by accident.
+        assert_eq!(nested_host(false, None, Some("tcp://10.0.0.9:8372")), None);
+
+        // The worker's own daemon, normalised to one spelling.
+        assert_eq!(
+            nested_host(true, None, Some("tcp://10.0.0.9:8372")).as_deref(),
+            Some("tcp://10.0.0.9:8372")
+        );
+        assert_eq!(
+            nested_host(true, None, Some("10.0.0.9:8372")).as_deref(),
+            Some("tcp://10.0.0.9:8372")
+        );
+
+        // NEVER loopback. earthly's IsLocal treats 127.0.0.1 as "a buildkit I
+        // manage" and starts its own container from an image that is not
+        // published, so the nested build dies on `manifest unknown` before it
+        // solves anything. That cost a baseline run to rediscover once.
+        for local in ["tcp://127.0.0.1:8372", "localhost:8372", "tcp://::1:8372"] {
+            assert_eq!(nested_host(true, None, Some(local)), None, "{local}");
+        }
+
+        // An explicit override wins - a worker's daemon address is how the
+        // WORKER reaches it, which is not always how an exec can.
+        assert_eq!(
+            nested_host(
+                true,
+                Some("tcp://172.17.0.1:8372"),
+                Some("tcp://127.0.0.1:8372")
+            )
+            .as_deref(),
+            Some("tcp://172.17.0.1:8372")
+        );
+        // Nothing configured is nothing done.
+        assert_eq!(nested_host(true, None, None), None);
+    }
+
     use super::*;
     use bazel_remote_apis::build::bazel::remote::execution::v2 as re;
 

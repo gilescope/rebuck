@@ -1,0 +1,708 @@
+# The build plan
+
+What to build, in what order, and what proves each step. Design rationale is in
+[dispatch-plan.md](dispatch-plan.md); product claims are in
+[dist-buildkit-principles.md](dist-buildkit-principles.md).
+
+**The goal is a distributed buildkit for any client. The mechanism is open.**
+Milestones M0-M5 below were cut for one mechanism -- subdivide the graph and
+offer subtrees to peers -- and most of that is now built and working. It is
+not established that it is the right mechanism, and the milestones should be
+read as "what got built and what it proved" rather than as a roadmap.
+
+## Where it actually stands
+
+| | state |
+| ---- | ------------------------------------------------------------- |
+| M0 | 9/12 cold numbers; two cold-only failures unexplained |
+| M1 | bin-packer built; the Earthfile change and measured round are not done |
+| M2 | **done** -- store, ingest, banking, stability, critical path |
+| M2.5 | superseded -- `lease`, `registry` and the store's upload surface were PINCHED rather than merged |
+| M3 | **done** -- published-key bloom, non-blocking batch query |
+| M4 | **done and demonstrated** -- a peer builds a subtree, driver disk reads 0 bytes |
+| M4.5 | **done** -- one transport. The gateway offers, the driver arbitrates, 51 checks green |
+| M4.6 | **done** -- a result is a digest; both registries fetch from the fleet, so a worker can be on its own machine |
+| M5 | not done |
+| gateway | **done** -- the proxy sees any client's graph on one connection, and a real earthly build succeeds through it |
+| fleet | **done and measured on two machines** -- see below. Two, because the proxy's own transport is what limits it; the mesh runs at 19 |
+
+## The target
+
+One driver and nineteen workers taking earthbuild's root Earthfile to
+completion, every solve arriving through the driver's proxy buildkit. Nothing
+below is finished until that runs.
+
+The duplicated transport (M4.5) is gone, and so is the thing that kept the
+fleet on one host: a result is now handed back as a DIGEST, and both the
+coordinator's registry and each worker's are backed by the fleet, so a layer
+is fetched from whoever built it rather than from one host everybody must be
+able to route to. Measured: the coordinator took 2 uploads and served 12
+blobs.
+
+What stands between here and the target is now a load large enough to mean
+anything, and the runs to prove it. Everything measured so far
+is seconds per build on one machine, where dispatch is mostly overhead by
+construction -- fine for deciding whether placement is CORRECT, useless for
+deciding whether it PAYS.
+
+## How much of earthbuild's Earthfile can actually run
+
+The target is the root Earthfile; this is the ladder to it, each rung
+measured on `earthly +code` through the gateway rather than estimated.
+
+| rung | state | dispatchable | blocker after |
+| ---- | ----- | -----------: | ------------- |
+| 0 | as shipped | **0 of 6** | `Secret` - the debugger mount on every RUN |
+| 1 | EarthBuild#784 gated locally | **1 of 6** | `CacheMount` on 5 |
+| 2 | + `REBUCK2_PEER_CACHE_MOUNTS=1` | measuring | - |
+| 3 | + a worker-side session for the 9 real secrets | not built | - |
+
+Rung 0 and 1 are like for like: same target, same fleet, 6 solves and 64 ops
+either side, both builds green.
+
+Two things this ladder makes visible that the earlier estimates hid.
+
+**Rung 1 is upstream, not here.** Nothing in this repo can lift the debugger
+secret: its id is minted per build inside earthly's process, so there is
+nothing outside that process which could answer for it.
+
+**Rung 2 may be a bad trade even when it works.** The lift exists on the
+argument that a cache mount is scratch and a peer has its own. These are
+`go-mod`, `go-build` and `npm` - a cold module cache on a worker is correct
+and SLOW. Dispatching five solves and taking longer is the lift working and
+the trade failing, and only a fleet of real machines can tell those apart.
+
+## What is now measured, not argued
+
+All from `rebuck2/scripts/fleet.sh`, which produces every number here.
+
+| claim | evidence |
+| ------------------------------- | ------------------------------------- |
+| a peer really builds the work | per-daemon cache grows where it ran |
+| the result is CORRECT | outputs byte-identical to a one-machine baseline, verified per build |
+| two machines are faster | 24 CPU-bound builds, 64s -> 32s |
+| a context can leave its machine | `local://` published as content; a sessionless peer builds from it |
+| native multi-arch is real | an emulated peer takes 0 of 6 placements against 2 in a uniform fleet |
+| a slow peer cannot hold the build | withdrawn after 3x the observed median; 164s -> 40s |
+| a dead peer does not break it | peer destroyed mid-build: 24/24 finish, bytes identical |
+| a dead registry does not either | mirror destroyed mid-build: 24/24 finish, bytes identical |
+
+Placement is one rule with no per-workload tuning: ship only when the local
+machine is full. It matches the best hand-swept split at the build size where
+the fleet matters most, and no constant in it was chosen to fit a fixture.
+
+## What is still NOT established
+
+- No real earthbuild graph has been through `analyse`. Cut counts on a 3-op
+  fixture prove the plumbing, not the opportunity.
+- **Subdivision does not exist.** Everything measured dispatches WHOLE solves.
+  Whether cutting a graph beats routing it is untested, and the mechanism
+  question below is still open for that reason.
+- Earthly dispatches ZERO, measured on a real target rather than inferred.
+  `earthly +code` through the gateway: 6 solves, 64 ops, build SUCCEEDS, and
+  all 6 excluded on `earthly_debugger_settings`. The earlier "1 in 12" was a
+  different build; for this one it is none. See
+  [earthly-dispatch.md](earthly-dispatch.md).
+- A named frontend (`docker build`) dispatches NOTHING and structurally
+  cannot: the daemon resolves the frontend, so the graph never crosses the
+  proxy.
+- The "bank the stem" comparison below is still unrun.
+- Everything above is two machines on one LAN. Three or more, and a WAN, are
+  untested -- and the cause is M4.5, not the fleet size. The proxy's transport
+  needs every daemon to reach one HTTP mirror; the mesh has no such
+  requirement and already runs at 4, 8, 12 and 19 workers. So this is a
+  de-duplication question wearing a scale question's clothes.
+- No real load. Every number here is seconds per build. earthbuild's root
+  Earthfile is the target and nothing has been run against it.
+
+## The mechanism-neutral measurement was taken, and it decided
+
+The plan called for a characterisation of a real build on the wire before
+pricing any one mechanism -- how many Solves, how big, how unbalanced, how
+much is `local://`, how much two Solves overlap. It was collected, and it
+chose per-Solve routing over subtree cutting for the first implementation:
+
+- **Solves are the natural unit.** A real build issues many, each a whole
+  graph, and routing one needs no cut analysis at all.
+- **`local://` is not a blocker.** It was assumed to pin work to the client's
+  machine. Publishing the context as content unpins it, and a sessionless peer
+  then builds from a digest.
+- **Overlap is 39%, not 73%.** The first reading counted byte-identical
+  RESENDS as shared work; graphs NEST, and the corrected number is small
+  enough that deduplicating across Solves is not the prize.
+
+What this does NOT settle is whether CUTTING a graph beats routing it whole.
+Every measurement in this repo dispatches whole solves, so subdivision remains
+untested rather than rejected. It becomes interesting exactly where routing
+runs out: a build whose Solves are few and enormous, where there is nothing to
+spread.
+
+## The numbers this plan is built on
+
+Per-group wall-clock, each measured COLD in its own rig invocation, because
+`SOLO=1` only restarts daemons in the pair phase -- so a sweep of N targets
+leaves the daemon warm for targets 2..N and every number after the first
+measures something else. Both columns are the same twelve groups.
+
+| group | cold | warm |    delta |
+| ----- | ---: | ---: | -------: |
+| 1     | 321s | 361s |          |
+| 3     | 210s | 226s |          |
+| 4     | 435s | 312s |          |
+| 6     | 189s |  91s |  **+98** |
+| 7     | 369s | 227s |     +142 |
+| 8     | 195s |  94s | **+101** |
+| 9     | 414s | 300s |          |
+| 10    | 203s |  90s | **+113** |
+| 11    | 222s | 110s |          |
+| 2, 5  | FAIL | 142s |          |
+
+The three bolded rows are the finding: groups whose own work is ~90s cost ~190s
+cold. **The delta is the shared stem, ~100s, and every group pays it.** That
+matches the independent measurement of the stem at 32 vertices / 94s.
+
+So of roughly 3,590 runner-seconds for a twelve-group run, about **1,176s (33%)
+is the same stem built twelve times.**
+
+## Which lever buys what
+
+Let `V` = total variable work (~2,414s), `S` = stem (~98s), `N` = runners.
+
+| | makespan | runner-seconds |
+| ------------------ | -------------------- | -------------- |
+| today | ~550s (the worst group) | 3,590 |
+| perfect rebalance | `S + V/12` = **~300s** | 3,590 (unchanged) |
+| coalesce + dispatch | `S + V/N` = **~300s** at N=12 | **2,512** |
+| both | ~300s | 2,512 |
+
+**Rebalancing and coalescing produce the SAME makespan.** Twelve groups each
+building the stem do it in parallel, and parallel duplicate work is free in
+wall-clock -- principle 2, again, from a new direction.
+
+They differ in what else they buy:
+
+- **Rebalancing is a latency fix**: 550s -> 300s, free, no new mechanism.
+- **Coalescing is a COST fix**: 3,590 -> 2,512 runner-seconds, a third of the
+  compute, and it only scales past 12 workers.
+
+Neither subsumes the other, and rebalancing is not a stepping stone to
+coalescing -- it is worth doing on its own and worth undoing later.
+
+## Milestones
+
+### M0 - trustworthy per-group costs (in flight)
+
+Twelve cold runs, one rig invocation each. Nine landed; groups 2 and 5 FAIL cold
+having passed warm, which is a finding rather than noise and blocks nothing else.
+
+- **Done when**: twelve cold numbers, and the two cold-only failures explained.
+- **Note**: `copy-tilde-test` fails cold on `output_does_not_contain` -- another
+  member of the class where a warm cache changes what a test means.
+
+### M1 - rebalance the twelve groups
+
+Bin-pack tests into twelve groups of equal expected cost, using M0's group totals
+and the per-target proxy ONLY to split within large groups (it correlates
+r=0.734 overall and is 10x wrong on groups with few targets, so it is a splitter
+of last resort, not a cost model).
+
+- **Done when**: cold makespan drops from ~550s toward ~300s, measured the same
+  way as M0.
+- **Cost**: an Earthfile change and one measurement round. No new mechanism.
+- **The packer is built** -- `rebuck2 bank timings plan <table> <bins> <target>...`,
+  longest-processing-time-first, deterministic across machines so two runners
+  derive the same plan rather than disagreeing about which group each is
+  building. A target with no samples costs the MEDIAN of those that have them,
+  and the plan reports how many were placed that way, because a plan that is
+  mostly guesses should be read as one. What M1 now waits on is not the
+  mechanism but the SAMPLES -- see M2.
+
+### M2 - the timing store
+
+Record per-vertex `Started`/`Completed` from buildkit's status stream (already
+streamed -- `client/graph.go`; no fork change), keyed by target + the build args
+that reach it, banked via `bank/`'s existing key/value machinery.
+
+**Keyed COARSELY on purpose** (principle 13). Not on the cache key, not on
+content: a content-keyed table is perfect and useless, because every commit
+empties it. `+deps` takes about as long as it did last week whether or not a
+source file moved. We are choosing robustness over precision, and the estimate
+only ever feeds decisions where being wrong is cheap.
+
+- **Also record STABILITY**, not only duration: how many consecutive builds
+  produced the same output digest for this key. That is what decides admission
+  to the bank (principle 14) -- and it wants the same coarse key, because
+  content-keyed stability is a contradiction: the key changes exactly when the
+  content does.
+- **Done when**: a second run can answer "how long does `+deps` take with these
+  args" with a median and a p90, and "has `+deps` changed in the last three
+  builds".
+- **Why before M3-M5**: rebalancing, longest-first scheduling, the cheap-bloom
+  and dispatch selection currently guess separately. This is the one instrument
+  all four need, and M1 is presently blocked on not having it.
+
+**Built** (`rebuck2/src/bank/timings.rs`): the coarse key, both statistics,
+tenure, the bin-packer, and banking across runs. `bank timings record | stats |
+plan | prune | tenured | merge | restore | publish`.
+
+Three decisions worth carrying, because each was a fork in the road:
+
+- **The banked unit is an OBSERVATION, not an aggregate** -- one row per
+  (key, run), with medians, p90s and stability computed at read time. That is
+  what lets a delta replay the way `bank/dice.rs`'s does: idempotent,
+  order-independent, first writer wins. Two runners adding to the same mean is
+  not order-independent, and the tidier-looking design is the broken one.
+- **The whole table travels, not a delta.** A few thousand lines after pruning
+  to eight samples a key, so one role's artifact bootstraps a cold machine.
+  `dice.rs` deltas because it is millions of rows.
+- **Fail open at every step**: an unreadable table, an artifact that will not
+  download, a digest that is not a digest -- each costs an estimate and never a
+  build. An estimate may only feed decisions where being wrong is cheap
+  (principle 13), and that has to include being absent.
+
+**The ingest needs no fork, and no earthbuild change either.** This plan said
+to record per-vertex `Started`/`Completed` from buildkit's status stream. It
+turns out `earthly --logstream-debug-file=X` already writes protojson deltas
+whose `TargetManifest` carries `canonicalName`, `overrideArgs`, both stamps and
+`dependsOn` -- and `overrideArgs` is already the `k=v` form the coarse key
+takes. Per-target is also COARSER than per-vertex, which is what principle 13
+wanted in the first place. `bank timings ingest <table> <run> <log>`.
+
+**Spans NEST, and it would have poisoned every estimate.** Measured on a real
+three-target build: `+test` 2995ms *contains* `+build` 2945ms *contains*
+`+deps` 469ms, so the spans of a 2995s build sum to 6409ms. A bin-packer fed
+those believes three targets' work where there is one target's. Samples carry
+SELF time -- span less what its dependencies were occupying. This was found by
+capturing a real run rather than reasoning about the format, which is the same
+lesson as "coordinate the seam that FIRES" (principle 8): one run settled what
+inference had wrong.
+
+**Stability comes from CACHEDNESS**, since no output digest is reported. A
+target whose EXEC commands were all served from cache did not change, so an
+identity is synthesised from that: cached keeps the one it had, uncached gets a
+fresh one, and the existing stability count works unchanged.
+
+Not "all commands cached" -- measured, the structural ones (`FROM +base`,
+`SAVE ARTIFACT`) report uncached on an identical rerun while the `RUN` beside
+them reports cached. That predicate is never true, and a predicate that is
+never true is not a signal.
+
+Tested in all three directions rather than argued:
+
+| case | reports | truth | cost |
+| --------------------- | -------- | --------- | ------------- |
+| unchanged rerun | cached | unchanged | correct |
+| source edited | uncached | changed | correct |
+| unchanged, COLD cache | uncached | unchanged | a lost tenure |
+
+The third row is the fresh-runner case, and it UNDER-tenures: we fail to bank
+something we could have. The dangerous direction -- claiming unchanged when it
+moved -- needs buildkit to report a cache hit on different inputs, which is
+principle 7's determinism bound and is already accepted everywhere else here.
+**The proxy lies only in the safe direction**, which is the blooms rule applied
+to a new question.
+
+So M2's done-when is met, on real logs: three laps with two untouched tenures
+`+deps`; one edit resets stability to 1 and withdraws it.
+
+Wiring into the bank actions stays deliberately undone until a real CI lap has
+produced a table worth banking -- the dependency runs ingest -> samples ->
+wiring, not the reverse.
+
+### M2.5 - port the dedup delta onto trunk (measured, and it is the blocker)
+
+M3 and M4 both extend `rebuck2/src/lease.rs`, which exists only on
+`giles-single-buildkit-with-dist`. That branch forked at `423e21a` (2026-07-12)
+and has 74 commits since -- but it never took what TRUNK gained in the same
+period, which includes the entire `bank/` module. So the three lines have three
+different module sets:
+
+| | has |
+| ------------------- | ---------------------------------- |
+| `origin/main` | `bank/` |
+| `giles-dispatch` | `bank/` + the timing store |
+| dedup branch | `lease.rs`, `registry.rs`, `payload/` |
+
+Merged in a scratch worktree to size it rather than guess:
+
+- **24 conflict hunks in 4 files** (`driver.rs` 10, `worker.rs` 5, `main.rs` 4,
+  `Cargo.lock` 5) between the dedup branch and TRUNK -- with none of the
+  dispatch work involved. This debt is pre-existing and grows with every
+  commit to either line.
+- **The dispatch work adds ONE hunk** to that, in this file. The timing store
+  is new files, and new files carry cleanly exactly as the plan predicted.
+- The conflicts are not union-able: the dedup branch MOVED code (e.g.
+  `result_digests` from `driver.rs` to `payload/reapi.rs`), so a side that
+  looks deleted is relocated, and a naive union duplicates it.
+- **`Cargo.toml` auto-merges into an INVALID file** -- no conflict marker, two
+  `reqwest` keys, one 0.12 and one 0.13. `cargo metadata` catches it; a merge
+  that only compiles the resolved conflicts does not. Resolution is 0.13 with
+  `stream` unioned in, which the mirror needs.
+
+So the plan's step 1 is its own PR against trunk, and it should happen before
+M3 rather than alongside it. Sequencing it after M2 rather than before cost
+nothing: the timing store never needed the lease.
+
+**Port status** (worktree `~/git/gilescope/rebuck2-port`, branch
+`giles-port-dedup`): `Cargo.toml`, `Cargo.lock`, `main.rs` and `worker.rs`
+resolved; `driver.rs` is the whole remainder. Two resolutions worth keeping
+whatever happens next:
+
+- The worker's own AC row survives the payload seam by adding `exit_code` to
+  `payload::Done`. The fleet then applies trunk's policy
+  (`!do_not_cache && exit_code == 0`) by reading two scalars the payload
+  already decoded, instead of naming a proto type in worker code -- which is
+  the one thing that seam exists to prevent.
+- `norm::ensure_execution_metadata` moves from `driver.rs` to the REAPI
+  frontend, because after the refactor `AcLookup::Hit` carries opaque bytes and
+  `rpc.rs` is where they are decoded. Normalisation is a REAPI concern and
+  belongs where the proto is.
+
+**And one thing that is NOT a merge conflict.** Trunk's name-independent
+caching and the dedup branch's single-flight lease both restructure
+`Driver::execute`: trunk writes a `canonical_put` after execution, the dedup
+branch wraps submission in a `LeaderGuard`. They collide because **a canonical
+key and a lease key are two different identities for the same work**, and
+principle 3 -- one canonical result per key, first writer wins -- does not say
+which one the lease is taken on.
+
+Both answers are defensible and they are not equivalent:
+
+- **Lease on the ACTION key**: single-flight stays exactly as measured, and two
+  label-different-but-identical actions still both build. The canonical cache
+  then dedups them only on the SECOND run.
+- **Lease on the CANONICAL key**: label-different actions merge in the same
+  run, which is strictly more sharing -- but the lease key stops being what
+  buildkit matches on, which is principle 4's rule, and a canonicalisation bug
+  becomes a wrong-layer bug rather than a missed hit. Principle 5 says prefer
+  over-specific to under-specific, and that argues for the action key.
+
+Unresolved deliberately: it wants a decision, not a merge, and picking one
+quietly inside a conflict resolution is how it would go wrong.
+
+### M3 - batched, mostly-local coordination
+
+A gossiped bloom of published lease keys, plus a non-blocking batch query;
+blocking `claim` only where we intend to follow.
+
+- **Done when**: a cold pair run shows the same `merged` count with an order of
+  magnitude fewer lease round trips (today: `led=828`, one per vertex).
+- **Risk**: a stale bloom loses sharing rather than breaking it. Size and gossip
+  cadence deliberately; do not inherit the blob-bloom's parameters.
+
+### M4 - `D2W::Lead { subtree, frontier }`
+
+The only genuinely new protocol. A peer is handed a subtree's spec and the
+descriptor chains of its frontier, builds it, and publishes -- the requester's
+existing `adoptLeaderResult` path is unchanged.
+
+- **Unit is a target** (principle 10). Exclusions propagate upward: one
+  `LOCALLY`, cache mount, secret or privileged exec anywhere excludes the whole
+  subtree. Platform is the union of the subtree's constraints.
+- **Principle 6 rules out the obvious implementation**: the frontier and the
+  result must travel peer-to-peer. The driver arbitrates and carries nothing.
+- **The driver OFFERS; it does not assign** (principle 12). A worker must be
+  able to refuse, because refusal is the backpressure -- and a protocol where
+  the coordinator assigns cannot express it and would have to rediscover it as a
+  load metric, later and worse.
+- **Worker-to-worker beats driver-dispatched.** A subdivided branch has a
+  machine blocked on it; new driver work does not. Without this, subdivision is
+  a REGRESSION: workers sit on warm state waiting for peers who took fresh work
+  instead.
+- **Done when**: a single earthly build whose vertices demonstrably executed on
+  machines that did not invoke it, and the driver's disk stays flat.
+
+### M4.5 - ONE transport: the proxy places over the mesh
+
+The gateway line and the mesh line grew separately and now do the same job
+twice. That is the thing to fix before any of it meets a real load, because
+the duplicate is also what pins the fleet to two machines on one LAN.
+
+| job | mesh (built, stress-tested to 19 workers) | proxy (built, one LAN) |
+| ---------------- | ----------------------------------------- | ---------------------- |
+| find a peer | `place_subtree` over `Candidate` + platform + load | `place` / `least_loaded` / weights / strikes |
+| offer it | `W2D::Offer` -> `D2W::Lead`, refusable | direct HTTP `Control.Solve` on the peer |
+| move layers | mesh registry, blobs peer-to-peer over iroh | shared HTTP mirror every daemon must reach |
+| take the result | `W2D::Led { image_ref }` from the builder's mirror | adopt by import from the shared mirror |
+| refuse | `W2D::Decline` - the backpressure (principle 12) | strike + hedge, rediscovered locally |
+
+The mesh side is the survivor in every row: it is older, tested at 4, 8, 12
+and 19 workers, and it already satisfies principle 6 - the driver arbitrates
+and carries nothing, which the shared mirror cannot claim because every layer
+crosses it.
+
+**What the proxy keeps**, because the mesh has no equivalent: the gateway
+itself. Holding the client's connection and seeing the graph any buildkit
+client sends is the whole reason this works for clients that are not ours, and
+nothing in the mesh does it.
+
+**What it loses**: `--peer`, the placement policy, the hedge, strikes, the
+mirror breaker, and publishing through a shared registry. Each has a mesh
+counterpart above, and keeping two answers to one question is how they drift.
+
+- **Done when**: a `buildctl` build through the proxy has solves that executed
+  on machines which did not invoke it, placed by the driver, with the driver's
+  disk flat afterwards.
+- **Retest locally first.** The local rig is seconds per round and the mesh
+  path is not yet exercised by it; de-duplicate against the fast loop and only
+  then scale. Correctness first, load after.
+- **Note**: `dispatch::inspect` is already shared - `driver.rs:1301`,
+  `worker.rs:468` and `proxy.rs:2071` all call it - so the exclusion set, the
+  platform union and the privilege rules survive the move untouched. So do the
+  registry and store fixes, since the mesh-backed registry is the same
+  `RegistryStore`.
+
+#### What M4.5 cost, and is not paid back yet
+
+The deletion took a capability with it, recorded here rather than discovered
+later.
+
+**No straggler withdrawal.** The proxy hedged: past three times the observed
+median an adoption was taken back and rebuilt at home, the peer left running
+so whoever published first won. It lived in the transport that went, and the
+mesh has no equivalent - a worker that crawls holds its lead until it
+finishes. Correctness is unaffected and the bytes are right; one slow machine
+can pace a build. The fleet suite still runs the scenario, asserting the part
+that is still true.
+
+**Secrets and the ssh agent do not travel.** A dispatched subtree used to be
+built over a connection the proxy had opened, so it could attach a session
+and answer the peer's secret lookups. A worker builds on its own connection
+with nobody to ask. This MATCHES M4 - one secret anywhere excludes the
+subtree - but `REBUCK2_SERVE_SECRETS` and `REBUCK2_FORWARD_AGENT` still lift
+the exclusion, so the graph is offered and every worker declines it. Correct,
+and a wasted round trip.
+
+### M4.7 - a real earthly target, entirely on peers (DONE 2026-08-10)
+
+`earthly +code` against earthbuild's own root Earthfile, four workers:
+**6 of 6 solves routed, 0 built at home.** Details and the wall-clock
+caveat in `earthly-dispatch.md`; the short version is that this measures
+dispatch, not speed, because four workers on one laptop share one daemon.
+
+What it took was not scheduling work. Five defects, and every one of them
+was a component of ours reporting a success it had not earned:
+
+1. `inspect` failed OPEN on mount types it did not know, so earthly's
+   fork-only `SOCKET = 101` read as a clean graph. Now an unmodelled mount
+   type is a blocker no flag lifts.
+2. `build_subtree` fell back to the tag when the exporter reported no
+   digest - naming the one reference guaranteed to be absent, because the
+   exporter reports no digest precisely when it did not export.
+3. Our `SolveRequest` named its exporter only in `exporters`, added in
+   buildkit 0.13. earthly's fork is from 2024-05 and reads
+   `Exporter`/`ExporterAttrs`. Protobuf drops unknown fields silently, so
+   the daemon was asked for no export, did none, and returned success.
+4. The driver's refusal reached the gateway stripped of its reason: four
+   idle workers reported as "fleet took nothing".
+5. Three components decided the travel policy independently and disagreed.
+
+The through-line is worth stating as a rule for the rungs above:
+
+> Everything that reports success must be able to say what it did. A
+> component that can only say "fine" cannot be debugged by a fleet, only
+> by a person with a hypothesis - and this project spent a day on two
+> wrong ones before asking the graph what it actually contained.
+
+Next rungs, in order: bigger targets from the same Earthfile (`+lint`,
+`+unit-test`), then more than one machine, then the 19-worker shape the
+whole thing is for.
+
+### M4.8 - the whole test target, and what refuses (DONE 2026-08-10)
+
+`earthly +test-no-qemu` - 786 solves, 54,000 ops, the target M5 is about -
+now puts **two thirds of itself on other daemons**, with the mesh carrying
+84% of every byte that crosses a machine boundary (peer 205, driver 39).
+
+Everything still refusing to move is refusing correctly: 170 privileged
+execs, 68 `WITH DOCKER` host binds, 2 unmirrored bases.
+
+Four fixes got from 269 routed to 537, and the two biggest were format
+strings wearing the costume of architectural limits:
+
+| reported as | actually |
+| ------------------------ | ------------------------------------------ |
+| context unmirrored (686) | `./buildkitd` is not a legal OCI tag |
+| not portable (397) | mirror keyed `git://h/r`, read back as `h/r` |
+| Unimplemented SAVE IMAGE | fork-only `rpc Export` we refused to relay |
+| CacheMount (194) | the report naming a hazard the flag had lifted |
+
+The build is still RED, and no further proxy work will change that:
+`+test-no-qemu` wants an ssh-agent, `test-remote` over git matchers, and a
+push registry. 118 targets pass and the suite then cancels. That is a
+question about credentials on the machine running it.
+
+**What is now the binding constraint: hardware.** Every number above comes
+from three workers sharing one laptop, three cold buildkitds and three
+registries contending for the same cores. `routed` and the peer:driver ratio
+are meaningful there; wall-clock is not, and has got monotonically WORSE with
+each honesty fix, because each one made the fleet do more real work.
+
+### M4.9 - across machines, on runners (DONE 2026-08-10)
+
+The thing this project is for, at one third of the intended size.
+
+**Four machines**, `+code`: 6 of 6 solves routed off-box, nothing built at
+home, nothing refused, and three blobs moved worker-to-worker.
+
+**Seven machines** (one coordinator, six workers), `+test-no-qemu-group2`,
+123 solves: 84 routed, 39 refused as `Insecure`, which is all of them - and
+the driver's share of blob traffic fell from 80% at three machines to 23% at
+six.
+
+**Locally, 11 of 12 test groups reach PARITY through the fleet** - the same
+set of targets fails with and without it, and for ten of the twelve that set
+is empty. group1's single failure is
+`./t/autocompletion+test-no-parent-at-root-from-home`, which fails on a bare
+daemon too.
+
+What it took, beyond the earlier milestones: three separate fixes for one
+idea. Subtree results, base images and contexts each crossed a machine named
+by TAG, and each was found only after fixing the one before, because a graph
+stops at the first thing it cannot pull.
+
+> Anything a peer must fetch is named by CONTENT. A tag is a name in one
+> machine's namespace, and a fleet has no namespace.
+
+None of the three is observable on one host, where every participant shares a
+registry and every tag resolves. A single-machine fleet cannot test the
+property that makes a fleet worth having - which is the argument for having
+run CI and local in parallel, and against the weeks spent not doing so.
+
+Remaining before nineteen: a baseline in the multi workflow (there is no
+wall-clock comparison yet), and the offer order, which gave one worker 38
+leads and another 2.
+
+### M4.10 - dispatch is solved; speed is not (2026-08-10)
+
+Where this actually stands, stated so the next person does not repeat the
+afternoon.
+
+**Working, measured, on real machines:**
+
+- 11 of 12 earthbuild test groups reach PARITY through the fleet locally; ten
+  of them fail nothing at all.
+- Seven separate GitHub runners build a real test group with 84 of 123 solves
+  routed off-box and every refusal correct.
+- The mesh carries 77% of cross-machine blob traffic at six machines, up from
+  20% at three - the driver's share FALLS as the fleet grows.
+- Three kinds of source (subtree results, base images, contexts) travel by
+  digest, which is what makes any of it work across a machine boundary.
+
+**Not working: distribution does not pay.**
+
+| | baseline | fleet |
+| ---------------------- | -------: | ----: |
+| 6 workers, group2 | 277s | 660s |
+| 2 workers, group2 | 299s | 401s |
+| 2 workers, group2 again | 300s | 358s |
+
+Fewer machines are faster, and the same configuration varies by 44s between
+runs.
+
+**Four remedies attempted, four failures, and the pattern in them:**
+
+| remedy | result | why it was wrong |
+| ---------------------- | ------ | ---------------- |
+| shared cache readwrite | +165s | export per solve, 84 writers |
+| shared cache read-only | worse | no writer existed, so nothing to import |
+| one reference export | +97s* | export ran inside the measured window |
+| suspecting a serial graph | n/a | peak concurrency was 9 with 6 workers |
+
+\* within about twice the run-to-run spread, so not established.
+
+Every one of them was chosen before the measurement that would have ruled it
+out. The measurements that finally arrived - peak concurrency, op duplication,
+lead-duration distribution, bytes served - each took under an hour to build
+and would each have prevented at least one of the four.
+
+**What is actually known about the gap**, after all that: execution
+duplication is 1.7x against a ceiling of 2.0, which is real but too small to
+explain a 20-60% slowdown. So most of the gap is elsewhere - transfer,
+earthly's per-solve overhead paid through a gateway, or the mirror hop - and
+none of those has been measured yet.
+
+**The next honest step is not a fifth remedy.** It is a breakdown of one lead
+into fetch versus execute, and repeated runs so a 50s difference means
+something.
+
+### M5 - coalesce CI to one build
+
+`+test-no-qemu` already BUILDs all twelve groups; no repo reorganisation. One
+driver job owning the invocation, N worker jobs lending CPU, via main's existing
+`rebuck2/actions` choreography.
+
+- **Done when**: runner-seconds drop toward `S + V`, i.e. ~2,512 against today's
+  ~3,590, with makespan no worse.
+- **Report utilisation PER PLATFORM**: a 60%-utilised heterogeneous fleet may be
+  100% on linux and 0% elsewhere.
+
+## Why the critical path is not the binding constraint (but measure it anyway)
+
+The fleet is expected to be WORK-bound, not depth-bound: the suite's total work
+is far larger than the fleet's capacity, so makespan is set by throughput and
+batch efficiency rather than by the longest chain. That is the case for
+dispatch, and it is why per-vertex handover (principle 10) and per-vertex
+coordination were both the wrong granularity.
+
+It is still worth computing the critical path ONCE, from the graph plus M2's
+timings, because it answers a question nothing else does: **the N at which
+adding workers stops paying.** Below that N the fleet is work-bound and batch
+efficiency dominates; above it, we are buying runners to wait on a chain.
+
+Also if we know the critical path, then that helps make sure that we get that priority
+scheduled.
+
+**Both are now one command**: `bank timings critical <logstream-file>` prints
+the chain and the saturation N. It weights by SELF time, because a parent that
+only waits on its child is not on the critical path in any sense that matters,
+and ties break on the names so two machines derive the SAME chain -- a
+prioritisation the fleet disagrees about is worse than none.
+
+On the sample build it reports a pure chain: 2995ms of 2995ms work on the
+critical path, saturating at ONE runner. That is the shape worth watching for
+in the real suite -- where a group is a chain, no amount of fleet helps it, and
+the lever is subdividing the chain (M4) rather than adding runners.
+
+## Bank the stem first, and compare against it
+
+Before M4/M5, the honest competitor to dispatch is: **bank the stem and keep
+twelve shards.** If the stem is stable across builds -- and by inspection it
+should be, it is the toolchain and the base images -- principle 14 tenures it,
+run two restores it, and the 1,176s of duplicated stem largely evaporates
+WITHOUT any dispatch at all.
+
+That would capture most of the compute saving for a fraction of the work. M2's
+stability statistic answers whether it holds; if it does, M4 and M5 must justify
+themselves on what is left, which is a much harder bar and the right one.
+
+**That question is now ASKABLE**, which it was not when this was written: run
+the suite three times with `bank timings ingest`, then `bank timings tenured`.
+If the stem's targets tenure and the leaves do not, the case for banking over
+dispatching is made in one command, on data, before a line of M4 is written.
+Note the fresh-runner caveat above -- a cold cache under-reports tenure, so the
+three laps want the bank warm, or the answer is pessimistic rather than wrong.
+
+Corollary from the same principle: do not bank what changes every commit. The
+upload is paid, the hit rate is zero, and the eviction is paid again.
+
+## Open, and honest about it
+
+- **How deep to subdivide, and where.** Principles 11 and 12 answer the "a
+  target is too big" objection: cut at the narrowest DECLARED seam -- a chain
+  rooted at `FROM <registry image>` needs nothing from us at all, a
+  `COPY +t/artifact` boundary crosses one artifact, and `BUILD +t` crosses a
+  whole snapshot -- and prioritise worker-to-worker work so a subdividing worker
+  is never left blocked on a peer that took fresh driver work instead. What is
+  NOT settled is when to STOP: one level deeper is always available, and past
+  some depth the frontier costs more than the work. Both seam width and work are
+  measurable, so M2's timing store answers it rather than a constant -- and
+  because that store is coarse by design (principle 13) it keeps answering
+  across commits instead of emptying on every source change. The first build of
+  anything has no statistics: fall back to not subdividing, and let run two be
+  informed.
+- **Two groups fail cold and pass warm.** Same class as the `secrets` and
+  `aws-flag` false passes: a warm cache changes what a test means. Expect more
+  of these as coalescing makes everything warm.
+- **`V` is an estimate.** It is `cold - 98s` for nine groups and the warm number
+  for the other three. M2 replaces the estimate with data.

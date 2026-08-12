@@ -1,0 +1,13 @@
+{
+  // Line length: 80, as everywhere else here.
+  //
+  // Tables are exempt because a table row CANNOT be wrapped - markdown has
+  // no continuation syntax for cells - so the rule can only be satisfied by
+  // making the cells say less. Every doc in docs/ already had rows over the
+  // limit for exactly that reason.
+  "MD013": {
+    "line_length": 80,
+    "tables": false,
+    "code_blocks": false
+  }
+}

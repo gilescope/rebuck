@@ -1,0 +1,131 @@
+From a619cecc550e46ef6ab687518893b3e75fa9a7ea Mon Sep 17 00:00:00 2001
+From: Giles Cope <gilescope@gmail.com>
+Date: Sun, 2 Aug 2026 06:37:23 +0100
+Subject: [PATCH 06/12] test: force_internal_buildkit for the host- and
+ cache-affine tests
+
+Running all twelve groups instead of one turned a guess into a taxonomy. This
+suite has been using a daemon per test as ISOLATION, not merely inheriting one
+by accident, and it splits three ways:
+
+  the daemon's HOST   host-bind-test binds source=/bind-test, a path on the
+                      DAEMON's filesystem that exists only in the test
+                      container: "test -f /bind/a.txt" exit 1.
+                      scrub-https-credentials starts nginx in its own container
+                      and its fixture pings buildkitsandbox precisely to assert
+                      the daemon shares that network.
+
+  the daemon's CACHE  test-cache-mode greps for what `stat` prints, so the RUN
+                      has to run. On a shared daemon it is a cache hit: the
+                      inner build reported SUCCESS with "*cached* --> RUN stat
+                      -c '%A %n' /cache-folder" and the expected line never
+                      appeared. All three cases, not just the failing one.
+
+  the daemon's CONFIG version flags and credentials, already covered.
+
+no-cache-local-artifact-test deliberately gets NOTHING here. It was not a test
+isolation problem: single-flight was adopting a --no-cache vertex, fixed in the
+buildkit fork rather than papered over here.
+
+Assisted-by: Claude:claude-opus-5 claude-code
+---
+ tests/Earthfile                         | 41 ++++++++++++++++++++-----
+ tests/scrub-https-credentials/Earthfile |  4 +++
+ 2 files changed, 38 insertions(+), 7 deletions(-)
+
+diff --git a/tests/Earthfile b/tests/Earthfile
+index 0cc5e86b..13e570f1 100644
+--- a/tests/Earthfile
++++ b/tests/Earthfile
+@@ -457,7 +457,10 @@ build-earthly-test:
+ host-bind-test:
+     RUN mkdir /bind-test
+     RUN echo "a" > /bind-test/a.txt
+-    DO +RUN_EARTHLY --earthfile=host-bind.earth --target=+test
++    # bind-experimental's source= is a path on the DAEMON's filesystem, and
++    # /bind-test only exists in THIS container.
++    DO +RUN_EARTHLY --earthfile=host-bind.earth --target=+test \
++        --force_internal_buildkit=true
+     RUN test -f /bind-test/b.txt
+     RUN cat /bind-test/b.txt
+ 
+@@ -1557,20 +1560,27 @@ test-cache-mount-mode:
+       --target=+test-default \
+       --output_contains="drw-r--r-- /cache-folder"
+ 
++# Each case greps for what `stat` PRINTS, so the RUN has to actually execute.
++# On a shared daemon it is a cache hit -- the inner build reports SUCCESS with
++# "*cached* --> RUN stat -c '%A %n' /cache-folder" and the expected line never
++# appears. Needs a daemon of its own.
+ test-cache-mode:
+   DO +RUN_EARTHLY \
++      --force_internal_buildkit=true \
+       --earthfile=cache-mode.earth \
+       --target=+test \
+       --post_command="--mode=0004 " \
+       --output_contains="d------r-- /cache-folder"
+ 
+   DO +RUN_EARTHLY \
++      --force_internal_buildkit=true \
+       --earthfile=cache-mode.earth \
+       --target=+test \
+       --post_command="--mode=0777 " \
+       --output_contains="drwxrwxrwx /cache-folder"
+ 
+   DO +RUN_EARTHLY \
++      --force_internal_buildkit=true \
+       --earthfile=cache-mode.earth \
+       --target=+test-default \
+       --output_contains="drw-r--r-- /cache-folder"
+@@ -1705,12 +1715,29 @@ RUN_EARTHLY:
+     # image pulls, which is what earthbuild currently buys Docker Hub credentials
+     # to survive (Earthfile:564).
+     #
+-    # It changes the meaning of exactly one command. LOCALLY runs on the DAEMON's
+-    # host, so a nested LOCALLY under a shared daemon writes its files on the
+-    # OUTER machine, where the assertion that follows cannot see them. Measured:
+-    # locally-in-function+test-function-in-sub-dir, "cat: can't open
+-    # /the-test/data". Tests whose inner Earthfile contains LOCALLY set this, and
+-    # declare themselves by doing so.
++    # A daemon per test is not only an accident of nesting -- this suite has been
++    # relying on it as ISOLATION. Three distinct affinities, all found by running
++    # all twelve groups rather than reasoned about:
++    #
++    #   the daemon's HOST   LOCALLY, --mount=type=bind-experimental, and any test
++    #                       that starts a server in its own container and expects
++    #                       the daemon to reach it. Under a shared daemon those
++    #                       resolve on the OUTER machine. Measured:
++    #                       locally-in-function, "cat: can't open /the-test/data";
++    #                       host-bind-test, "test -f /bind/a.txt" exit 1.
++    #
++    #   the daemon's CACHE  an assertion that needs a step to actually RUN -- to
++    #                       print, to write, to differ. A shared daemon carries
++    #                       cache across test boundaries, so the step is a hit and
++    #                       never executes. Measured: test-cache-mode, where the
++    #                       inner build reported SUCCESS with "*cached* --> RUN
++    #                       stat -c '%A %n' /cache-folder" and the expected line
++    #                       therefore never appeared.
++    #
++    #   the daemon's CONFIG version flags and credentials -- the if/for/
++    #                       first-command fixtures.
++    #
++    # Tests with any of those set this, and declare themselves by doing so.
+     ARG force_internal_buildkit=false
+     IF [ ! -z "$earthfile" ]
+         COPY "$earthfile" "$earthfile_dest"
+diff --git a/tests/scrub-https-credentials/Earthfile b/tests/scrub-https-credentials/Earthfile
+index e3a8ceb5..724e7fc1 100644
+--- a/tests/scrub-https-credentials/Earthfile
++++ b/tests/scrub-https-credentials/Earthfile
+@@ -99,7 +99,11 @@ RUN_EARTHLY_ARGS:
+     ARG earthfile
+     ARG pre_command
+     ARG exec_cmd
++    # nginx runs in THIS container, and the fixture pings buildkitsandbox first
++    # to assert the daemon can see it. A shared outer daemon cannot: it is in a
++    # different container, with different /etc/hosts and no route to that nginx.
+     DO ..+RUN_EARTHLY \
++        --force_internal_buildkit=true \
+         --earthfile=$earthfile \
+         --pre_command=$pre_command \
+         --exec_cmd=$exec_cmd

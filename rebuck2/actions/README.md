@@ -148,6 +148,25 @@ shell. A consumer's restore is:
           shard: ${{ matrix.owns }}
 ```
 
+The same restore also brings back the coarse per-target timing table and
+reports its path as `timings-table`. Feed the build's own log stream into
+it and `bank-publish` banks it:
+
+```yaml
+      - id: bank
+        uses: gilescope/rebuck/rebuck2/actions/bank-restore@<sha>
+        with: { role: driver, mode: all }
+      - run: earthly --logstream-debug-file=ls.json +test-no-qemu
+      - run: rebuck2 bank timings ingest "$TABLE" "$GITHUB_RUN_NUMBER" ls.json
+        env:
+          TABLE: ${{ steps.bank.outputs.timings-table }}
+```
+
+Nothing about the timing table is load-bearing, and the wiring says so:
+a cold or unreadable table logs a line and the lap proceeds. It does NOT
+set `cold`, which gates real bank behaviour, and it never fails the job -
+a build with no estimates schedules worse and produces the same bytes.
+
 The store is hash-verified before the build sees it: a CAS filename IS
 the sha256 of its content, and artifacts cross GitHub's branch-scoping
 wall - any run, any branch, including fork PRs, shares one namespace.

@@ -13,6 +13,55 @@ use crate::mesh::Dig;
 /// sha256 of the empty string — REAPI clients assume it exists without upload.
 pub const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+/// Hashes this process's CAS has gained, for whoever is gossiping them.
+///
+/// A bloom filter is ADDITIVE - inserting sets bits and never clears them -
+/// so a holdings filter never needs rebuilding from disk. Insert each new
+/// hash as it lands, O(k) apiece, and the 256-directory walk disappears
+/// entirely. That is what makes prompt gossip affordable: the walk is why
+/// the tick was 30 seconds, and 30 seconds is longer than the window in
+/// which a freshly-fetched share is worth anything to anyone.
+///
+/// Bounded, and the bound has a purpose. If nobody drains this - a driver
+/// process gossips nothing - it must not grow without limit, so past the cap
+/// it stops recording and asks for a resync instead. A consumer that sees
+/// `resync` walks the tree once and starts again, which is the old behaviour
+/// as a fallback rather than as the design.
+#[derive(Debug, Default)]
+pub struct Gained {
+    pub hashes: Vec<String>,
+    pub resync: bool,
+}
+
+pub static GAINED: std::sync::LazyLock<(std::sync::Mutex<Gained>, tokio::sync::Notify)> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Record a blob this process now holds, and wake anyone gossiping.
+pub fn note_gained(hash: &str) {
+    const CAP: usize = 50_000;
+    {
+        let Ok(mut g) = GAINED.0.lock() else { return };
+        if g.hashes.len() >= CAP {
+            g.hashes.clear();
+            g.resync = true;
+        } else {
+            g.hashes.push(hash.to_owned());
+        }
+    }
+    GAINED.1.notify_waiters();
+}
+
+/// A digest without its algorithm prefix.
+///
+/// One digest is written two ways in this crate: [`sha256_hex`] returns bare
+/// hex, while every LLB `Input.digest` and `Op` reference carries
+/// `sha256:`. Comparing the two spellings raw is silent and always false -
+/// it made the prefetch consumer gate refuse every op it was asked about.
+/// Normalise before comparing, on both sides.
+pub fn bare_digest(s: &str) -> &str {
+    s.strip_prefix("sha256:").unwrap_or(s)
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let d = Sha256::digest(bytes);
@@ -25,6 +74,57 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Process-wide tmp-file sequence — see the uniqueness note in [`Store::put`].
 static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A blob being streamed into the CAS: hashed as it is written, so the bytes
+/// never accumulate in memory. Created by [`Store::begin_upload`], landed by
+/// [`Store::finish_upload`].
+///
+/// An `Upload` dropped without finishing (client hung up, digest mismatch,
+/// task cancelled) takes its tmp file with it — an abandoned upload must not
+/// leave a turd in `tmp/`.
+pub struct Upload {
+    file: tokio::fs::File,
+    hasher: sha2::Sha256,
+    tmp: PathBuf,
+    len: u64,
+}
+
+impl Upload {
+    /// Append a chunk. Hashing and writing happen together so the bytes are
+    /// touched once.
+    pub async fn write(&mut self, chunk: &[u8]) -> Result<()> {
+        use sha2::Digest;
+        use tokio::io::AsyncWriteExt;
+        self.hasher.update(chunk);
+        self.file.write_all(chunk).await?;
+        self.len += chunk.len() as u64;
+        Ok(())
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn hash(&self) -> String {
+        use sha2::Digest;
+        let d = self.hasher.clone().finalize();
+        let mut s = String::with_capacity(64);
+        for b in d {
+            s.push_str(&format!("{b:02x}"));
+        }
+        s
+    }
+}
+
+impl Drop for Upload {
+    fn drop(&mut self) {
+        // `finish_upload` takes the path when it renames; an empty path means
+        // the blob landed and there is nothing to clean.
+        if !self.tmp.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
+}
 
 /// How a blob reached its destination — decides who owns exec-bit duty.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -122,7 +222,10 @@ impl Store {
     }
 
     pub fn new(root: PathBuf) -> Result<Self> {
-        for sub in ["cas", "ac", "tmp"] {
+        // "tags" is the OCI ref namespace - without it every tag_put fails
+        // at the rename and the registry answers 500 to a perfectly valid
+        // manifest PUT.
+        for sub in ["cas", "ac", "tmp", "tags"] {
             std::fs::create_dir_all(root.join(sub))?;
         }
         Ok(Self {
@@ -233,6 +336,9 @@ impl Store {
                 use std::os::unix::fs::PermissionsExt;
                 tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)).await?;
             }
+            // Held from here, whoever won the race - so gossip should say
+            // so now rather than at the next tick.
+            note_gained(&hash);
             if let Err(e) = tokio::fs::rename(&tmp, &dest).await {
                 // A concurrent identical put may have won the rename; content
                 // is identical by construction, so losing is fine.
@@ -442,6 +548,7 @@ impl Store {
                 tokio::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)).await?;
             }
             tokio::fs::rename(&tmp, &dest).await?;
+            note_gained(&hash);
             self.stored_bytes
                 .fetch_add(total, std::sync::atomic::Ordering::Relaxed);
         }
@@ -663,10 +770,295 @@ impl Store {
     pub async fn ac_delete(&self, action_hash: &str) {
         let _ = tokio::fs::remove_file(self.root.join("ac").join(action_hash)).await;
     }
+
+    /// being that this runs on a 7 GB CI runner beside a compiler.
+    pub async fn begin_upload(&self) -> Result<Upload> {
+        let tmp = self.root.join("tmp").join(format!(
+            "up.{}.{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let file = tokio::fs::File::create(&tmp).await?;
+        Ok(Upload {
+            file,
+            hasher: <sha2::Sha256 as sha2::Digest>::new(),
+            tmp,
+            len: 0,
+        })
+    }
+
+    /// Land a streamed blob in the CAS under its own content hash. Rejects a
+    /// digest mismatch (the CAS's whole contract is that a name means its
+    /// content), and mirrors [`Store::put`]'s invariants: 0o555 from first
+    /// visibility, rename-race tolerant.
+    pub async fn finish_upload(&self, mut up: Upload, expected: Option<&str>) -> Result<String> {
+        use tokio::io::AsyncWriteExt;
+        up.file.flush().await?;
+        up.file.sync_all().await?;
+        let hash = up.hash();
+        if let Some(exp) = expected {
+            if exp != hash {
+                bail!("digest mismatch: claimed {exp}, got {hash}");
+            }
+        }
+        let dest = self.cas_path(&hash);
+        if tokio::fs::metadata(&dest).await.is_ok() {
+            // Already held — the upload was redundant. Drop the tmp.
+            return Ok(hash);
+        }
+        tokio::fs::create_dir_all(dest.parent().context("cas path has parent")?).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&up.tmp, std::fs::Permissions::from_mode(0o555)).await?;
+        }
+        let len = up.len;
+        // Defuse the Drop cleanup: from here the tmp file is either renamed
+        // into the CAS or explicitly removed below.
+        let tmp = std::mem::take(&mut up.tmp);
+        if let Err(e) = tokio::fs::rename(&tmp, &dest).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            if tokio::fs::metadata(&dest).await.is_err() {
+                return Err(e).context("persist streamed blob");
+            }
+        } else {
+            self.stored_bytes
+                .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(hash)
+    }
+
+    /// Size of blob `hash`, if present. OCI hands us a digest with no size
+    /// (unlike REAPI, where every `Digest` carries one), so presence and
+    /// `Content-Length` both have to come off the filesystem. Getting the
+    /// length wrong is not cosmetic: BuildKit's cache importer caps the config
+    /// blob at 1 MiB and rejects a size mismatch *silently*.
+    pub async fn size_of(&self, hash: &str) -> Option<u64> {
+        if hash == EMPTY_SHA256 {
+            return Some(0);
+        }
+        tokio::fs::metadata(self.cas_path(hash))
+            .await
+            .ok()
+            .map(|m| m.len())
+    }
+
+    /// Blob by hash alone. See [`Store::size_of`] for why OCI needs this.
+    /// Open a blob for STREAMING, with its length -- the read counterpart of
+    /// [`Store::begin_upload`]. A layer is hundreds of MB; anything that only
+    /// ever exists whole in memory is a memory bug waiting for a big enough
+    /// image.
+    pub async fn open_blob(&self, hash: &str) -> Option<(u64, tokio::fs::File)> {
+        let path = self.cas_path(hash);
+        let file = tokio::fs::File::open(&path).await.ok()?;
+        let len = file.metadata().await.ok()?.len();
+        Some((len, file))
+    }
+
+    pub async fn get_by_hash(&self, hash: &str) -> Result<Option<Vec<u8>>> {
+        if hash == EMPTY_SHA256 {
+            return Ok(Some(Vec::new()));
+        }
+        match tokio::fs::read(self.cas_path(hash)).await {
+            Ok(b) => {
+                self.read_bytes
+                    .fetch_add(b.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                Ok(Some(b))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Tag namespace: an OCI ref (`<repo>:<tag>`) -> the manifest digest it
+    /// points at. The manifest bytes themselves are a CAS blob like any other;
+    /// a tag is only ever a mutable pointer into it.
+    ///
+    /// The key is HASHED, not used as a path component: `<repo>` arrives from
+    /// an HTTP path and would otherwise be a directory-traversal vector
+    /// (`/v2/../../etc/passwd/manifests/x`). Hashing makes traversal
+    /// unrepresentable rather than merely filtered.
+    fn tag_path(&self, key: &str) -> PathBuf {
+        self.root.join("tags").join(sha256_hex(key.as_bytes()))
+    }
+
+    pub async fn tag_get(&self, key: &str) -> Option<String> {
+        tokio::fs::read_to_string(self.tag_path(key)).await.ok()
+    }
+
+    pub async fn tag_put(&self, key: &str, manifest_hash: &str) -> Result<()> {
+        let hashed = sha256_hex(key.as_bytes());
+        let tmp = self
+            .root
+            .join("tmp")
+            .join(format!("tag-{hashed}.{}", std::process::id()));
+        tokio::fs::write(&tmp, manifest_hash).await?;
+        tokio::fs::rename(&tmp, self.tag_path(key)).await?;
+        Ok(())
+    }
+}
+
+/// Take a lock, ignoring poisoning.
+///
+/// The mutexes this is used on guard a counter, a map or a timestamp. There
+/// is no invariant across them that a panic mid-update could leave broken, so
+/// poisoning carries no information worth acting on.
+///
+/// What it does carry is a cascade. A panic while one is held makes every
+/// LATER lock panic too, so one bad solve stops being one bad solve and
+/// becomes every subsequent request dying. That is exactly inverted from what
+/// the proxy promises: a build that cannot be distributed is a build that
+/// runs locally.
+pub trait Held<T> {
+    fn held(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> Held<T> for std::sync::Mutex<T> {
+    fn held(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod held_across_await {
+    /// A `held()` guard must not still be alive at an `.await`.
+    ///
+    /// `Held` hands back a `std::sync::MutexGuard`, which is not `Send` and
+    /// blocks rather than yields. Holding one across an await point does two
+    /// bad things: the future stops being `Send` (a compile error, so that
+    /// half looks after itself), and any OTHER task that reaches the same
+    /// mutex from inside a poll blocks an executor thread on a guard whose
+    /// owner is suspended. That is a deadlock, and it is not a compile error.
+    ///
+    /// Tripped four times in this repo, most recently by a status-stream tap
+    /// that took `wire` once per progress frame. Vigilance has now failed
+    /// often enough to be replaced by a check.
+    ///
+    /// Deliberately a SOURCE test and deliberately crude: it counts braces
+    /// from the binding to the end of its block and looks for `.await`. It
+    /// cannot see through macros or closures, so it is a floor and not a
+    /// proof - `drop(x)` before the await is how you tell it you meant it,
+    /// which is also how you tell the next reader.
+    /// The scan itself, over text, so it can be shown to FAIL.
+    ///
+    /// The first version of this was "verified" by injecting an await into
+    /// proxy.rs and watching the check stay quiet - which proved nothing,
+    /// because the injection did not compile and the test never ran. A
+    /// checker whose failure path has never executed is the thing this
+    /// session keeps finding.
+    pub fn guards_alive_at_await(text: &str) -> Vec<usize> {
+        let lines: Vec<&str> = text.lines().collect();
+        let mut bad = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            if !t.starts_with("let ") || !t.contains(".held()") {
+                continue;
+            }
+            let name = t
+                .trim_start_matches("let ")
+                .trim_start_matches("mut ")
+                .split([' ', ':', '='])
+                .next()
+                .unwrap_or("")
+                .to_owned();
+            let mut depth = 0i32;
+            for (j, l) in lines.iter().enumerate().skip(i) {
+                if j > i {
+                    if l.contains(&format!("drop({name})")) {
+                        break;
+                    }
+                    if l.contains(".await") {
+                        bad.push(j + 1);
+                        break;
+                    }
+                }
+                depth += l.matches('{').count() as i32;
+                depth -= l.matches('}').count() as i32;
+                if j > i && depth <= 0 {
+                    break;
+                }
+            }
+        }
+        bad
+    }
+
+    #[test]
+    fn the_scan_finds_a_guard_held_across_an_await() {
+        let bad = guards_alive_at_await(
+            "async fn f() {\n    let mut w = self.wire.held();\n    other().await;\n    w.n += 1;\n}\n",
+        );
+        assert_eq!(bad, vec![3], "a guard alive at an await is the whole point");
+
+        // Dropped first: fine, and `drop(w)` is how you say you meant it.
+        let ok = guards_alive_at_await(
+            "async fn f() {\n    let mut w = self.wire.held();\n    w.n += 1;\n    drop(w);\n    other().await;\n}\n",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+
+        // Scoped block that ends before the await: also fine, and the
+        // commonest shape in this codebase.
+        let ok = guards_alive_at_await(
+            "async fn f() {\n    {\n        let mut w = self.wire.held();\n        w.n += 1;\n    }\n    other().await;\n}\n",
+        );
+        assert!(ok.is_empty(), "{ok:?}");
+    }
+
+    #[test]
+    fn no_std_guard_is_alive_at_an_await() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut bad: Vec<String> = Vec::new();
+        for f in std::fs::read_dir(&dir).expect("src") {
+            let f = f.expect("entry").path();
+            if f.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&f).expect("read");
+            let name = f
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            for line in guards_alive_at_await(&text) {
+                bad.push(format!(
+                    "{name}: a held() guard is still alive at line {line}"
+                ));
+            }
+        }
+        assert!(
+            bad.is_empty(),
+            "std MutexGuard alive across an await - drop it first:\n  {}",
+            bad.join("\n  ")
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    /// What `bare_digest` does, and - the part that bit - what it does NOT.
+    ///
+    /// It strips an algorithm prefix. It is not a reference parser. Handed a
+    /// full `host/repo@sha256:...` it returns the whole string unchanged,
+    /// which looks like a hash to a caller that only ever tested it with
+    /// bare ones - and a store lookup then silently misses.
+    ///
+    /// That happened within an hour of the function being added, in the
+    /// prefetch path, to size a manifest. The size was not load-bearing so
+    /// nothing broke; the next misuse might be.
+    #[test]
+    fn bare_digest_strips_a_prefix_and_does_not_parse_a_reference() {
+        use super::bare_digest;
+        assert_eq!(bare_digest("sha256:abc"), "abc");
+        assert_eq!(bare_digest("abc"), "abc", "already bare is a no-op");
+
+        let full = "172.17.0.1:15000/rebuck2/subtree@sha256:abc";
+        assert_eq!(
+            bare_digest(full),
+            full,
+            "a reference comes back whole - use solve::manifest_dig to take \
+             the digest out of one"
+        );
+    }
+
     /// Case-collision / leftover tolerance: materializing onto an existing
     /// dest replaces it (last-wins - the semantics tar gave case-colliding
     /// trees when each OS unpacked its own copy). Run 29199153837: a
@@ -759,6 +1151,146 @@ mod tests {
                 t.await.unwrap().expect("concurrent put must not race");
             }
         }
+    }
+
+    /// A bare hash must find a blob whose size we never knew - and the
+    /// size-carrying path must NOT be used for it. `has()` compares the
+    /// recorded size against the file length, so a fabricated size-0 `Dig`
+    /// calls a blob we are holding absent, and `put` then rejects the very
+    /// bytes it already has. That is why `get_blob_by_hash` exists at all.
+    #[tokio::test]
+    async fn a_bare_hash_finds_what_a_sizeless_dig_would_miss() {
+        let (s, _root) = tmp_store();
+        let d = s.put(None, b"a layer of some size").await.unwrap();
+
+        assert_eq!(
+            s.get_by_hash(&d.hash).await.unwrap().as_deref(),
+            Some(&b"a layer of some size"[..]),
+            "by hash alone must find it"
+        );
+        assert_eq!(s.size_of(&d.hash).await, Some(20));
+
+        // The trap, pinned: pretend we did not know the size.
+        let sizeless = Dig {
+            hash: d.hash.clone(),
+            size: 0,
+        };
+        assert!(
+            !s.has(&sizeless).await,
+            "a size-0 Dig calls a held blob absent - this is why OCI lookups \
+             may not fabricate one"
+        );
+        assert!(
+            s.put(Some(&sizeless), b"a layer of some size")
+                .await
+                .is_err(),
+            "and putting under one is rejected outright"
+        );
+
+        // The empty blob is the one case where size 0 is the truth.
+        assert!(
+            s.has(&Dig {
+                hash: EMPTY_SHA256.into(),
+                size: 0
+            })
+            .await
+        );
+        assert_eq!(s.get_by_hash(EMPTY_SHA256).await.unwrap(), Some(Vec::new()));
+        assert_eq!(s.size_of(EMPTY_SHA256).await, Some(0));
+
+        // A hash we have never seen is a clean miss, not an error.
+        assert_eq!(s.get_by_hash(&"f".repeat(64)).await.unwrap(), None);
+        assert_eq!(s.size_of(&"f".repeat(64)).await, None);
+    }
+
+    fn tmp_store() -> (Store, PathBuf) {
+        let root = tempfile::tempdir().unwrap().keep();
+        (Store::new(root.clone()).unwrap(), root)
+    }
+
+    fn tmp_files(root: &std::path::Path) -> Vec<PathBuf> {
+        std::fs::read_dir(root.join("tmp"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn streamed_upload_matches_a_buffered_put() {
+        let (s, _root) = tmp_store();
+        let payload: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+
+        let mut up = s.begin_upload().await.unwrap();
+        for chunk in payload.chunks(7919) {
+            up.write(chunk).await.unwrap();
+        }
+        assert_eq!(up.len(), payload.len() as u64);
+        let streamed = s.finish_upload(up, None).await.unwrap();
+
+        let buffered = s.put(None, &payload).await.unwrap();
+        assert_eq!(streamed, buffered.hash);
+        assert_eq!(s.get_by_hash(&streamed).await.unwrap().unwrap(), payload);
+    }
+
+    /// An upload abandoned mid-flight (client hung up, task cancelled) must
+    /// take its tmp file with it. Otherwise a CI runner accretes half-written
+    /// layers until the disk dies — and disk death is the failure mode this
+    /// whole project exists to avoid.
+    #[tokio::test]
+    async fn abandoned_upload_leaves_no_tmp_file() {
+        let (s, root) = tmp_store();
+        {
+            let mut up = s.begin_upload().await.unwrap();
+            up.write(b"half a layer").await.unwrap();
+            assert_eq!(
+                tmp_files(&root).len(),
+                1,
+                "tmp file should exist mid-upload"
+            );
+        } // dropped without finishing
+        assert!(
+            tmp_files(&root).is_empty(),
+            "abandoned upload leaked its tmp file"
+        );
+    }
+
+    /// A client that claims a digest its bytes do not have gets refused, and
+    /// the rejected bytes must not linger. The CAS's contract is that a name
+    /// means its content.
+    #[tokio::test]
+    async fn streamed_digest_mismatch_is_rejected_and_cleaned_up() {
+        let (s, root) = tmp_store();
+        let mut up = s.begin_upload().await.unwrap();
+        up.write(b"the actual bytes").await.unwrap();
+
+        let lie = "c".repeat(64);
+        let e = s.finish_upload(up, Some(&lie)).await.unwrap_err();
+        assert!(e.to_string().contains("digest mismatch"), "{e}");
+        assert!(
+            tmp_files(&root).is_empty(),
+            "rejected upload leaked its tmp"
+        );
+        assert!(s.get_by_hash(&lie).await.unwrap().is_none());
+    }
+
+    /// Re-uploading a blob we already hold is a no-op, not a rewrite.
+    #[tokio::test]
+    async fn redundant_streamed_upload_is_a_noop() {
+        let (s, root) = tmp_store();
+        let first = s.put(None, b"already here").await.unwrap();
+
+        let mut up = s.begin_upload().await.unwrap();
+        up.write(b"already here").await.unwrap();
+        let again = s.finish_upload(up, Some(&first.hash)).await.unwrap();
+
+        assert_eq!(again, first.hash);
+        assert!(tmp_files(&root).is_empty());
+        assert_eq!(
+            s.get_by_hash(&again).await.unwrap().unwrap(),
+            b"already here"
+        );
     }
 }
 
