@@ -8381,3 +8381,26 @@ data point and a mechanism.
 That is a larger ask than anything else outstanding, and lower priority than
 `-w1` - which sizes the term on the one target where every other number is
 already known.
+
+### Why `-w1` measures what it claims to, despite one machine doing everything
+
+A single worker defaults to `available_parallelism()` slots - four on a
+runner - so it runs up to four leads at once on four cores. Those leads
+contend, and each takes longer than it would alone.
+
+**That contention inflates the leg and leaves the CPU total alone.** Four
+processes sharing four cores use the same CPU-seconds as four processes with
+a core each; they simply take more wall time to spend them. So the number
+this run exists to produce is the one the configuration cannot distort.
+
+Which is the second reason CPU is the right metric here, after the
+like-for-like argument. It also means the caveat filed earlier - "the leg
+from this run means nothing" - is stronger than it sounded: the leg is not
+merely uninformative, it is actively misleading, because a one-machine
+fleet's leg is a queueing artefact and nothing else.
+
+Expected duration, so a slow run is not mistaken for a hung one: lead time
+was ~8,000s at occupancy 7.5 on six workers. At four slots on one, the leg
+should be roughly 2,000s - and less if the ancestry hypothesis is right,
+since a single machine materialises the common 705 MiB once rather than six
+times. Job cap is 150 minutes, so there is ample room either way.
