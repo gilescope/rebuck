@@ -31,9 +31,11 @@ ARG --global RUST="1.92.0"
 # `0.6.16 export -format=lcov`. An ARG becomes an env var in the container,
 # and this tool has an opinion about that name.
 ARG --global LLVM_COV_VERSION="0.6.16"
-# Report-only by default. A threshold is a promise about a number nobody has
-# measured yet; `+coverage-gate` is where a real floor goes once there is one.
-ARG --global FAIL_UNDER="0"
+# MEASURED, not chosen: 56.95% of lines on 2026-08-12. The floor is set a
+# little under it so ordinary churn does not turn the gate red, and raising
+# it is a deliberate edit. A threshold picked before measuring is a number
+# people route around.
+ARG --global FAIL_UNDER="55"
 
 deps:
     # `-slim-bookworm` and not alpine: the crate graph pulls in ring and
