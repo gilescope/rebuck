@@ -107,10 +107,14 @@ This has never been varied. It has been on in every run in the ledger,
 which is why it reads as part of the furniture.
 
 **The experiment is an env switch and one run.** Drop `rewrite-timestamp`
-and `source-date-epoch` behind `REBUCK2_REPRODUCIBLE` (default on, so no
-existing number is repriced) and run a `-norepro` arm against the
-reference. Prediction, stated first as this file requires: worker CPU falls
-by more than any change measured so far. If it does not, the premium is the
+and `source-date-epoch` behind a new flag (default on, so no existing number
+is repriced) and run a `-norepro` arm against the reference. Deliberately
+not named here: `check-flag-jobs.py` reads such a token in a doc as a
+promise, and a flag documented before it is implemented is the phantom
+that check exists to catch.
+
+Prediction, stated first as this file requires: worker CPU falls by more
+than any change measured so far. If it does not, the premium is the
 portable rewrite and that is the next instrument.
 
 What is given up is byte-identical layers between machines, which buys

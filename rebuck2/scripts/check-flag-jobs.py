@@ -29,6 +29,18 @@ SRC = ROOT / "rebuck2/src"
 # Files whose code runs in the worker job. `dispatch.rs` is shared by both
 # and so proves nothing either way; it is left out rather than guessed at.
 WORKER_SIDE = {"worker", "exec"}
+# Files BOTH jobs run, so a flag read only from here is unresolved rather
+# than fine. Silence was not neutral: REBUCK2_COMPRESSION sat in the
+# coordinator job while `solve::build_subtree` - called from worker.rs:919 -
+# exported every dispatched result from the WORKER, and this script passed
+# it because `solve` is in neither set. Every dispatched export in every run
+# used buildkit's default codec, and two arms measured the coordinator only.
+#
+# Adding `solve` to WORKER_SIDE would be wrong: the coordinator genuinely
+# reads it too (publish_context, mirror_image). The defect is that a
+# file-level map cannot see that ONE FUNCTION in a shared file runs on one
+# side, so the honest repair is to say so rather than to guess.
+SHARED = {"solve", "dispatch", "mesh", "store", "registry"}
 
 owner: dict[str, set] = {}
 job = None
@@ -83,8 +95,29 @@ for d in sorted((ROOT / "docs").glob("*.md")):
 for line in phantom:
     print(line, file=sys.stderr)
 
+# A check that finds nothing must prove it looked (shape 12). These are the
+# ones this script CANNOT rule on, and they are printed every run - not only
+# when something is wrong - because a line that appears only on failure
+# cannot evidence an absence.
+unresolved = [
+    (v, sorted(reads.get(v, set())))
+    for v, jobs in sorted(owner.items())
+    if jobs == {"coordinator"}
+    and not (reads.get(v, set()) & WORKER_SIDE)
+    and (reads.get(v, set()) & SHARED)
+]
+for v, r in unresolved:
+    print(
+        f"{v}: coordinator-only, read from shared file(s) {r} - "
+        f"check which JOB runs the function that reads it",
+        file=sys.stderr,
+    )
+
 print(
     f"{len(owner)} flag(s) in the workflow, {len(bad)} in the wrong job, "
-    f"{len(phantom)} documented but unimplemented"
+    f"{len(phantom)} documented but unimplemented, "
+    f"{len(unresolved)} unresolved (shared reader)"
 )
+# `unresolved` does not fail the run: it is a prompt to think, and a check
+# that goes red on every shared-file flag would be turned off within a week.
 sys.exit(1 if (bad or phantom) else 0)
