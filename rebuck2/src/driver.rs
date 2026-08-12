@@ -1990,6 +1990,23 @@ impl Driver {
         self.prefetch_image_for(image_ref, None).await
     }
 
+    /// [`Driver::prefetch_image`], but every worker takes ALL of the blobs
+    /// instead of its share.
+    ///
+    /// For a CACHE SEED, and the case is not a judgement call: every graph
+    /// naming that cache id wants it, on every machine, at the start of its
+    /// first lead. Split 1-in-N, five workers in six have to fetch it
+    /// peer-to-peer at exactly the moment it is needed - and run
+    /// 31552464169 shows what that costs, with 274 leads failing on
+    /// `could not fetch content descriptor ... not found`.
+    ///
+    /// Not gated behind a switch of its own. Seeding is already behind
+    /// `-seed`, and seeding without this is measured broken rather than
+    /// merely slower, so there is no configuration worth preserving.
+    pub async fn prefetch_image_everywhere(self: &Arc<Self>, image_ref: &str) {
+        self.prefetch_image_inner(image_ref, None, true).await
+    }
+
     /// As [`Driver::prefetch_image`], but only if `op` has more than one
     /// consumer.
     ///
@@ -1997,6 +2014,15 @@ impl Driver {
     /// mirrored base image is needed by every graph that names it, and no
     /// count is required to establish that.
     pub async fn prefetch_image_for(self: &Arc<Self>, image_ref: &str, op: Option<&str>) {
+        self.prefetch_image_inner(image_ref, op, false).await
+    }
+
+    async fn prefetch_image_inner(
+        self: &Arc<Self>,
+        image_ref: &str,
+        op: Option<&str>,
+        everyone: bool,
+    ) {
         if !prefetch_ahead() {
             return;
         }
@@ -2078,7 +2104,7 @@ impl Driver {
                 }
             };
             match blobs {
-                Some(d) if !d.is_empty() => this.prefetch_everywhere(d).await,
+                Some(d) if !d.is_empty() => this.prefetch_everywhere(d, everyone).await,
                 Some(_) => println!("[driver] prefetch: {r} names no blobs"),
                 None => {}
             }
@@ -2097,7 +2123,9 @@ impl Driver {
     /// Advisory. A worker that drops this builds what it would have built
     /// anyway, one lazy pull later, so it can never fail a build - which is
     /// why it is broadcast without waiting for or checking a reply.
-    async fn prefetch_everywhere(self: &Arc<Self>, digests: Vec<crate::mesh::Dig>) {
+    /// `everyone` forwards to the frame: see [`crate::mesh::D2W::Prefetch`]
+    /// for why a cache seed cannot be split.
+    async fn prefetch_everywhere(self: &Arc<Self>, digests: Vec<crate::mesh::Dig>, everyone: bool) {
         if digests.is_empty() {
             return;
         }
@@ -2112,6 +2140,7 @@ impl Driver {
             let _ = w.tx.send(D2W::Prefetch {
                 digests: digests.clone(),
                 peers: peers.clone(),
+                everyone,
             });
         }
         drop(ws);

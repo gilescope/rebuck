@@ -407,7 +407,11 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
             // the mechanism costs exactly what it saves. Failures are
             // dropped - a blob that does not arrive now arrives lazily
             // later, which is what happens today.
-            D2W::Prefetch { digests, peers } => {
+            D2W::Prefetch {
+                digests,
+                peers,
+                everyone,
+            } => {
                 let n = digests.len();
                 let blobs = blobs.clone();
                 tokio::spawn(async move {
@@ -416,7 +420,7 @@ pub async fn run(store: Arc<Store>, cfg: WorkerCfg) -> Result<()> {
                     // `seeder_for` exists to prevent - and a prefetch makes
                     // it arrive EARLIER, so it would hurt more than the lazy
                     // path it replaces.
-                    let mine = blobs.my_share(digests, &peers).await;
+                    let mine = blobs.my_share(digests, &peers, everyone).await;
                     let share = mine.len();
                     let mut got = 0usize;
                     // BEHIND the gate, not around each fetch: holding it for
@@ -1096,7 +1100,7 @@ impl RemoteBlobs {
     /// herd that `seeder_for` exists to prevent, arriving earlier and
     /// therefore hurting more. Each worker takes its own share; the rest
     /// reach it from peers, at six times the width, which is principle 16.
-    async fn my_share(&self, digests: Vec<Dig>, fleet: &[String]) -> Vec<Dig> {
+    async fn my_share(&self, digests: Vec<Dig>, fleet: &[String], everyone: bool) -> Vec<Dig> {
         // The DRIVER's list, not this worker's gossip. Computed locally the
         // shares do not partition: two workers with different peer sets both
         // claim some blobs and neither claims others, so the split leaves
@@ -1123,7 +1127,9 @@ impl RemoteBlobs {
             &digests.iter().map(|d| d.hash.clone()).collect::<Vec<_>>(),
             &ids,
             &self.my_id,
-            prefetch_broadcast(),
+            // Either the SENDER said this is wanted everywhere - a cache
+            // seed - or the operator asked for broadcast globally.
+            everyone || prefetch_broadcast(),
         )
         .into_iter()
         .collect();

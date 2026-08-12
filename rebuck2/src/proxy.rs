@@ -2074,7 +2074,12 @@ impl Proxy {
                                 "[proxy] seed {id} = {reference}, {} blob(s) - pre-positioning",
                                 b.len()
                             );
-                            self.driver.prefetch_image(reference).await;
+                            // EVERYWHERE, not this-worker's-share. See
+                            // `prefetch_image_everywhere`: the comment above
+                            // already says a seed is wanted "on every
+                            // machine", and until now it was handed to a
+                            // mechanism that splits it 1-in-N.
+                            self.driver.prefetch_image_everywhere(reference).await;
                             ok.insert(id.clone(), reference.clone());
                         }
                         _ => println!(

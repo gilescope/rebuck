@@ -263,6 +263,21 @@ pub enum D2W {
         /// time. The driver is the only party that knows the list
         /// authoritatively, and it is the party sending the message.
         peers: Vec<String>,
+        /// Take ALL of these, not this worker's share of them.
+        ///
+        /// The split exists so six workers do not pull the same layer off
+        /// the coordinator at once. That reasoning fails for content every
+        /// machine needs immediately: a CACHE SEED is wanted by every graph
+        /// naming that cache id, on every worker, at the start of the first
+        /// lead. Split 1-in-N it has to be fetched peer-to-peer at exactly
+        /// the moment it is needed, against gossip that has not propagated
+        /// and a five-second peer timeout - which is how a run seeded three
+        /// mounts and then failed 274 leads with
+        /// `could not fetch content descriptor ... not found`.
+        ///
+        /// Set by the SENDER, because the worker cannot tell a seed blob
+        /// from any other one by looking at it.
+        everyone: bool,
     },
 }
 
@@ -453,6 +468,7 @@ mod tests {
         let last = D2W::Prefetch {
             digests: vec![],
             peers: vec![],
+            everyone: false,
         };
         let bytes = postcard::to_allocvec(&last).expect("encode");
         let idx = bytes[0];
@@ -484,11 +500,20 @@ mod tests {
                 size: 7,
             }],
             peers: vec!["w1".to_owned(), "w2".to_owned()],
+            everyone: true,
         };
         let back: D2W =
             postcard::from_bytes(&postcard::to_allocvec(&sent).expect("encode")).expect("decode");
         match back {
-            D2W::Prefetch { digests, peers } => {
+            D2W::Prefetch {
+                digests,
+                peers,
+                everyone,
+            } => {
+                // A SEED is wanted by every machine, so it must not be
+                // split. Carried on the frame rather than inferred, because
+                // the worker cannot tell a seed blob from any other one.
+                assert!(everyone, "the broadcast flag has to survive the wire");
                 assert_eq!(digests.len(), 1);
                 assert_eq!(digests[0].hash, "abc");
                 assert_eq!(digests[0].size, 7);
