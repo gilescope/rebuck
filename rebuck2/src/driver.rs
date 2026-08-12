@@ -2103,6 +2103,28 @@ impl Driver {
                     }
                 }
             };
+            // THE MANIFEST TOO. `image_blobs`/`manifest_blobs` return what
+            // the manifest points at - config and layers - so a
+            // pre-positioned image was missing the one blob a puller reads
+            // FIRST. Every worker fetched it at lead time instead, and 60
+            // leads in run 31554856118 died on
+            // `...subtree@sha256:...: not found`.
+            let blobs = match blobs {
+                Some(mut d) => {
+                    let bare = crate::store::bare_digest(&r).to_owned();
+                    // Its real length if we hold it. A wrong size is not
+                    // fatal - the provider frames its own response - but it
+                    // is free to be right.
+                    let size = this.store.size_of(&bare).await.unwrap_or(0) as i64;
+                    if let Some(m) = crate::solve::manifest_dig(&r, size) {
+                        if !d.iter().any(|x| x.hash == m.hash) {
+                            d.push(m);
+                        }
+                    }
+                    Some(d)
+                }
+                None => None,
+            };
             match blobs {
                 Some(d) if !d.is_empty() => this.prefetch_everywhere(d, everyone).await,
                 Some(_) => println!("[driver] prefetch: {r} names no blobs"),

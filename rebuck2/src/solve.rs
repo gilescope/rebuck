@@ -554,6 +554,30 @@ pub async fn publish_context(
 /// expect - a manifest LIST rather than a manifest, an empty layers array,
 /// a digest without its algorithm - and none of those need a registry to
 /// reproduce.
+/// The manifest's own blob, when the reference names it by digest.
+///
+/// [`manifest_blobs`] returns what a manifest POINTS AT, namely config and
+/// layers, which left a pre-positioned image missing the one blob a puller
+/// reads first. Every worker then fetched it at lead time, and a miss reads as
+/// `<registry>/rebuck2/subtree@sha256:...: not found`, which is a build
+/// failure rather than a slow fetch.
+///
+/// `None` for a tag: resolving it takes a fetch, and announcing a guessed
+/// digest would pre-position something nobody holds.
+pub fn manifest_dig(reference: &str, size: i64) -> Option<crate::mesh::Dig> {
+    let (_, digest) = reference
+        .rsplit_once("@sha256:")
+        .or_else(|| reference.strip_prefix("sha256:").map(|hex| ("", hex)))?;
+    (!digest.is_empty() && digest.chars().all(|c| c.is_ascii_hexdigit())).then(|| {
+        crate::mesh::Dig {
+            // Bare, like every other Dig in the mesh - see
+            // `store::bare_digest` for what mixing the two spellings costs.
+            hash: digest.to_owned(),
+            size,
+        }
+    })
+}
+
 pub fn manifest_blobs(json: &str) -> Vec<crate::mesh::Dig> {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
         return Vec::new();
@@ -1315,6 +1339,32 @@ mod tests {
         // tcp:// is what earthly writes and what tonic cannot dial, so it
         // becomes http:// rather than being passed through to fail later.
         assert_eq!(d("tcp://host:8372"), "http://host:8372");
+    }
+
+    /// A prefetch that announces an image's contents but not the image.
+    ///
+    /// `manifest_blobs` returns config and layers - everything the manifest
+    /// POINTS AT, and not the manifest itself. So a pre-positioned image
+    /// left every worker still needing one small blob, fetched at lead time,
+    /// and a miss on it reads as
+    /// `172.17.0.1:15000/rebuck2/subtree@sha256:...: not found`. Run
+    /// 31554856118 failed 60 leads that way.
+    #[test]
+    fn the_manifest_is_part_of_the_image_it_describes() {
+        let d = |r: &str| super::manifest_dig(r, 493);
+
+        // A digest reference names the manifest directly - that IS the blob.
+        let got = d("172.17.0.1:15000/rebuck2/subtree@sha256:abc123").expect("digest ref");
+        assert_eq!(got.hash, "abc123", "stored bare, like every other Dig");
+        assert_eq!(got.size, 493);
+
+        // A bare digest too: the driver hands these around internally.
+        assert_eq!(d("sha256:abc123").expect("bare").hash, "abc123");
+
+        // A TAG names no blob we can pre-position - resolving it needs a
+        // fetch, and guessing would announce a digest nobody holds.
+        assert!(d("ghcr.io/me/seed:v1").is_none());
+        assert!(d("172.17.0.1:15000/library/busybox:1").is_none());
     }
 
     #[test]
