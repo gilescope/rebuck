@@ -955,6 +955,22 @@ async fn handle<S: RegistryStore>(
                             None => err(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", reference),
                         }
                     } else {
+                        // SAY SO. This 404 is the end of the whole chain -
+                        // local store, then peers by bloom, then the driver,
+                        // then upstream - and it said nothing, so the only
+                        // trace was buildkit's own `could not fetch content
+                        // descriptor ... not found` on the other side of the
+                        // wire. Diagnosing 274 of those cost an hour and an
+                        // artifact download; the digest and the fact that
+                        // everything was tried is one line.
+                        eprintln!(
+                            "[registry] MISS {reference} in {_repo}: not local, no peer                              advertised it, the driver did not have it, and upstream                              {} - the caller will see a 404 and probably fail its build",
+                            if reg.upstream.is_some() {
+                                "could not supply it"
+                            } else {
+                                "is not configured"
+                            }
+                        );
                         err(StatusCode::NOT_FOUND, "BLOB_UNKNOWN", reference)
                     }
                 }
