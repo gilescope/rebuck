@@ -8347,3 +8347,37 @@ So the table supports "every target loses" and supports the mechanism, and
 does NOT support any ordering claim. **Measuring per-worker distinct content
 on the other four targets is what would** - and it is one grep of a run that
 has already happened for three of them.
+
+### The ancestry figure is extractable per target, and it differs
+
+Acting on the previous entry: the variable principle 30 needs is per-worker
+distinct content, and it can be pulled from runs that already exist.
+
+| run | target | distinct per worker | left the boxes |
+| ----------- | ------------------- | ------------------- | -------------- |
+| 31559656955 | `+test-ast` | **705 MiB** | 32,924 MiB |
+| 31544510798 | `+all` | **241 MiB** | 6,816 MiB |
+| 31535562277 | `+test-no-qemu` | (no serve summary) | 0 MiB |
+
+So the quantity is real, measurable, and varies threefold between two
+targets - which is what an explanatory variable is supposed to do.
+
+**But neither of these runs can be turned into a ratio.** Both used
+`-nobase`, so neither has a baseline leg to divide by. That is the whole
+reason `-nobase` exists - it halves the runner cost when the question is
+about the fleet alone - and it makes these runs useless for the correlation
+they would otherwise settle.
+
+`+test-no-qemu`'s zero is not missing data. Its workers served nothing over
+a megabyte to anyone, which fits a target that is mostly `WITH DOCKER` and
+half undispatchable: there is little ancestry to share because there is
+little dispatched.
+
+**What it would take:** one run per target WITH a baseline, reading
+`distinct per worker` and the wall figures together. Four targets, four
+runs, and then principle 30 has an ordering claim behind it instead of one
+data point and a mechanism.
+
+That is a larger ask than anything else outstanding, and lower priority than
+`-w1` - which sizes the term on the one target where every other number is
+already known.
