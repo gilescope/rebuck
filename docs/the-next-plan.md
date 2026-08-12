@@ -167,17 +167,48 @@ measured the benefit carefully and priced nothing. That is shape 24 — a
 trade-off judged on one side of the trade — which this file already invokes
 against cache-mount seeding.
 
-**What this does not change:** integrity. Everything here is fetched by
+**4. And it may be breaking build caches, which is not a cost at all but a
+correctness bug.** `rewrite-timestamp` does not truncate mtimes — it sets
+every file in the layer to **epoch 0**. Any tool that decides freshness by
+comparing timestamps sees a source tree entirely dated 1970.
+
+Cargo is exactly such a tool. rustc's incremental compilation is content-
+hashed and does not care, but **cargo** decides whether to invoke rustc at
+all by comparing source mtimes against output mtimes, and cargo already
+knows about this failure mode in containers — `rust-lang/cargo#6529`:
+
+> when a step is cached in Docker, the nanosecond portions of all files is
+> zeroed out
+
+Epoch 0 is that failure mode taken to its limit. The workaround on the
+cargo side is `-Z checksum-freshness` (nightly; build-script inputs still
+use mtimes), which swaps mtimes for content checksums and is documented as
+being for exactly this — "systems with a poor mtime implementation, or in
+CI/CD".
+
+This does not explain any number currently in the ledger: the benchmarked
+targets are Go, and Go's build cache is content-hashed, so it is immune.
+**It becomes live the moment a Rust workload is used**, which is one of
+this document's own recommendations, and it would show up as dispatch
+overhead rather than as a broken cache.
+
+**What none of this changes:** integrity. Everything here is fetched by
 digest, so a client that asks for a digest and gets bytes hashing to it has
 the right bytes, whatever their mtimes. Determinism is about *cheap
 republish*, not correctness, and `publish_attrs`' own comment confirms
 client-visible output digests were identical with and without it.
 
-**So the fix is conditional, not a deletion.** Keep both attrs for the
-persistent-mirror case they were measured on; drop them for per-solve
-dispatch, where the repeat does not occur and the price is the largest term
-in the build. Same argument for `force-compression`, which normalises a
-layer's encoding — something a digest-addressed transport never needs.
+**So: off by default, on where it was measured.** Keep both attrs for the
+persistent-mirror path they were justified on; do not pay them on per-solve
+dispatch, where the repeat does not occur, the price is the largest term in
+the build, and the side effect is a layer full of 1970. Same argument for
+`force-compression`, which normalises a layer's encoding — something a
+digest-addressed transport never needs.
+
+**Flipping the default reprices the ledger**, and `solve.rs`' own comment
+says so about the sibling codec knob. Do it behind a named switch reported
+in the wire line, so a run says which regime it was in and no future reader
+compares across the change without noticing.
 
 ### The `-nocomp` arm as committed is confounded
 
@@ -424,11 +455,63 @@ in one line: **placement decides who does the work, not how much there is.**
 5. Admission predicate, printed, in the corrected units. No run.
 6. Then, and only if 1 leaves headroom: a load that clears admission, on
    workers that outlive it.
+7. **Last, and only if a Rust workload makes it pay: patch containerd to
+   keep nanosecond mtimes.** See below.
 
 Steps 1 and 5 cost nothing and are the two that say whether the rest is
 worth running at all. That ordering is the actual change of plan: **stop
 measuring the fleet, and start measuring whether the target has a win in
 it.**
+
+### 7, in full: nanosecond mtimes in exported layers
+
+Layer tars written by containerd carry **whole-second** mtimes, and this is
+not a setting. `pkg/archive/tar.go`:
+
+```go
+// truncate timestamp for compatibility. without PAX stdlib rounds timestamps instead
+hdr.Format = tar.FormatPAX
+if cw.modTimeUpperBound != nil && hdr.ModTime.After(*cw.modTimeUpperBound) {
+    hdr.ModTime = *cw.modTimeUpperBound
+}
+hdr.ModTime = hdr.ModTime.Truncate(time.Second)
+hdr.AccessTime = time.Time{}
+hdr.ChangeTime = time.Time{}
+```
+
+Note it selects **PAX**, which can carry nanoseconds, and discards them on
+the next line. Access and change times are wiped outright. BuildKit uses
+this differ, so it applies to every layer this fleet exports.
+
+The precision exists at every other stage — ext4, xfs, btrfs and APFS all
+store nanoseconds, and PAX has a field for them. Container tooling is the
+only place it is thrown away.
+
+**The patch is one line** (drop the `Truncate`) plus a BuildKit built
+against it. `rebuck2/patches/` already carries fork patches, so the
+machinery exists.
+
+**Why it is step 7 and not step 2.** Three reasons, in order:
+
+- **`rewrite-timestamp` dominates it.** Setting every mtime to 1970 is
+  strictly worse than truncating to a second, so while that is on, this
+  patch changes nothing. Step 2 has to land first or this cannot even be
+  measured.
+- **It fights dedup.** Finer timestamps make identical builds produce
+  different layer bytes more reliably, which is the opposite of what
+  `81a0ce7` was reaching for. Worth paying only where a build cache
+  depends on it.
+- **Nothing currently benefits.** The benchmarked targets are Go, whose
+  build cache is content-hashed. The beneficiary is cargo, and cargo has
+  its own answer in `-Z checksum-freshness`, which needs no patched
+  containerd at all.
+
+So this is the right fix for the case where a Rust workload is the load,
+`-Z checksum-freshness` is unacceptable (it is nightly-only), and the
+measurement says mtime granularity is what is costing rebuilds. **Record
+that condition before doing it** — a containerd fork is a maintenance
+liability, and this project has been bitten before by mechanisms adopted
+on a plausible mechanism rather than a measured need.
 
 ## What this document got wrong, and what caught it
 
