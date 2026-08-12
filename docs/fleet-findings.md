@@ -5857,3 +5857,49 @@ Worth noting what unblocked it. Three turns ago I wrote "needs a solve ref
 the baseline never surfaces" and listed three unpalatable options. All three
 were workarounds for a constraint that does not exist - and the fork has
 been checked out three directories away the whole time.
+
+## The join run failed parity, and the new suspect is my own history read
+
+```text
+17 success  the Earthfile, through the fleet     (636s, against 1050s)
+18 failure  did the fleet change the answer
+Error: async force execution for ./tests/integration-base+test-base:
+  unlazy force execution: failed to copy: httpReadSeeker: failed open:
+  could not fetch content descriptor sha256:485a2ed9f85270d9aaf6
+```
+
+**636 seconds is not a result.** The leg was fast because it stopped early -
+the same shape as `-bcast`, caught by the same gate, and the second time
+today a suspiciously good number has turned out to be a broken build.
+
+### What is new in this run
+
+Two things, and only one of them is exonerated.
+
+**The worker vertex tap is not the cause.** Run 31541993907 carried it
+ungated, passed parity, and cost 15%. Same code, same effect, no failure.
+
+**The baseline history read is new.** `watch-vertices` opens
+`ListenBuildHistory` and then a `Status` stream per record against the
+BASELINE daemon, immediately before the fleet leg. It is meant to be a pure
+read. Buildkit's history subsystem holds references to build results, and
+whether enumerating it disturbs content lifetime is not something I know -
+`could not fetch content descriptor` is exactly what a prematurely released
+blob looks like.
+
+That is a suspicion with a mechanism, not a diagnosis. What makes it
+actionable is that it is cheap to separate: **the history step runs on any
+run with a baseline leg**, so the next plain `-ast-balance` run tests it
+without `-vtx` in the way.
+
+### The immediate consequence
+
+Every future run with a baseline now carries this step. If it is harmful, it
+is harmful to the reference band itself - the 1050s number that six
+comparisons today rest on. So it goes behind the same flag as the worker
+half rather than running by default, and the join becomes a two-flag
+experiment instead of a free rider on every baseline.
+
+Recorded before changing anything, because "my instrument broke the build"
+has happened twice today and both times the fix was to make it optional
+rather than to argue it was safe.
