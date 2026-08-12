@@ -8247,3 +8247,61 @@ the ancestry term is and everything else is guesswork until then. But if
 `-w1` confirms it, grafting against a warm bank is the cheapest attack on
 it, needs no new code, and its only contrary measurement is one this file
 already calls unrepresentative.
+
+## The pair: worker CPU is reproducible to 0.1%, and that changes everything
+
+Two runs, identical code, identical configuration, back to back.
+
+| | ref1 | ref2 | spread |
+| ------------------- | ------ | ------ | ------ |
+| leg | 1,092s | 1,039s | 5.1% |
+| baseline CPU | 607s | 604s | 0.5% |
+| **worker CPU total** | **5,575s** | **5,579s** | **0.1%** |
+| amplification | 9.2x | 9.2x | - |
+
+**The worker CPU total is reproducible to one part in a thousand.** Four
+seconds apart on five and a half thousand.
+
+So "43% run-to-run variance in CPU" was wrong, and wrong in the way that
+matters: I measured the spread across runs with DIFFERENT configurations -
+seeded, seeded-with-a-regression, unseeded - and attributed it to noise.
+Same configuration twice gives 0.1%.
+
+### What that unlocks
+
+Every CPU comparison tonight is now admissible, and they say something the
+leg alone did not:
+
+| run | amplification | configuration |
+| ----- | ------------- | ----------------------------- |
+| C | 6.5x | seeded |
+| D | 8.7x | seeded, plus my manifest regression |
+| ref1 | 9.2x | unseeded, fixed |
+| ref2 | 9.2x | unseeded, fixed |
+
+**Seeding lowers the CPU amplification from 9.2x to 6.5x.** It is doing real
+work: a filled cache mount means a worker skips work it would otherwise do,
+and that shows up as 29% less total CPU.
+
+**And it raises the leg from ~1,065s to 1,396-1,783s.**
+
+So seeding is not useless, which is what the leg alone said all night. It
+trades **critical path for total work**, and this fleet is critical-path
+bound, so the trade loses. On a fleet that was throughput-bound - many
+targets queued, machines saturated - the same mechanism would win.
+
+That is a genuinely different conclusion from "seeding does not pay", and it
+was invisible until the noise band existed.
+
+### What is still not reproducible
+
+The per-worker split. ref1 `240 742 878 985 1084 1646`, ref2
+`243 360 674 1284 1293 1725` - the same total, distributed differently every
+time. Placement is where the randomness lives, and it moves the leg (5.1%)
+while leaving the total untouched (0.1%).
+
+Which is a clean statement of what the scheduler can and cannot do: **it
+decides who does the work, not how much there is.** Every mechanism that
+tried to reduce total work by placing differently was attempting something
+placement cannot do, and principle 30 says why - the ancestry is needed by
+whoever runs the lead, wherever that is.
