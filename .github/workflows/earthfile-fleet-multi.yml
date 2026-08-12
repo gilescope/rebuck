@@ -80,6 +80,11 @@ on:
       # actually show.
       - giles-dispatch-ci-ast-balance-bcast
       - giles-dispatch-ci-ast-balance-vtx
+      # Seeding ON TOP of balance, not instead of it. `-ast-seed` already
+      # existed and would answer a different question: the 1113s reference
+      # this is measured against is a balanced leg, so an unbalanced seeded
+      # run confounds the two mechanisms and neither number means anything.
+      - giles-dispatch-ci-ast-balance-seed
       - giles-dispatch-ci-tests-nobase
       # The coverage run, with whatever placement is known best at the time.
       # A coverage run's deliverable is the failed-target list, not a clock,
