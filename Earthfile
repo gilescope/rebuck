@@ -26,7 +26,11 @@ VERSION 0.8
 ARG --global RUST="1.92.0"
 # Pinned, and `--locked` below pins its own dependency tree. An unpinned
 # coverage tool makes the metric drift under you.
-ARG --global LLVM_COV="0.6.16"
+# NOT named LLVM_COV: cargo-llvm-cov reads that env var as the PATH to the
+# llvm-cov binary, so a version string there makes it try to execute
+# `0.6.16 export -format=lcov`. An ARG becomes an env var in the container,
+# and this tool has an opinion about that name.
+ARG --global LLVM_COV_VERSION="0.6.16"
 # Report-only by default. A threshold is a promise about a number nobody has
 # measured yet; `+coverage-gate` is where a real floor goes once there is one.
 ARG --global FAIL_UNDER="0"
@@ -53,7 +57,7 @@ deps:
      && apt-get install -y --no-install-recommends \
           pkg-config libssl-dev protobuf-compiler zstd sqlite3 \
      && rm -rf /var/lib/apt/lists/*
-    RUN cargo install cargo-llvm-cov --version $LLVM_COV --locked
+    RUN cargo install cargo-llvm-cov --version $LLVM_COV_VERSION --locked
     WORKDIR /w
 
 # The dependency graph on its own layer, so editing src/ does not rebuild it.

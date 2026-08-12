@@ -8615,3 +8615,48 @@ Two errors in the Earthfile were found by running it rather than reading it:
 `ARG --global X := v` is not Earthly syntax, and the binary is now `earth`.
 A build file nobody has executed is a hypothesis - shape 10, and it applies
 to the thing measuring the tests as much as to the tests.
+
+## The amplification, isolated: 1.9 CPU-seconds local, 23.5 dispatched
+
+Run `31566167945` - one worker, coordinator instrumented for the first time.
+
+| | solves | CPU | per solve |
+| ------------------- | ------ | ------ | --------- |
+| baseline, one machine | 412 | 634s | 1.5s |
+| coordinator (at home) | 374 | 707s | **1.9s** |
+| worker (dispatched) | 38 | 892s | **23.5s** |
+
+**A worker given 38 of 412 solves spends more CPU than the baseline spends
+on all 412.** The same work costs about **twelve times** as much per solve
+when it is dispatched as when it is built locally, and this is the first
+measurement that separates the two on one run, with one clock, in one
+configuration.
+
+The coordinator's 1.9s per solve against the baseline's 1.5s is the honest
+control: building through the proxy, at home, costs 27% more than building
+directly. That is the gateway's own overhead and it is small.
+
+### What it kills
+
+**The linear model.** `T = nA + W + leads*P` predicted `A = (T6 - T2)/4`,
+which gives 994s - larger than the entire 634s baseline, so a "per-machine
+setup cost" cannot be what this is. Per machine the fleet spends 800s (two
+machines) and 929s (six); the baseline spends 634s doing the whole job.
+**Every machine that participates does more work than the whole build.**
+
+**And it kills "the leads are too small" as the explanation.** The 38
+dispatched solves here are not the small ones - they are what a saturated
+worker accepted - and they cost 23.5s each.
+
+### What remains
+
+Why a dispatched solve costs twelve times a local one. The candidates are
+now few and all measurable:
+
+- **materialising ancestry** - 425 MiB distinct on that single worker
+- **the portable rewrite** - different digests, so nothing the coordinator
+  built can be reused, and possibly more materialised than the baseline needs
+- **export and push** of every result
+
+The `building` split - materialise / run / export - separates all three and
+still does not exist. It is now unambiguously the next instrument.
