@@ -116,7 +116,8 @@ confident version first - which has happened to me, in this file, twice.
 
 | question | why it is open |
 | -------- | -------------- |
-| **Whether the leads are simply too small** | THE live hypothesis. `+all-binaries` wins 2.7x with five leads of minutes; `+test-ast` loses with 412 leads whose median is 2.6s. Same fleet, same per-unit cost. `worth_offering` would test it and has no callers |
+| Whether the small leads matter | BOUNDED: they are half the count and at most 15% of lead time, so `worth_offering` is worth wiring and cannot be the 6-9x |
+| **Why the BIG leads cost what they do** | THE live question. The top 10% of leads hold 45% of lead time at 87-302s each - the size a build farm wants - and `+all-binaries` proves large leads can win. Something makes these cost several times their one-machine equivalent |
 | **What the per-unit cost is** | Two samples of the same binary: 6.5x and 8.7x in CPU. So ~6-9x with a third of run-to-run variance, not a number. Cold mounts eliminated. Export bounded at 5-10%. Delivery eliminated (325 prefetch misses cost 7 leads). No candidate for the remainder |
 | What the run-to-run noise band actually is | never measured. Two identical runs are in flight to find out, and until they land no tens-of-percent claim in this file is safe |
 | How much of the fleet's traffic crosses a wire | `SERVED_BYTES` mixes loopback with peer serving; `SERVED_LOCAL_BYTES` exists and has never reported. The per-worker `N MiB left it` lines now answer most of this |
@@ -7600,3 +7601,43 @@ manifest regression that produced most of those 325 misses, and the seeder-
 first ordering that stops six machines asking one for the same bytes. What
 does NOT deserve another run is the theory that delivery failure is why the
 fleet is slow. It is not, and the arithmetic was available in this run.
+
+### The small leads are half the count and at most 15% of the time
+
+Before "the leads are too small" is allowed to stand as THE hypothesis, the
+distribution. Run D, from the workflow's own line:
+
+```text
+n=519 min=659ms p50=5738ms p90=87367ms max=302059ms mean=19608ms
+```
+
+| | |
+| ---------------------------------- | ------------------- |
+| total lead time (n x mean) | 10,177s, against a reported 10,058s |
+| bottom HALF of leads, upper bound | **1,489s = 15%** |
+| top 10% of leads, lower bound | **4,534s = 45%** |
+
+The bound on the bottom half is generous by construction - it assumes every
+lead below the median took exactly the median. So **eliminating every
+short lead entirely removes at most 15% of lead time**, and less than that
+in practice, because the work still has to happen somewhere: keeping it home
+saves the toll, not the build.
+
+Meanwhile **the top tenth of leads holds at least 45% of the time**, and
+those are leads of 87 to 302 seconds - exactly the size that ought to
+dispatch well.
+
+So the honest version of the hypothesis is narrower than the one I put at
+the top of the open list twenty minutes ago:
+
+- `worth_offering` is still worth wiring. Fifteen percent is a real number
+  and it is nearly free to take, and 260 fewer round trips is 260 fewer
+  chances for the delivery faults this file has spent a night on.
+- but it **cannot be the 6-9x**. The amplification lives in the big leads,
+  which are already the size a build farm wants, and something is making
+  those cost several times what the same work costs on one machine.
+
+`+all-binaries` still wins with five large leads, so large leads CAN be
+efficient. The question that survives is why `+test-ast`'s large ones are
+not - and that is a different question from lead size, asked of a population
+that a size filter would not touch.
