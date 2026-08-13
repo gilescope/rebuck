@@ -1105,6 +1105,21 @@ jobs:
                 docker exec own-bk cat /etc/buildkitd.toml | grep -n snapshotter || true
                 exit 1; }
             echo "[estargz] snapshotter=stargz confirmed on own-bk"
+            # THE TRANSPORT half of this is NOT checked here, deliberately.
+            # The check above proves the daemon can MOUNT and says nothing
+            # about whether anything can serve a byte range - which is what
+            # lazy pulling is, and what run 31638559820 lacked while passing
+            # this guard on all seven daemons.
+            #
+            # A probe belongs where the registry is running, and the
+            # registry starts in a LATER step than this one. A probe here
+            # could only ever hit a closed port, and the version I wrote
+            # first accepted that as a pass - an assertion that cannot fail,
+            # which is worse than no assertion.
+            #
+            # It is covered instead by
+            # `registry::tests::a_range_get_returns_206_and_only_the_bytes_asked_for`,
+            # which goes red on the exact regression: 200 where 206 was due.
           fi
           # Shell variable AND $GITHUB_ENV: the latter only reaches LATER
           # steps, and this one uses it below. See the single-runner
@@ -1621,6 +1636,21 @@ jobs:
                 docker exec own-bk cat /etc/buildkitd.toml | grep -n snapshotter || true
                 exit 1; }
             echo "[estargz] snapshotter=stargz confirmed on own-bk"
+            # THE TRANSPORT half of this is NOT checked here, deliberately.
+            # The check above proves the daemon can MOUNT and says nothing
+            # about whether anything can serve a byte range - which is what
+            # lazy pulling is, and what run 31638559820 lacked while passing
+            # this guard on all seven daemons.
+            #
+            # A probe belongs where the registry is running, and the
+            # registry starts in a LATER step than this one. A probe here
+            # could only ever hit a closed port, and the version I wrote
+            # first accepted that as a pass - an assertion that cannot fail,
+            # which is worse than no assertion.
+            #
+            # It is covered instead by
+            # `registry::tests::a_range_get_returns_206_and_only_the_bytes_asked_for`,
+            # which goes red on the exact regression: 200 where 206 was due.
           fi
           # Shell variable AND $GITHUB_ENV: the latter only reaches LATER
           # steps, and this one uses it below. See the single-runner
