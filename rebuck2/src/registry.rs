@@ -20,8 +20,16 @@
 //!
 //! Deliberately absent, each verified rather than assumed:
 //!
-//! - **No Range GET.** The client falls back to a serial fetch when the server
-//!   ignores `Range`.
+//! Range GET is served (`206`, `Content-Range`, and the suffix form
+//! `bytes=-N` that eStargz's footer probe needs). It was deliberately absent
+//! for a long time, on the reasoning quoted here — "the client falls back to
+//! a serial fetch when the server ignores `Range`" — which is true and was
+//! the wrong trade the moment lazy pulling arrived: a snapshotter that
+//! cannot range-fetch does not fail, it fetches whole layers, and
+//! `-estargz` cost 26% more CPU across six machines before anyone looked
+//! at this line.
+//!
+//! Deliberately absent, each verified rather than assumed:
 //! - **No auth, no TLS.** containerd's `MatchLocalhost` forces plain HTTP for
 //!   `127.0.0.1`/`localhost`, so no `buildkitd.toml` stanza is needed.
 //! - **No Referrers API.** `FetchReferrers` exists on the fetcher but the cache
@@ -627,6 +635,7 @@ fn streamed_blob_response(method: &Method, len: u64, body: Body, digest: &str) -
         HeaderValue::from_static("application/octet-stream"),
     );
     h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     h.insert(
         "Docker-Content-Digest",
         HeaderValue::from_str(digest).unwrap(),
@@ -637,10 +646,101 @@ fn streamed_blob_response(method: &Method, len: u64, body: Body, digest: &str) -
     (StatusCode::OK, h, body).into_response()
 }
 
+/// A single byte range, resolved against a known length.
+///
+/// Returns `None` for anything this server does not implement, and the
+/// caller then serves the WHOLE blob with 200. That fallback is legal - a
+/// server may ignore `Range` - and it is the only safe answer, because the
+/// alternative to "I did not slice it" is a wrong slice, which a
+/// content-addressed client would only discover as a digest mismatch far
+/// from here.
+///
+/// `Some(Err(()))` is different from `None`: the header parsed and asks for
+/// bytes past the end, which is 416 rather than a silent full body.
+///
+/// The suffix form carries the whole feature. eStargz's footer is the last
+/// 51 bytes of a blob and is read with `bytes=-51` before anything else, so
+/// a server that handled only `bytes=a-b` would never be asked a second
+/// question.
+#[allow(clippy::type_complexity)]
+fn parse_range(header: Option<&str>, len: u64) -> Option<Result<(u64, u64), ()>> {
+    let spec = header?.trim().strip_prefix("bytes=")?;
+    // Multipart ranges are legal and we do not serve them. Detected rather
+    // than mis-parsed: `bytes=0-9,20-29` would otherwise read as `0-9` and
+    // return a plausible, wrong slice under a 206 the client believes.
+    if spec.contains(',') {
+        return None;
+    }
+    let (a, b) = spec.split_once('-')?;
+    let (start, end) = match (a.trim(), b.trim()) {
+        // `bytes=-N`: the LAST n bytes. Not "from 0 to N", which is the
+        // reading that makes a footer probe return a header.
+        ("", n) => {
+            let n: u64 = n.parse().ok()?;
+            if n == 0 {
+                return Some(Err(()));
+            }
+            (len.saturating_sub(n), len - 1)
+        }
+        (s, "") => (s.parse().ok()?, len.saturating_sub(1)),
+        (s, e) => (s.parse().ok()?, e.parse().ok()?),
+    };
+    if len == 0 || start >= len || end < start {
+        return Some(Err(()));
+    }
+    // A client may ask for more than exists; the spec says clamp, not fail.
+    Some(Ok((start, end.min(len - 1))))
+}
+
+/// 206, with the slice and the total. Both, always: a `Content-Range`
+/// without the total leaves the client unable to size the blob, and sizing
+/// it is what the next range is computed from.
+fn partial_blob_response(
+    method: &Method,
+    bytes: &[u8],
+    start: u64,
+    end: u64,
+    digest: &str,
+) -> Response {
+    let slice = bytes[start as usize..=end as usize].to_vec();
+    let mut h = HeaderMap::new();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    h.insert(header::CONTENT_LENGTH, HeaderValue::from(slice.len()));
+    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    h.insert(
+        header::CONTENT_RANGE,
+        HeaderValue::from_str(&format!("bytes {start}-{end}/{}", bytes.len())).unwrap(),
+    );
+    h.insert(
+        "Docker-Content-Digest",
+        HeaderValue::from_str(digest).unwrap(),
+    );
+    if method == Method::HEAD {
+        return (StatusCode::PARTIAL_CONTENT, h).into_response();
+    }
+    (StatusCode::PARTIAL_CONTENT, h, slice).into_response()
+}
+
+/// 416, naming the size so the client can correct itself rather than retry
+/// the same impossible ask.
+fn range_not_satisfiable(len: u64) -> Response {
+    let mut h = HeaderMap::new();
+    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    h.insert(
+        header::CONTENT_RANGE,
+        HeaderValue::from_str(&format!("bytes */{len}")).unwrap(),
+    );
+    (StatusCode::RANGE_NOT_SATISFIABLE, h).into_response()
+}
+
 fn blob_response(method: &Method, bytes: Vec<u8>, digest: &str, ctype: &str) -> Response {
     let mut h = HeaderMap::new();
     h.insert(header::CONTENT_TYPE, HeaderValue::from_str(ctype).unwrap());
     h.insert(header::CONTENT_LENGTH, HeaderValue::from(bytes.len()));
+    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
     h.insert(
         "Docker-Content-Digest",
         HeaderValue::from_str(digest).unwrap(),
@@ -690,6 +790,9 @@ async fn handle<S: RegistryStore>(
     method: Method,
     Path(path): Path<String>,
     Query(q): Query<HashMap<String, String>>,
+    // BEFORE `body`, and axum enforces it: the body extractor consumes the
+    // request, so anything after it cannot compile. Here for `Range`.
+    headers: HeaderMap,
     body: Body,
 ) -> Response {
     // POST /v2/<name>/blobs/uploads/ — begin an upload.
@@ -936,6 +1039,7 @@ async fn handle<S: RegistryStore>(
                 Some(len) => {
                     let mut h = HeaderMap::new();
                     h.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+                    h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
                     h.insert(
                         header::CONTENT_TYPE,
                         HeaderValue::from_static("application/octet-stream"),
@@ -951,10 +1055,34 @@ async fn handle<S: RegistryStore>(
             Method::GET => match reg.store.blob_get(hex).await {
                 Ok(Some(bytes)) => {
                     reg.bw.served.fetch_add(1, Ordering::Relaxed);
-                    reg.bw
-                        .serve_bytes
-                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                    blob_response(&method, bytes, reference, "application/octet-stream")
+                    // A RANGE, when one is asked for. This is the whole of
+                    // lazy pulling: the stargz snapshotter reads a footer,
+                    // then a TOC, then the chunks a build actually touches,
+                    // all by byte range. Without it the snapshotter falls
+                    // back to whole layers and builds correctly - which is
+                    // how `-estargz` ran green on six machines and cost 26%
+                    // more CPU than the reference.
+                    //
+                    // The blob is already in memory here, so the saving is
+                    // on the WIRE and not in this store. That is the term
+                    // that matters: the fleet moved 32 GiB to put 705 MiB
+                    // on six machines.
+                    let hdr = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+                    match parse_range(hdr, bytes.len() as u64) {
+                        Some(Ok((start, end))) => {
+                            reg.bw
+                                .serve_bytes
+                                .fetch_add(end - start + 1, Ordering::Relaxed);
+                            partial_blob_response(&method, &bytes, start, end, reference)
+                        }
+                        Some(Err(())) => range_not_satisfiable(bytes.len() as u64),
+                        None => {
+                            reg.bw
+                                .serve_bytes
+                                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                            blob_response(&method, bytes, reference, "application/octet-stream")
+                        }
+                    }
                 }
                 // Nobody in the fleet holds it. THIS is where the bytes enter:
                 // fetch once from the origin into a store the blooms advertise,
@@ -962,6 +1090,24 @@ async fn handle<S: RegistryStore>(
                 // same request. Without this the 404 below sends buildkit
                 // upstream itself and the fleet never learns anything.
                 Ok(None) => {
+                    // NO RANGE ON THIS ARM, and it is a real limit rather
+                    // than an oversight. A miss goes to a peer or upstream
+                    // and `ensure_present` fetches the blob WHOLE, because
+                    // the mirror populates as a side effect of serving -
+                    // that is what makes the next machine's fetch local.
+                    //
+                    // So laziness bites only where the serving store
+                    // already holds the bytes. A worker's FIRST touch of a
+                    // layer still moves all of it, and a fleet of six cold
+                    // registries pays that six times.
+                    //
+                    // Ranging this arm means ranging the mesh fetch too,
+                    // and that is a larger change: `ensure_present` would
+                    // have to serve a slice without populating, or populate
+                    // sparsely and track which parts it holds. Deliberately
+                    // not done here - the buffered path is what the
+                    // `-estargz` re-run measures, and doing both at once
+                    // would make the result unattributable.
                     if ensure_present(&reg, _repo, reference, hex).await {
                         match reg.store.blob_stream(hex).await {
                             Some((len, body)) => {
@@ -1603,6 +1749,136 @@ mod tests {
     /// and it was hiding the one thing worth knowing about a 24.7 GiB total:
     /// that almost all of it is the same few artifacts, re-materialised on a
     /// machine that already had them.
+    /// Range GET, which is the whole of lazy pulling.
+    ///
+    /// `-estargz` ran green on six machines and cost 26% more CPU because
+    /// this did not exist. The stargz snapshotter asks for byte ranges; a
+    /// server that ignores `Range` answers 200 with the whole blob and the
+    /// snapshotter falls back to fetching every layer entire - correct
+    /// builds, no laziness, and estargz's larger blobs paid for nothing.
+    /// Nothing errored, which is why it took a fleet run to notice.
+    ///
+    /// The suffix form is not an extra: eStargz's footer is the LAST 51
+    /// bytes of the blob and is read with `bytes=-51` before anything else.
+    /// Without it the TOC is never found and every other range is moot.
+    #[tokio::test]
+    async fn a_range_get_returns_206_and_only_the_bytes_asked_for() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store =
+            std::sync::Arc::new(crate::store::Store::new(dir.path().to_path_buf()).unwrap());
+        let payload: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+        let hash = store.blob_put(&payload).await.expect("put");
+        let app = super::router(store);
+        let get = |range: &'static str| {
+            let app = app.clone();
+            let hash = hash.clone();
+            async move {
+                tower::ServiceExt::oneshot(
+                    app,
+                    axum::http::Request::get(format!("/v2/x/blobs/sha256:{hash}"))
+                        .header(axum::http::header::RANGE, range)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .expect("serve")
+            }
+        };
+
+        // A closed range.
+        let res = get("bytes=10-19").await;
+        assert_eq!(res.status(), 206, "a satisfiable Range must be 206");
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CONTENT_RANGE)
+                .map(|v| v.to_str().unwrap().to_owned()),
+            Some("bytes 10-19/2000".to_owned()),
+            "Content-Range states the slice AND the total, or the client cannot size the blob"
+        );
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), &payload[10..20]);
+
+        // The suffix form - the footer read that starts every lazy pull.
+        let res = get("bytes=-51").await;
+        assert_eq!(res.status(), 206);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            body.as_ref(),
+            &payload[1949..],
+            "bytes=-51 is the LAST 51, not the first"
+        );
+
+        // Open-ended.
+        let res = get("bytes=1990-").await;
+        assert_eq!(res.status(), 206);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), &payload[1990..]);
+
+        // Past the end is 416, and must still say how big the blob is, or a
+        // client cannot correct itself.
+        let res = get("bytes=5000-6000").await;
+        assert_eq!(res.status(), 416);
+        assert_eq!(
+            res.headers()
+                .get(axum::http::header::CONTENT_RANGE)
+                .map(|v| v.to_str().unwrap().to_owned()),
+            Some("bytes */2000".to_owned())
+        );
+
+        // A range we do not implement must serve the WHOLE blob with 200,
+        // never a wrong slice. Falling back is legal; guessing is not.
+        let res = get("bytes=0-9,20-29").await;
+        assert_eq!(
+            res.status(),
+            200,
+            "multipart ranges fall back to the full blob"
+        );
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), payload.len());
+    }
+
+    /// The capability has to be ADVERTISED or it is not used.
+    ///
+    /// containerd's fetcher checks `Accept-Ranges` before attempting a
+    /// resumable or partial fetch. A server that handles ranges silently is
+    /// a server whose ranges nobody asks for - the inverse of the bug
+    /// above and just as quiet.
+    #[tokio::test]
+    async fn accept_ranges_is_advertised_on_both_head_and_get() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store =
+            std::sync::Arc::new(crate::store::Store::new(dir.path().to_path_buf()).unwrap());
+        let hash = store.blob_put(b"hello").await.expect("put");
+        let app = super::router(store);
+        for m in [axum::http::Method::HEAD, axum::http::Method::GET] {
+            let res = tower::ServiceExt::oneshot(
+                app.clone(),
+                axum::http::Request::builder()
+                    .method(m.clone())
+                    .uri(format!("/v2/x/blobs/sha256:{hash}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("serve");
+            assert_eq!(
+                res.headers()
+                    .get(axum::http::header::ACCEPT_RANGES)
+                    .map(|v| v.to_str().unwrap().to_owned()),
+                Some("bytes".to_owned()),
+                "{m} must advertise Accept-Ranges"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn a_blob_served_twice_is_counted_twice() {
         let dir = tempfile::tempdir().expect("tmp");
